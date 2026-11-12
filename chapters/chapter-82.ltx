@@ -1,0 +1,610 @@
+%%
+%% chapter-82.ltx — Equality Saturation and E-Graphs
+%%
+
+\section{Introduction}\label{sec:egraph-intro}
+
+\emph{Equality saturation} is a recently developed optimization technique that uses \emph{equality graphs} (e-graphs) to represent and exploit equivalences between expressions. Unlike traditional compiler optimization passes, which apply transformations sequentially and irreversibly, equality saturation maintains a compact representation of all equivalent forms of an expression simultaneously and extracts the optimal form at the end.
+
+The e-graph data structure, originally developed in the theorem proving community~\cite{nelson1980fast} (Nelson and Oppen, 1980), provides an efficient representation for equivalence classes of expressions. When combined with equality saturation, e-graphs enable a new approach to compiler optimization that is more composable, more thorough, and often more effective than traditional pass-based optimization.
+
+This chapter develops the theory and practice of e-graphs and equality saturation, covering the core data structure, the saturation algorithm, rewrite rules, extraction, cost models, and modern implementations like \texttt{egg} and \texttt{Ruler}.
+
+\section{E-Graphs: Definition and Operations}\label{sec:egraph-definition}
+
+\subsection{Definition}\label{sec:egraph-def}
+
+\begin{definition}[E-Graph]\label{def:egraph}
+An \textbf{e-graph} is a data structure that maintains a set of \textbf{e-classes} (equivalence classes of expressions). Each e-class contains a set of \textbf{e-nodes}, where each e-node represents an expression (an operator applied to child e-classes). The e-graph maintains the invariant that if two e-nodes have the same operator and the same children (modulo e-class equality), they are in the same e-class.
+\end{definition}
+
+\begin{definition}[E-Class]\label{def:e-class}
+An \textbf{e-class} is an equivalence class of e-nodes. All e-nodes in the same e-class represent equivalent expressions. E-classes are identified by unique identifiers and can be merged.
+\end{definition}
+
+\begin{definition}[E-Node]\label{def:e-node}
+An \textbf{e-node} is a pair $(f, [c_1, c_2, \ldots, c_k])$ where $f$ is an operator (function symbol) and $c_1, \ldots, c_k$ are e-class identifiers representing the children.
+\end{definition}
+
+\subsection{Core Operations}\label{sec:egraph-operations}
+
+The e-graph supports three fundamental operations:
+
+\begin{definition}[E-Graph Operations]\label{def:egraph-ops}
+\begin{itemize}
+  \item \textbf{Add}: Add an expression to the e-graph, creating e-nodes and e-classes as needed. Returns the e-class of the expression.
+  \item \textbf{Merge}: Merge two e-classes, making them equivalent. All e-nodes in both classes are now in the same equivalence class.
+  \item \textbf{Rebuild}: Restore the e-graph invariants after a sequence of merges. This involves recomputing the hash-consing (ensuring structurally identical e-nodes are in the same class) and propagating equivalences.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{E-Graph Add Operation}
+\label{alg:egraph-add}
+\begin{algorithmic}[1]
+\Require E-graph $G$, expression $e$
+\Ensure E-class of $e$ in $G$
+\If{$e$ is a variable $x$}
+  \State Create e-node $(x, [])$
+  \State Create new e-class $c$ containing this e-node
+  \State \Return $c$
+\ElsIf{$e$ is $f(e_1, \ldots, e_k)$}
+  \State $c_i \gets \textsc{Add}(G, e_i)$ for each $i$
+  \State Create e-node $n = (f, [c_1, \ldots, c_k])$
+  \If{$n$ already exists in $G$}
+    \State \Return e-class of existing $n$
+  \Else
+    \State Create new e-class $c$ containing $n$
+    \State \Return $c$
+  \EndIf
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{E-Graph Merge Operation}
+\label{alg:egraph-merge}
+\begin{algorithmic}[1]
+\Require E-graph $G$, e-classes $c_1, c_2$
+\Ensure $c_1$ and $c_2$ are merged
+\State $c_1' \gets \textsc{Find}(c_1)$ \Comment{Find canonical representative}
+\State $c_2' \gets \textsc{Find}(c_2)$
+\If{$c_1' \neq c_2'$}
+  \State Union $c_1'$ and $c_2'$ (union-find)
+  \State Mark $G$ as needing rebuild
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{The Rebuild Algorithm}\label{sec:rebuild}
+
+The \emph{rebuild} operation is the most complex part of the e-graph. After merges, the e-graph may have e-nodes that are structurally identical but in different e-classes. Rebuild restores the invariant by:
+
+\begin{enumerate}
+  \item Recomputing the hash-consing table (mapping e-node structures to e-classes).
+  \item Merging e-classes that now contain identical e-nodes.
+  \item Propagating equivalences: if two e-classes are merged, all parent e-nodes that reference them must be updated.
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{E-Graph Rebuild}
+\label{alg:egraph-rebuild}
+\begin{algorithmic}[1]
+\Require E-graph $G$ (dirty, after merges)
+\Ensure $G$ satisfies all invariants
+\While{$G$ has pending changes}
+  \ForAll{e-classes $c$ that were modified}
+    \ForAll{e-nodes $n$ in $c$}
+      \State Update $n$'s children to canonical representatives
+      \State Look up $n$ in hash-consing table
+      \If{equivalent e-node $n'$ exists}
+        \State Merge $c$ with e-class of $n'$
+      \Else
+        \State Insert $n$ into hash-consing table
+      \EndIf
+    \EndFor
+  \EndFor
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\section{Equality Saturation Algorithm}\label{sec:equality-saturation}
+
+\subsection{Overview}\label{sec:es-overview}
+
+\emph{Equality saturation} applies a set of rewrite rules to an e-graph until no more rules apply (a fixedpoint is reached). The e-graph accumulates all equivalent forms of the original expression, and the best form is extracted at the end.
+
+\begin{definition}[Equality Saturation]\label{def:equality-saturation}
+\textbf{Equality saturation} is the process of:
+\begin{enumerate}
+  \item Adding the original expression to the e-graph.
+  \item Repeatedly applying rewrite rules: for each rule $l \to r$, find all matches of $l$ in the e-graph and add $r$ (merged with $l$).
+  \item Continue until no more rules apply or a resource limit is reached.
+  \item Extract the best (lowest-cost) expression from the e-graph.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Equality Saturation}
+\label{alg:equality-saturation}
+\begin{algorithmic}[1]
+\Require Expression $e$, rewrite rules $R$, cost function $\mathit{cost}$
+\Ensure Optimized expression $e'$
+\State $G \gets$ new e-graph
+\State $c \gets \textsc{Add}(G, e)$
+\Repeat
+  \State $\mathit{changed} \gets \text{false}$
+  \ForAll{rules $l \to r \in R$}
+    \ForAll{matches of $l$ in $G$}
+      \State $c_l \gets$ e-class of match
+      \State $c_r \gets \textsc{Add}(G, r[\text{matching substitution}])$
+      \State $\textsc{Merge}(G, c_l, c_r)$
+      \State $\mathit{changed} \gets \text{true}$
+    \EndFor
+  \EndFor
+  \State $\textsc{Rebuild}(G)$
+\Until{$\neg \mathit{changed}$ or resource limit reached}
+\State \Return $\textsc{Extract}(G, c, \mathit{cost})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Advantages Over Traditional Optimization}\label{sec:es-advantages}
+
+Equality saturation has several advantages over traditional sequential optimization passes:
+
+\begin{itemize}
+  \item \textbf{Order independence}: Rules can be applied in any order; the result is the same (up to the fixedpoint). No need to worry about pass ordering.
+  \item \textbf{Commute and associate}: Rules like $a + b = b + a$ and $(a + b) + c = a + (b + c)$ are naturally handled because all equivalent forms coexist in the e-graph.
+  \item \textbf{Phase ordering}: Traditional optimization suffers from the ``phase ordering problem'' (pass A enables pass B but disables pass C). Equality saturation avoids this by applying all rules simultaneously.
+\end{itemize}
+
+\section{Rewrite Rules and Extraction}\label{sec:rewrite-extraction}
+
+\subsection{Rewrite Rules}\label{sec:rewrite-rules}
+
+\begin{definition}[Rewrite Rule]\label{def:rewrite-rule}
+A \textbf{rewrite rule} is a pair $(l, r)$ where $l$ and $r$ are expressions with variables. The rule states that any substitution instance of $l$ is equivalent to the corresponding instance of $r$.
+\end{definition}
+
+\begin{example}[Algebraic Rewrite Rules]\label{ex:rewrite-rules}
+\begin{verbatim}
+  x + 0         → x                    (additive identity)
+  x * 1         → x                    (multiplicative identity)
+  x * 0         → 0                    (annihilation)
+  x + x         → x * 2               (strength reduction)
+  (x + y) + z   → x + (y + z)         (associativity)
+  x + y         → y + x               (commutativity)
+  x - x         → 0                   (subtraction self)
+  x / x         → 1                   (division self, x ≠ 0)
+\end{verbatim}
+\end{example}
+
+\subsection{Pattern Matching in E-Graphs}\label{sec:pattern-matching-egraph}
+
+Matching a pattern $l$ in an e-graph requires finding all e-nodes that match $l$ under some substitution. This is more complex than tree matching because e-graphs represent equivalence classes.
+
+\begin{definition}[E-Graph Matching]\label{def:egraph-matching}
+A \textbf{match} of pattern $l$ in e-graph $G$ is a substitution $\sigma$ mapping variables in $l$ to e-classes in $G$ such that $l\sigma$ is represented in $G$ (i.e., the e-node for $l\sigma$ exists and its e-class is found).
+\end{definition}
+
+\section{Cost Models for Extraction}\label{sec:cost-models}
+
+\subsection{The Extraction Problem}\label{sec:extraction-problem}
+
+After equality saturation, the e-graph contains many equivalent forms of the original expression. \emph{Extraction} selects the best (lowest-cost) form.
+
+\begin{definition}[Extraction]\label{def:extraction}
+\textbf{Extraction} finds the expression $e'$ in the e-class $c$ that minimizes $\mathit{cost}(e')$, where $\mathit{cost}$ is a cost function assigning a numeric cost to each expression.
+\end{definition}
+
+\begin{definition}[Cost Function]\label{def:cost-function}
+A \textbf{cost function} $\mathit{cost} : \mathit{Expr} \to \mathbb{N}$ assigns a cost to each expression. Common cost models:
+\begin{itemize}
+  \item \textbf{Size}: Number of nodes in the expression tree.
+  \item \textbf{Instruction cost}: Sum of instruction latencies.
+  \item \textbf{Custom}: Domain-specific cost (e.g., preferring vectorized operations).
+\end{itemize}
+\end{definition}
+
+\subsection{Extraction Algorithm}\label{sec:extraction-algorithm}
+
+\begin{algorithm}[H]
+\caption{E-Graph Extraction}
+\label{alg:extraction}
+\begin{algorithmic}[1]
+\Require E-graph $G$, root e-class $c$, cost function $\mathit{cost}$
+\Ensure Lowest-cost expression in e-class $c$
+\ForAll{e-classes $c'$ in $G$ (bottom-up)}
+  \State $\mathit{best}[c'] \gets \min_{n \in c'} (\mathit{cost}(n.\mathit{op}, \mathit{best}[n.\mathit{children}]))$
+\EndFor
+\State \Return expression corresponding to $\mathit{best}[c]$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Extraction Correctness]\label{thm:extraction-correct}
+If the cost function is \emph{monotone} (replacing a subexpression with a cheaper equivalent never increases the total cost), then the extraction algorithm finds the globally optimal expression.
+\end{theorem}
+
+\subsection{Non-Monotone Cost Functions}\label{sec:non-monotone}
+
+When the cost function is not monotone (e.g., when instruction scheduling constraints make the cost of a subexpression depend on its context), extraction becomes NP-hard. In practice, the bottom-up extraction provides a good approximation.
+
+\section{Applications to Compiler Optimization}\label{sec:egraph-applications}
+
+\subsection{Peephole Optimization}\label{sec:egraph-peephole}
+
+E-graphs can replace traditional peephole optimization by encoding all peephole rules as rewrite rules and running equality saturation on each basic block.
+
+\begin{example}[Peephole via E-Graph]\label{ex:egraph-peephole}
+\begin{verbatim}
+  // Rewrite rules:
+  x + 0 → x
+  x * 1 → x
+  x << 0 → x
+  x - x → 0
+  
+  // Input: (a + 0) * 1 - (a + 0)
+  // After saturation: e-graph contains both the original and "0"
+  // Extraction: "0" (cost 1 < cost of original)
+\end{verbatim}
+\end{example}
+
+\subsection{Instruction Selection}\label{sec:egraph-isel}
+
+E-graphs can encode instruction selection patterns as rewrite rules, combining pattern matching and optimization in a single framework.
+
+\subsection{Superoptimization}\label{sec:egraph-superopt}
+
+\emph{Superoptimization} searches for the optimal instruction sequence for a given computation. E-graphs enable superoptimization by exploring all equivalent instruction sequences simultaneously.
+
+\section{egg, Ruler, and Modern Implementations}\label{sec:modern-implementations}
+
+\subsection{egg}\label{sec:egg}
+
+\emph{egg}~\cite{willsey2021egg} is a fast, extensible e-graph library written in Rust. It provides:
+\begin{itemize}
+  \item A generic e-graph implementation parameterized by the language (operators and their arities).
+  \item A pattern matching engine for finding matches in e-graphs.
+  \item An extraction algorithm with configurable cost functions.
+  \item \emph{Equality saturation driver} that applies rules until convergence.
+\end{itemize}
+
+\begin{definition}[egg Architecture]\label{def:egg-arch}
+\textbf{egg} is built on the \texttt{Language} trait, which defines:
+\begin{itemize}
+  \item The set of operators (enum variants).
+  \item The arity of each operator.
+  \item Hashing and equality for e-nodes.
+\end{itemize}
+Users define their language by implementing this trait, and egg provides the e-graph, matching, and saturation infrastructure.
+\end{definition}
+
+\subsection{Ruler}\label{sec:ruler}
+
+\emph{Ruler}~\cite{nandi2021ruler} is a tool that automatically discovers rewrite rules using e-graphs. Given a set of expressions (e.g., all expressions up to a certain size), Ruler uses equality saturation to find equivalences and then extracts a minimal set of rewrite rules that generate all discovered equivalences.
+
+\begin{definition}[Rule Discovery]\label{def:rule-discovery}
+\textbf{Rule discovery} is the process of finding a set of rewrite rules $R$ such that:
+\begin{itemize}
+  \item $R$ is \emph{sound}: every equivalence derivable from $R$ is a true equivalence.
+  \item $R$ is \emph{complete} (for a given expression set): every equivalence in the expression set is derivable from $R$.
+  \item $R$ is \emph{minimal}: no rule in $R$ is derivable from the other rules.
+\end{itemize}
+\end{definition}
+
+\subsection{Applications Beyond Compilers}\label{sec:beyond-compilers}
+
+E-graphs and equality saturation have applications beyond compiler optimization:
+\begin{itemize}
+  \item \textbf{Program synthesis}: Search for programs that satisfy a specification by exploring equivalent programs.
+  \item \textbf{Theorem proving}: Maintain equivalence classes of terms during proof search.
+  \item \textbf{Computer algebra}: Simplify and transform mathematical expressions.
+  \item \textbf{Quantum compilation}: Optimize quantum circuits by exploring equivalent gate sequences.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.5cm,
+  eclass/.style={rectangle, draw=TomeInk, fill=TomeBg, minimum width=1.5cm, minimum height=0.6cm, align=center, font=\small},
+  enode/.style={circle, draw=TomeGold, fill=TomeExBg, minimum size=0.5cm, font=\tiny},
+  edge_style/.style={->, thick, color=TomeInk}
+]
+  % E-classes
+  \node[eclass] (c1) {c1};
+  \node[eclass, right=2cm of c1] (c2) {c2};
+  \node[eclass, right=2cm of c2] (c3) {c3};
+  
+  % E-nodes in c1
+  \node[enode, below=0.3cm of c1] (n1) {+};
+  \node[enode, below=0.3cm of n1] (n2) {*};
+  
+  % E-nodes in c2
+  \node[enode, below=0.3cm of c2] (n3) {x};
+  
+  % E-nodes in c3
+  \node[enode, below=0.3cm of c3] (n4) {0};
+  
+  % Edges
+  \draw[edge_style] (n1) -- node[left, font=\tiny] {c2} (c2);
+  \draw[edge_style] (n1) -- node[right, font=\tiny] {c3} (c3);
+  \draw[edge_style] (n2) -- node[left, font=\tiny] {c2} (c2);
+  \draw[edge_style] (n2) -- node[right, font=\tiny] {c3} (c3);
+  
+  % Labels
+  \node[font=\small, below=1.5cm of c1] {c1: $\{x + 0, x * 0\}$};
+  \node[font=\small, below=1.0cm of c2] {c2: $\{x\}$};
+  \node[font=\small, below=1.0cm of c3] {c3: $\{0\}$};
+\end{tikzpicture}
+\caption{An e-graph representing the expression $x + 0$ and its equivalent form $x * 0 = 0$. After applying the rules $x + 0 \to x$ and $x * 0 \to 0$, the e-graph contains e-nodes for all equivalent forms.}
+\label{fig:egraph-example}
+\end{figure}
+
+\begin{historical}
+E-graphs were introduced by Nelson and Oppen~\cite{nelson1980fast} (1980) for use in theorem proving. The application to compiler optimization was pioneered by Tate et al.~\cite{tate2009equality} (2009) with the ``equality saturation'' framework in the Joule compiler. The \texttt{egg} library of Willsey et al.~\cite{willsey2021egg} (2021) brought e-graphs to a wider audience with a fast, practical implementation. Ruler~\cite{nandi2021ruler} (2021) demonstrated automatic rule discovery. The field is rapidly evolving, with applications in quantum compilation, program synthesis, and verified compilation.
+\end{historical}
+
+\section{Summary}\label{sec:egraph-summary}
+
+Equality saturation and e-graphs provide a powerful new approach to compiler optimization. E-graphs compactly represent equivalence classes of expressions, supporting efficient merge and rebuild operations. Equality saturation applies rewrite rules to explore all equivalent forms simultaneously, avoiding the phase ordering problem. Extraction selects the optimal form based on a cost model. Modern tools like \texttt{egg} and \texttt{Ruler} make e-graphs practical and accessible. The approach has applications beyond compilers, including program synthesis, theorem proving, and computer algebra. Equality saturation represents a paradigm shift in how we think about program optimization: rather than applying transformations sequentially, we explore the space of equivalent programs and select the best.
+
+\section{The \texttt{egg} Library}\label{sec:egg-detail}
+
+The \texttt{egg} library (Willsey et al., 2021) provides a fast, practical implementation of e-graphs and equality saturation.
+
+\begin{definition}[E-Graph Core Operations]\label{def:egg-ops}
+The \texttt{egg} library provides three core operations:
+\begin{itemize}
+  \item \textbf{add}: Add an expression (e-node) to the e-graph, returning its e-class ID.
+  \item \textbf{merge}: Merge two e-classes, making them equivalent. This triggers \emph{rebuilding} to restore invariants.
+  \item \textbf{rebuild}: After merges, restore the e-graph invariants:
+  \begin{enumerate}
+    \item \textbf{Uniqueness}: No two e-nodes in the same e-class have the same operator and children.
+    \item \textbf{Consistency}: All e-nodes with equivalent children are in the same e-class.
+  \end{enumerate}
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{E-Graph Rebuild Algorithm}
+\label{alg:egg-rebuild}
+\begin{algorithmic}[1]
+\Require E-graph with pending merges
+\ensure E-graph with restored invariants
+\State \textbf{Phase 1: Union-Find normalization}
+\ForAll{pending merges $(c_1, c_2)$}
+  \State Union $c_1$ and $c_2$ in the union-find structure
+  \State Merge e-class data (analysis information)
+\EndFor
+\State \textbf{Phase 2: Canonicalization}
+\ForAll{e-nodes $n$ in the e-graph}
+  \State Update $n$'s children to their canonical e-class representatives
+\EndFor
+\State \textbf{Phase 3: Hash consing}
+\ForAll{e-nodes $n$}
+  \State Look up $n$ in the hash cons table
+  \If{equivalent e-node $n'$ exists}
+    \State Merge $n$'s e-class with $n'$'s e-class
+  \Else
+    \State Insert $n$ into hash cons table
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{definition}[E-Graph Analysis]\label{def:egg-analysis}
+An \textbf{e-graph analysis} associates abstract data with each e-class, updated during rebuilding. Examples:
+\begin{itemize}
+  \item \textbf{Constant folding}: Track whether an e-class represents a known constant.
+  \item \textbf{Type inference}: Track the type of expressions in each e-class.
+  \item \textbf{Cost estimation}: Track the minimum cost of any expression in the e-class.
+\end{itemize}
+\end{definition}
+
+\section{Extraction from E-Graphs}\label{sec:extraction-detail}
+
+\emph{Extraction} selects the best concrete expression from each e-class, based on a cost model.
+
+\begin{definition}[Optimal Extraction]\label{def:optimal-extraction}
+\textbf{Optimal extraction} finds, for each e-class, the expression tree with minimum cost among all equivalent expressions in the e-graph. This is solved by bottom-up dynamic programming on the e-graph.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{E-Graph Extraction (Bottom-Up)}
+\label{alg:egg-extract}
+\begin{algorithmic}[1]
+\Require E-graph $G$, cost function $cost$
+\ensure Minimum-cost expression for each e-class
+\State Initialize: $best(c) \gets \infty$ for all e-classes $c$
+\State Initialize: $bestExpr(c) \gets \text{null}$ for all e-classes $c$
+\Repeat
+  \State changed $\gets$ false
+  \ForAll{e-nodes $n = op(c_1, \ldots, c_k)$}
+    \State $c \gets$ e-class of $n$
+    \State $candidate \gets cost(op) + \sum_{i=1}^{k} best(c_i)$
+    \If{$candidate < best(c)$}
+      \State $best(c) \gets candidate$
+      \State $bestExpr(c) \gets op(bestExpr(c_1), \ldots, bestExpr(c_k))$
+      \State changed $\gets$ true
+    \EndIf
+  \EndFor
+\Until{$\neg$ changed}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Extraction Complexity]\label{thm:extraction-complexity}
+Extraction runs in $O(|E| \cdot d)$ time where $|E|$ is the number of e-nodes and $d$ is the maximum number of iterations (bounded by the e-graph depth). For most practical e-graphs, extraction is very fast.
+\end{theorem}
+
+\begin{example}[Extraction Example]\label{ex:extraction}
+\begin{verbatim}
+  // E-graph contains:
+  //   e-class c1: {x + 0, x, x * 1}
+  //   e-class c2: {x * 0, 0}
+  
+  // Cost model: add=1, mul=3, var=0, const=0
+  // Extraction:
+  //   best(c1) = x        (cost 0, vs x+0 cost 1, vs x*1 cost 3)
+  //   best(c2) = 0        (cost 0, vs x*0 cost 3)
+\end{verbatim}
+\end{example}
+
+\section{Equality Saturation for Compiler Optimization}\label{sec:eqsat-compiler}
+
+\subsection{Integrating Equality Saturation with Traditional Compilation}\label{sec:eqsat-integration}
+
+\begin{definition}[Equality Saturation Pipeline]\label{def:eqsat-pipeline}
+The \textbf{equality saturation pipeline} for compiler optimization:
+\begin{enumerate}
+  \item Build an e-graph from the program's expressions.
+  \item Apply rewrite rules to saturation (or until a resource limit is reached).
+  \item Extract the optimal program from the e-graph.
+  \item Continue with the rest of the compilation pipeline.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Equality Saturation Optimization Pass}
+\label{alg:eqsat-pass}
+\begin{algorithmic}[1]
+\Require Program $P$, rewrite rules $R$, resource limit $L$
+\ensure Optimized program $P'$
+\State $G \gets$ build e-graph from $P$
+\State $iter \gets 0$
+\Repeat
+  \ForAll{rules $r \in R$}
+    \State Find all matches of $r.lhs$ in $G$
+    \ForAll{matches $m$}
+      \State Instantiate $r.rhs$ with matched variables
+      \State Merge $m$ with the new expression in $G$
+    \EndFor
+  \EndFor
+  \State $G.rebuild()$
+  \State $iter \gets iter + 1$
+\Until{$iter \geq L$ or $G$ unchanged}
+\State $P' \gets$ extract optimal program from $G$
+\State \Return $P'$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Rewrite Rule Design}\label{sec:rewrite-design}
+
+\begin{definition}[Rewrite Rule Categories]\label{def:rewrite-categories}
+Rewrite rules for compiler optimization fall into several categories:
+\begin{itemize}
+  \item \textbf{Algebraic simplification}: $x + 0 \to x$, $x * 1 \to x$, $x * 0 \to 0$
+  \item \textbf{Strength reduction}: $x * 2 \to x + x$, $x^2 \to x * x$
+  \item \textbf{Canonicalization}: $a + b \to b + a$ (sort operands), $a - b \to a + (-1 * b)$
+  \item \textbf{Bit manipulation}: $x \& (x - 1) \to$ clear lowest set bit
+  \item \textbf{Domain-specific}: Architecture-specific instruction combinations
+\end{itemize}
+\end{definition}
+
+\section{Ruler: Automatic Rule Discovery}\label{sec:ruler-detail}
+
+\emph{Ruler} (Nandi et al., 2021) automatically discovers rewrite rules from a set of equality assertions.
+
+\begin{definition}[Ruler Algorithm]\label{def:ruler}
+\textbf{Ruler} takes:
+\begin{itemize}
+  \item A set of \emph{equality assertions} (pairs of equivalent expressions)
+  \item A set of \emph{operators} and their arities
+  \item A \emph{maximum rule size}
+\end{itemize}
+And produces a minimal set of rewrite rules that can derive all the equalities.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Ruler Rule Discovery (Simplified)}
+\label{alg:ruler}
+\begin{algorithmic}[1]
+\Require Equality assertions $E$, operators $O$, max size $k$
+\ensure Rewrite rules $R$
+\State $R \gets \emptyset$
+\For{size $s = 1$ to $k$}
+  \State Generate candidate rules of size $s$
+  \ForAll{candidates $c = (lhs \to rhs)$}
+    \State Check if $c$ is \emph{valid}: for all assertions in $E$, $lhs$ and $rhs$ evaluate to the same value
+    \State Check if $c$ is \emph{useful}: it derives equalities not derivable by $R$
+    \If{$c$ is valid and useful}
+      \State Add $c$ to $R$
+    \EndIf
+  \EndFor
+\EndFor
+\State Minimize $R$: remove redundant rules
+\State \Return $R$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Ruler Discovery]\label{ex:ruler}
+\begin{verbatim}
+  // Input: operators {+, *, 0, 1, -}, equalities like:
+  //   x + 0 = x, x * 1 = x, x * 0 = 0, x + x = x * 2
+  
+  // Ruler discovers:
+  //   Rule 1: ?a + 0 → ?a
+  //   Rule 2: ?a * 1 → ?a
+  //   Rule 3: ?a * 0 → 0
+  //   Rule 4: ?a + ?a → ?a * 2
+  // These rules are minimal and complete for the given equalities.
+\end{verbatim}
+\end{example}
+
+\section{E-Graph Applications Beyond Compilers}\label{sec:egraph-applications}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lll}
+\hline
+\textbf{Application} & \textbf{Description} & \textbf{Tool} \\
+\hline
+Compiler optimization & Rewrite-based optimization & \texttt{egg}, \texttt{cranelift} \\
+Program synthesis & Search for programs satisfying specifications & \texttt{Ruler}, \texttt{egraph} \\
+Theorem proving & Equational reasoning & \texttt{egg}, Z3 \\
+Quantum compilation & Optimize quantum circuits & \texttt{egg} \\
+Computer algebra & Simplify mathematical expressions & \texttt{egg} \\
+Database optimization & Query rewriting & \texttt{egg} \\
+Type checking & Equivalence of types & \texttt{egg} \\
+\hline
+\end{tabular}
+\caption{Applications of e-graphs and equality saturation.}
+\label{tab:egraph-apps}
+\end{table}
+
+\begin{tikzpicture}[
+  node distance=1.5cm,
+  enode/.style={circle, draw, minimum size=0.6cm, fill=blue!20},
+  eclass/.style={rectangle, draw, rounded corners, dashed, minimum width=1.5cm, minimum height=1cm, fill=yellow!10},
+  arr/.style={->, thick}
+]
+  % E-classes
+  \node[eclass] (c1) at (0, 0) {};
+  \node[eclass] (c2) at (3, 0) {};
+  \node[eclass] (c3) at (6, 0) {};
+  
+  % E-nodes
+  \node[enode] (n1) at (-0.3, 0.2) {+};
+  \node[enode] (n2) at (0.3, 0.2) {*};
+  \node[enode] (n3) at (-0.3, -0.3) {x};
+  \node[enode] (n4) at (0.3, -0.3) {0};
+  
+  \node[enode] (n5) at (2.7, 0.2) {x};
+  \node[enode] (n6) at (3.3, 0.2) {0};
+  
+  \node[enode] (n7) at (6, 0.2) {0};
+  
+  % Edges
+  \draw[arr] (n1) -- (n3);
+  \draw[arr] (n1) -- (n4);
+  \draw[arr] (n2) -- (n3);
+  \draw[arr] (n2) -- (n4);
+  
+  % Labels
+  \node[font=\small, below=0.8cm of c1] {$c_1$: $\{x+0, x*0\}$};
+  \node[font=\small, below=0.8cm of c2] {$c_2$: $\{x\}$};
+  \node[font=\small, below=0.8cm of c3] {$c_3$: $\{0\}$};
+  
+  % Extraction arrows
+  \node[font=\small, above=0.8cm of c1, color=green!60!black] {Extract: $x*0 \to 0$};
+  \node[font=\small, above=0.8cm of c2, color=green!60!black] {Extract: $x$};
+\end{tikzpicture}

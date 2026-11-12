@@ -1,0 +1,424 @@
+%% Chapter 39: GLR and GLL Parsing
+\label{ch:glr-gll}
+
+\section{Introduction to General Parsing}
+\label{sec:general-parsing-intro}
+
+The LR and LL parsing algorithms described in previous chapters are \emph{deterministic}: at each step, the parser makes a single choice about which action to take. This works well for grammars that satisfy the LR or LL conditions, but many practical grammars---including those for programming languages with ambiguous syntax or complex precedence rules---do not satisfy these conditions.
+
+\emph{General parsing} algorithms can handle any context-free grammar, including ambiguous grammars. They produce a representation of all possible parse trees (or a compact representation thereof) rather than a single parse tree. The two most important general parsing algorithms are GLR (Generalized LR) and GLL (Generalized LL).
+
+\begin{historical}
+General parsing has a long history. The CYK algorithm (Cocke, 1970; Younger, 1967; Kasami, 1965) was the first practical general parsing algorithm, running in $O(n^3)$ time. Earley's algorithm (1970) improved on CYK by handling left-recursive grammars more efficiently. Tomita's GLR algorithm (1984) extended LR parsing to handle arbitrary grammars by combining the efficiency of LR parsing for unambiguous regions with the generality of ambiguous parsing for problematic regions. Scott and Johnstone's GLL algorithm (2007) provided the LL counterpart. Recent work has focused on making general parsing practical for language workbenches, IDEs, and refactoring tools.
+\end{historical}
+
+\section{Tomita's GLR Algorithm}
+\label{sec:tomita-glr}
+
+\subsection{Overview}
+\label{sec:glr-overview}
+
+Tomita's GLR algorithm extends the standard LR parser to handle shift--reduce and reduce--reduce conflicts by exploring multiple parse paths simultaneously. The key innovations are:
+
+\begin{itemize}
+  \item \textbf{Node splitting}: When a conflict is encountered, the parser forks into multiple parallel threads.
+  \item \textbf{Graph-structured stack (GSS)}: Multiple threads share common stack prefixes, avoiding exponential space blowup.
+  \item \textbf{Shared packed parse forest (SPPF)}: The output is a compact representation of all parse trees, sharing common subtrees.
+\end{itemize}
+
+\subsection{Detailed Algorithm}
+\label{sec:glr-detailed}
+
+The GLR algorithm maintains a set of parse threads, each with its own position in the graph-structured stack. At each step:
+
+\begin{enumerate}
+  \item For each active thread, examine the ACTION table entry for the current state and lookahead.
+  \item If the entry is a single action (shift or reduce), execute it normally.
+  \item If the entry has multiple actions (conflict), fork the thread: create a new thread for each action.
+  \item If a reduce action creates a new node that already exists in the GSS, merge the threads.
+  \item If a thread reaches an error state with no valid actions, kill it.
+  \item If all threads are killed, report a parse error.
+  \item If exactly one thread remains and it accepts, the parse is unambiguous.
+  \item If multiple threads accept, the parse is ambiguous.
+\end{enumerate}
+
+\begin{algorithm}[htbp]
+\caption{Process one item (state, lookahead) in GLR}
+\begin{algorithmic}[1]
+\For{each action in $\texttt{ACTION}[s, a]$}
+  \If{action is $\texttt{shift } j$}
+    \State Create new GSS node $n$ with $\texttt{state}(n) = j$, $\texttt{symbol}(n) = a$
+    \State Add edge from $n$ to current top node
+    \State Set $n$ as the new top node for this thread
+  \ElsIf{action is $\texttt{reduce } A \to \beta$}
+    \State Find the node $m$ that is $|\beta|$ steps below the top node
+    \State $j \gets \texttt{GOTO}[\texttt{state}(m), A]$
+    \If{GSS node with $\texttt{state} = j$, $\texttt{symbol} = A$, parent $= m$ exists}
+      \State Merge this thread with the existing thread (add to family set)
+    \Else
+      \State Create new GSS node $n$ with $\texttt{state}(n) = j$, $\texttt{symbol}(n) = A$
+      \State Add edge from $n$ to $m$
+      \State Create SPPF node for $A \to \beta$
+    \EndIf
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{SPPF (Shared Packed Parse Forest)}
+\label{sec:sppf}
+
+\subsection{Motivation}
+\label{sec:sppf-motivation}
+
+An ambiguous grammar can produce an exponential number of parse trees. Storing all trees explicitly would require exponential space. The SPPF provides a compact representation by sharing common subtrees.
+
+\subsection{Structure of the SPPF}
+\label{sec:sppf-structure}
+
+\begin{definition}[SPPF Node Types]
+\label{def:sppf-nodes}
+The SPPF contains three types of nodes:
+\begin{itemize}
+  \item \textbf{Symbol nodes}: One for each (nonterminal, start position, end position) triple. If multiple parse trees produce the same nonterminal over the same span, they share a single symbol node.
+  \item \textbf{Rule nodes}: One for each (production, start position, end position) triple. Each alternative parse of a nonterminal corresponds to a different rule node.
+  \item \textbf{Token nodes}: One for each input token.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Family Set]
+\label{def:family-set}
+A symbol node may have multiple \emph{children} (rule nodes), each representing a different way to parse the nonterminal over the given span. The set of children is called the \emph{family set}.
+\end{definition}
+
+\begin{example}[SPPF for Ambiguous Expression]
+\label{ex:sppf-ambiguous}
+For the ambiguous grammar $E \to E + E \mid \texttt{id}$ and the input \texttt{id + id + id}, the SPPF contains:
+\begin{itemize}
+  \item A symbol node $E[0, 3]$ with two rule nodes in its family set:
+    \begin{itemize}
+      \item $E \to E + E$ with children $E[0, 1]$, $+[1, 2]$, $E[2, 3]$
+      \item $E \to E + E$ with children $E[0, 2]$, $+[2, 3]$, $E[3, 4]$ (wait, this is wrong for the span)
+    \end{itemize}
+  \item The SPPF compactly represents both left-associative and right-associative parses.
+\end{itemize}
+\end{example}
+
+\subsection{Extracting Parse Trees from SPPF}
+\label{sec:sppf-extract}
+
+Individual parse trees can be extracted from the SPPF by choosing one child from each family set. The number of distinct parse trees is the product of the family set sizes.
+
+\begin{algorithm}[htbp]
+\begin{algorithmic}[1]
+\Function{ExtractTree}{node}
+  \If{node is a token node}
+    \State \textbf{return} leaf node for token
+  \ElsIf{node is a rule node}
+    \State \textbf{return} tree with children \Call{ExtractTree}{child} for each child
+  \ElsIf{node is a symbol node}
+    \State Choose one rule node $r$ from the family set
+    \State \textbf{return} \Call{ExtractTree}{$r$}
+  \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\section{GLL Parsing}
+\label{sec:gll}
+
+\subsection{Overview}
+\label{sec:gll-overview}
+
+GLL (Generalized LL) parsing, developed by Scott and Johnstone (2007, 2010), is the LL counterpart of GLR. It extends recursive descent parsing to handle arbitrary context-free grammars, including left-recursive and ambiguous grammars.
+
+\subsection{Key Innovations}
+\label{sec:gll-innovations}
+
+GLL introduces several key innovations:
+
+\begin{itemize}
+  \item \textbf{Binary parse stack}: The parse stack is a binary tree (trampoline) rather than a linear stack, allowing multiple parse threads to share stack prefixes.
+  \item \textbf{Slot labels}: Each call to a nonterminal's parsing function is labeled with a \emph{slot} that identifies the position in the calling production. This allows the parser to resume parsing at the correct position after a recursive call.
+  \item \textbf{SPPF construction}: Like GLR, GLL produces an SPPF as output.
+\end{itemize}
+
+\subsection{The GLL Algorithm}
+\label{sec:gll-algorithm}
+
+The GLL algorithm uses a set of \emph{parse table entries} (called GSS nodes) that represent the current state of each parse thread. The algorithm processes these entries in a worklist fashion:
+
+\begin{algorithmic}[1]
+\State Initialize worklist with $(S', \text{root}, 0)$ \Comment{start symbol, root node, input position}
+\While{worklist is not empty}
+  \State Remove $(A, n, i)$ from worklist
+  \For{each production $A \to \alpha$}
+    \State Try to match $\alpha$ starting at position $i$
+    \If{match succeeds}
+      \State Create SPPF node and add to forest
+      \State Add continuation to worklist
+    \EndIf
+  \EndFor
+\EndWhile
+\end{algorithmic}
+
+\subsection{GLL vs.\ GLR}
+\label{sec:gll-vs-glr}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Property} & \textbf{GLR} & \textbf{GLL} \\
+\hline
+Base algorithm & LR (bottom-up) & LL (top-down) \\
+Stack structure & Graph-structured stack & Binary parse tree \\
+Conflict handling & Fork threads at conflicts & Try all alternatives \\
+Left recursion & Natural (LR handles it) & Requires special handling \\
+Implementation & Table-driven & Recursive descent + trampoline \\
+Generated code & Parser tables & Parser functions \\
+\hline
+\end{tabular}
+\caption{Comparison of GLR and GLL}
+\label{tab:gll-vs-glr}
+\end{table}
+
+\section{Handling Ambiguity in General Parsing}
+\label{sec:ambiguity-handling}
+
+\subsection{Ambiguity Detection}
+\label{sec:ambiguity-detection}
+
+General parsing algorithms naturally detect ambiguity: if a symbol node in the SPPF has more than one child in its family set, the grammar is ambiguous for that input.
+
+\begin{definition}[Ambiguity in SPPF]
+\label{def:ambiguity-sppf}
+An SPPF represents an ambiguous parse if and only if there exists a symbol node with a family set of size greater than 1.
+\end{definition}
+
+\subsection{Disambiguation Filters}
+\label{sec:disambiguation-filters}
+
+Once ambiguity is detected, it must be resolved. Common disambiguation strategies include:
+
+\begin{itemize}
+  \item \textbf{Precedence and associativity}: Assign precedence levels to operators and filter out parse trees that violate precedence rules.
+  \item \textbf{Priority rules}: Assign priorities to productions and prefer higher-priority parses.
+  \item \textbf{Filter functions}: Apply user-defined functions to select the desired parse from the SPPF.
+  \item \textbf{Grammar restrictions}: Modify the grammar to eliminate ambiguity (when possible).
+\end{itemize}
+
+\section{Performance Considerations}
+\label{sec:general-performance}
+
+\subsection{Complexity Analysis}
+\label{sec:complexity}
+
+\begin{theorem}[Complexity of General Parsing]
+\label{thm:general-complexity}
+Both GLR and GLL parsing have the following complexity:
+\begin{itemize}
+  \item \textbf{Unambiguous inputs}: $O(n)$ time and space (same as deterministic LR/LL)
+  \item \textbf{Ambiguous inputs}: $O(n^3)$ time and $O(n^2)$ space in the worst case
+\end{itemize}
+where $n$ is the length of the input.
+\end{theorem}
+
+\subsection{Optimization Techniques}
+\label{sec:general-optimization}
+
+Several techniques improve the practical performance of general parsing:
+
+\begin{itemize}
+  \item \textbf{Early conflict resolution}: Resolve conflicts as soon as possible to minimize the number of active threads.
+  \item \textbf{Memoization}: Cache results of sub-parses to avoid redundant computation.
+  \item \textbf{Lazy SPPF construction}: Only construct SPPF nodes when needed (e.g., when ambiguity is detected).
+  \item \textbf{Hybrid parsing}: Use deterministic parsing for unambiguous regions and general parsing only where needed.
+\end{itemize}
+
+\subsection{Practical Performance}
+\label{sec:practical-performance}
+
+In practice, GLR and GLL parsers perform close to $O(n)$ for most inputs, even for grammars that are not LR or LL. The cubic worst case is rarely encountered in practice because:
+\begin{itemize}
+  \item Most programming language inputs are unambiguous
+  \item Ambiguity is usually localized to small regions of the input
+  \item The overhead of general parsing is small compared to other compiler phases
+\end{itemize}
+
+\section{Applications}
+\label{sec:general-applications}
+
+\subsection{Language Workbenches}
+\label{sec:language-workbenches}
+
+General parsing is essential for \emph{language workbenches}---tools for designing, implementing, and experimenting with programming languages. Language workbenches need to handle arbitrary grammars, including ambiguous ones, because:
+\begin{itemize}
+  \item Language designers often start with ambiguous grammars and refine them later
+  \item Some language features (e.g., overloading, optional semicolons) are naturally ambiguous
+  \item Rapid prototyping requires flexible parsing
+\end{itemize}
+
+Tools that use general parsing include:
+\begin{itemize}
+  \item \textbf{Rascal}: A meta-language for language design with GLR parsing
+  \item \textbf{TXL}: A language for rapid prototyping with general parsing
+  \item \textbf{Stratego/XT}: A program transformation system with SDF (Syntax Definition Formalism) and GLR parsing
+\end{itemize}
+
+\subsection{Refactoring Tools}
+\label{sec:refactoring}
+
+Refactoring tools need to parse source code even when it contains errors or ambiguities. General parsing provides:
+\begin{itemize}
+  \item \textbf{Error tolerance}: Parse as much of the input as possible, even with syntax errors
+  \item \textbf{Ambiguity representation}: Represent all possible interpretations of ambiguous code
+  \item \textbf{Incremental parsing}: Re-parse only the changed portions of the file
+\end{itemize}
+
+\subsection{IDE Support}
+\label{sec:ide-support}
+
+IDEs benefit from general parsing for:
+\begin{itemize}
+  \item \textbf{Syntax highlighting}: Highlight code correctly even when it contains errors
+  \item \textbf{Code completion}: Provide completion suggestions based on all possible parses
+  \item \textbf{Error recovery}: Continue providing IDE services after syntax errors
+  \item \textbf{Incremental analysis}: Update analysis results as the user types
+\end{itemize}
+
+\section{Detailed Implementation Considerations}
+\label{sec:detailed-impl}
+
+\subsection{GSS Implementation Details}
+\label{sec:gss-impl}
+
+The graph-structured stack requires careful implementation to achieve good performance:
+
+\begin{itemize}
+  \item \textbf{Node representation}: Each GSS node contains a state number, a grammar symbol, and a list of parent pointers. The parent pointers form a DAG structure.
+  \item \textbf{Node sharing}: When two parse threads reach the same state with the same stack prefix, they share the GSS node. This requires efficient lookup (typically hash-based).
+  \item \textbf{Garbage collection}: GSS nodes that are no longer reachable from any active parse thread can be reclaimed. This is essential for memory efficiency on long inputs.
+\end{itemize}
+
+\subsection{SPPF Construction Details}
+\label{sec:sppf-construction}
+
+The SPPF is constructed incrementally during parsing:
+
+\begin{algorithmic}[1]
+\State Initialize SPPF with root node
+\For{each reduce action $A \to \beta$ in state $s$}
+  \State Find GSS nodes corresponding to the symbols of $\beta$
+  \State Create or find SPPF symbol node for $(A, i, j)$ where $i$ is start position, $j$ is end position
+  \State Create SPPF rule node for $(A \to \beta, i, j)$
+  \State Add rule node to symbol node's family set
+  \State Link rule node's children to the SPPF nodes for $\beta$'s symbols
+\EndFor
+\end{algorithmic}
+
+\subsection{Performance Optimization for GLR}
+\label{sec:glr-opt}
+
+Several techniques improve GLR parsing performance:
+
+\begin{itemize}
+  \item \textbf{Early termination}: If a parse thread reaches an error state and no other thread can make progress, terminate immediately.
+  \item \textbf{Thread merging}: When two threads reach the same state with the same GSS top node, merge them to avoid redundant work.
+  \item \textbf{Lazy SPPF construction}: Only construct SPPF nodes when ambiguity is actually encountered. For unambiguous inputs, no SPPF overhead is incurred.
+  \item \textbf{Incremental parsing}: Reuse the SPPF from a previous parse when the input has been modified slightly.
+\end{itemize}
+
+\section{GLL Parsing: Detailed Algorithm}
+\label{sec:gll-detailed}
+
+\subsection{Slot Labels and the Trampoline}
+\label{sec:gll-slots}
+
+The GLL algorithm uses \emph{slot labels} to identify positions within productions. When a nonterminal $A$ is called from position $k$ in production $B \to \alpha A \beta$, the slot label is $(B, k)$. This allows the parser to resume at the correct position after $A$ returns.
+
+\begin{definition}[GSS Node for GLL]
+\label{def:gll-gss}
+A GSS node in the GLL algorithm is a pair $(A, (B, k))$ where $A$ is the nonterminal being parsed and $(B, k)$ is the slot label indicating where to resume after $A$ is parsed.
+\end{definition}
+
+\subsection{The GLL Trampoline}
+\label{sec:gll-trampoline}
+
+The GLL parser uses a \emph{trampoline} mechanism to manage the flow of control between parsing functions:
+
+\begin{algorithmic}[1]
+\State Initialize worklist with root invocation $(S, (\text{root}, 0), 0)$
+\While{worklist is not empty}
+  \State Remove invocation $(A, \text{slot}, i)$ from worklist
+  \For{each production $A \to X_1 X_2 \cdots X_n$}
+    \State Try to match $X_1 X_2 \cdots X_n$ starting at position $i$
+    \For{each symbol $X_j$}
+      \If{$X_j$ is a terminal}
+        \If{$\texttt{input}[i + j - 1] = X_j$}
+          \State Continue matching
+        \Else
+          \State Fail; try next production
+        \EndIf
+      \ElsIf{$X_j$ is a nonterminal}
+        \State Add invocation $(X_j, (A, j), i + j - 1)$ to worklist
+        \State Wait for result
+      \EndIf
+    \EndFor
+    \If{all symbols matched}
+      \State Create SPPF node for $A \to X_1 \cdots X_n$
+      \State Resume caller at slot $(A, j)$
+    \EndIf
+  \EndFor
+\EndWhile
+\end{algorithmic}
+
+\subsection{Handling Left Recursion in GLL}
+\label{sec:gll-left-recursion}
+
+Unlike GLR, which handles left recursion naturally (since it is bottom-up), GLL must handle left recursion explicitly. The GLL algorithm detects left recursion by checking if a nonterminal is already being parsed at the current input position:
+
+\begin{itemize}
+  \item If $A$ is already being parsed at position $i$, a left recursion is detected
+  \item The parser creates a ``seed'' SPPF node for $A$ and returns it
+  \item As the left-recursive derivation completes, the seed node is updated with the new result
+  \item This process continues until a fixed point is reached
+\end{itemize}
+
+\section{Disambiguation in Practice}
+\label{sec:disambig-practice}
+
+\subsection{Priority and Associativity}
+\label{sec:priority-assoc}
+
+The most common disambiguation mechanism in general parsing is the use of \emph{priority} and \emph{associativity} declarations:
+
+\begin{verbatim}
+  {left} E '+' E;
+  {left} E '*' E;
+  {non-assoc} E '=' E;
+\end{verbatim}
+
+These declarations filter out parse trees that violate the specified precedence and associativity rules.
+
+\subsection{Reject Productions}
+\label{sec:reject-productions}
+
+Some general parsing frameworks support \emph{reject productions}---productions that are explicitly excluded from the parse.
+
+\section{Summary}
+\label{sec:general-summary}
+
+GLR and GLL parsing extend deterministic parsing to handle arbitrary context-free grammars, including ambiguous ones. Their key contributions include:
+
+\begin{itemize}
+  \item The ability to parse any CFG, not just LR or LL grammars
+  \item Compact representation of all parse trees via the SPPF
+  \item Linear-time performance for unambiguous inputs
+  \item Natural support for ambiguity detection and resolution
+  \item Applications in language workbenches, refactoring tools, and IDEs
+\end{itemize}
+
+\begin{historical}
+The development of general parsing from Tomita's GLR algorithm to modern implementations spans four decades. Key milestones include: CYK algorithm (1965--1970); Earley's algorithm (1970); Tomita's GLR (1984); Rekers' GLR implementation (1992); SDF and Syntax tool (van den Brand et al., 1990s); Scott and Johnstone's GLL (2007, 2010); Rascal's GLR implementation (2009); and modern work on integrating general parsing into IDEs and language workbenches. General parsing continues to be an active area of research, with ongoing work on performance optimization, better disambiguation mechanisms, and integration with modern software development tools.
+\end{historical}

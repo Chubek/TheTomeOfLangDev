@@ -1,0 +1,454 @@
+%%
+%% chapter-95.ltx — Incremental and Continuous Compilation
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:incremental}
+
+\section{Introduction}\label{sec:incremental-intro}
+
+Traditional compilers operate in a batch mode: the entire program is compiled from scratch each time. This model worked when programs were small and compilation was fast. But modern software projects consist of millions of lines of code, and even small changes can trigger lengthy recompilation. \emph{Incremental compilation} addresses this by reusing the results of previous compilations, recomputing only what has changed.
+
+This chapter explores the application of incremental computation to compilation, from basic dependency tracking to sophisticated change propagation algorithms and the emerging paradigm of compilers as persistent services.
+
+\section{Incremental Computation Applied to Compilation}\label{sec:inc-comp}
+
+\subsection{The Problem}\label{sec:inc-problem}
+
+\begin{definition}[Incremental Compilation]\label{def:incremental-comp}
+\emph{Incremental compilation} is a compilation strategy in which a change to the source program triggers recompilation of only those parts of the program affected by the change, reusing the results of previous compilations for unaffected parts.
+\end{definition}
+
+The goal is to reduce the cost of recompilation from $O(|P|)$ (where $|P|$ is the program size) to $O(|\Delta|)$ (where $|\Delta|$ is the size of the change), or at least to something significantly smaller than $|P|$.
+
+\subsection{Levels of Incrementality}\label{sec:inc-levels}
+
+\begin{itemize}
+  \item \textbf{File-level}: recompile only the files that changed. This is what \texttt{make} does.
+  \item \item \textbf{Module-level}: recompile only the modules whose interfaces or implementations changed. This is what build systems like Bazel and Gradle do.
+  \item \textbf{Function-level}: recompile only the functions affected by a change. This requires finer-grained dependency tracking.
+  \item \textbf{Analysis-level}: recompute only the analysis results affected by a change. This is the domain of incremental dataflow analysis.
+  \item \textbf{IR-level}: update only the IR nodes affected by a change. This is the most fine-grained approach.
+\end{itemize}
+
+\section{Dependency Tracking}\label{sec:dependency-tracking}
+
+\subsection{Dependency Graphs}\label{sec:dep-graphs}
+
+\begin{definition}[Compilation Dependency Graph]\label{def:dep-graph}
+A \emph{compilation dependency graph} is a directed graph where nodes represent compilation artifacts (source files, modules, functions, analysis results) and edges represent dependencies (``$A$ depends on $B$'' means that a change to $B$ may require recomputing $A$).
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw, fill=TomeBg, circle, minimum size=0.8cm, font=\small},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[node] (src) at (0, 3) {Source};
+  \node[node, fill=TomeExBg] (ast) at (-2, 1.5) {AST};
+  \node[node, fill=TomeExBg] (ir) at (0, 0) {IR};
+  \node[node, fill=TomeDefBg] (analysis) at (2, 1.5) {Analysis};
+  \node[node, fill=TomeWarnBg] (opt) at (0, -1.5) {Optimized IR};
+  \node[node, fill=TomeWarnBg] (codegen) at (0, -3) {Code};
+
+  \draw[arr] (src) -- (ast);
+  \draw[arr] (ast) -- (ir);
+  \draw[arr] (src) -- (analysis);
+  \draw[arr] (ir) -- (analysis);
+  \draw[arr] (analysis) -- (opt);
+  \draw[arr] (ir) -- (opt);
+  \draw[arr] (opt) -- (codegen);
+\end{tikzpicture}
+\caption{Compilation dependency graph}
+\label{fig:dep-graph}
+\end{figure}
+
+\subsection{Fine-Grained Dependencies}\label{sec:fine-grained-deps}
+
+Effective incremental compilation requires tracking dependencies at a fine granularity:
+
+\begin{itemize}
+  \item \textbf{Definition--use chains}: which definitions does each use depend on?
+  \item \textbf{Call graph edges}: which functions call which other functions?
+  \item \textbf{Type dependencies}: which types does each function depend on?
+  \item \textbf{Import dependencies}: which modules does each module import?
+  \item \textbf{Analysis dependencies}: which analysis facts does each optimization decision depend on?
+\end{itemize}
+
+\subsection{Interface-Based Dependencies}\label{sec:interface-deps}
+
+A key insight is that dependencies should be through \emph{interfaces}, not implementations:
+
+\begin{definition}[Interface Dependency]\label{def:interface-dep}
+Module $A$ depends on module $B$'s \emph{interface} (its exported types, functions, and constants), not its implementation. Changes to $B$'s implementation that do not affect its interface do not require recompiling $A$.
+\end{definition}
+
+This is the principle behind module systems like ML's, Haskell's, and Rust's, where the interface (signature, module header) is separate from the implementation.
+
+\section{Change Propagation}\label{sec:change-propagation}
+
+\subsection{The Propagation Algorithm}\label{sec:propagation-alg}
+
+When a change occurs, the compiler must determine what to recompute:
+
+\begin{algorithm}[htbp]
+\caption{Incremental Change Propagation}
+\label{alg:change-propagation}
+\begin{algorithmic}[1]
+\Procedure{PropagateChange}{$\Delta$, $\text{dep\_graph}$}
+  \Let{changed}{\text{nodes affected by } \Delta}
+  \Let{worklist}{changed}
+  \While{worklist is not empty}
+    \Let{node}{\textsc{Dequeue}(worklist)}
+    \Let{new\_value}{\textsc{Recompute}(node)}
+    \If{$\text{new\_value} \neq \text{node.value}$}
+      \State $\text{node.value} \gets \text{new\_value}$
+      \For{each dependent $d$ of node}
+        \State \textsc{Enqueue}(worklist, $d$)
+      \EndFor
+    \EndIf
+  \EndWhile
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Self-Adjusting Computation}\label{sec:self-adjusting}
+
+\begin{definition}[Self-Adjusting Computation]\label{def:self-adjusting}
+\emph{Self-adjusting computation} is a framework (developed by Acar, Blelloch, and others) in which the computation records its dependency structure during execution and automatically re-executes only the affected parts when inputs change.
+\end{definition}
+
+The key data structures are:
+\begin{itemize}
+  \item \textbf{Modifiable values}: values that can change over time.
+  \item \textbf{Dependency graph}: records which computations depend on which modifiable values.
+  \item \textbf{Change propagation}: when a modifiable value changes, re-executes only the computations that depend on it.
+\end{itemize}
+
+\subsection{Adapting to Compilation}\label{sec:adapting-to-compilation}
+
+Self-adjusting computation can be applied to compilation by treating source files as modifiable values and compilation phases as computations that depend on them. When a source file changes, only the compilation phases that depend on it are re-executed.
+
+\section{Reactive Compilation}\label{sec:reactive}
+
+\subsection{The Reactive Model}\label{sec:reactive-model}
+
+\begin{definition}[Reactive Compilation]\label{def:reactive-comp}
+\emph{Reactive compilation} treats the compilation process as a reactive system: source code changes are inputs, and compiled artifacts are outputs. The compiler maintains a dependency graph and automatically updates outputs when inputs change.
+\end{definition}
+
+This is analogous to reactive programming frameworks (like React, RxJS, or Svelte) where changes to inputs automatically propagate through a dependency graph to update outputs.
+
+\subsection{Implementation}\label{sec:reactive-impl}
+
+A reactive compiler maintains:
+\begin{itemize}
+  \item \textbf{Cells}: cached computation results (e.g., the AST for a file, the IR for a function).
+  \item \textbf{Dependencies}: which cells depend on which other cells.
+  \item \textbf{Invalidation}: when a cell changes, its dependents are marked dirty.
+  \item \textbf{Recomputation}: dirty cells are recomputed on demand (lazily) or eagerly.
+\end{itemize}
+
+\section{Compiler as a Service}\label{sec:compiler-service}
+
+\subsection{Long-Lived Compiler Processes}\label{sec:long-lived}
+
+Instead of starting a new compiler process for each compilation, the compiler runs as a long-lived service:
+
+\begin{itemize}
+  \item \textbf{Persistent state}: the compiler maintains its internal state (parsed files, analysis results, IR) across compilations.
+  \item \textbf{Incremental requests}: each compilation request specifies only what has changed.
+  \item \textbf{Fast response}: because most state is cached, responses are fast.
+\end{itemize}
+
+\subsection{Examples}\label{sec:service-examples}
+
+\begin{itemize}
+  \item \textbf{Scala's Bloop}: a build server that maintains compilation state for Scala projects.
+  \item \textbf{Kotlin's daemon}: a long-running process that caches compilation results.
+  \item \textbf{Rust's rust-analyzer}: an LSP server that incrementally analyzes Rust code.
+  \item \textbf{TypeScript's tsserver}: the TypeScript language server.
+  \item \textbf{Dart's analysis server}: incrementally analyzes Dart code.
+\end{itemize}
+
+\subsection{Language Server Protocol (LSP)}\label{sec:lsp}
+
+The Language Server Protocol standardizes the interface between editors and language servers:
+
+\begin{itemize}
+  \item \textbf{Text synchronization}: the editor sends file changes to the server.
+  \item \textbf{Diagnostics}: the server sends errors, warnings, and hints.
+  \item \textbf{Completion}: the server provides code completion suggestions.
+  \item \textbf{Go to definition}: the server resolves symbol references.
+  \item \textbf{Find references}: the server finds all uses of a symbol.
+\end{itemize}
+
+All of these require incremental analysis: the server must update its analysis results as the user types, without re-analyzing the entire project.
+
+\section{IDE Integration}\label{sec:ide-integration}
+
+\subsection{Incremental Parsing}\label{sec:incremental-parsing}
+
+IDEs need to parse code as the user types. Incremental parsers update the parse tree in response to small changes:
+
+\begin{itemize}
+  \item \textbf{Tree-sitter}: an incremental parsing library that produces a concrete syntax tree and updates it efficiently when the source changes.
+  \item \textbf{rust-analyzer}: uses an incremental parser that re-parses only the changed regions.
+  \item \textbf{Dart's analyzer}: uses a fully incremental parser and resolver.
+\end{itemize}
+
+\subsection{Incremental Type Checking}\label{sec:incremental-type-checking}
+
+Type checking can also be performed incrementally:
+\begin{itemize}
+  \item When a type annotation changes, only the functions that use that type need to be re-checked.
+  \item When a function body changes, only the function and its callers (if the signature changed) need to be re-checked.
+  \item Type inference results can be cached and invalidated based on dependency tracking.
+\end{itemize}
+
+\subsection{Error Recovery and Partial Analysis}\label{sec:error-recovery}
+
+During interactive editing, the code is often in an invalid state (syntax errors, type errors). The incremental compiler must:
+\begin{itemize}
+  \item Parse as much of the code as possible, even with errors.
+  \item Perform analysis on the valid portions.
+  \item Report errors without crashing or losing all analysis results.
+\end{itemize}
+
+\section{Advanced Dependency Tracking}\label{sec:advanced-dep-tracking}
+
+\subsection{Dependency Granularity and Precision}\label{sec:dep-granularity}
+
+The effectiveness of incremental compilation depends on the precision of dependency tracking. Over-approximating dependencies causes unnecessary recompilation; under-approximating causes missed updates and stale results.
+
+\begin{definition}[Dependency Precision]\label{def:dep-precision}
+A dependency tracking system is \emph{precise} if it tracks exactly those dependencies that can affect the result of a computation. It is \emph{sound} if it never misses a real dependency (but may track some spurious ones).
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Dependency tracking precision levels}
+\label{tab:dep-precision}
+\begin{tabular}{llll}
+\hline
+\textbf{Level} & \textbf{Granularity} & \textbf{Precision} & \textbf{Overhead} \\
+\hline
+File & Source files & Low & Low \\
+Module & Module interfaces & Medium & Low \\
+Symbol & Individual definitions & High & Medium \\
+Expression & Individual expressions & Very high & High \\
+Value & Individual values & Maximum & Very high \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Semantic Change Detection}\label{sec:semantic-change}
+
+A key challenge is determining whether a change is \emph{semantic}---whether it affects the meaning of the program. Consider:
+
+\begin{itemize}
+  \item \textbf{Whitespace changes}: do not affect semantics; no recompilation needed.
+  \item \textbf{Comment changes}: do not affect semantics; no recompilation needed.
+  \item \textbf{Variable renaming}: affects the name but not the semantics (if all references are updated).
+  \item \textbf{Type annotation changes}: may or may not affect downstream type checking.
+  \item \textbf{Function body changes}: affects the function and its callers (if inlined).
+\end{itemize}
+
+\begin{algorithm}[htbp]
+\caption{Semantic Change Detection}
+\label{alg:semantic-change}
+\begin{algorithmic}[1]
+\Procedure{DetectSemanticChange}{$\text{old\_ast}, \text{new\_ast}$}
+  \Let{diff}{\textsc{ComputeTreeDiff}(old\_ast, new\_ast)}
+  \For{each change $c$ in diff}
+    \If{$c$ is whitespace or comment}
+      \State \textbf{continue} \Comment{Not semantic}
+    \EndIf
+    \If{$c$ is a rename with all references updated}
+      \State \textsc{UpdateSymbolTable}(c)
+      \State \textbf{continue} \Comment{Name change only}
+    \EndIf
+    \If{$c$ is a type signature change}
+      \State \textsc{InvalidateDependents}(c.symbol, \text{type\_deps})
+    \EndIf
+    \If{$c$ is a body change}
+      \State \textsc{InvalidateDependents}(c.symbol, \text{call\_deps})
+    \EndIf
+    \State \textsc{Recompute}(c.affected\_node)
+  \EndFor
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cross-Module Dependencies}\label{sec:cross-module-deps}
+
+Dependencies often cross module boundaries. Tracking them requires understanding module interfaces:
+
+\begin{itemize}
+  \item \textbf{Export dependencies}: if module $A$ exports type $T$, and module $B$ uses $T$, then $B$ depends on $A$'s export of $T$.
+  \item \textbf{Implementation dependencies}: if module $A$ changes the implementation of function $f$ (without changing its signature), modules that call $f$ do not need recompilation.
+  \item \textbf{Transitive dependencies}: if $A$ depends on $B$ and $B$ depends on $C$, then a change to $C$ may affect $A$ (if the change propagates through $B$'s interface).
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  mod/.style={draw, fill=TomeBg, minimum width=2cm, minimum height=0.8cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth},
+  darr/.style={->, thick, >=stealth, dashed}
+]
+  \node[mod, fill=TomeExBg] (a) at (0, 2) {Module A};
+  \node[mod, fill=TomeDefBg] (b) at (3, 2) {Module B};
+  \node[mod, fill=TomeWarnBg] (c) at (6, 2) {Module C};
+  \node[mod, fill=TomeExBg] (d) at (1.5, 0) {Module D};
+  \node[mod, fill=TomeDefBg] (e) at (4.5, 0) {Module E};
+
+  \draw[arr] (a) -- node[above, font=\footnotesize] {imports T} (b);
+  \draw[arr] (b) -- node[above, font=\footnotesize] {imports f} (c);
+  \draw[arr] (a) -- node[left, font=\footnotesize] {uses g} (d);
+  \draw[arr] (b) -- (d);
+  \draw[arr] (b) -- (e);
+  \draw[darr] (c) -- node[right, font=\footnotesize] {change propagates} (a);
+\end{tikzpicture}
+\caption{Cross-module dependency graph with change propagation}
+\label{fig:cross-module-deps}
+\end{figure}
+
+\section{Reactive Compilation Systems}\label{sec:reactive-systems}
+
+\subsection{Salsa-Style Incremental Computation}\label{sec:salsa-style}
+
+The Salsa framework (used by rust-analyzer) provides a clean model for reactive compilation:
+
+\begin{definition}[Salsa-Style Incremental Computation]\label{def:salsa}
+\emph{Salsa-style incremental computation} organizes the compiler as a set of \emph{queries} (functions with memoized results) and \emph{inputs} (source files). When an input changes, only the queries whose results are affected are recomputed.
+\end{definition}
+
+Key concepts:
+\begin{itemize}
+  \item \textbf{Query}: a function from inputs to outputs, whose result is cached.
+  \item \textbf{Input}: a source file or configuration value that can change.
+  \item \textbf{Durability}: an estimate of how often a value changes. High-durability values (like the standard library) change rarely.
+  \item \textbf{Revision}: a version counter that increments each time an input changes.
+\end{itemize}
+
+\begin{verbatim}
+  // Pseudocode for Salsa-style queries
+  #[salsa::query_group]
+  trait CompilerDatabase {
+      // Input: source files
+      fn source_file(&self, file: FileId) -> String;
+      
+      // Query: parse a file into an AST
+      fn parse(&self, file: FileId) -> Ast;
+      
+      // Query: compute the type of an expression
+      fn type_of(&self, expr: ExprId) -> Type;
+      
+      // Query: compute diagnostics for a file
+      fn diagnostics(&self, file: FileId) -> Vec<Diagnostic>;
+  }
+\end{verbatim}
+
+\subsection{Verification and Changed-Value Tracking}\label{sec:changed-value-tracking}
+
+A critical optimization in reactive compilation is \emph{changed-value tracking}: even if a query is re-executed (because its inputs changed), if its output is the same as before, its dependents do not need to be recomputed.
+
+\begin{algorithm}[htbp]
+\caption{Changed-Value Tracking in Reactive Compilation}
+\label{alg:changed-value}
+\begin{algorithmic}[1]
+\Procedure{RecomputeQuery}{$q$, \text{revision}}
+  \Let{old\_value}{q.\text{cached\_value}}
+  \Let{new\_value}{\textsc{Execute}(q)}
+  \If{new\_value == old\_value}
+    \State q.\text{verified\_at} $\gets$ revision
+    \State \Return \textbf{unchanged} \Comment{Dependents need not recompute}
+  \Else
+    \State q.\text{cached\_value} $\gets$ new\_value
+    \State q.\text{changed\_at} $\gets$ revision
+    \State \Return \textbf{changed} \Comment{Dependents must recompute}
+  \EndIf
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+This optimization is crucial because many changes (e.g., modifying a comment or renaming a local variable) do not change the results of downstream queries (e.g., type checking of other functions).
+
+\subsection{Garbage Collection of Cached Results}\label{sec:cache-gc}
+
+As the program evolves, cached query results accumulate. The system must garbage-collect results that are no longer needed:
+
+\begin{itemize}
+  \item \textbf{Liveness analysis}: a cached result is live if it was used in the current revision.
+  \item \textbf{Dependency-based GC}: a cached result can be freed if no live query depends on it.
+  \item \textbf{Periodic sweeping}: periodically scan all cached results and free those not used since the last sweep.
+\end{itemize}
+
+\section{Parallel Incremental Compilation}\label{sec:parallel-incremental}
+
+\subsection{Parallel Query Evaluation}\label{sec:parallel-queries}
+
+Incremental compilation can be parallelized by evaluating independent queries concurrently:
+
+\begin{itemize}
+  \item Queries that depend on different inputs can be evaluated in parallel.
+  \item When a query's dependencies are all satisfied, it can be evaluated immediately.
+  \item A work-stealing scheduler can balance the load across threads.
+\end{itemize}
+
+\begin{definition}[Parallel Query Evaluation]\label{def:parallel-query}
+\emph{Parallel query evaluation} evaluates independent queries concurrently, using a dependency graph to determine which queries can be evaluated in parallel and which must wait for their dependencies.
+\end{definition}
+
+\subsection{Handling Cycles in Parallel Evaluation}\label{sec:parallel-cycles}
+
+If queries form a cycle (e.g., mutual recursion in type inference), parallel evaluation must detect and handle the cycle:
+
+\begin{itemize}
+  \item \textbf{Cycle detection}: use a visited set to detect cycles during query evaluation.
+  \item \textbf{Cycle recovery}: when a cycle is detected, use a fallback strategy (e.g., assume a default type, report an error).
+  \item \textbf{Fixpoint iteration}: for some cyclic queries, iterate to a fixpoint (e.g., type inference with recursive types).
+\end{itemize}
+
+\section{Formal Foundations of Incremental Compilation}\label{sec:formal-foundations}
+
+\subsection{Change Propagation Correctness}\label{sec:propagation-correctness}
+
+The correctness of incremental compilation rests on a key property:
+
+\begin{theorem}[Incremental Correctness]\label{thm:incremental-correct}
+Let $C$ be a compilation function and $\Delta$ a change to the source program. If the incremental compilation algorithm produces result $R'$, then $R' = C(P + \Delta)$, where $P + \Delta$ is the modified program. That is, the incremental result is identical to a from-scratch compilation of the modified program.
+\end{theorem}
+
+Proving this theorem requires showing that:
+\begin{enumerate}
+  \item The dependency graph correctly captures all dependencies (soundness).
+  \item The change propagation algorithm recomputes all affected results (completeness).
+  \item The recomputation of each node produces the same result as a fresh computation.
+\end{enumerate}
+
+\subsection{Complexity of Incremental Compilation}\label{sec:inc-complexity}
+
+\begin{definition}[Incremental Complexity]\label{def:inc-complexity}
+The \emph{incremental complexity} of a compilation is the cost of propagating a change, measured as a function of the change size $|\Delta|$ and the dependency graph structure.
+\end{definition}
+
+In the best case, incremental compilation is $O(|\Delta|)$---only the directly affected nodes are recomputed. In the worst case (a change that cascades through the entire dependency graph), it is $O(|P|)$, no better than from-scratch compilation.
+
+The average case depends on the program's dependency structure:
+\begin{itemize}
+  \item \textbf{Modular programs}: changes tend to be local; incremental cost is low.
+  \item \textbf{Monolithic programs}: changes may cascade widely; incremental cost is higher.
+  \item \textbf{Interface-stable changes}: changes that do not affect interfaces have minimal incremental cost.
+\end{itemize}
+
+\section{Summary}\label{sec:incremental-summary}
+
+Incremental and continuous compilation transforms the compiler from a batch process into a reactive service that maintains a live model of the program. By tracking dependencies at fine granularity and propagating only the effects of changes, incremental compilers can provide near-instant feedback even for very large projects. This is essential for modern IDE integration, where the compiler must respond to the user's edits in milliseconds.
+
+\begin{historical}
+Incremental compilation has been studied since the 1980s, with early work on incremental attribute evaluation and incremental dataflow analysis. The rise of large-scale software projects in the 1990s and 2000s made incremental compilation a practical necessity. Build systems like \texttt{make} (1976), \texttt{Jam} (1993), and modern systems like Bazel (2015) and Ninja (2011) implement file-level incrementality. The concept of self-adjusting computation (Acar et al., 2006) provided a theoretical foundation for fine-grained incrementality. The Language Server Protocol (Microsoft, 2016) standardized the interface between editors and language servers, driving the development of incremental compilers for languages like TypeScript, Rust, and Dart. The trend is toward fully incremental, reactive compilers that maintain a live, up-to-date model of the program at all times.
+\end{historical}

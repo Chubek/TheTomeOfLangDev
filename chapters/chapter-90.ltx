@@ -1,0 +1,405 @@
+%%
+%% chapter-90.ltx — Concurrency and the Runtime
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:concurrency-runtime}
+
+\section{Introduction}\label{sec:concurrency-runtime-intro}
+
+Concurrency---the ability of a program to manage multiple computations that overlap in time---is now a fundamental requirement of programming language runtimes. Whether through operating system threads, green threads, coroutines, or async/await, modern languages must provide mechanisms for concurrent execution and synchronization. The runtime system is responsible for creating and scheduling these concurrent entities, providing synchronization primitives, and ensuring that the memory model gives programmers predictable semantics for concurrent access to shared state.
+
+This chapter covers the runtime support for concurrency, from low-level thread management to high-level async/await implementations. We examine synchronization primitives, lock-free algorithms, memory models, and the various threading models that modern languages employ.
+
+\section{Thread Creation and Management}\label{sec:thread-creation}
+
+\subsection{OS Threads}\label{sec:os-threads}
+
+Operating system threads are the fundamental unit of concurrency provided by the kernel. Each thread has:
+\begin{itemize}
+  \item Its own stack (typically 1--8 MB).
+  \item Its own register context (saved/restored on context switch).
+  \item A thread-local storage area.
+  \item A scheduling priority.
+\end{itemize}
+
+\begin{definition}[OS Thread]\label{def:os-thread}
+An \emph{OS thread} (or \emph{kernel thread}) is a schedulable entity managed by the operating system kernel. The kernel is responsible for scheduling threads onto CPU cores and performing context switches.
+\end{definition}
+
+Thread creation via the OS API:
+\begin{itemize}
+  \item \textbf{POSIX}: \texttt{pthread\_create(\&thread, \&attr, start\_routine, arg)}.
+  \item \textbf{Windows}: \texttt{CreateThread(NULL, stack\_size, start\_address, parameter, flags, \&thread\_id)}.
+  \item \textbf{Linux}: \texttt{clone()} system call (underlying both threads and processes).
+\end{itemize}
+
+\subsection{Thread Costs}\label{sec:thread-costs}
+
+OS threads are relatively expensive:
+\begin{itemize}
+  \item \textbf{Creation}: requires a system call, stack allocation, and kernel data structure setup. Typically takes microseconds.
+  \item \textbf{Memory}: each thread requires a stack (default 8 MB on Linux, though virtual memory means physical pages are allocated on demand).
+  \item \textbf{Context switch}: saving/restoring registers, TLB flushes (on address space switch), and scheduler overhead. Typically takes hundreds of nanoseconds.
+  \item \textbf{Scalability}: thousands of threads cause excessive context switching and memory pressure.
+\end{itemize}
+
+These costs motivate lighter-weight concurrency mechanisms.
+
+\subsection{Runtime Thread Abstraction}\label{sec:runtime-thread}
+
+Language runtimes typically provide a thread abstraction on top of OS threads:
+
+\begin{itemize}
+  \item \textbf{Java}: \texttt{java.lang.Thread} maps to OS threads (in HotSpot). Thread objects carry additional metadata (thread group, priority, uncaught exception handler).
+  \item \textbf{Go}: goroutines are lightweight, runtime-scheduled entities multiplexed onto OS threads.
+  \item \textbf{Rust}: \texttt{std::thread} is a thin wrapper around OS threads. Async tasks are scheduled by an executor.
+  \item \textbf{Erlang}: processes are extremely lightweight, with their own heaps and garbage collectors, communicating via message passing.
+\end{itemize}
+
+\section{Synchronization Primitives}\label{sec:synchronization}
+
+\subsection{Mutexes}\label{sec:mutexes}
+
+A \emph{mutex} (mutual exclusion) ensures that only one thread at a time can access a critical section.
+
+\begin{definition}[Mutex]\label{def:mutex}
+A \emph{mutex} is a synchronization primitive that supports two operations:
+\begin{itemize}
+  \item \texttt{lock()}: acquire exclusive access. If the mutex is held, the calling thread blocks.
+  \item \texttt{unlock()}: release exclusive access, allowing another waiting thread to proceed.
+\end{itemize}
+\end{definition}
+
+Implementation strategies:
+\begin{itemize}
+  \item \textbf{Spinlock}: busy-wait in a loop, repeatedly attempting an atomic test-and-set. Low latency but wastes CPU.
+  \item \textbf{Blocking mutex}: use OS futex (fast userspace mutex) to block the thread when contended. Higher latency but does not waste CPU.
+  \item \textbf{Two-phase mutex}: spin briefly, then block. Combines low latency for short critical sections with CPU efficiency for long ones.
+\end{itemize}
+
+\subsection{Condition Variables}\label{sec:condition-vars}
+
+\begin{definition}[Condition Variable]\label{def:condvar}
+A \emph{condition variable} allows threads to wait for a condition to become true:
+\begin{itemize}
+  \item \texttt{wait(mutex)}: atomically release the mutex and block the thread.
+  \item \texttt{signal()}: wake one waiting thread.
+  \item \texttt{broadcast()}: wake all waiting threads.
+\end{itemize}
+\end{definition}
+
+Condition variables are the building block for higher-level synchronization: bounded buffers, reader--writer locks, barriers, and semaphores can all be implemented using mutexes and condition variables.
+
+\subsection{Atomic Operations}\label{sec:atomics}
+
+Atomic operations are the foundation of all synchronization:
+
+\begin{definition}[Atomic Operation]\label{def:atomic}
+An \emph{atomic operation} is one that appears to execute instantaneously from the perspective of other threads. No intermediate state is visible.
+\end{definition}
+
+Common atomic operations:
+\begin{itemize}
+  \item \textbf{Atomic load/store}: read or write a value atomically.
+  \item \textbf{Compare-and-swap (CAS)}: \texttt{CAS(addr, expected, new)} atomically sets \texttt{*addr = new} if \texttt{*addr == expected}, returning the old value.
+  \item \textbf{Fetch-and-add}: atomically read and increment a value.
+  \item \textbf{Exchange}: atomically swap a value.
+\end{itemize}
+
+\subsection{Read-Write Locks}\label{sec:rw-locks}
+
+\begin{definition}[Read-Write Lock]\label{def:rwlock}
+A \emph{read-write lock} allows multiple concurrent readers or one exclusive writer:
+\begin{itemize}
+  \item \texttt{read\_lock()}: acquire shared (read) access.
+  \item \texttt{write\_lock()}: acquire exclusive (write) access.
+  \item \texttt{unlock()}: release the held lock.
+\end{itemize}
+\end{definition}
+
+\section{Lock-Free and Wait-Free Algorithms}\label{sec:lock-free}
+
+\subsection{Definitions}\label{sec:lock-free-defs}
+
+\begin{definition}[Lock-Free]\label{def:lock-free}
+A data structure or algorithm is \emph{lock-free} if at least one thread is guaranteed to make progress in a finite number of steps, regardless of the behavior of other threads.
+\end{definition}
+
+\begin{definition}[Wait-Free]\label{def:wait-free}
+A data structure or algorithm is \emph{wait-free} if \emph{every} thread is guaranteed to make progress in a finite number of steps, regardless of the behavior of other threads.
+\end{definition}
+
+\begin{definition}[Obstruction-Free]\label{def:obstruction-free}
+A data structure is \emph{obstruction-free} if a thread is guaranteed to make progress provided no other thread concurrently accesses the same data.
+\end{definition}
+
+These form a hierarchy: wait-free $\subset$ lock-free $\subset$ obstruction-free.
+
+\subsection{Lock-Free Stack Example}\label{sec:lock-free-stack}
+
+\begin{algorithm}[htbp]
+\caption{Lock-Free Stack Push (CAS-based)}
+\label{alg:lock-free-push}
+\begin{algorithmic}[1]
+\Procedure{Push}{$stack$, $value$}
+  \Let{node}{\textsc{NewNode}(value)}
+  \Loop
+    \Let{old\_top}{stack.\text{top}}
+    \State $\text{node}.\text{next} \gets \text{old\_top}$
+    \If{$\textsc{CAS}(\&stack.\text{top}, \text{old\_top}, \text{node})$}
+      \State \Return
+    \EndIf
+  \EndLoop
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{The ABA Problem}\label{sec:aba-problem}
+
+Lock-free algorithms using CAS face the \emph{ABA problem}: the value at an address changes from $A$ to $B$ and back to $A$, causing a CAS to succeed when it should not.
+
+\begin{itemize}
+  \item \textbf{Tagged pointers}: include a version counter that increments on every modification.
+  \item \textbf{Hazard pointers}: each thread publishes the pointers it is currently accessing, preventing their reclamation.
+  \item \textbf{Epoch-based reclamation}: defer deallocation until no thread can possibly hold a reference.
+\end{itemize}
+
+\section{Memory Models and Ordering}\label{sec:memory-models}
+
+\subsection{The Need for a Memory Model}\label{sec:memory-model-need}
+
+In a concurrent program, the order in which memory operations become visible to other threads is not always the order in which they appear in the program. Compilers and processors reorder operations for performance, and without a formal specification of the allowed reorderings, concurrent programs have undefined behavior.
+
+\begin{definition}[Memory Model]\label{def:memory-model}
+A \emph{memory model} is a formal specification of the values that a memory load can return, given the set of stores executed by all threads. It defines the allowed reorderings of memory operations and the synchronization mechanisms that restrict those reorderings.
+\end{definition}
+
+\subsection{Sequential Consistency}\label{sec:sequential-consistency}
+
+\begin{definition}[Sequential Consistency]\label{def:seq-cst}
+A system is \emph{sequentially consistent} if the result of any execution is the same as if all operations of all threads were interleaved in some total order, and the operations of each thread appear in this order in the order specified by the program.
+\end{definition}
+
+Sequential consistency is intuitive but expensive: it forbids all reorderings of memory operations.
+
+\subsection{Relaxed Memory Models}\label{sec:relaxed-models}
+
+Modern architectures use relaxed memory models that allow certain reorderings:
+
+\begin{table}[htbp]
+\centering
+\caption{Memory ordering in modern architectures}
+\label{tab:memory-ordering}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Architecture} & \textbf{Load--Load} & \textbf{Load--Store} & \textbf{Store--Store} & \textbf{Store--Load} \\
+\hline
+x86-TSO & Ordered & Ordered & Ordered & \emph{Relaxed} \\
+ARM & Relaxed & Relaxed & Relaxed & Relaxed \\
+RISC-V & Relaxed & Relaxed & Relaxed & Relaxed \\
+POWER & Relaxed & Relaxed & Relaxed & Relaxed \\
+\hline
+\end{tabular}
+\end{table}
+
+x86's Total Store Order (TSO) is the strongest mainstream model: it only relaxes store-to-load reordering. ARM, RISC-V, and POWER are weakly ordered: all reorderings are permitted unless explicitly prevented by fence instructions.
+
+\subsection{Language Memory Models}\label{sec:lang-memory-models}
+
+Languages define their own memory models on top of the hardware models:
+
+\begin{itemize}
+  \item \textbf{C/C++ (C11/C++11)}: defines memory orderings (\texttt{relaxed}, \texttt{consume}, \texttt{acquire}, \texttt{release}, \texttt{acq\_rel}, \texttt{seq\_cst}) and atomic operations. The compiler maps these to hardware fences and atomic instructions.
+  \item \textbf{Java}: defines a happens-before relationship. Synchronization actions (volatile reads/writes, monitor enter/exit) establish happens-before edges.
+  \item \textbf{Rust}: follows the C/C++ memory model, with additional safety guarantees enforced by the type system (\texttt{Send} and \texttt{Sync} traits).
+\end{itemize}
+
+\section{Green Threads and Coroutines}\label{sec:green-threads}
+
+\subsection{Green Threads}\label{sec:green-thread-def}
+
+\begin{definition}[Green Thread]\label{def:green-thread}
+A \emph{green thread} (or \emph{user-level thread}) is a lightweight thread scheduled by the runtime rather than the OS kernel. Multiple green threads are multiplexed onto a smaller number of OS threads.
+\end{definition}
+
+Advantages:
+\begin{itemize}
+  \item Very cheap creation (a few KB of stack, no system call).
+  \item Fast context switching (no kernel involvement).
+  \item Millions of concurrent green threads are feasible.
+\end{itemize}
+
+Disadvantages:
+\begin{itemize}
+  \item Blocking system calls block the entire OS thread (unless the runtime detects and handles this).
+  \item Cannot take advantage of multiple cores without an M:N scheduler.
+  \item Debugging is more complex (non-preemptive scheduling).
+\end{itemize}
+
+\subsection{Goroutines}\label{sec:goroutines}
+
+Go's goroutines are the most widely used green thread implementation:
+\begin{itemize}
+  \item Initial stack size: 2 KB (grows as needed).
+  \item M:N scheduling: goroutines are multiplexed onto OS threads (M) managed by worker threads (P).
+  \item Non-blocking runtime: the runtime intercepts blocking operations and parks the goroutine.
+  \item Channel-based communication: goroutines communicate via channels rather than shared memory.
+\end{itemize}
+
+\subsection{Coroutines}\label{sec:coroutines}
+
+\begin{definition}[Coroutine]\label{def:coroutine}
+A \emph{coroutine} is a generalization of a subroutine that can suspend its execution (yield) and later resume from the point of suspension. Coroutines maintain their own stack frame (or continuation) across suspensions.
+\end{definition}
+
+Coroutine implementations:
+\begin{itemize}
+  \item \textbf{Stackful}: the coroutine has its own stack (e.g., Lua coroutines, C++ coroutines with \texttt{symmetric transfer}).
+  \item \textbf{Stackless}: the coroutine state is represented as a state machine; no separate stack is needed (e.g., C\# async/await, Rust async).
+\end{itemize}
+
+\section{Async/Await Implementation}\label{sec:async-await}
+
+\subsection{The Async/Await Pattern}\label{sec:async-pattern}
+
+\begin{definition}[Async/Await]\label{def:async-await}
+\emph{Async/await} is a language feature for writing asynchronous code in a sequential style. An \texttt{async} function can \texttt{await} a future/promise, suspending itself until the awaited operation completes.
+\end{definition}
+
+\subsection{State Machine Transformation}\label{sec:state-machine}
+
+The compiler transforms async functions into state machines:
+
+\begin{example}[Async Transformation]\label{ex:async-transform}
+Source code:
+\begin{verbatim}
+  async fn fetch_data() -> String {
+      let response = await http_get(url);
+      let parsed = await parse_json(response);
+      return parsed;
+  }
+\end{verbatim}
+Transformed state machine:
+\begin{verbatim}
+  enum FetchDataState {
+      Start,
+      AwaitingGet(Response),
+      AwaitingParse(String),
+      Done,
+  }
+
+  fn poll(state: &mut FetchDataState) -> Poll<String> {
+      match state {
+          Start => {
+              let fut = http_get(url);
+              *state = AwaitingGet(fut);
+              Poll::Pending
+          }
+          AwaitingGet(response) => {
+              let parsed = parse_json(response);
+              *state = AwaitingParse(parsed);
+              Poll::Pending
+          }
+          AwaitingParse(result) => {
+              *state = Done;
+              Poll::Ready(result)
+          }
+          Done => panic!("polled after completion"),
+      }
+  }
+\end{verbatim}
+\end{example}
+
+\subsection{Executor and Reactor}\label{sec:executor-reactor}
+
+The runtime provides:
+\begin{itemize}
+  \item \textbf{Executor}: schedules and polls async tasks. Examples: Tokio (Rust), asyncio (Python), the .NET thread pool.
+  \item \textbf{Reactor}: monitors I/O events (using \texttt{epoll}, \texttt{kqueue}, \texttt{IOCP}) and wakes tasks when I/O is ready.
+  \item \textbf{Waker}: a handle that allows the reactor to notify the executor that a task is ready to make progress.
+\end{itemize}
+
+\subsection{Stackless vs.\ Stackful Async}\label{sec:stackless-stackful}
+
+\begin{table}[htbp]
+\centering
+\caption{Stackless vs.\ stackful async implementations}
+\label{tab:async-comparison}
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Stackless} & \textbf{Stackful} \\
+\hline
+State representation & State machine enum & Separate stack \\
+Memory per suspension & Small (only live locals) & Full stack frame \\
+Coloring & ``Colored'' (async is viral) & ``Colorless'' \\
+Implementation complexity & Higher (compiler transform) & Lower (context switch) \\
+Interoperability & Async/sync boundary & Transparent \\
+Languages & Rust, C\#, JS & Go, Kotlin (JVM) \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Runtime Support for Parallelism}\label{sec:parallelism}
+
+\subsection{Work Stealing}\label{sec:work-stealing}
+
+\begin{definition}[Work Stealing]\label{def:work-stealing}
+\emph{Work stealing} is a scheduling strategy where each worker thread maintains a local deque of tasks. When a worker's deque is empty, it ``steals'' tasks from another worker's deque (typically from the bottom, to minimize contention).
+\end{definition}
+
+Work stealing provides:
+\begin{itemize}
+  \item \textbf{Load balancing}: work is automatically distributed across workers.
+  \item \textbf{Cache locality}: tasks created by a worker are likely to be executed by the same worker.
+  \item \textbf{Low contention}: workers mostly operate on their own deques without synchronization.
+\end{itemize}
+
+\subsection{Task Parallelism}\label{sec:task-parallelism}
+
+The runtime may support task-based parallelism:
+\begin{itemize}
+  \item \textbf{Fork-join}: spawn parallel tasks and wait for all to complete.
+  \item \textbf{Dataflow tasks}: tasks with explicit data dependencies, scheduled when inputs are ready.
+  \item \textbf{Continuation-based}: tasks are represented as continuations, scheduled by the runtime.
+\end{itemize}
+
+\subsection{Compiler Support for Parallelism}\label{sec:compiler-parallelism}
+
+The compiler supports parallelism through:
+\begin{itemize}
+  \item \textbf{Auto-parallelization}: automatically converting sequential loops into parallel ones.
+  \item \textbf{OpenMP support}: recognizing pragmas and generating parallel code.
+  \item \textbf{Vectorization}: converting scalar loops into SIMD instructions (\cref{sec:vectorization}).
+  \item \textbf{Thread-safety analysis}: checking that shared data is properly synchronized.
+\end{itemize}
+
+\section{Concurrency and the Type System}\label{sec:concurrency-types}
+
+\subsection{Type-Based Concurrency Safety}\label{sec:type-concurrency}
+
+Some languages use the type system to prevent concurrency bugs:
+
+\begin{itemize}
+  \item \textbf{Rust}: \texttt{Send} and \texttt{Sync} traits ensure that types are safe to share across threads.
+  \item \textbf{Linear types}: ensure that resources are used exactly once, preventing data races.
+  \item \textbf{Session types}: ensure that communication protocols are followed correctly.
+  \item \textbf{Ownership types}: track which thread owns which data.
+\end{itemize}
+
+\subsection{Actor Model}\label{sec:actor-model}
+
+\begin{definition}[Actor Model]\label{def:actor-model}
+The \emph{actor model} is a concurrency model where computation is performed by \emph{actors} that communicate exclusively through asynchronous message passing. Each actor processes messages sequentially, eliminating shared state.
+\end{definition}
+
+The actor model is used in Erlang, Akka (Scala), and Orleans (.NET). It eliminates data races by construction but requires careful protocol design to avoid deadlocks and livelocks.
+
+\section{Summary}\label{sec:concurrency-summary}
+
+Concurrency support is a critical component of any modern language runtime. From low-level OS threads and atomic operations to high-level async/await and green threads, the runtime must provide a spectrum of concurrency mechanisms that balance performance, programmability, and safety. The memory model---the formal specification of how concurrent memory accesses behave---is the theoretical foundation that makes all of this possible.
+
+\begin{historical}
+Concurrency in programming languages has evolved from the raw threads of the 1980s (pthreads, Win32 threads) through the actor model of Erlang (1986), the Java memory model (2004), to the modern async/await pattern popularized by C\# (2012) and adopted by Rust, Python, JavaScript, and others. Go's goroutines (2009) demonstrated that lightweight threading could be practical at massive scale. The C11/C++11 memory model (2011) provided the first widely-adopted formal specification of concurrent memory semantics, resolving years of debate about what concurrent programs mean. The evolution continues with effect systems, structured concurrency, and verified concurrent algorithms pushing the boundaries of what is achievable.
+\end{historical}

@@ -1,0 +1,410 @@
+%%
+%% chapter-85.ltx — Calling Conventions and ABI
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:calling-conventions}
+
+\section{Introduction}\label{sec:calling-conv-intro}
+
+A calling convention is a protocol governing how subroutines are called and how they return. It specifies which registers hold arguments, where return values are placed, which registers the caller must preserve, and how the stack is organized during a call. The calling convention is the most visible aspect of the \emph{application binary interface} (ABI)---the contract between independently compiled code units.
+
+The calling convention must be agreed upon by all compilers and libraries that produce code for a given platform. If two compilers disagree on the calling convention, code compiled by one cannot correctly call functions compiled by the other. This makes calling conventions a matter of standardization, not just implementation.
+
+This chapter develops the theory and practice of calling conventions, from the fundamental design choices to the specifics of major platform ABIs.
+
+\section{Argument Passing: Registers vs.\ Stack}\label{sec:arg-passing}
+
+\subsection{The Design Space}\label{sec:arg-design-space}
+
+The fundamental question in calling convention design is: how are arguments passed from caller to callee?
+
+\begin{definition}[Argument Passing Mechanisms]\label{def:arg-passing}
+Arguments can be passed via:
+\begin{enumerate}
+  \item \textbf{Registers}: the caller places arguments in designated registers before the call.
+  \item \textbf{Stack}: the caller pushes arguments onto the stack before the call.
+  \item \textbf{Hybrid}: the first $k$ arguments go in registers; overflow arguments go on the stack.
+\end{enumerate}
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Trade-offs in argument passing}
+\label{tab:arg-passing}
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Registers} & \textbf{Stack} \\
+\hline
+Speed & Fast (no memory access) & Slower (memory access) \\
+Code size & Compact & Larger (push instructions) \\
+Simplicity & Complex (register allocation) & Simple (uniform) \\
+Variadic support & Difficult & Natural \\
+Recursion & No extra work & Natural \\
+\hline
+\end{tabular}
+\end{table}
+
+Most modern ABIs use the hybrid approach: registers for the common case (few arguments), stack for the general case (many arguments or large arguments).
+
+\subsection{Register Argument Classification}\label{sec:arg-classification}
+
+Arguments are classified by type and size to determine which register class they use:
+
+\begin{definition}[Argument Classification]\label{def:arg-class}
+Each argument type is classified into a \emph{register class}:
+\begin{itemize}
+  \item \textbf{INTEGER}: integer types, pointers, and small structures containing only integer fields.
+  \item \textbf{SSE}/\textbf{VECTOR}: floating-point types and SIMD vectors.
+  \item \textbf{MEMORY}: large types or types with complex structure that must be passed on the stack.
+  \item \textbf{COMPLEX}: types that span multiple register classes (e.g., a struct with both integer and float fields).
+\end{itemize}
+\end{definition}
+
+The System V AMD64 ABI, for example, classifies each eightbyte (8-byte chunk) of an argument independently. A struct with two doubles is classified as two SSE eightbytes; a struct with an int and a double is classified as one INTEGER and one SSE eightbyte.
+
+\subsection{Stack Argument Layout}\label{sec:stack-arg-layout}
+
+When arguments overflow to the stack, their layout must be specified:
+
+\begin{itemize}
+  \item \textbf{Order}: arguments are pushed right-to-left (C convention) or left-to-right.
+  \item \textbf{Alignment}: each argument may require specific alignment on the stack.
+  \item \textbf{Padding}: gaps may be inserted between arguments for alignment.
+  \item \textbf{Home space}: some ABIs reserve stack space for register arguments (the ``shadow space'' or ``home area'') so that callees can spill register arguments to a known location.
+\end{itemize}
+
+\section{Return Value Conventions}\label{sec:return-values}
+
+\subsection{Single Return Values}\label{sec:single-return}
+
+The simplest case: a function returns a single value.
+
+\begin{definition}[Return Value Placement]\label{def:return-value}
+The return value is placed in a designated register:
+\begin{itemize}
+  \item Integer/pointer types: \texttt{RAX} (x86-64), \texttt{X0} (ARM64), \texttt{a0} (RISC-V).
+  \item Floating-point types: \texttt{XMM0} (x86-64), \texttt{D0} (ARM64), \texttt{fa0} (RISC-V).
+  \item Large types: returned via a hidden pointer argument (the caller allocates space and passes its address).
+\end{itemize}
+\end{definition}
+
+\subsection{Multiple Return Values}\label{sec:multiple-return}
+
+Some languages support functions that return multiple values. The ABI must specify how these are placed:
+
+\begin{itemize}
+  \item \textbf{Pair in registers}: two integer values in \texttt{RAX}/\texttt{RDX}, two floats in \texttt{XMM0}/\texttt{XMM1}.
+  \item \textbf{Hidden pointer}: the caller allocates a struct and passes a pointer; the callee fills it in.
+  \item \textbf{Stack return}: the return value is placed on the stack (rare in modern ABIs).
+\end{itemize}
+
+\subsection{Struct Return}\label{sec:struct-return}
+
+Structures that do not fit in the return registers require special handling:
+
+\begin{definition}[Struct Return Convention]\label{def:struct-return}
+When a function returns a struct too large for the return registers:
+\begin{enumerate}
+  \item The caller allocates space for the return value.
+  \item The caller passes a \emph{hidden first argument} (a pointer to this space).
+  \item The callee writes the return value to this location.
+  \item The callee returns the pointer (in \texttt{RAX} on x86-64) for chaining.
+\end{enumerate}
+\end{definition}
+
+\section{Caller-Saved vs.\ Callee-Saved Registers}\label{sec:save-conventions}
+
+\subsection{The Preservation Question}\label{sec:preservation-question}
+
+When a function is called, some registers may be overwritten by the callee. The question is: who is responsible for preserving the values that survive across the call---the caller or the callee?
+
+\begin{definition}[Caller-Saved (Volatile) Registers]\label{def:caller-saved}
+A \emph{caller-saved} (volatile) register may be destroyed by the callee. If the caller needs the value after the call, it must save the register before the call and restore it afterward.
+\end{definition}
+
+\begin{definition}[Callee-Saved (Non-Volatile) Registers]\label{def:callee-saved}
+A \emph{callee-saved} (non-volatile) register must be preserved by the callee. If the callee uses the register, it must save the original value on entry and restore it before returning.
+\end{definition}
+
+\subsection{Design Considerations}\label{sec:save-design}
+
+The choice of which registers are caller-saved vs.\ callee-saved affects code quality:
+
+\begin{itemize}
+  \item \textbf{Many callee-saved registers}: fewer saves around calls, but each function that uses them must save/restore. Good for functions with few calls but many local variables.
+  \item \textbf{Many caller-saved registers}: the register allocator has more freedom, but must insert saves around each call. Good for leaf functions and functions with many calls.
+  \item \textbf{Mixed}: most ABIs use a mix, balancing the two concerns.
+\end{itemize}
+
+\begin{table}[htbp]
+\centering
+\caption{Register preservation in major ABIs}
+\label{tab:register-preservation}
+\begin{tabular}{lll}
+\hline
+\textbf{Architecture} & \textbf{Caller-Saved} & \textbf{Callee-Saved} \\
+\hline
+x86-64 (SysV) & RAX, RCX, RDX, RSI, RDI, & RBX, RBP, R12--R15 \\
+ & R8--R11, XMM0--XMM15 & \\
+x86-64 (Windows) & RAX, RCX, RDX, R8--R11, & RBX, RBP, RDI, RSI, R12--R15, \\
+ & XMM0--XMM5 & XMM6--XMM15 \\
+ARM64 & X0--X15 (X0--X7 args), & X19--X28, X29 (FP), X30 (LR) \\
+ & D0--D7, D16--D31 & D8--D15 \\
+RISC-V & x1, x5--x7, x10--x17, & x8--x9, x18--x27 \\
+ & f10--f17, f28--f31 & \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Stack Frame Layout}\label{sec:stack-frame}
+
+\subsection{Activation Records}\label{sec:activation-records}
+
+Each function invocation creates an \emph{activation record} (stack frame) on the call stack. The frame contains:
+
+\begin{definition}[Stack Frame Components]\label{def:stack-frame}
+A typical stack frame contains:
+\begin{enumerate}
+  \item \textbf{Arguments}: passed by the caller (may be in registers or on the stack).
+  \item \textbf{Return address}: the address to return to after the function completes.
+  \item \textbf{Dynamic link}: pointer to the caller's frame (frame pointer chain).
+  \item \textbf{Saved registers}: callee-saved registers that the function uses.
+  \item \textbf{Local variables}: the function's local storage.
+  \item \textbf{Temporaries}: intermediate values computed during execution.
+  \item \textbf{Outgoing arguments}: space for arguments passed to callees.
+\end{enumerate}
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  frame/.style={draw, minimum width=5cm, minimum height=0.6cm, font=\small, align=center},
+  label/.style={font=\small, right=0.3cm}
+]
+  \node[frame, fill=TomeExBg] (args) at (0, 4) {Arguments (from caller)};
+  \node[frame, fill=TomeWarnBg] (retaddr) at (0, 3.2) {Return Address};
+  \node[frame, fill=TomeDefBg] (fp) at (0, 2.4) {Saved FP (Dynamic Link)};
+  \node[frame, fill=TomeBg] (saved) at (0, 1.6) {Callee-Saved Registers};
+  \node[frame, fill=TomeBg] (locals) at (0, 0.6) {Local Variables};
+  \node[frame, fill=TomeBg] (temps) at (0, -0.4) {Temporaries};
+  \node[frame, fill=TomeExBg] (outargs) at (0, -1.4) {Outgoing Arguments};
+
+  \node[label] at (args.east) {High addresses};
+  \node[label] at (outargs.east) {Low addresses (SP)};
+
+  \draw[<->, thick] (-3.5, 4.3) -- node[left, font=\small] {Frame Pointer (FP)} (-3.5, 2.7);
+  \draw[<->, thick] (-3.5, -1.7) -- node[left, font=\small] {Stack Pointer (SP)} (-3.5, -1.1);
+\end{tikzpicture}
+\caption{Typical stack frame layout}
+\label{fig:stack-frame}
+\end{figure}
+
+\subsection{Frame Pointer Omission}\label{sec:fp-omission}
+
+Modern compilers often omit the frame pointer to free up a register for general use. This is safe when:
+\begin{itemize}
+  \item The function does not use variable-length arrays (VLAs) or \texttt{alloca}.
+  \item Debug information (DWARF \texttt{.eh\_frame} or \texttt{.debug\_frame}) provides alternative stack unwinding information.
+  \item The platform ABI permits it.
+\end{itemize}
+
+Frame pointer omission improves performance by making one more register available for allocation, but complicates debugging and profiling (which must use DWARF unwind info instead of the FP chain).
+
+\subsection{Stack Alignment}\label{sec:stack-alignment}
+
+Most ABIs require the stack pointer to be aligned to a specific boundary at function entry:
+
+\begin{itemize}
+  \item x86-64: 16-byte alignment at \texttt{CALL} instruction (so SP is $8 \bmod 16$ after the return address is pushed).
+  \item ARM64: 16-byte alignment at all times.
+  \item RISC-V: 16-byte alignment (for the base integer ABI).
+\end{itemize}
+
+Misaligned stack access can cause crashes (on architectures that require alignment) or performance degradation (on architectures that support it but with penalties).
+
+\section{Variadic Functions and Varargs}\label{sec:varargs}
+
+\subsection{The Variadic Challenge}\label{sec:variadic-challenge}
+
+Variadic functions (like C's \texttt{printf}) accept a variable number of arguments. The callee does not know at compile time how many arguments it will receive or their types.
+
+\begin{definition}[Variadic Function]\label{def:variadic}
+A \emph{variadic function} is one that accepts a fixed number of named parameters followed by a variable number of additional arguments, accessed through a language-specific mechanism (e.g., C's \texttt{stdarg.h}).
+\end{definition}
+
+\subsection{Varargs Implementation}\label{sec:varargs-implementation}
+
+The implementation of varargs depends on the calling convention:
+
+\subsubsection{Stack-Based Varargs}
+When all arguments are on the stack, varargs is trivial: the callee accesses arguments at increasing offsets from the frame pointer. The \texttt{va\_list} is simply a pointer into the stack frame.
+
+\subsubsection{Register-Based Varargs}
+When arguments are passed in registers, the implementation is more complex:
+
+\begin{itemize}
+  \item The caller must save all argument registers to a known location (the \emph{register save area}) in the stack frame.
+  \item The callee's \texttt{va\_start} macro initializes a \texttt{va\_list} structure that points first to the register save area, then to the stack arguments.
+  \item Each \texttt{va\_arg} call advances the pointer and reads the next argument.
+\end{itemize}
+
+\begin{example}[System V AMD64 Varargs]\label{ex:sysv-varargs}
+On x86-64 System V, the first 6 integer arguments go in \texttt{RDI, RSI, RDX, RCX, R8, R9} and the first 8 float arguments go in \texttt{XMM0--XMM7}. For a variadic function:
+\begin{itemize}
+  \item The caller saves all argument registers to the \emph{register save area} on the stack.
+  \item The \texttt{va\_list} structure contains:
+    \begin{itemize}
+      \item \texttt{gp\_offset}: offset to the next integer argument in the save area.
+      \item \texttt{fp\_offset}: offset to the next float argument in the save area.
+      \item \texttt{overflow\_arg\_area}: pointer to stack arguments.
+      \item \texttt{reg\_save\_area}: pointer to the register save area.
+    \end{itemize}
+\end{itemize}
+\end{example}
+
+\section{Platform ABIs}\label{sec:platform-abis}
+
+\subsection{System V AMD64 ABI}\label{sec:sysv-amd64}
+
+The System V AMD64 ABI is used on Linux, BSD, and macOS (for x86-64). Key features:
+
+\begin{itemize}
+  \item \textbf{Integer arguments}: \texttt{RDI, RSI, RDX, RCX, R8, R9} (first 6).
+  \item \textbf{Float arguments}: \texttt{XMM0--XMM7} (first 8).
+  \item \textbf{Return value}: \texttt{RAX}/\texttt{RDX} (integer), \texttt{XMM0}/\texttt{XMM1} (float).
+  \item \textbf{Caller-saved}: \texttt{RAX, RCX, RDX, RSI, RDI, R8--R11, XMM0--XMM15}.
+  \item \textbf{Callee-saved}: \texttt{RBX, RBP, R12--R15}.
+  \item \textbf{Stack alignment}: 16 bytes before \texttt{CALL}.
+  \item \textbf{Red zone}: 128 bytes below SP that leaf functions can use without adjusting SP.
+\end{itemize}
+
+\subsection{ARM64 ABI}\label{sec:arm64-abi}
+
+The ARM64 (AArch64) ABI is used on 64-bit ARM platforms:
+
+\begin{itemize}
+  \item \textbf{Integer arguments}: \texttt{X0--X7} (first 8).
+  \item \textbf{Float arguments}: \texttt{D0--D7} (first 8, or \texttt{V0--V7} for SIMD).
+  \item \textbf{Return value}: \texttt{X0} (integer), \texttt{D0}/\texttt{V0} (float).
+  \item \textbf{Caller-saved}: \texttt{X0--X15}, \texttt{D0--D7}, \texttt{D16--D31}.
+  \item \textbf{Callee-saved}: \texttt{X19--X28}, \texttt{D8--D15}.
+  \item \textbf{Link register}: \texttt{X30} (LR) holds the return address.
+  \item \textbf{Frame pointer}: \texttt{X29} (FP).
+  \item \textbf{Stack alignment}: 16 bytes at all times.
+\end{itemize}
+
+\subsection{RISC-V ABI}\label{sec:riscv-abi}
+
+The RISC-V ABI follows similar principles:
+
+\begin{itemize}
+  \item \textbf{Integer arguments}: \texttt{x10--x17} (\texttt{a0--a7}, first 8).
+  \item \textbf{Float arguments}: \texttt{f10--f17} (\texttt{fa0--fa7}, first 8).
+  \item \textbf{Return value}: \texttt{a0}/\texttt{a1} (integer), \texttt{fa0}/\texttt{fa1} (float).
+  \item \textbf{Caller-saved}: \texttt{x1} (\texttt{ra}), \texttt{x5--x7} (\texttt{t0--t2}), \texttt{x10--x17} (\texttt{a0--a7}), \texttt{x28--x31} (\texttt{t3--t6}).
+  \item \textbf{Callee-saved}: \texttt{x8--x9} (\texttt{s0/s1}, i.e.\ FP), \texttt{x18--x27} (\texttt{s2--s11}).
+  \item \textbf{Stack alignment}: 16 bytes.
+\end{itemize}
+
+\subsection{Windows x64 ABI}\label{sec:windows-x64}
+
+The Windows x64 ABI differs from System V in several important ways:
+
+\begin{itemize}
+  \item \textbf{Arguments}: \texttt{RCX, RDX, R8, R9} (first 4 integer/pointer), \texttt{XMM0--XMM3} (first 4 float).
+  \item \textbf{Shadow space}: the caller must allocate 32 bytes of shadow space on the stack for the first 4 register arguments.
+  \item \textbf{Return value}: \texttt{RAX} (integer), \texttt{XMM0} (float).
+  \item \textbf{Stack alignment}: 16 bytes.
+  \item \textbf{No red zone}: the area below SP is not safe to use.
+  \item \textbf{Exception handling}: uses table-based exception handling with \texttt{.pdata} and \texttt{.xdata} sections.
+\end{itemize}
+
+\section{Tail Call Optimization and the ABI}\label{sec:tail-call-abi}
+
+\subsection{Tail Calls}\label{sec:tail-calls}
+
+A \emph{tail call} is a function call that is the last action of the calling function. Tail call optimization (TCO) reuses the caller's stack frame for the callee, avoiding stack growth for recursive tail calls.
+
+\begin{definition}[Tail Call Optimization]\label{def:tco}
+\emph{Tail call optimization} (TCO) transforms a tail call into a jump rather than a call, reusing the current stack frame. This requires:
+\begin{itemize}
+  \item The caller's frame must be deallocated before the call.
+  \item The callee's arguments must be placed in the calling convention's argument registers.
+  \item The callee returns directly to the caller's caller.
+\end{itemize}
+\end{definition}
+
+\subsection{ABI Implications}\label{sec:tco-abi}
+
+TCO interacts with the calling convention in several ways:
+\begin{itemize}
+  \item The callee-saved registers must be restored before the tail call.
+  \item The stack pointer must be restored to the caller's value.
+  \item Some ABIs explicitly guarantee TCO (Scheme, ML); others do not (C, C++).
+  \item Debug information must reflect the optimized call chain.
+\end{itemize}
+
+\subsection{Guaranteed Tail Calls}\label{sec:guaranteed-tc}
+
+Some languages guarantee tail call optimization as part of their specification:
+\begin{itemize}
+  \item \textbf{Scheme}: the R5RS/R6RS/R7RS standards require proper tail recursion.
+  \item \textbf{Erlang}: tail calls are the primary mechanism for iteration.
+  \item \textbf{ES6 (JavaScript)}: tail call optimization is specified but not widely implemented.
+  \item \textbf{Lua}: supports tail calls as part of the language semantics.
+\end{itemize}
+
+\section{ABI Testing and Compliance}\label{sec:abi-testing}
+
+\subsection{ABI Compliance Testing}\label{sec:abi-compliance}
+
+Ensuring ABI compliance is critical for interoperability:
+\begin{itemize}
+  \item \textbf{ABI test suites}: collections of test programs that exercise the calling convention.
+  \item \textbf{Cross-compiler testing}: compile with one compiler, link with another, verify correct behavior.
+  \item \textbf{Fuzz testing}: generate random function signatures and call patterns to stress-test the ABI.
+\end{itemize}
+
+\subsection{Common ABI Violations}\label{sec:abi-violations}
+
+Common ABI violations include:
+\begin{itemize}
+  \item Failing to preserve callee-saved registers.
+  \item Misaligning the stack.
+  \item Incorrectly handling the red zone.
+  \item Violating the argument passing rules for complex types.
+  \item Failing to provide proper unwind information.
+\end{itemize}
+
+These violations often manifest as subtle bugs that appear only when code compiled by different compilers is linked together.
+
+\section{ABI Stability and Evolution}\label{sec:abi-stability}
+
+\subsection{ABI Stability Requirements}\label{sec:abi-stability-req}
+
+Once an ABI is published and code is deployed, it cannot be changed without breaking binary compatibility. This creates significant constraints:
+
+\begin{itemize}
+  \item New registers cannot be added to the caller-saved set (existing code would not save them).
+  \item Stack layout changes break existing object files.
+  \item New argument types may require new calling conventions.
+\end{itemize}
+
+\subsection{ABI Extensions}\label{sec:abi-extensions}
+
+ABIs evolve through careful extension:
+\begin{itemize}
+  \item \textbf{Vector ABI extensions}: x86-64 added AVX/AVX-512 register passing without breaking the existing ABI by defining new calling conventions for vector types.
+  \item \textbf{Hardware capability dispatch}: IFUNC (indirect functions) allow runtime selection of optimized implementations based on CPU features.
+  \item \textbf{Compatibility flags}: compilers can target older ABI versions for backward compatibility.
+\end{itemize}
+
+\section{Summary}\label{sec:calling-conv-summary}
+
+Calling conventions are the bedrock of binary interoperability. They must be designed carefully, balancing performance against simplicity, and once established, they are extremely difficult to change. The compiler must implement the calling convention precisely---any deviation results in subtle bugs that manifest only at the boundaries between compilation units.
+
+\begin{historical}
+The first calling conventions were ad hoc, varying between compilers on the same machine. The need for binary compatibility led to standardized ABIs, beginning with the System V ABI for 32-bit x86 in the 1980s. The 64-bit era saw a split: the System V AMD64 ABI (used by Unix-like systems) and the Microsoft x64 ABI (used by Windows). ARM's transition from 32-bit to 64-bit (AArch64) provided an opportunity to redesign the ABI from scratch, incorporating lessons from decades of experience. RISC-V's ABI, designed in the modern era, benefits from this accumulated knowledge while introducing its own innovations, such as a larger callee-saved register set to support the language's diverse calling patterns.
+\end{historical}

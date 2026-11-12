@@ -1,0 +1,450 @@
+%%
+%% chapter-98.ltx — Compiler as a Database
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:compiler-database}
+
+\section{Introduction}\label{sec:compiler-db-intro}
+
+The previous chapter introduced the idea of viewing optimization as query answering over a database of program facts. This chapter takes the idea further: what if the compiler's internal representation \emph{is} a database? Instead of representing the program as an abstract syntax tree, a control-flow graph, or a sea of nodes, the compiler represents it as a collection of relational tables, and all operations on the program---analysis, transformation, optimization---are expressed as database queries.
+
+This radical reconceptualization of the compiler has implications for incrementality, persistence, parallelism, and composability. It also raises fundamental questions about the nature of the IR and the relationship between compilation and database management.
+
+\section{IR as a Relational Model}\label{sec:ir-relational}
+
+\subsection{From Graphs to Relations}\label{sec:graphs-to-relations}
+
+Traditional IRs are graph-based: the program is a graph (AST, CFG, call graph, dependence graph) and transformations are graph rewrites. In the relational model, the program is a collection of relations (tables), and transformations are expressed as queries that produce new relations.
+
+\begin{definition}[Relational IR]\label{def:relational-ir}
+A \emph{relational IR} represents a program as a set of relations (tables), where each relation captures a specific aspect of the program structure. Operations on the program are expressed as queries (select, project, join, aggregate) over these relations.
+\end{definition}
+
+\subsection{Core Relations}\label{sec:core-relations}
+
+The fundamental relations in a relational IR include:
+
+\begin{table}[htbp]
+\centering
+\caption{Core IR relations}
+\label{tab:core-relations}
+\begin{tabular}{lll}
+\hline
+\textbf{Relation} & \textbf{Schema} & \textbf{Meaning} \\
+\hline
+\texttt{Function} & \texttt{(fid, name, module)} & Function declarations \\
+\texttt{Block} & \texttt{(bid, fid, order)} & Basic blocks \\
+\texttt{Instr} & \texttt{(iid, bid, opcode, order)} & Instructions \\
+\texttt{Operand} & \texttt{(iid, pos, value)} & Instruction operands \\
+\texttt{Defines} & \texttt{(iid, var)} & Variable definitions \\
+\texttt{Uses} & \texttt{(iid, var)} & Variable uses \\
+\texttt{CfgEdge} & \texttt{(src, dst)} & Control-flow edges \\
+\texttt{Type} & \texttt{(var, type)} & Variable types \\
+\texttt{Const} & \texttt{(var, value)} & Constant values \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Derived Relations}\label{sec:derived-relations}
+
+Many useful program properties can be derived from the core relations:
+
+\begin{verbatim}
+  -- Dominance: block A dominates block B
+  Dominates(A, B) :- CfgEdge(A, B).
+  Dominates(A, C) :- Dominates(A, B), Dominates(B, C).
+
+  -- Live variables at block entry
+  LiveIn(var, B) :- Uses(I, var), InBlock(I, B),
+                    !KilledBefore(I, var, B).
+  LiveIn(var, B) :- CfgEdge(P, B), LiveOut(var, P),
+                    !Defines(B, var).
+
+  -- Reaching definitions
+  ReachesDef(I1, var, I2) :- Defines(I1, var), Uses(I2, var),
+                              !KilledBetween(I1, var, I2).
+\end{verbatim}
+
+\section{Facts: Defines, Uses, Blocks, Edges, Types}\label{sec:facts}
+
+\subsection{Def-Use Chains as Relations}\label{sec:def-use-relations}
+
+Def-use chains are naturally represented as a relation:
+
+\begin{verbatim}
+  DefUseChain(def_instr, use_instr, var) :-
+    Defines(def_instr, var),
+    Uses(use_instr, var),
+    ReachesDef(def_instr, var, use_instr).
+\end{verbatim}
+
+This relation can be queried for many purposes:
+\begin{itemize}
+  \item \textbf{Dead code}: \texttt{Defines(I, V) WHERE NOT EXISTS (SELECT 1 FROM DefUseChain WHERE def\_instr = I)}
+  \item \textbf{Constant propagation}: \texttt{DefUseChain WHERE var IN (SELECT var FROM Const)}
+  \item \textbf{Copy propagation}: \texttt{DefUseChain WHERE opcode(def\_instr) = 'copy'}
+\end{itemize}
+
+\subsection{Type Information as Relations}\label{sec:type-relations}
+
+Type information is stored in the \texttt{Type} relation and can be queried for type-based optimizations:
+
+\begin{verbatim}
+  -- Find all integer variables
+  IntegerVars(var) :- Type(var, 'int').
+
+  -- Find all calls to functions returning pointers
+  PointerReturns(call_instr) :-
+    Instr(call_instr, _, 'call', _),
+    Defines(call_instr, var),
+    Type(var, 'ptr').
+
+  -- Find type mismatches (for gradual typing)
+  TypeMismatch(instr) :-
+    Uses(instr, v1), Uses(instr, v2),
+    Type(v1, t1), Type(v2, t2),
+    t1 != t2, !Compatible(t1, t2).
+\end{verbatim}
+
+\subsection{Alias Information}\label{sec:alias-relations}
+
+Alias analysis results are stored as a relation:
+
+\begin{verbatim}
+  MayAlias(v1, v2) :- PointsTo(v1, obj), PointsTo(v2, obj).
+  NoAlias(v1, v2) :- Type(v1, t1), Type(v2, t2), !MayAlias(v1, v2).
+\end{verbatim}
+
+\section{Queries over Program Structure}\label{sec:queries}
+
+\subsection{Structural Queries}\label{sec:structural-queries}
+
+The relational model enables powerful structural queries:
+
+\begin{verbatim}
+  -- Find all functions that call themselves (recursive)
+  RecursiveFunctions(fid) :-
+    Function(fid, name, _),
+    Instr(iid, _, 'call', _),
+    InBlock(iid, bid), Block(bid, fid, _),
+    Operand(iid, _, target),
+    Function(target, name, _).
+
+  -- Find all loops (back edges in CFG)
+  LoopHeader(header) :-
+    CfgEdge(tail, header),
+    Dominates(header, tail).
+
+  -- Find all instructions in a loop
+  LoopInstr(header, iid) :-
+    LoopHeader(header),
+    Block(bid, header_fid, _),
+    Dominates(header, bid),
+    InBlock(iid, bid).
+
+  -- Count instructions per function
+  InstrCount(fid, COUNT(iid)) :-
+    Block(bid, fid, _),
+    InBlock(iid, bid).
+\end{verbatim}
+
+\subsection{Optimization Queries}\label{sec:optimization-queries}
+
+Optimizations are expressed as queries that identify optimization opportunities:
+
+\begin{verbatim}
+  -- Common subexpression elimination: find identical instructions
+  CSEPair(i1, i2) :-
+    Instr(i1, b1, op, _), Instr(i2, b2, op, _),
+    i1 < i2,
+    AllOperandsMatch(i1, i2),
+    Dominates(b1, b2).  -- i1 dominates i2
+
+  -- Strength reduction: find expensive operations
+  StrengthReduction(iid) :-
+    Instr(iid, _, 'mul', _),
+    Operand(iid, _, Const(power_of_2)).
+  -- Replace with shift
+
+  -- Loop-invariant code motion
+  LoopInvariant(iid, loop_header) :-
+    LoopInstr(loop_header, iid),
+    AllOperandsInvariant(iid, loop_header).
+\end{verbatim}
+
+\section{Dependency Tracking and Invalidation}\label{sec:dep-tracking}
+
+\subsection{Query Dependencies}\label{sec:query-deps}
+
+When a query result is cached, the system must track which facts the result depends on:
+
+\begin{definition}[Query Dependency]\label{def:query-dep}
+A \emph{query dependency} records which input facts a cached query result depends on. When any of those facts change, the cached result is invalidated.
+\end{definition}
+
+\subsection{Incremental View Maintenance}\label{sec:ivm}
+
+\begin{definition}[Incremental View Maintenance]\label{def:ivm}
+\emph{Incremental view maintenance} (IVM) is the technique of maintaining the results of queries (``views'') as the underlying data changes, by computing only the delta (change) rather than recomputing from scratch.
+\end{definition}
+
+For compiler optimizations, this means:
+\begin{itemize}
+  \item When an instruction is added, removed, or modified, only the affected analysis results are recomputed.
+  \item The delta is computed by evaluating the query on the changed facts and propagating the changes through derived relations.
+\end{itemize}
+
+\subsection{Fine-Grained Invalidation}\label{sec:fine-grained}
+
+The relational model enables fine-grained invalidation:
+\begin{itemize}
+  \item Changing one instruction invalidates only the queries that depend on that instruction.
+  \item Adding a CFG edge invalidates only the dominance and dataflow queries affected by the new edge.
+  \item Changing a type annotation invalidates only the type-dependent optimizations.
+\end{itemize}
+
+\section{Persistent Compiler State}\label{sec:persistent}
+
+\subsection{Saving and Loading the Database}\label{sec:save-load}
+
+A relational IR can be persisted to disk:
+\begin{itemize}
+  \item Serialize the relations to a file format (e.g., SQLite, CSV, custom binary).
+  \item On the next compilation, load the saved state and apply only the changes.
+  \item This enables \emph{persistent compilation}: the compiler remembers everything from previous compilations.
+\end{itemize}
+
+\subsection{Compilation Caching}\label{sec:compilation-caching}
+
+Persistent state enables powerful caching:
+\begin{itemize}
+  \item \textbf{Analysis caching}: analysis results from previous compilations are reused.
+  \item \textbf{Optimization caching}: optimized code from previous compilations is reused.
+  \item \textbf{Build caching}: compiled artifacts are cached and shared across builds (like Bazel's remote caching).
+\end{itemize}
+
+\subsection{Database Engines for Compilers}\label{sec:db-engines}
+
+Several database engines are suitable for compiler use:
+\begin{itemize}
+  \item \textbf{SQLite}: embedded, ACID-compliant, well-tested. Good for persistent compiler state.
+  \item \textbf{In-memory databases}: Redis, Memcached for fast access to frequently-queried facts.
+  \item \textbf{Datalog engines}: Soufflé, LogicBlox for declarative analysis.
+  \item \textbf{Custom engines}: purpose-built for the specific needs of the compiler.
+\end{itemize}
+
+\section{Comparison with Traditional IR Representations}\label{sec:comparison-traditional}
+
+\subsection{AST}\label{sec:comparison-ast}
+
+\begin{table}[htbp]
+\centering
+\caption{AST vs.\ relational IR}
+\label{tab:ast-vs-relational}
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{AST} & \textbf{Relational} \\
+\hline
+Structure & Tree & Tables \\
+Traversal & Recursive descent & SQL queries \\
+Mutation & Tree rewriting & INSERT/UPDATE/DELETE \\
+Analysis & Tree walks & Queries \\
+Incrementality & Difficult & Natural (IVM) \\
+Persistence & Serialization & Database dump \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{CFG / SSA}\label{sec:comparison-cfg}
+
+CFGs and SSA form are also graph-based. The relational model can represent them faithfully:
+\begin{itemize}
+  \item Basic blocks are rows in the \texttt{Block} table.
+  \item CFG edges are rows in the \texttt{CfgEdge} table.
+  \item $\phi$-nodes are instructions with the \texttt{phi} opcode.
+  \item SSA def-use chains are captured by the \texttt{Defines}/\texttt{Uses} relations.
+\end{itemize}
+
+The advantage of the relational representation is that cross-cutting queries (e.g., ``find all $\phi$-nodes for variable $x$'') are natural, while in a graph representation they require traversing the graph.
+
+\subsection{Sea of Nodes}\label{sec:comparison-sea-of-nodes}
+
+The sea of nodes is perhaps closest to the relational model:
+\begin{itemize}
+  \item Both represent the program as a collection of nodes with edges.
+  \item Both support flexible querying (any node can be found by any property).
+  \item The sea of nodes uses pointers; the relational model uses foreign keys.
+  \item The relational model has better support for persistence, incrementality, and parallelism.
+\end{itemize}
+
+\section{Advanced Facts and Queries}\label{sec:advanced-facts}
+
+\subsection{Rich Fact Schemas}\label{sec:rich-schemas}
+
+A practical relational IR requires a rich set of facts beyond the core relations. Additional facts include:
+
+\begin{table}[htbp]
+\centering
+\caption{Extended IR relations}
+\label{tab:extended-relations}
+\begin{tabular}{lll}
+\hline
+\textbf{Relation} & \textbf{Schema} & \textbf{Meaning} \\
+\hline
+\texttt{LoopInfo} & \texttt{(header, depth, trip\_count)} & Loop metadata \\
+\texttt{InlineSite} & \texttt{(call\_iid, callee\_fid, bci)} & Inlined call sites \\
+\texttt{DebugLoc} & \texttt{(iid, file, line, col)} & Source locations \\
+\texttt{SideEffect} & \texttt{(iid, kind)} & Side-effect classification \\
+\texttt{Align} & \texttt{(var, alignment)} & Alignment constraints \\
+\texttt{Volatile} & \texttt{(var)} & Volatile variables \\
+\texttt{Phi} & \texttt{(iid, pred, value)} & Phi node operands \\
+\texttt{Exception} & \texttt{(iid, handler\_bid)} & Exception handlers \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Optimization Fact Injections}\label{sec:fact-injections}
+
+Optimization passes can inject new facts into the database as they discover optimization opportunities:
+
+\begin{verbatim}
+  -- After constant propagation discovers that x = 42:
+  INSERT INTO Const(var, value) VALUES ('x', 42);
+  
+  -- After escape analysis discovers that obj does not escape:
+  INSERT INTO NoEscape(var) VALUES ('obj');
+  
+  -- After loop analysis discovers a loop's trip count:
+  INSERT INTO LoopInfo(header, depth, trip_count) VALUES ('bb3', 2, 100);
+\end{verbatim}
+
+These injected facts trigger recomputation of dependent queries, enabling a \emph{reactive optimization pipeline} where each optimization's results feed into subsequent optimizations automatically.
+
+\subsection{Query Composition and Optimization Pipelines}\label{sec:query-composition}
+
+Complex optimizations are composed from simpler queries:
+
+\begin{verbatim}
+  -- Step 1: Find constant operands
+  ConstantOperand(iid, var, val) :-
+    Uses(iid, var), Const(var, val).
+  
+  -- Step 2: Find instructions that are fully constant
+  FullyConstantInstr(iid) :-
+    Instr(iid, _, op, _),
+    AllOperandsConstant(iid),
+    op IN ('add', 'sub', 'mul', 'div').
+  
+  -- Step 3: Compute the constant result
+  ConstantResult(iid, result) :-
+    FullyConstantInstr(iid),
+    Instr(iid, _, 'add', _),
+    ConstantOperand(iid, _, v1),
+    ConstantOperand(iid, _, v2),
+    result = v1 + v2.
+  
+  -- Step 4: Replace with constant
+  -- (transformation: replace iid's uses with the constant result)
+\end{verbatim}
+
+\section{Advanced Dependency Tracking}\label{sec:advanced-dep-tracking-db}
+
+\subsection{Fine-Grained Query Dependencies}\label{sec:fine-grained-query-deps}
+
+Each cached query result tracks its dependencies at the tuple level:
+
+\begin{definition}[Tuple-Level Dependency Tracking]\label{def:tuple-deps}
+\emph{Tuple-level dependency tracking} records exactly which input tuples (facts) a cached query result tuple depends on. When any of those input tuples change, only the affected result tuples are invalidated.
+\end{definition}
+
+\begin{verbatim}
+  -- Dependency tracking for a derived relation:
+  -- ReachesDef(I1, x, I2) depends on:
+  --   Defines(I1, x), Uses(I2, x), and all CfgEdge tuples on the path
+  
+  -- If Defines(I1, x) is deleted, only ReachesDef tuples
+  -- with that specific I1 and x are invalidated.
+\end{verbatim}
+
+\subsection{Incremental View Maintenance for Analyses}\label{sec:ivm-analyses}
+
+Incremental view maintenance (IVM) is the key technique for efficient updates:
+
+\begin{algorithm}[htbp]
+\caption{Incremental View Maintenance for Dataflow Analysis}
+\label{alg:ivm-dataflow}
+\begin{algorithmic}[1]
+\Procedure{IncrementalUpdate}{$\Delta_{\text{facts}}$, \text{views}}
+  \For{each view $V$ in views}
+    \Let{\Delta_V}{\textsc{ComputeDelta}(V, \Delta_{\text{facts}})}
+    \If{$\Delta_V$ is not empty}
+      \State \textsc{ApplyDelta}($V$, $\Delta_V$)
+      \State \textsc{PropagateToDependents}($V$, $\Delta_V$)
+    \EndIf
+  \EndFor
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+For dataflow analyses, the delta computation is:
+\begin{itemize}
+  \item \textbf{Added facts}: compute the new tuples that the added facts contribute to the view.
+  \item \textbf{Deleted facts}: compute the tuples that are no longer supported by the deleted facts.
+  \item \textbf{Modified facts}: treat as a deletion followed by an insertion.
+\end{itemize}
+
+\subsection{Dependency Graph Maintenance}\label{sec:dep-graph-maintenance}
+
+As the IR changes (instructions added, removed, or modified), the dependency graph must be updated:
+
+\begin{itemize}
+  \item \textbf{Adding an instruction}: insert new tuples into \texttt{Instr}, \texttt{Defines}, \texttt{Uses}; recompute affected views.
+  \item \textbf{Removing an instruction}: delete tuples from \texttt{Instr}, \texttt{Defines}, \texttt{Uses}; invalidate dependent views.
+  \item \textbf{Modifying an instruction}: update tuples in \texttt{Instr}, \texttt{Operand}; recompute affected views.
+  \item \textbf{Adding a CFG edge}: insert into \texttt{CfgEdge}; recompute dominance, dataflow analyses.
+\end{itemize}
+
+\section{Transaction Support for Transformations}\label{sec:transactions}
+
+\subsection{Atomic Transformations}\label{sec:atomic-transforms}
+
+Compiler transformations should be atomic: either the entire transformation succeeds, or the database is rolled back to its pre-transformation state.
+
+\begin{definition}[Transactional Transformation]\label{def:transactional-transform}
+A \emph{transactional transformation} is a sequence of database operations (inserts, updates, deletes) that are applied atomically. If any part of the transformation fails (e.g., a validation check fails), all operations are rolled back.
+\end{definition}
+
+\begin{verbatim}
+  BEGIN TRANSACTION;
+  
+  -- Attempt constant folding: replace add with constant
+  INSERT INTO Instr(new_iid, bid, 'const', order) VALUES (...);
+  INSERT INTO Const(new_var, 42) VALUES (...);
+  UPDATE Uses SET value = new_var WHERE value = old_iid;
+  DELETE FROM Instr WHERE iid = old_iid;
+  
+  -- Validate: check that no uses of old_iid remain
+  ASSERT NOT EXISTS (SELECT 1 FROM Uses WHERE value = old_iid);
+  
+  COMMIT;  -- or ROLLBACK if assertion fails
+\end{verbatim}
+
+\subsection{Optimization Speculation and Rollback}\label{sec:opt-rollback}
+
+Speculative optimizations can be implemented as transactions:
+\begin{itemize}
+  \item Apply the speculative transformation.
+  \item Validate the result (e.g., check that the optimization is correct).
+  \item If validation succeeds, commit the transformation.
+  \item If validation fails, roll back and try a different optimization.
+\end{itemize}
+
+\section{Summary}\label{sec:compiler-db-summary}
+
+Viewing the compiler as a database---with the IR as a collection of relations, analyses as queries, and transformations as query-driven rewrites---offers a fundamentally different approach to compiler architecture. It enables natural incrementality, persistence, and parallelism, and provides a declarative interface for expressing analyses and optimizations. While the approach is still largely research, it points toward a future where compilers are more modular, more maintainable, and more responsive to changes.
+
+\begin{historical}
+The idea of representing programs as databases has appeared in various forms over the decades. The Program Database (PDB) at Microsoft, used by Visual Studio's C++ compiler, stores program information in a persistent database for incremental compilation and debugging. The Datalog-based approach to program analysis (Whaley et al., 2004) demonstrated the scalability of declarative analysis. The relational view of compilation has been explored in research systems like Optix and in the emerging field of ``compiler as a service.'' The convergence of database technology (with its mature query optimization, indexing, and transaction support) and compiler technology is a promising direction for future compiler architectures.
+\end{historical}

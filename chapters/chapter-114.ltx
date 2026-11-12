@@ -1,0 +1,409 @@
+%%
+%% chapter-114.ltx — Self-Healing Compiler Pipelines
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:healing-intro}
+
+Compiler optimization pipelines are complex, fragile systems.  A modern
+optimizing compiler contains hundreds of passes, each of which may fail for
+various reasons: assertion failures, internal compiler errors, timeouts, memory
+exhaustion, or incorrect transformations detected by translation validation
+(\cref{ch:translation-validation}).  When a pass fails, the traditional response
+is to abort the compilation, leaving the user with an error message and no
+compiled code.
+
+\emph{Self-healing compiler pipelines} take a different approach: when a pass
+fails, the compiler automatically recovers by falling back to a safer
+configuration, skipping the failed pass, or trying an alternative optimization
+strategy.  The goal is to ensure that compilation always succeeds, even in the
+presence of failures, while still producing high-quality code.
+
+This concept draws inspiration from self-healing systems in other domains:
+fault-tolerant distributed systems, self-healing networks, and resilient
+software architectures.  The key principles are:
+\begin{itemize}
+\item \textbf{Failure detection:} Recognize when a pass has failed.
+\item \textbf{Automatic recovery:} Respond to failures without user intervention.
+\item \textbf{Graceful degradation:} Produce the best possible output even when
+      some passes fail.
+\item \textbf{Learning:} Improve the pipeline's behavior based on past failures.
+\end{itemize}
+
+In this chapter, we develop the theory and practice of self-healing compiler
+pipelines, from failure detection (\cref{sec:healing-detection}) through
+recovery strategies (\cref{sec:healing-recovery}) to learning from failures
+(\cref{sec:healing-learning}) and monitoring (\cref{sec:healing-monitoring}).
+
+% ============================================================
+% Detecting Optimization Failures
+% ============================================================
+\section{Detecting Optimization Failures}\label{sec:healing-detection}
+
+\subsection{Types of Failures}\label{sec:healing-failure-types}
+
+Compiler optimization passes can fail in several ways:
+
+\begin{definition}[Failure Classification]\label{def:failure-class}
+\begin{enumerate}
+\item \textbf{Hard failures:} The pass crashes (segfault, assertion failure,
+      unhandled exception).  The IR may be in an inconsistent state.
+\item \textbf{Soft failures:} The pass detects a problem and reports it
+      (e.g., ``unable to vectorize this loop'').  The IR is unchanged.
+\item \textbf{Silent failures:} The pass produces incorrect output (a
+      miscompilation).  The failure is not detected by the pass itself.
+\item \textbf{Resource failures:} The pass exceeds a resource limit (time,
+      memory).  The IR may be partially modified.
+\end{enumerate}
+\end{definition}
+
+\subsection{Failure Detection Mechanisms}\label{sec:healing-detection-mech}
+
+\begin{itemize}
+\item \textbf{Assertions:} Internal assertions check the IR's consistency
+      before and after each pass.  An assertion failure indicates a hard
+      failure.
+\item \textbf{IR verification:} A verification pass checks the IR's well-formedness
+      (e.g., SSA dominance, type correctness) after each transformation.
+\item \textbf{Translation validation:} A validator checks that the pass
+      preserved the program's semantics (\cref{ch:translation-validation}).
+\item \textbf{Timeouts:} A watchdog timer kills passes that exceed a time limit.
+\item \textbf{Memory limits:} A memory limiter prevents passes from exhausting
+      available memory.
+\end{itemize}
+
+\subsection{Consistent State Recovery}\label{sec:healing-consistent}
+
+When a hard failure occurs, the IR may be in an inconsistent state.  Recovery
+requires restoring the IR to a consistent state:
+
+\begin{itemize}
+\item \textbf{Pre-pass snapshot:} Save the IR before each pass; restore on
+      failure.  This is the approach used by transactional transformations
+      (\cref{ch:transactional}).
+\item \textbf{Verification-based:} If the IR fails verification, re-parse from
+      the last known-good state.
+\item \textbf{Checkpoint-based:} Periodically checkpoint the IR; restore from
+      the last checkpoint on failure.
+\end{itemize}
+
+% ============================================================
+% Automatic Fallback Strategies
+% ============================================================
+\section{Automatic Fallback Strategies}\label{sec:healing-recovery}
+
+\subsection{Pass Skipping}\label{sec:healing-skip}
+
+The simplest recovery strategy is to \emph{skip} the failed pass and continue
+with the next pass.  This is appropriate when:
+\begin{itemize}
+\item The failed pass is not critical (its optimization is nice-to-have, not
+      essential).
+\item Subsequent passes do not depend on the failed pass's output.
+\end{itemize}
+
+\begin{algorithm}[htbp]
+\caption{Pass Skipping with Fallback}\label{alg:healing-skip}
+\begin{algorithmic}[1]
+\Require Pass pipeline $P = [p_1, \ldots, p_n]$, IR state $S$
+\Ensure Optimized IR state
+\For{$i = 1$ to $n$}
+  \State $S_{\mathit{saved}} \gets \mathit{snapshot}(S)$
+  \State \textbf{try}
+    \State $S \gets p_i(S)$
+    \State $\mathit{verify}(S)$
+  \State \textbf{catch} \textit{Failure}
+    \State Log failure: $p_i$ failed on $S_{\mathit{saved}}$
+    \State $S \gets S_{\mathit{saved}}$ \Comment{Restore pre-pass state}
+    \State \textbf{continue} \Comment{Skip to next pass}
+  \State \textbf{end try}
+\EndFor
+\State \Return $S$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Optimization Level Reduction}\label{sec:healing-level}
+
+A more aggressive strategy is to reduce the optimization level.  If passes at
+\texttt{-O3} fail, retry at \texttt{-O2}; if \texttt{-O2} fails, retry at
+\texttt{-O1}; and so on.
+
+\begin{definition}[Optimization Level Cascade]\label{def:opt-cascade}
+An \emph{optimization level cascade} is a sequence of optimization
+configurations $C_0 \supset C_1 \supset \cdots \supset C_n$ where each $C_i$
+is a subset of the passes in $C_{i-1}$.  On failure at level $C_i$, the
+compiler falls back to $C_{i+1}$.
+\end{definition}
+
+\subsection{Alternative Pass Selection}\label{sec:healing-alternative}
+
+Some optimizations can be achieved by multiple passes.  If one pass fails, an
+alternative pass can be tried:
+
+\begin{itemize}
+\item \textbf{Register allocation:} If graph-coloring allocation fails, fall
+      back to linear-scan allocation.
+\item \textbf{Instruction selection:} If tree-pattern matching fails, fall back
+      to instruction scheduling with a simpler selector.
+\item \textbf{Loop optimization:} If polyhedral optimization fails, fall back
+      to classical loop transformations.
+\end{itemize}
+
+\subsection{Partial Optimization}\label{sec:healing-partial}
+
+For function-level failures, the compiler can optimize some functions and leave
+others unoptimized:
+
+\begin{algorithm}[htbp]
+\caption{Partial Optimization}\label{alg:healing-partial}
+\begin{algorithmic}[1]
+\Require Module $M$ with functions $f_1, \ldots, f_n$, pass pipeline $P$
+\Ensure Optimized module
+\For{each $f_i \in M$}
+  \State \textbf{try}
+    \State $f_i \gets \mathit{optimize}(f_i, P)$
+  \State \textbf{catch} \textit{Failure}
+    \State Log: $f_i$ could not be optimized
+    \State $f_i \gets \mathit{compile\_unoptimized}(f_i)$
+  \State \textbf{end try}
+\EndFor
+\State \Return $M$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% Learning from Failures
+% ============================================================
+\section{Learning from Failures}\label{sec:healing-learning}
+
+\subsection{Failure Databases}\label{sec:healing-db}
+
+A \emph{failure database} records all pass failures, including the pass that
+failed, the IR state at the time of failure, and the recovery action taken.
+This database can be used to:
+
+\begin{itemize}
+\item \textbf{Identify recurring failures:} If a pass frequently fails on
+      certain IR patterns, the pass can be fixed or the pattern can be avoided.
+\item \textbf{Tune the pipeline:} Adjust the pass ordering or configuration to
+      avoid known failure modes.
+\item \textbf{Train predictive models:} Use machine learning to predict which
+      passes are likely to fail on a given IR, and proactively skip them.
+\end{itemize}
+
+\subsection{Predictive Failure Avoidance}\label{sec:healing-predict}
+
+Given a failure database, the compiler can learn to \emph{predict} failures:
+
+\begin{definition}[Failure Prediction]\label{def:failure-pred}
+A \emph{failure predictor} is a function $F : \mathit{IR} \times \mathit{Pass} \to [0, 1]$
+that estimates the probability that pass $p$ will fail on IR state $S$.
+\end{definition}
+
+The predictor can be implemented using:
+\begin{itemize}
+\item \textbf{Rule-based:} Hand-crafted rules (e.g., ``skip vectorization if
+      the loop has more than 100 basic blocks'').
+\item \textbf{Statistical:} Frequency-based estimates from the failure database.
+\item \textbf{Machine learning:} A classifier trained on features of the IR
+      and pass configuration.
+\end{itemize}
+
+\subsection{Adaptive Pass Ordering}\label{sec:healing-adaptive}
+
+The pass ordering can be adapted based on past failures:
+\begin{itemize}
+\item Move reliable passes earlier in the pipeline.
+\item Move failure-prone passes later, after the IR has been simplified.
+\item Skip passes that have a high predicted failure probability.
+\end{itemize}
+
+% ============================================================
+% Redundant Optimization Paths
+% ============================================================
+\section{Redundant Optimization Paths}\label{sec:healing-redundant}
+
+\subsection{Multiple Optimization Strategies}\label{sec:healing-multi-strategy}
+
+A self-healing pipeline can maintain \emph{multiple optimization strategies},
+each optimized for different characteristics of the input:
+
+\begin{itemize}
+\item \textbf{Aggressive strategy:} Maximizes optimization, accepts higher risk
+      of failure.
+\item \textbf{Conservative strategy:} Minimizes risk of failure, accepts lower
+      optimization.
+\item \textbf{Balanced strategy:} Intermediate risk and reward.
+\end{itemize}
+
+The pipeline starts with the aggressive strategy and falls back to more
+conservative strategies on failure.
+
+\subsection{Parallel Redundant Execution}\label{sec:healing-parallel}
+
+For critical compilations (e.g., safety-critical code), the pipeline can run
+multiple strategies in parallel and compare the results:
+
+\begin{algorithm}[htbp]
+\caption{Redundant Optimization with Cross-Checking}\label{alg:healing-redundant}
+\begin{algorithmic}[1]
+\Require IR state $S$, strategies $T_1, T_2$
+\Ensure Optimized IR or failure
+\State $S_1 \gets T_1(S)$ \Comment{Parallel}
+\State $S_2 \gets T_2(S)$ \Comment{Parallel}
+\If{$\mathit{validate}(S_1) \land \mathit{validate}(S_2)$}
+  \If{$\mathit{equivalent}(S_1, S_2)$}
+    \State \Return $\mathit{better}(S_1, S_2)$
+  \Else
+    \State Report: strategies disagree (potential miscompilation)
+    \State \Return $S$ \Comment{Conservative: no optimization}
+  \EndIf
+\ElsIf{$\mathit{validate}(S_1)$}
+  \State \Return $S_1$
+\ElsIf{$\mathit{validate}(S_2)$}
+  \State \Return $S_2$
+\Else
+  \State \Return $S$ \Comment{Both failed}
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% Graceful Degradation
+% ============================================================
+\section{Graceful Degradation}\label{sec:healing-graceful}
+
+\subsection{Quality Metrics}\label{sec:healing-quality}
+
+A self-healing pipeline should track the \emph{quality} of the output code:
+
+\begin{definition}[Compilation Quality]\label{def:quality}
+\emph{Compilation quality} is a vector of metrics:
+\[
+Q = (\mathit{correctness}, \mathit{performance}, \mathit{code\_size}, \mathit{compile\_time})
+\]
+where $\mathit{correctness} \in \{0, 1\}$ indicates whether the output is
+correct, and the other metrics are continuous values.
+\end{definition}
+
+\subsection{Degradation Policies}\label{sec:healing-policies}
+
+A \emph{degradation policy} specifies how the pipeline should respond to
+failures:
+
+\begin{itemize}
+\item \textbf{Correctness-first:} Never produce incorrect code.  If a pass
+      might produce incorrect code, skip it.
+\item \textbf{Performance-first:} Maximize performance even at the cost of
+      longer compile times.  Retry failed passes with more resources.
+\item \textbf{Time-first:} Minimize compile time.  Skip failed passes without
+      retrying.
+\end{itemize}
+
+\subsection{User Notification}\label{sec:healing-notification}
+
+When the pipeline degrades (e.g., skips a pass or reduces optimization level),
+the user should be notified:
+
+\begin{verbatim}
+  warning: pass 'loop-vectorize' failed on function 'compute_fft'
+           (assertion failure in LCSSA verification)
+           falling back to unoptimized code for this function
+           performance may be degraded
+\end{verbatim}
+
+% ============================================================
+% Monitoring and Observability
+% ============================================================
+\section{Monitoring and Observability}\label{sec:healing-monitoring}
+
+\subsection{Pipeline Telemetry}\label{sec:healing-telemetry}
+
+A self-healing pipeline should emit \emph{telemetry}---structured data about
+its behavior---for monitoring and analysis:
+
+\begin{itemize}
+\item \textbf{Pass execution log:} Which passes ran, how long they took,
+      whether they succeeded.
+\item \textbf{Failure log:} Which passes failed, why, and what recovery action
+      was taken.
+\item \textbf{Quality metrics:} The quality of the output code (estimated
+      performance, code size, etc.).
+\item \textbf{Resource usage:} Memory and time consumed by each pass.
+\end{itemize}
+
+\subsection{Dashboards and Alerts}\label{sec:healing-dashboards}
+
+Telemetry data can be visualized in dashboards that show:
+\begin{itemize}
+\item The health of the compilation pipeline (pass success rate, failure rate).
+\item Trends over time (is the failure rate increasing?).
+\item Specific failure patterns (which passes fail most often?).
+\end{itemize}
+
+Alerts can be configured to notify developers when:
+\begin{itemize}
+\item The failure rate exceeds a threshold.
+\item A new type of failure is observed.
+\item The output quality degrades below a threshold.
+\end{itemize}
+
+\subsection{Continuous Improvement}\label{sec:healing-continuous}
+
+The telemetry data feeds back into the failure database, enabling continuous
+improvement:
+\begin{enumerate}
+\item Monitor pipeline health.
+\item Identify recurring failures.
+\item Fix the root causes (in the passes or in the pipeline configuration).
+\item Verify that the fixes reduce the failure rate.
+\end{enumerate}
+
+\begin{insight}
+Self-healing compiler pipelines embody a fundamental shift in how we think about
+compiler reliability.  Rather than treating failures as catastrophic events that
+halt compilation, we treat them as expected occurrences that the pipeline is
+designed to handle gracefully.  This is analogous to the shift from
+fault-intolerant to fault-tolerant distributed systems: the system is designed
+to continue operating even when individual components fail.  The key insight is
+that \emph{partial optimization is better than no optimization}: a program
+compiled with 90\% of the intended optimizations is far more useful than a
+program that fails to compile.
+\end{insight}
+
+\begin{historical}
+The concept of self-healing compiler pipelines is relatively new, but its
+components have deep roots.  Translation validation (\cref{ch:translation-validation})
+provides the failure detection mechanism.  Transactional transformations
+(\cref{ch:transactional}) provide the rollback and recovery mechanism.  The idea
+of optimization level cascades is implicit in compilers that support multiple
+optimization levels (\texttt{-O0}, \texttt{-O1}, \texttt{-O2}, \texttt{-O3}).
+The integration of these ideas into a unified self-healing framework is an
+active area of research, driven by the increasing complexity of compiler
+optimization pipelines and the growing demand for compiler reliability.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:healing-summary}
+
+Self-healing compiler pipelines improve the reliability and robustness of
+compilation by automatically detecting and recovering from optimization failures.
+The key principles are failure detection, automatic recovery, graceful
+degradation, and continuous learning.
+
+Key open challenges include:
+\begin{itemize}
+\item \textbf{Balancing recovery and quality:} Ensuring that recovery does not
+      sacrifice too much code quality.
+\item \textbf{Predicting failures:} Building accurate failure predictors that
+      can proactively avoid failures.
+\item \textbf{Formal guarantees:} Proving that the recovery mechanism preserves
+      program semantics.
+\item \textbf{Integration with existing compilers:} Retrofitting self-healing
+      capabilities into production compilers.
+\end{itemize}

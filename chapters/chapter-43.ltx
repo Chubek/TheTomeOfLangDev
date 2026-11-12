@@ -1,0 +1,485 @@
+%%
+%% chapter-43.ltx — Type Checking and Type Inference
+%%
+
+\label{ch:type-checking}
+
+Type checking and type inference stand at the crossroads of programming language theory and compiler implementation. A type checker verifies that a program respects the constraints imposed by its type system; a type inferencer goes further, reconstructing the types that the programmer chose not to annotate. Together, these two activities form the backbone of static analysis in modern compilers, and their design profoundly shapes both the expressiveness of a language and the quality of error messages its users receive.
+
+This chapter develops the theory and practice of type checking and type inference from first principles. We begin by recasting type checking as a constraint generation problem, then present the unification algorithm that lies at the heart of most type inference procedures. We proceed to bidirectional type checking, a technique that elegantly handles systems where full inference is undecidable or impractical, and close with a survey of implementation strategies used in production compilers.
+
+%% ============================================================
+%% Section 43.1
+%% ============================================================
+\section{Type Checking as Constraint Generation}\label{sec:constraint-generation}
+
+The traditional presentation of type checking uses syntax-directed rules that compute a type for each expression in a single top-down pass. While this presentation is clear, it conflates two conceptually distinct phases: \emph{gathering} the constraints that types must satisfy, and \emph{solving} those constraints. Separating these phases yields a more modular architecture and, as we shall see, enables powerful generalizations.
+
+\subsection{The Constraint-Based View}\label{sec:constraint-view}
+
+In the constraint-based approach, type checking proceeds in two stages:
+
+\begin{enumerate}
+  \item \textbf{Constraint generation.} Traverse the abstract syntax tree, introducing fresh type variables for unknown types and emitting constraints that relate them.
+  \item \textbf{Constraint solving.} Find an assignment of concrete types to the type variables that satisfies all constraints simultaneously.
+\end{enumerate}
+
+\begin{definition}[Type Constraint]\label{def:type-constraint}
+A \emph{type constraint} over a set of type variables $\mathcal{V}$ and a set of type constructors $\mathcal{C}$ is a predicate of the form $\tau_1 = \tau_2$, where $\tau_1, \tau_2$ are types built from $\mathcal{V} \cup \mathcal{C}$. A \emph{constraint system} $C$ is a finite set of such constraints.
+\end{definition}
+
+A \emph{solution} to a constraint system $C$ is a substitution $\sigma : \mathcal{V} \to \mathrm{Types}(\mathcal{C})$ such that for every $(\tau_1 = \tau_2) \in C$, we have $\sigma(\tau_1) = \sigma(\tau_2)$.
+
+\subsection{Constraint Generation Rules}\label{sec:constraint-gen-rules}
+
+Consider a simply-typed lambda calculus extended with type variables. We define a judgment $\Gamma \vdash e \rightsquigarrow \tau \mid C$ meaning ``under environment $\Gamma$, expression $e$ has type $\tau$ subject to constraint set $C$.''
+
+\begin{semrules}{Constraint Generation}
+  \typeaxiom{Var}{\Gamma, x : \tau \vdash x \rightsquigarrow \tau \mid \emptyset} \\[6pt]
+  \typerule{Abs}{\Gamma, x : \alpha \vdash e \rightsquigarrow \tau \mid C \quad \alpha \text{ fresh}}
+            {\Gamma \vdash \lambda x.\, e \rightsquigarrow \alpha \to \tau \mid C} \\[6pt]
+  \typerule{App}{\Gamma \vdash e_1 \rightsquigarrow \tau_1 \mid C_1 \quad
+                  \Gamma \vdash e_2 \rightsquigarrow \tau_2 \mid C_2 \quad
+                  \alpha \text{ fresh}}
+            {\Gamma \vdash e_1\; e_2 \rightsquigarrow \alpha \mid C_1 \cup C_2 \cup \{\tau_1 = \tau_2 \to \alpha\}} \\[6pt]
+  \typerule{Let}{\Gamma \vdash e_1 \rightsquigarrow \tau_1 \mid C_1 \quad
+                  \Gamma, x : \tau_1 \vdash e_2 \rightsquigarrow \tau_2 \mid C_2}
+            {\Gamma \vdash \mathtt{let}\; x = e_1\; \mathtt{in}\; e_2 \rightsquigarrow \tau_2 \mid C_1 \cup C_2}
+\end{semrules}
+
+\begin{example}[Constraint generation for application]\label{ex:constraint-app}
+Consider the expression $(\lambda f.\, \lambda x.\, f\; x)\; (\lambda y.\, y)$. Constraint generation proceeds as follows:
+
+For the argument $\lambda y.\, y$, we introduce a fresh variable $\alpha$ and obtain type $\alpha \to \alpha$ with empty constraints.
+
+For the function $\lambda f.\, \lambda x.\, f\; x$, we introduce fresh variables $\beta, \gamma$ for $f$ and $x$ respectively, and a fresh $\delta$ for the result of the application $f\; x$. This yields the constraint $\beta = \gamma \to \delta$ and type $\beta \to (\gamma \to \delta)$.
+
+The outer application generates the constraint:
+\[
+  \beta \to (\gamma \to \delta) = (\alpha \to \alpha) \to \epsilon
+\]
+where $\epsilon$ is fresh. Solving yields $\beta = \alpha \to \alpha$, $\epsilon = \gamma \to \delta$, $\gamma = \alpha$, $\delta = \alpha$, giving the final type $(\alpha \to \alpha) \to \alpha \to \alpha$.
+\end{example}
+
+\subsection{Soundness and Completeness}\label{sec:soundness-completeness}
+
+The constraint-based approach is sound and complete with respect to the standard type system, in the following sense:
+
+\begin{theorem}[Equivalence of Constraint-Based and Declarative Typing]\label{thm:constraint-equiv}
+For all $\Gamma$ and $e$, there exists $\tau$ and $C$ such that $\Gamma \vdash e \rightsquigarrow \tau \mid C$ and a solution $\sigma$ of $C$ with $\sigma(\tau) = \tau'$ if and only if $\Gamma \vdash e : \tau'$.
+\end{theorem}
+
+\begin{proof}
+By induction on the structure of $e$. The key case is application, where the constraint $\tau_1 = \tau_2 \to \alpha$ ensures that the function's type is compatible with the argument's type. The substitution $\sigma$ resolves all type variables to concrete types, yielding exactly the derivations of the declarative system. \qed
+\end{proof}
+
+\subsection{Advantages of the Constraint-Based Approach}\label{sec:constraint-advantages}
+
+The separation of constraint generation from solving offers several benefits:
+
+\begin{itemize}
+  \item \textbf{Modularity.} The constraint generator can be written independently of the solver. New type features (records, variants, overloading) add constraints without modifying the solver.
+  \item \textbf{Error reporting.} Unsolved constraints can be analyzed to produce informative error messages, identifying the source location of conflicting requirements.
+  \item \textbf{Extensibility.} Type classes, row polymorphism, and other extensions can be expressed as additional constraint forms handled by specialized solvers.
+  \item \textbf{Incremental checking.} When a program is edited, only the affected constraints need regeneration, enabling fast incremental type checking in IDEs.
+\end{itemize}
+
+%% ============================================================
+%% Section 43.2
+%% ============================================================
+\section{The Unification Algorithm}\label{sec:unification}
+
+Constraint solving for simple type equations reduces to the problem of \emph{unification}: given a set of equations between terms, find a substitution that makes both sides of every equation identical. Unification was introduced by Herbrand~\cite{herbrand1931} and formalized by Robinson~\cite{robinson1965}.
+
+\subsection{First-Order Unification}\label{sec:first-order-unification}
+
+\begin{definition}[Unification Problem]\label{def:unification}
+A \emph{unification problem} is a finite set of equations $E = \{s_1 = t_1, \ldots, s_n = t_n\}$ where each $s_i, t_i$ is a first-order term built from variables $\mathcal{V}$ and function symbols $\mathcal{F}$. A \emph{unifier} is a substitution $\sigma$ such that $\sigma(s_i) = \sigma(t_i)$ for all $i$. A unifier $\sigma$ is \emph{most general} (an MGU) if for every other unifier $\theta$, there exists a substitution $\rho$ such that $\theta = \rho \circ \sigma$.
+\end{definition}
+
+\begin{theorem}[Existence and Uniqueness of MGU]\label{thm:mgu}
+If a unification problem $E$ has a unifier, then it has a most general unifier, unique up to renaming of variables.
+\end{theorem}
+
+\subsection{Robinson's Unification Algorithm}\label{sec:robinson-algorithm}
+
+The classical algorithm, due to Robinson~\cite{robinson1965}, works by iteratively simplifying the equation set through a process called \emph{syntactic decomposition}.
+
+\begin{algorithm}[H]
+\caption{Robinson's Unification Algorithm}\label{alg:unify}
+\begin{algorithmic}[1]
+\Function{Unify}{$E$}
+  \State $\sigma \gets \mathrm{id}$
+  \While{$E \neq \emptyset$}
+    \State Remove an equation $s = t$ from $E$
+    \If{$s = t$}
+      \State \Comment{Trivial: skip}
+    \ElsIf{$s$ is a variable $x$ and $x \notin \mathrm{vars}(t)$}
+      \State $\sigma \gets \sigma \circ \{t/x\}$
+      \State $E \gets \{r[t/x] = u[t/x] \mid (r = u) \in E\}$
+    \ElsIf{$t$ is a variable $x$ and $x \notin \mathrm{vars}(s)$}
+      \State $\sigma \gets \sigma \circ \{s/x\}$
+      \State $E \gets \{r[s/x] = u[s/x] \mid (r = u) \in E\}$
+    \ElsIf{$s = f(s_1, \ldots, s_n)$ and $t = f(t_1, \ldots, t_n)$}
+      \State $E \gets E \cup \{s_1 = t_1, \ldots, s_n = t_n\}$
+    \Else
+      \State \Return \textbf{fail} \Comment{Occurs check or clash}
+    \EndIf
+  \EndWhile
+  \State \Return $\sigma$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{The Occurs Check}\label{sec:occurs-check}
+
+The \emph{occurs check} tests whether a variable $x$ appears within a term $t$. If $x \in \mathrm{vars}(t)$, then the equation $x = t$ has no finite solution (it would require an infinite term). This check is essential for correctness.
+
+\begin{definition}[Occurs Check]\label{def:occurs-check}
+The predicate $\mathrm{occurs}(x, t)$ is defined recursively:
+\begin{itemize}
+  \item $\mathrm{occurs}(x, x) = \mathrm{true}$
+  \item $\mathrm{occurs}(x, y) = \mathrm{false}$ for $y \neq x$
+  \item $\mathrm{occurs}(x, f(t_1, \ldots, t_n)) = \bigvee_{i=1}^{n} \mathrm{occurs}(x, t_i)$
+\end{itemize}
+\end{definition}
+
+\begin{insight}
+The occurs check is the single most common source of bugs in naive unification implementations. Many production systems omit it for performance (notably early Prolog systems), accepting the risk of unsound infinite types. Modern type checkers universally include it.
+\end{insight}
+
+\subsection{Efficient Unification}\label{sec:efficient-unification}
+
+Robinson's algorithm has worst-case complexity $O(n^2)$ due to repeated application of substitutions. Paterson and Wegman~\cite{paterson1978} presented an $O(n \alpha(n))$ algorithm using a union-find data structure with path compression, where $\alpha$ is the inverse Ackermann function.
+
+The key insight is to represent terms as directed acyclic graphs (DAGs) rather than trees, sharing common subexpressions. When two variables are unified, their equivalence classes are merged in the union-find structure, and the DAG edges are updated accordingly.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  level distance=1.5cm,
+  sibling distance=2cm,
+  every node/.style={circle, draw, minimum size=6mm},
+  edge/.style={->, >=latex}
+]
+  \node (f) {$f$}
+    child { node (g1) {$g$}
+      child { node (x) {$x$} }
+      child { node (y) {$y$} }
+    }
+    child { node (g2) {$g$}
+      child { node (z) {$z$} }
+      child { node (w) {$w$} }
+    };
+  \node[draw=none, right=3cm of f, align=left, font=\small] {
+    Before unification: $f(g(x,y),g(z,w))$\\
+    represented as a DAG with\\
+    shared subterm $g$.
+  };
+\end{tikzpicture}
+\caption{DAG representation of terms for efficient unification. Shared subexpressions are represented once, reducing the cost of substitution application.}\label{fig:dag-unification}
+\end{figure}
+
+\subsection{Unification with Partial Information}\label{sec:partial-unification}
+
+In type inference, we often encounter \emph{conditional} constraints: ``if $\alpha = \mathrm{int}$, then $\beta = \mathrm{bool}$.'' These arise from conditional expressions and pattern matching. The standard approach is to defer such constraints, solving only the unconditional ones and checking deferred constraints against the partial solution.
+
+\begin{definition}[Conditional Constraint]\label{def:conditional-constraint}
+A \emph{conditional constraint} has the form $c \Rightarrow (s = t)$, meaning ``if constraint $c$ is satisfied, then $s$ must unify with $t$.'' A constraint system with conditional constraints is solved by first solving the unconditional fragment, then checking each conditional constraint under the partial solution.
+\end{definition}
+
+%% ============================================================
+%% Section 43.3
+%% ============================================================
+\section{Type Inference for Simple Types}\label{sec:simple-type-inference}
+
+With constraint generation and unification in hand, we can now present a complete type inference algorithm for the simply-typed lambda calculus.
+
+\subsection{Algorithm Overview}\label{sec:inference-overview}
+
+The type inference algorithm takes an untyped term $e$ and either returns a type $\tau$ (the most general type of $e$) or reports a type error. It proceeds as follows:
+
+\begin{enumerate}
+  \item Assign a fresh type variable to each bound variable and each subexpression.
+  \item Generate constraints by traversing the term.
+  \item Solve the constraints using unification.
+  \item Read off the type from the solution.
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{Type Inference for the Simply-Typed Lambda Calculus}\label{alg:type-inference}
+\begin{algorithmic}[1]
+\Function{InferType}{$\Gamma, e$}
+  \State $\tau, C \gets \mathrm{Generate}(\Gamma, e)$
+  \State $\sigma \gets \mathrm{Unify}(C)$
+  \If{$\sigma = \mathrm{fail}$}
+    \State \Return \textbf{error} ``Type mismatch''
+  \EndIf
+  \State \Return $\sigma(\tau)$
+\EndFunction
+\Statex
+\Function{Generate}{$\Gamma, e$}
+  \State \textbf{case} $e$ \textbf{of}
+  \State \quad $x$: \Return $\Gamma(x), \emptyset$
+  \State \quad $\lambda x.\, e'$:
+    \State \quad $\alpha \gets \mathrm{fresh}()$
+    \State \quad $\tau, C \gets \mathrm{Generate}(\Gamma[x \mapsto \alpha], e')$
+    \State \quad \Return $\alpha \to \tau, C$
+  \State \quad $e_1\; e_2$:
+    \State \quad $\tau_1, C_1 \gets \mathrm{Generate}(\Gamma, e_1)$
+    \State \quad $\tau_2, C_2 \gets \mathrm{Generate}(\Gamma, e_2)$
+    \State \quad $\alpha \gets \mathrm{fresh}()$
+    \State \quad \Return $\alpha, C_1 \cup C_2 \cup \{\tau_1 = \tau_2 \to \alpha\}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Principal Types}\label{sec:principal-types}
+
+A central result in type inference theory is the existence of \emph{principal types}: types from which all other valid types can be obtained by substitution.
+
+\begin{definition}[Principal Type]\label{def:principal-type}
+A type $\tau$ is a \emph{principal type} for expression $e$ in environment $\Gamma$ if:
+\begin{enumerate}
+  \item $\Gamma \vdash e : \tau$ (it is a valid type), and
+  \item For every $\tau'$ such that $\Gamma \vdash e : \tau'$, there exists a substitution $\sigma$ such that $\sigma(\tau) = \tau'$.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Principal Type Theorem for STLC]\label{thm:principal-type}
+Every typable expression in the simply-typed lambda calculus has a principal type.
+\end{theorem}
+
+\begin{proof}
+The constraint generation algorithm produces a finite set of type equations. The most general unifier, if it exists, yields the most general solution to these equations. Since the MGU is unique up to renaming, the resulting type is principal. \qed
+\end{proof}
+
+\subsection{Let-Bindings and Monomorphic Inference}\label{sec:let-monomorphic}
+
+Without let-polymorphism (which we treat in \cref{ch:hm-inference}), let-bindings are typed monomorphically: the bound expression receives a single type, and the variable is used at that type throughout the body.
+
+\begin{semrules}{Monomorphic Let}
+  \typerule{Let}{\Gamma \vdash e_1 \rightsquigarrow \tau_1 \mid C_1 \quad
+                  \Gamma, x : \tau_1 \vdash e_2 \rightsquigarrow \tau_2 \mid C_2}
+            {\Gamma \vdash \mathtt{let}\; x = e_1\; \mathtt{in}\; e_2 \rightsquigarrow \tau_2 \mid C_1 \cup C_2}
+\end{semrules}
+
+This restriction means that \texttt{let $x = \mathtt{id}$ in $(x\; 3, x\; \mathtt{true})$} fails to type-check, because $x$ cannot be simultaneously $\mathrm{int} \to \mathrm{int}$ and $\mathrm{bool} \to \mathrm{bool}$. The Hindley--Milner system of \cref{ch:hm-inference} lifts this restriction.
+
+%% ============================================================
+%% Section 43.4
+%% ============================================================
+\section{Bidirectional Type Checking}\label{sec:bidirectional}
+
+Full type inference is undecidable for many useful type systems, including System~F (\cref{ch:poly-types}) and systems with subtyping (\cref{ch:subtyping}). \emph{Bidirectional type checking}, introduced by Pierce and Turner~\cite{pierce1998}, offers a principled compromise: the programmer provides type annotations at strategic points, and the checker infers types everywhere else.
+
+\subsection{The Two Modes}\label{sec:two-modes}
+
+Bidirectional type checking defines two mutually recursive judgments:
+
+\begin{itemize}
+  \item $\Gamma \vdash e \Rightarrow \tau$ (\textbf{inference}): ``Given $\Gamma$, we can determine that $e$ has type $\tau$.''
+  \item $\Gamma \vdash e \Leftarrow \tau$ (\textbf{checking}): ``Given $\Gamma$ and a type $\tau$, we can verify that $e$ has type $\tau$.''
+\end{itemize}
+
+The key insight is that some constructs are naturally suited to inference (variables, applications with annotated functions), while others are naturally suited to checking (lambdas, let-bindings with annotated bound variables).
+
+\begin{semrules}{Bidirectional Type Checking}
+  \typeaxiom{Var-Check}{\Gamma \vdash x \Leftarrow \tau \quad \text{if } \Gamma(x) = \tau} \\[6pt]
+  \typerule{Abs-Check}{\Gamma, x : \tau_1 \vdash e \Leftarrow \tau_2}
+            {\Gamma \vdash \lambda x.\, e \Leftarrow \tau_1 \to \tau_2} \\[6pt]
+  \typerule{Abs-Infer}{\Gamma, x : \tau_1 \vdash e \Leftarrow \tau_2}
+            {\Gamma \vdash \lambda x : \tau_1.\, e \Rightarrow \tau_1 \to \tau_2} \\[6pt]
+  \typerule{App-Infer}{\Gamma \vdash e_1 \Rightarrow \tau_1 \to \tau_2 \quad
+                        \Gamma \vdash e_2 \Leftarrow \tau_1}
+            {\Gamma \vdash e_1\; e_2 \Rightarrow \tau_2} \\[6pt]
+  \typerule{Subsume}{\Gamma \vdash e \Rightarrow \tau' \quad \tau' = \tau}
+            {\Gamma \vdash e \Leftarrow \tau}
+\end{semrules}
+
+\subsection{Subsumption and Subtyping}\label{sec:subsumption}
+
+When the type system includes subtyping (\cref{ch:subtyping}), the subsumption rule becomes:
+
+\[
+  \typerule{Subsume-Sub}{\Gamma \vdash e \Rightarrow \tau' \quad \tau' <: \tau}
+            {\Gamma \vdash e \Leftarrow \tau}
+\]
+
+This allows a value of a more specific type to be used where a more general type is expected. The interplay between inference, checking, and subsumption must be carefully designed to avoid ambiguity.
+
+\subsection{Bidirectional Typing for Records and Variants}\label{sec:bidirectional-records}
+
+Bidirectional typing extends naturally to record and variant types. For records, checking mode allows the field types to be inferred from the expected type:
+
+\[
+  \typerule{Record-Check}{\Gamma \vdash e_1 \Leftarrow \tau_1 \quad \cdots \quad \Gamma \vdash e_n \Leftarrow \tau_n}
+            {\Gamma \vdash \{l_1 = e_1, \ldots, l_n = e_n\} \Leftarrow \{l_1 : \tau_1, \ldots, l_n : \tau_n\}}
+\]
+
+For variants, inference mode determines the variant type from the tag and the inferred type of the payload:
+
+\[
+  \typerule{Variant-Infer}{\Gamma \vdash e \Rightarrow \tau}
+            {\Gamma \vdash \mathtt{inj}_{l}(e) \Rightarrow \langle l : \tau \mid \ldots \rangle}
+\]
+
+\subsection{Completeness and Annotation Placement}\label{sec:annotation-placement}
+
+\begin{theorem}[Bidirectional Completeness]\label{thm:bidirectional-complete}
+If $\Gamma \vdash e : \tau$ in the declarative system, then there exists an annotation of $e$ (adding type annotations at lambda-bound variables and let-bound variables) such that the annotated term is accepted by the bidirectional system with type $\tau$.
+\end{theorem}
+
+The theorem tells us that bidirectional checking is \emph{complete relative to annotation placement}: if the programmer provides enough annotations, the checker will accept all valid programs. The art of language design lies in choosing a minimal set of annotation sites that covers typical usage patterns.
+
+\begin{insight}
+Bidirectional type checking has become the de facto standard for languages with complex type systems. It is used in GHC Haskell (for type-class contexts), in Agda and Coq (for dependent types), in TypeScript (for structural subtyping), and in many other systems. Its practical success rests on a simple principle: the programmer and the compiler cooperate, each doing what they do best.
+\end{insight}
+
+%% ============================================================
+%% Section 43.5
+%% ============================================================
+\section{Local Type Inference}\label{sec:local-type-inference}
+
+\emph{Local type inference} (Pierce and Turner~\cite{pierce2000}) extends bidirectional checking with limited inference of type arguments to polymorphic functions. The idea is to infer type arguments at call sites from the types of value arguments, without requiring global unification.
+
+\subsection{Type Argument Inference}\label{sec:type-arg-inference}
+
+Consider a polymorphic function $\mathtt{map} : \forall \alpha.\, \forall \beta.\, (\alpha \to \beta) \to [\alpha] \to [\beta]$. When the programmer writes $\mathtt{map}\; f\; xs$, the type checker can infer $\alpha$ and $\beta$ from the types of $f$ and $xs$:
+
+\begin{enumerate}
+  \item Infer the type of $f$: say $\mathrm{int} \to \mathrm{string}$.
+  \item Infer the type of $xs$: say $[\mathrm{int}]$.
+  \item Match against the expected parameter types: $\alpha = \mathrm{int}$, $\beta = \mathrm{string}$.
+\end{enumerate}
+
+This is a form of \emph{local} inference: it uses only the types of immediately available expressions, not global constraint solving.
+
+\subsection{Local Inference with Subtyping}\label{sec:local-subtyping}
+
+When subtyping is present, local type inference must account for the fact that the argument types may be subtypes of the expected parameter types. Pierce and Turner's algorithm works by:
+
+\begin{enumerate}
+  \item Inferring the types of all arguments.
+  \item Computing the \emph{minimal} type instantiation that is compatible with the inferred argument types under subtyping.
+  \item Checking that the result type is compatible with the expected type.
+\end{enumerate}
+
+\subsection{Limitations}\label{sec:local-limitations}
+
+Local type inference cannot handle all cases. When a polymorphic function's type arguments cannot be determined from the value arguments alone (for example, $\mathtt{empty} : \forall \alpha.\, [\alpha]$), the programmer must provide explicit type annotations or use a more powerful inference mechanism.
+
+\begin{example}[Failure of local inference]\label{ex:local-failure}
+The expression $\mathtt{let}\; xs = \mathtt{empty}\; \mathtt{in}\; \mathtt{head}\; xs$ cannot be typed by local inference alone, because the type of $\mathtt{empty}$ is not constrained by any value arguments. The programmer must write $\mathtt{empty}\langle \mathrm{int} \rangle$ or provide a type annotation on $xs$.
+\end{example}
+
+%% ============================================================
+%% Section 43.6
+%% ============================================================
+\section{Implementation Strategies}\label{sec:implementation-strategies}
+
+The implementation of a type checker involves numerous engineering decisions that profoundly affect performance, error message quality, and maintainability.
+
+\subsection{Representation of Types}\label{sec:type-representation}
+
+Types are typically represented as trees or DAGs in memory. The choice of representation affects the cost of fundamental operations:
+
+\begin{table}[htbp]
+\centering
+\caption{Type representation strategies and their trade-offs}\label{tab:type-repr}
+\begin{tabular}{lccp{5cm}}
+\hline
+\textbf{Representation} & \textbf{Equality} & \textbf{Substitution} & \textbf{Notes} \\
+\hline
+Naive trees & $O(n)$ & $O(n)$ & Simple but wasteful \\
+Hash-consed trees & $O(1)$ & $O(n)$ & Structural sharing via hash table \\
+De Bruijn indices & $O(n)$ & $O(n)$ & Nameless; avoids $\alpha$-conversion \\
+Nominal with caching & $O(1)$ amortized & $O(n)$ & Names with hash-consing \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Error Recovery and Reporting}\label{sec:error-recovery}
+
+A type checker that aborts on the first error is of limited use. Production type checkers employ several strategies for error recovery:
+
+\begin{itemize}
+  \item \textbf{Continuation after errors.} When a constraint fails, assign a fresh ``error type'' and continue checking, collecting all errors.
+  \item \textbf{Hole filling.} When a type cannot be determined, introduce a metavariable and report it as an ``unresolved type'' at the end.
+  \item \textbf{Error slicing.} For a chain of constraints leading to a contradiction, identify the minimal subset responsible and report only those locations.
+  \item \textbf{Suggested fixes.} Use edit-distance or type-distance heuristics to suggest corrections for common mistakes.
+\end{itemize}
+
+\subsection{Incremental Type Checking}\label{sec:incremental}
+
+Modern IDEs require type checking to be responsive---on the order of milliseconds for small edits. Incremental type checking achieves this by:
+
+\begin{enumerate}
+  \item Maintaining a dependency graph of definitions.
+  \item When a definition changes, invalidating only the constraints that depend on it.
+  \item Re-solving only the affected constraint subsystem.
+  \item Caching solutions for unchanged subsystems.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.5cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.8cm, fill=TomeBg},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (a) {Definition $A$};
+  \node[block, right=of a] (b) {Definition $B$};
+  \node[block, right=of b] (c) {Definition $C$};
+  \node[block, below=1.2cm of b] (d) {Definition $D$};
+  \node[block, below=1.2cm of c] (e) {Definition $E$};
+
+  \draw[arrow] (a) -- (b);
+  \draw[arrow] (b) -- (c);
+  \draw[arrow] (b) -- (d);
+  \draw[arrow] (c) -- (e);
+  \draw[arrow] (d) -- (e);
+
+  \node[draw=none, below=0.5cm of d, font=\small, align=center] {
+    Dependency graph: editing $A$ invalidates\\
+    $A, B, C, D, E$; editing $D$ invalidates only $D, E$.
+  };
+\end{tikzpicture}
+\caption{Dependency graph for incremental type checking. Only definitions reachable from a changed definition need re-checking.}\label{fig:dependency-graph}
+\end{figure}
+
+\subsection{Constraint Solvers in Practice}\label{sec:practical-solvers}
+
+Production compilers use a variety of constraint-solving strategies:
+
+\begin{itemize}
+  \item \textbf{GHC (Haskell).} Uses a constraint monad that combines unification with type-class resolution. Constraints are solved in a fixed-point loop that interleaves unification with dictionary construction.
+  \item \textbf{Rust.} Uses a region-based constraint solver for lifetime inference, combined with a trait solver for trait bounds. The solver operates in a ``selection then confirmation'' strategy.
+  \item \textbf{TypeScript.} Uses a structural type checker with local inference and limited constraint solving. The solver handles conditional types and template literal types through a normalization procedure.
+  \item \textbf{OCaml.} Uses Algorithm~W (see \cref{ch:hm-inference}) with a union-find structure for efficient unification.
+\end{itemize}
+
+\subsection{Performance Considerations}\label{sec:performance}
+
+The performance of type checking is dominated by three factors:
+
+\begin{enumerate}
+  \item \textbf{Unification cost.} For large programs with many type variables, unification can dominate. Path-compressed union-find structures reduce the amortized cost to nearly linear.
+  \item \textbf{Substitution application.} Applying a substitution to a large type can be expensive if the type is represented as a tree. Hash-consing and lazy substitution (applying substitutions only when types are inspected) mitigate this.
+  \item \textbf{Constraint explosion.} Some type system features (e.g., type families in GHC) can generate exponentially many constraints. Careful constraint simplification and early pruning are essential.
+\end{enumerate}
+
+\begin{historical}
+The first practical type inference algorithm was developed by Hindley~\cite{hindley1969} and Milner~\cite{milner1978} for the ML language. Their algorithm, now known as Algorithm~W, combined unification with a clever treatment of let-bindings that enabled polymorphic recursion within a decidable framework. The constraint-based view was articulated later by Pottier and R{\'e}my~\cite{pottier2005}, who showed that it provides a clean separation of concerns and enables modular extensions to the core algorithm.
+\end{historical}
+
+%% ============================================================
+%% Section 43.7
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-43}
+
+This chapter has established the foundations of type checking and type inference. We have seen how type checking can be decomposed into constraint generation and constraint solving, how unification provides the core algorithm for solving type equations, and how bidirectional type checking offers a practical compromise between full inference and full annotation.
+
+The Hindley--Milner system, presented in the next chapter, extends these ideas with let-polymorphism, enabling a form of parametric polymorphism that can be inferred without any programmer annotations. The chapters that follow explore increasingly sophisticated type systems---polymorphic, subtyping, dependent, linear---each of which presents new challenges and opportunities for type checking and inference.
+
+For further reading, we recommend Pottier and R{\'e}my's comprehensive treatment of type inference~\cite{pottier2005}, Pierce and Turner's work on bidirectional typing~\cite{pierce1998}, and Dunfield and Krishnaswami's tutorial on bidirectional type checking~\cite{dunfield2021}.

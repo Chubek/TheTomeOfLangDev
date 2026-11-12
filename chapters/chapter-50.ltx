@@ -1,0 +1,488 @@
+%%
+%% chapter-50.ltx — Effect Systems
+%%
+
+\label{ch:effect-systems}
+
+While type systems track what values a program can produce, \emph{effect systems} track what a program can \emph{do}---what side effects it can perform, what exceptions it can raise, what state it can modify. Effect systems make the computational behavior of programs explicit in their types, enabling reasoning about purity, resource usage, and concurrency. This chapter develops the theory of effect systems, from simple effect annotations to algebraic effects and handlers.
+
+%% ============================================================
+%% Section 50.1
+%% ============================================================
+\section{What Are Effects?}\label{sec:what-are-effects}
+
+An \emph{effect} is any computational behavior beyond the production of a value. Common effects include:
+
+\begin{itemize}
+  \item \textbf{State mutation.} Reading or writing mutable variables.
+  \item \textbf{I/O.} Reading from or writing to files, networks, or the console.
+  \item \textbf{Exceptions.} Raising or handling errors.
+  \item \textbf{Non-determinism.} Making choices that affect the computation.
+  \item \textbf{Concurrency.} Spawning threads, synchronizing, or communicating.
+  \item \textbf{Allocation.} Allocating or freeing memory.
+\end{itemize}
+
+\subsection{Effects as Type Information}\label{sec:effects-as-types}
+
+An effect system extends the type judgment $\Gamma \vdash e : \tau$ with an effect annotation:
+\[
+  \Gamma \vdash e : \tau \mid \epsilon
+\]
+where $\epsilon$ describes the effects that $e$ may perform. A \emph{pure} expression has the empty effect $\epsilon = \emptyset$; an expression that may raise exceptions has $\epsilon \supseteq \{\mathrm{exn}\}$.
+
+\subsection{Effect Lattices}\label{sec:effect-lattices}
+
+Effects are typically organized as a lattice, where the join (least upper bound) represents the union of effects:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 2cm,
+  eff/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.6cm, fill=TomeBg, font=\small}
+]
+  \node[eff] (all) {All};
+  \node[eff, below left=1.2cm and 1cm of all] (io) {IO};
+  \node[eff, below right=1.2cm and 1cm of all] (st) {State};
+  \node[eff, below left=1.2cm and 0cm of io] (exn) {Exn};
+  \node[eff, below right=1.2cm and 0cm of st] (alloc) {Alloc};
+  \node[eff, below=1.2cm of exn] (pure) {$\emptyset$ (Pure)};
+
+  \draw[-, >=latex] (pure) -- (exn);
+  \draw[-, >=latex] (pure) -- (alloc);
+  \draw[-, >=latex] (exn) -- (io);
+  \draw[-, >=latex] (alloc) -- (st);
+  \draw[-, >=latex] (io) -- (all);
+  \draw[-, >=latex] (st) -- (all);
+\end{tikzpicture}
+\caption{An effect lattice. The bottom element $\emptyset$ represents pure computation; the top element represents arbitrary effects. The join of two effects is their least upper bound.}\label{fig:effect-lattice}
+\end{figure}
+
+%% ============================================================
+%% Section 50.2
+%% ============================================================
+\section{Effect Typing Rules}\label{sec:effect-typing}
+
+Effect typing rules extend the standard typing rules with effect annotations.
+
+\subsection{Basic Rules}\label{sec:basic-effect-rules}
+
+\begin{semrules}{Effect Typing}
+  \typeaxiom{Var}{\Gamma, x : \tau \vdash x : \tau \mid \emptyset} \\[6pt]
+  \typerule{Abs}{\Gamma, x : \tau_1 \vdash e : \tau_2 \mid \epsilon}
+            {\Gamma \vdash \lambda x.\, e : \tau_1 \xrightarrow{\epsilon} \tau_2 \mid \emptyset} \\[6pt]
+  \typerule{App}{\Gamma \vdash e_1 : \tau_1 \xrightarrow{\epsilon_1} \tau_2 \mid \epsilon_1' \quad
+                  \Gamma \vdash e_2 : \tau_1 \mid \epsilon_2}
+            {\Gamma \vdash e_1\; e_2 : \tau_2 \mid \epsilon_1 \cup \epsilon_1' \cup \epsilon_2} \\[6pt]
+  \typerule{Let}{\Gamma \vdash e_1 : \tau_1 \mid \epsilon_1 \quad
+                  \Gamma, x : \tau_1 \vdash e_2 : \tau_2 \mid \epsilon_2}
+            {\Gamma \vdash \mathtt{let}\; x = e_1\; \mathtt{in}\; e_2 : \tau_2 \mid \epsilon_1 \cup \epsilon_2}
+\end{semrules}
+
+The key principle is \emph{effect union}: the effect of a composite expression is the union of the effects of its subexpressions.
+
+\subsection{Effectful Operations}\label{sec:effectful-ops}
+
+Specific operations have specific effects:
+
+\begin{semrules}{Effectful Operations}
+  \typeaxiom{Read}{\Gamma \vdash \mathtt{read}(r) : \tau \mid \{\mathrm{read}\}} \\[6pt]
+  \typeaxiom{Write}{\Gamma \vdash \mathtt{write}(r, v) : \mathrm{unit} \mid \{\mathrm{write}\}} \\[6pt]
+  \typeaxiom{Throw}{\Gamma \vdash \mathtt{throw}(e) : \tau \mid \{\mathrm{exn}\}} \\[6pt]
+  \typeaxiom{Print}{\Gamma \vdash \mathtt{print}(s) : \mathrm{unit} \mid \{\mathrm{io}\}}
+\end{semrules}
+
+\subsection{Effect Subtyping}\label{sec:effect-subtyping}
+
+Effects are ordered by inclusion: if $\epsilon_1 \subseteq \epsilon_2$, then an expression with effect $\epsilon_1$ can be used where effect $\epsilon_2$ is expected (it does fewer effects).
+
+\[
+  \typerule{Effect-Sub}{\Gamma \vdash e : \tau \mid \epsilon_1 \quad \epsilon_1 \subseteq \epsilon_2}
+            {\Gamma \vdash e : \tau \mid \epsilon_2}
+\]
+
+%% ============================================================
+%% Section 50.3
+%% ============================================================
+\section{Effect Polymorphism}\label{sec:effect-polymorphism}
+
+Effect polymorphism allows functions to be polymorphic in their effects: a higher-order function's effect depends on the effects of its function arguments.
+
+\subsection{Effect Variables}\label{sec:effect-variables}
+
+\begin{example}[Effect-polymorphic map]\label{ex:effect-map}
+The function $\mathtt{map}$ has the effect-polymorphic type:
+\[
+  \mathtt{map} : \forall \epsilon.\, (\alpha \xrightarrow{\epsilon} \beta) \to [\alpha] \to [\beta] \mid \epsilon
+\]
+This says that $\mathtt{map}$ has exactly the effects of its function argument $f$. If $f$ is pure ($\epsilon = \emptyset$), then $\mathtt{map}$ is pure. If $f$ performs I/O, then $\mathtt{map}$ performs I/O.
+\end{example}
+
+\subsection{Effect Constraints}\label{sec:effect-constraints}
+
+Effect polymorphism introduces effect constraints, analogous to type constraints in type-class systems:
+
+\[
+  \mathtt{compose} : \forall \epsilon_1, \epsilon_2.\, (\beta \xrightarrow{\epsilon_2} \gamma) \to (\alpha \xrightarrow{\epsilon_1} \beta) \to (\alpha \xrightarrow{\epsilon_1 \cup \epsilon_2} \gamma)
+\]
+
+\subsection{Effect Inference}\label{sec:effect-inference}
+
+Effect inference extends type inference to determine the effects of expressions without explicit annotations. The algorithm is similar to HM type inference, but with effect variables and effect unification.
+
+\begin{algorithm}[H]
+\caption{Effect Inference}\label{alg:effect-inference}
+\begin{algorithmic}[1]
+\Function{InferEffect}{$\Gamma, e$}
+  \State \textbf{case} $e$ \textbf{of}
+  \State \quad $x$: \Return $\Gamma(x).\tau, \Gamma(x).\epsilon, \emptyset$
+  \State \quad $\lambda x.\, e'$:
+    \State \quad $\alpha \gets \mathrm{fresh}()$; $\epsilon \gets \mathrm{fresh\_effect}()$
+    \State \quad $\tau', \epsilon', C \gets \mathrm{InferEffect}(\Gamma[x : \alpha \xrightarrow{\epsilon} \tau'], e')$
+    \State \quad \Return $\alpha \xrightarrow{\epsilon} \tau', \emptyset, C$
+  \State \quad $e_1\; e_2$:
+    \State \quad $\tau_1 \xrightarrow{\epsilon_1} \tau_1', \epsilon_1', C_1 \gets \mathrm{InferEffect}(\Gamma, e_1)$
+    \State \quad $\tau_2, \epsilon_2, C_2 \gets \mathrm{InferEffect}(\Gamma, e_2)$
+    \State \quad $C_3 \gets \{\tau_2 = \tau_1\}$
+    \State \quad \Return $\tau_1', \epsilon_1 \cup \epsilon_1' \cup \epsilon_2, C_1 \cup C_2 \cup C_3$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+%% ============================================================
+%% Section 50.4
+%% ============================================================
+\section{Algebraic Effects and Handlers}\label{sec:algebraic-effects}
+
+\emph{Algebraic effects}, introduced by Plotkin and Power~\cite{plotkin2003}, provide a modular framework for defining and composing effects. An effect is defined by a set of \emph{operations}; a \emph{handler} interprets those operations.
+
+\subsection{Effect Signatures}\label{sec:effect-signatures}
+
+\begin{definition}[Effect Signature]\label{def:effect-signature}
+An \emph{effect signature} $\Sigma$ is a set of operation symbols, each with an arity specifying the types of its argument and the type of its continuation:
+\[
+  \Sigma = \{ \mathtt{op}_i : A_i \to B_i \}_{i \in I}
+\]
+\end{definition}
+
+\begin{example}[State effect signature]\label{ex:state-signature}
+The state effect with state type $S$ has two operations:
+\begin{align*}
+  \mathtt{get} &: \mathrm{unit} \to S \\
+  \mathtt{set} &: S \to \mathrm{unit}
+\end{align*}
+\end{example}
+
+\subsection{Effect Operations}\label{sec:effect-operations}
+
+An effect operation is invoked by the program and handled by the handler:
+
+\begin{verbatim}
+  -- Program using state effect
+  let x = get() in
+  set(x + 1);
+  get()
+
+  -- Handler interpreting state effect
+  handle program with
+    | get() -> k -> \s -> k(s)(s)
+    | set(s') -> k -> \s -> k()(s')
+    | return v -> \s -> (v, s)
+\end{verbatim}
+
+The handler receives a continuation $k$ for each operation, allowing it to decide how (and whether) to resume the computation.
+
+\subsection{Handlers}\label{sec:handlers}
+
+\begin{definition}[Handler]\label{def:handler}
+A \emph{handler} for an effect signature $\Sigma$ consists of:
+\begin{itemize}
+  \item A \emph{return clause} that handles the final value of the computation.
+  \item An \emph{operation clause} for each $\mathtt{op}_i \in \Sigma$ that handles the operation, receiving the argument and a continuation.
+\end{itemize}
+\end{definition}
+
+\begin{example}[Exception handler]\label{ex:exception-handler}
+\begin{verbatim}
+  handle
+    let x = 1 / 0 in
+    x + 1
+  with
+    | raise() -> k -> 0   -- ignore the exception, return 0
+    | return v -> v
+\end{verbatim}
+The handler catches the division-by-zero exception and returns 0 instead.
+\end{example}
+
+\subsection{Multi-Shot Continuations}\label{sec:multi-shot}
+
+A key feature of algebraic effects is that handlers can invoke the continuation \emph{multiple times} or \emph{zero times}:
+
+\begin{example}[Non-determinism handler]\label{ex:nondeterminism}
+\begin{verbatim}
+  handle
+    let x = choose([1, 2, 3]) in
+    let y = choose([4, 5]) in
+    (x, y)
+  with
+    | choose(xs) -> k -> concatMap k xs  -- run for each choice
+    | return v -> [v]
+\end{verbatim}
+The handler invokes the continuation once for each element of the choice list, collecting all results. This implements backtracking search.
+\end{example}
+
+%% ============================================================
+%% Section 50.5
+%% ============================================================
+\section{Effect Inference}\label{sec:effect-inference-adv}
+
+Effect inference determines the effects of expressions without explicit annotations. The challenge is that effects, unlike types, form a lattice rather than a free algebra, making unification more complex.
+
+\subsection{Effect Unification}\label{sec:effect-unification}
+
+Effect unification solves equations of the form $\epsilon_1 = \epsilon_2$ where $\epsilon_i$ are effect expressions built from effect variables, effect constants, union ($\cup$), and intersection ($\cap$).
+
+\begin{example}[Effect unification]\label{ex:effect-unification}
+The equation $\epsilon \cup \{\mathrm{io}\} = \{\mathrm{io}, \mathrm{exn}\}$ has the solution $\epsilon = \{\mathrm{exn}\}$ (or any $\epsilon \subseteq \{\mathrm{exn}\}$).
+\end{example}
+
+\subsection{Effect Inference in Practice}\label{sec:effect-inference-practice}
+
+\begin{itemize}
+  \item \textbf{Koka.} Microsoft Research's Koka language performs full effect inference, determining the effects of every expression without annotations.
+  \item \textbf{Eff.} The Eff language uses algebraic effects with handlers, requiring explicit handler annotations but inferring effect types.
+  \item \textbf{Frank.} Frank combines effect inference with session types, tracking both effects and communication protocols.
+\end{itemize}
+
+%% ============================================================
+%% Section 50.6
+%% ============================================================
+\section{Comparison with Monadic Effects}\label{sec:monadic-effects}
+
+The monadic approach to effects (used by Haskell) and the algebraic effects approach (used by Koka, Eff) represent two fundamentally different philosophies.
+
+\subsection{Monadic Effects}\label{sec:monadic-approach}
+
+In the monadic approach, each effect is represented by a monad:
+\begin{itemize}
+  \item $\mathrm{State}\; S\; A$: stateful computation producing $A$.
+  \item $\mathrm{IO}\; A$: I/O computation producing $A$.
+  \item $\mathrm{Maybe}\; A$: computation that may fail.
+\end{itemize}
+
+Effects are composed using monad transformers: $\mathrm{StateT}\; S\; (\mathrm{ExceptT}\; E\; \mathrm{IO})\; A$ represents a computation with state, exceptions, and I/O.
+
+\subsection{Algebraic Effects}\label{sec:algebraic-approach}
+
+In the algebraic approach, effects are defined by operations and composed by union:
+\begin{itemize}
+  \item $\{\mathrm{get} : \mathrm{unit} \to S, \mathrm{set} : S \to \mathrm{unit}\}$: state effect.
+  \item $\{\mathrm{raise} : E \to \mathrm{void}\}$: exception effect.
+  \item $\{\mathrm{read} : \mathrm{String} \to \mathrm{String}, \mathrm{write} : \mathrm{String} \to \mathrm{unit}\}$: I/O effect.
+\end{itemize}
+
+Effects are composed by simple union: $\{\mathrm{state}\} \cup \{\mathrm{exn}\} \cup \{\mathrm{io}\}$.
+
+\subsection{Comparison}\label{sec:comparison}
+
+\begin{table}[htbp]
+\centering
+\caption{Monadic vs. algebraic effects}\label{tab:monadic-algebraic}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Aspect} & \textbf{Monadic} & \textbf{Algebraic} \\
+\hline
+Composition & Monad transformers & Effect union \\
+Handler & \texttt{runState}, \texttt{runExcept} & \texttt{handle} with clauses \\
+Ordering & Fixed by transformer stack & Flexible, any handler order \\
+Extensibility & New transformer needed & New operation signature \\
+Inference & Explicit monad type & Effect inference possible \\
+Performance & Transformer overhead & Direct compilation \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}
+The algebraic effects approach is more modular than the monadic approach: effects are composed by union rather than by stacking, and handlers can be applied in any order. This eliminates the ``transformer hell'' of deeply nested monad transformers and enables more flexible effect handling. However, the monadic approach is more mature and has better tooling support in languages like Haskell.
+\end{insight}
+
+\begin{historical}
+The idea of tracking effects in types dates back to the early 1990s, with effect systems for exceptions (Talpin and Jouvelot~\cite{talpin1992}) and state (Gifford and Lucassen~\cite{gifford1986}). The monadic approach, pioneered by Moggi~\cite{moggi1991} and popularized by Wadler~\cite{wadler1992}, became the dominant paradigm in Haskell. The algebraic effects approach, introduced by Plotkin and Power~\cite{plotkin2003} and developed by Plotkin and Pretnar~\cite{plotkin2013}, offers a more modular alternative. Modern languages like Koka, Unison, and Lean 4 have adopted algebraic effects, signaling a shift toward this more flexible approach.
+\end{historical}
+
+%% ============================================================
+%% Section 50.7
+%% ============================================================
+\section{Advanced Algebraic Effects and Inference}\label{sec:algebraic-effects-advanced}
+
+\subsection{Effect Handlers and Continuations}\label{sec:handlers-continuations}
+
+The semantics of algebraic effects is given by \emph{effect handlers}, which interpret effect operations by transforming the computation into a continuation-passing style.
+
+\begin{definition}[Effect Handler Semantics]\label{def:handler-semantics}
+An effect handler $\mathrm{handle}\; M\; \mathrm{with}\; H$ evaluates the computation $M$ as follows:
+\begin{itemize}
+  \item If $M$ returns a value $v$, the return clause of $H$ is applied to $v$.
+  \item If $M$ performs an operation $\mathtt{op}(a, k)$ where $a$ is the argument and $k$ is the continuation, the operation clause of $H$ for $\mathtt{op}$ is applied to $a$ and $k$.
+\end{itemize}
+\end{definition}
+
+\begin{example}[State handler in detail]\label{ex:state-handler-detail}
+\begin{verbatim}
+  -- State effect:
+  effect State(S) {
+    get : () -> S
+    set : S -> ()
+  }
+
+  -- Handler:
+  handle_state : (State(S) => A) -> S -> (A * S)
+  handle_state m s0 = handle m with
+    | get() -> k -> \s -> handle_state (k(s)) s
+    | set(s') -> k -> \s -> handle_state (k()) s'
+    | return v -> \s -> (v, s)
+
+  -- Example:
+  -- handle_state (fun () -> let x = get() in set(x + 1); get()) 0
+  -- = (1, 1)
+\end{verbatim}
+\end{example}
+
+\subsection{Effect Inference Algorithm}\label{sec:effect-inference-alg}
+
+Effect inference extends Hindley--Milner type inference with effect variables and effect constraints.
+
+\begin{algorithm}[H]
+\caption{Effect Inference with Effect Variables}\label{alg:effect-inference-adv}
+\begin{algorithmic}[1]
+\Function{InferEffect}{$\Gamma, e$}
+  \State \textbf{case} $e$ \textbf{of}
+  \State \quad $x$: \Return $\Gamma(x).\tau, \Gamma(x).\epsilon, \{\}$
+  \State \quad $\lambda x.\, e'$:
+    \State \quad $\alpha \gets \mathrm{fresh\_type}()$; $\epsilon_f \gets \mathrm{fresh\_effect}()$; $\tau' \gets \mathrm{fresh\_type}()$
+    \State \quad $\Gamma' = \Gamma[x : \alpha \xrightarrow{\epsilon_f} \tau']$
+    \State \quad $\tau'', \epsilon', C \gets \mathrm{InferEffect}(\Gamma', e')$
+    \State \quad \Return $\alpha \xrightarrow{\epsilon_f} \tau', \emptyset, C \cup \{\epsilon' \subseteq \epsilon_f\}$
+  \State \quad $e_1\; e_2$:
+    \State \quad $\tau_1 \xrightarrow{\epsilon_1} \tau_1', \epsilon_1', C_1 \gets \mathrm{InferEffect}(\Gamma, e_1)$
+    \State \quad $\tau_2, \epsilon_2, C_2 \gets \mathrm{InferEffect}(\Gamma, e_2)$
+    \State \quad $\epsilon_f \gets \mathrm{fresh\_effect}()$
+    \State \quad \Return $\tau_1', \epsilon_1 \cup \epsilon_1' \cup \epsilon_2, C_1 \cup C_2 \cup \{\tau_2 = \tau_1\}$
+  \State \quad $\mathtt{handle}\; e'\; \mathrm{with}\; H$:
+    \State \quad $\tau', \epsilon', C \gets \mathrm{InferEffect}(\Gamma, e')$
+    \State \quad $\epsilon_H \gets \mathrm{effects\_of\_handler}(H)$
+    \State \quad \Return $\mathrm{result\_type}(H), \epsilon_H, C \cup \{\epsilon' \subseteq \mathrm{handled}(H)\}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Effect Rows and Row Polymorphism}\label{sec:effect-rows}
+
+Effect rows provide a way to represent effect sets that supports row polymorphism:
+
+\begin{definition}[Effect Row]\label{def:effect-row}
+An \emph{effect row} is a sequence of effect labels terminated by a row variable:
+\[
+  \langle \epsilon_1, \epsilon_2, \ldots, \epsilon_n \mid \rho \rangle
+\]
+where $\rho$ is a row variable representing the remaining effects. Row polymorphism allows functions to be polymorphic over the remaining effects.
+\end{definition}
+
+\begin{example}[Effect row polymorphism]\label{ex:effect-row-poly}
+\begin{verbatim}
+  -- Effect row polymorphic function:
+  map : forall <r | Row>. (a -> b <r>) -> [a] -> [b] <r>
+  -- The function works for any effect row r
+  -- If f is pure (r = empty), map is pure
+  -- If f has IO, map has IO
+\end{verbatim}
+\end{example}
+
+\subsection{Scoped Effects and Lexical Handlers}\label{sec:scoped-effects}
+
+\emph{Scoped effects} restrict the scope of effect handlers, enabling more efficient compilation.
+
+\begin{verbatim}
+  -- Scoped effect:
+  with_resource r {
+    -- r is available only in this block
+    use(r)
+  }
+  -- r is no longer available here
+
+  -- Lexical handler: the handler's scope is determined by lexical scope
+  -- This enables stack-based allocation of effect handlers
+\end{verbatim}
+
+\begin{table}[htbp]
+\centering
+\caption{Effect system implementations compared}\label{tab:effect-implementations}
+\begin{tabular}{lp{3cm}p{3cm}p{3cm}p{2.5cm}}
+\hline
+\textbf{System} & \textbf{Effect Model} & \textbf{Inference} & \textbf{Handlers} & \textbf{Performance} \\
+\hline
+Koka & Algebraic & Full & Lexical & CPS compilation \\
+Eff & Algebraic & Partial & Dynamic & Continuation-based \\
+Frank & Algebraic + sessions & Full & Lexical & Direct-style \\
+OCaml 5 & Effect handlers & None & Dynamic & Stack-based \\
+Unison & Algebraic & Full & Lexical & Ability-based \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Effect-Based Optimization}\label{sec:effect-based-optimization}
+
+Effect information enables powerful compiler optimizations:
+
+\begin{itemize}
+  \item \textbf{Purity-based parallelization.} Pure computations can be safely parallelized.
+  \item \textbf{Effect-based inlining.} Pure functions can be inlined without concern for effect ordering.
+  \item \textbf{Dead code elimination.} Pure computations with unused results can be eliminated.
+  \item \textbf{Memoization.} Pure functions can be memoized safely.
+  \item \textbf{Effect specialization.} Generate specialized code for different effect profiles.
+\end{itemize}
+
+\begin{example}[Effect-based parallelization]\label{ex:effect-parallel}
+\begin{verbatim}
+  -- If f is pure:
+  results = par_map(f, data)  // safe to parallelize
+
+  -- If f has IO:
+  results = seq_map(f, data)  // must be sequential (IO ordering)
+
+  -- The compiler selects the appropriate version based on effect analysis
+\end{verbatim}
+\end{example}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (effects) {Effect Systems};
+  \node[block, below left=1.5cm and 0.5cm of effects] (algebraic) {Algebraic Effects};
+  \node[block, below right=1.5cm and 0.5cm of effects] (monadic) {Monadic Effects};
+  \node[block, below=1cm of algebraic] (koka) {Koka};
+  \node[block, below=1cm of monadic] (haskell) {Haskell};
+  \node[block, below=1.5cm of koka] (inference) {Effect Inference};
+  \node[block, below=1.5cm of haskell] (transformers) {Monad Transformers};
+
+  \draw[arrow] (effects) -- (algebraic);
+  \draw[arrow] (effects) -- (monadic);
+  \draw[arrow] (algebraic) -- (koka);
+  \draw[arrow] (monadic) -- (haskell);
+  \draw[arrow] (koka) -- (inference);
+  \draw[arrow] (haskell) -- (transformers);
+\end{tikzpicture}
+\caption{Two approaches to effect systems: algebraic effects (Koka, Eff) with effect inference, and monadic effects (Haskell) with explicit monad transformers.}\label{fig:effect-approaches}
+\end{figure}
+
+%% ============================================================
+%% Section 50.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-50}
+
+Effect systems extend type systems with information about the computational behavior of programs. From simple effect annotations to algebraic effects and handlers, they provide a spectrum of tools for reasoning about purity, resource usage, and side effects. The algebraic effects approach, with its modular composition and flexible handling, represents the state of the art in effect system design.
+
+For further reading, we recommend Plotkin and Power's foundational paper~\cite{plotkin2003}, the Koka language documentation~\cite{leijen2019}, and the survey by Pretnar~\cite{pretnar2015} on algebraic effects and handlers.

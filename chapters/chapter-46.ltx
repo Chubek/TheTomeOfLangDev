@@ -1,0 +1,485 @@
+%%
+%% chapter-46.ltx — Subtyping and Variance
+%%
+
+\label{ch:subtyping}
+
+Subtyping is the principle that a value of one type can be used wherever a value of another type is expected. It is the theoretical foundation of object-oriented programming, where a \texttt{Dog} can be used wherever an \texttt{Animal} is expected, and it pervades modern type systems in the form of structural subtyping, row polymorphism, and coercion. This chapter develops the theory of subtyping, the concept of variance, and the implementation techniques that make subtyping practical in compilers.
+
+%% ============================================================
+%% Section 46.1
+%% ============================================================
+\section{Subtyping Rules}\label{sec:subtyping-rules}
+
+A subtyping relation $S <: T$ (read ``$S$ is a subtype of $T$'') asserts that every value of type $S$ can be used as a value of type $T$. The relation is a preorder: it is reflexive and transitive.
+
+\subsection{Basic Rules}\label{sec:basic-subtyping}
+
+\begin{typerules}{Basic Subtyping}
+  \typeaxiom{Refl}{\Gamma \vdash \tau <: \tau} \\[6pt]
+  \typerule{Trans}{\Gamma \vdash \tau_1 <: \tau_2 \quad \Gamma \vdash \tau_2 <: \tau_3}
+            {\Gamma \vdash \tau_1 <: \tau_3} \\[6pt]
+  \typeaxiom{Top}{\Gamma \vdash \tau <: \top} \\[6pt]
+  \typeaxiom{Bot}{\Gamma \vdash \bot <: \tau}
+\end{typerules}
+
+The type $\top$ (top) is the supertype of all types; the type $\bot$ (bottom) is the subtype of all types. In most languages, $\top$ corresponds to \texttt{Object} or \texttt{Any}, and $\bot$ corresponds to the type of non-termination or exceptions.
+
+\subsection{Subsumption}\label{sec:subsumption}
+
+The connection between subtyping and typing is the \emph{subsumption rule}:
+
+\[
+  \typerule{Subsumption}{\Gamma \vdash e : \tau_1 \quad \Gamma \vdash \tau_1 <: \tau_2}
+            {\Gamma \vdash e : \tau_2}
+\]
+
+This rule allows a value of type $\tau_1$ to be used wherever type $\tau_2$ is expected, provided $\tau_1$ is a subtype of $\tau_2$.
+
+\subsection{Function Subtyping}\label{sec:function-subtyping}
+
+Function types are subtyped \emph{contravariantly} in their argument and \emph{covariantly} in their result:
+
+\[
+  \typerule{Arrow}{\Gamma \vdash \tau_1' <: \tau_1 \quad \Gamma \vdash \tau_2 <: \tau_2'}
+            {\Gamma \vdash \tau_1 \to \tau_2 <: \tau_1' \to \tau_2'}
+\]
+
+This means that a function accepting a more general argument and returning a more specific result can be used where a function accepting a more specific argument and returning a more general result is expected.
+
+\begin{proof}[Justification]
+If $f : \tau_1 \to \tau_2$ and we need a function of type $\tau_1' \to \tau_2'$, we must show that $f$ can accept any argument of type $\tau_1'$ and produce a result of type $\tau_2'$. Since $\tau_1' <: \tau_1$, any value of type $\tau_1'$ can be passed to $f$. Since $\tau_2 <: \tau_2'$, the result of $f$ can be used as a value of type $\tau_2'$. \qed
+\end{proof}
+
+%% ============================================================
+%% Section 46.2
+%% ============================================================
+\section{Variance: Covariance, Contravariance, and Invariance}\label{sec:variance}
+
+Variance describes how subtyping between component types relates to subtyping between compound types.
+
+\subsection{Definitions}\label{sec:variance-defs}
+
+\begin{definition}[Variance]\label{def:variance}
+Let $F$ be a type constructor (a function from types to types). The \emph{variance} of $F$ in its parameter is:
+\begin{itemize}
+  \item \textbf{Covariant} if $S <: T \implies F(S) <: F(T)$.
+  \item \textbf{Contravariant} if $S <: T \implies F(T) <: F(S)$.
+  \item \textbf{Invariant} if neither covariance nor contravariance holds (in general).
+  \item \textbf{Bivariant} if both covariance and contravariance hold (only in degenerate cases).
+\end{itemize}
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Variance of common type constructors}\label{tab:variance-examples}
+\begin{tabular}{lcc}
+\hline
+\textbf{Type Constructor} & \textbf{Variance} & \textbf{Justification} \\
+\hline
+$\tau \to -$ (return position) & Covariant & Results flow outward \\
+$- \to \tau$ (argument position) & Contravariant & Arguments flow inward \\
+$\mathrm{List}<$-$>$ & Covariant & Elements are produced, not consumed \\
+$\mathrm{Consumer}<$-$>$ & Contravariant & Elements are consumed, not produced \\
+$\mathrm{Ref}<$-$>$ (mutable) & Invariant & Both read and write \\
+$\mathrm{Array}<$-$>$ (mutable) & Invariant & Both read and write \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Variance in Java and C\#}\label{sec:variance-java}
+
+Java's generics use \emph{use-site variance} (wildcards):
+\begin{itemize}
+  \item \texttt{List<? extends Animal>} is covariant: you can read \texttt{Animal}s but not write.
+  \item \texttt{List<? super Dog>} is contravariant: you can write \texttt{Dog}s but not read (except as \texttt{Object}).
+  \item \texttt{List<Dog>} is invariant: you can both read and write \texttt{Dog}s.
+\end{itemize}
+
+C\# uses \emph{declaration-site variance}:
+\begin{itemize}
+  \item \texttt{IEnumerable<out T>} is covariant in \texttt{T}.
+  \item \texttt{IComparer<in T>} is contravariant in \texttt{T}.
+\end{itemize}
+
+\subsection{Variance Checking}\label{sec:variance-checking}
+
+For declaration-site variance, the compiler must verify that the declared variance is sound. The rule is:
+\begin{itemize}
+  \item A type parameter declared \textbf{covariant} (\texttt{out}) may appear only in \emph{output} positions (return types of methods).
+  \item A type parameter declared \textbf{contravariant} (\texttt{in}) may appear only in \emph{input} positions (parameter types of methods).
+  \item An \textbf{invariant} type parameter may appear in both positions.
+\end{itemize}
+
+\begin{example}[Variance checking in Scala]\label{ex:scala-variance}
+\begin{verbatim}
+  trait Producer[+A] {          // covariant: A in output position only
+    def get(): A
+  }
+
+  trait Consumer[-A] {          // contravariant: A in input position only
+    def consume(a: A): Unit
+  }
+
+  trait Ref[A] {                // invariant: A in both positions
+    def get(): A
+    def set(a: A): Unit
+  }
+\end{verbatim}
+\end{example}
+
+%% ============================================================
+%% Section 46.3
+%% ============================================================
+\section{Record and Object Subtyping}\label{sec:record-subtyping}
+
+Record and object types introduce structural subtyping: a record with more fields is a subtype of a record with fewer fields (provided the shared fields have compatible types).
+
+\subsection{Width Subtyping}\label{sec:width-subtyping}
+
+\begin{definition}[Width Subtyping]\label{def:width-subtyping}
+A record type $\{l_1 : \tau_1, \ldots, l_n : \tau_n, \ldots, l_m : \tau_m\}$ is a subtype of $\{l_1 : \tau_1, \ldots, l_n : \tau_n\}$ (the same fields, possibly in a different order). That is, adding fields preserves subtyping.
+\end{definition}
+
+\[
+  \typeaxiom{Width}{\{l_1 : \tau_1, \ldots, l_n : \tau_n, l_{n+1} : \tau_{n+1}, \ldots, l_m : \tau_m\} <: \{l_1 : \tau_1, \ldots, l_n : \tau_n\}}
+\]
+
+\subsection{Depth Subtyping}\label{sec:depth-subtyping}
+
+\begin{definition}[Depth Subtyping]\label{def:depth-subtyping}
+Record types are subtyped component-wise: if each field type of the first record is a subtype of the corresponding field type of the second, then the first record is a subtype of the second.
+\end{definition}
+
+\[
+  \typerule{Depth}{\forall i.\, \tau_i <: \tau_i'}
+            {\{l_1 : \tau_1, \ldots, l_n : \tau_n\} <: \{l_1 : \tau_1', \ldots, l_n : \tau_n'\}}
+\]
+
+\subsection{Permutation Subtyping}\label{sec:permutation-subtyping}
+
+Record types are also subtyped up to field reordering:
+\[
+  \typeaxiom{Permute}{\{l_1 : \tau_1, \ldots, l_n : \tau_n\} = \{l_{\pi(1)} : \tau_{\pi(1)}, \ldots, l_{\pi(n)} : \tau_{\pi(n)}\} \text{ for permutation } \pi}
+\]
+
+\subsection{Object Subtyping}\label{sec:object-subtyping}
+
+In object-oriented languages, subtyping combines width, depth, and permutation subtyping with \emph{method subtyping}: an object with more methods is a subtype of an object with fewer methods, provided the shared methods have compatible types (contravariant in arguments, covariant in return types).
+
+\begin{example}[Object subtyping]\label{ex:object-subtyping}
+Consider:
+\begin{verbatim}
+  class Animal { def speak(): String }
+  class Dog extends Animal { def speak(): String = "Woof"; def fetch(): Unit }
+\end{verbatim}
+\texttt{Dog} is a subtype of \texttt{Animal} because it has all of \texttt{Animal}'s methods (with compatible types) plus additional ones.
+\end{example}
+
+%% ============================================================
+%% Section 46.4
+%% ============================================================
+\section{Intersection and Union Types}\label{sec:intersection-union}
+
+Intersection and union types extend the subtyping lattice with greatest lower bounds and least upper bounds.
+
+\subsection{Intersection Types}\label{sec:intersection-types}
+
+\begin{definition}[Intersection Type]\label{def:intersection-type}
+The intersection type $\tau_1 \wedge \tau_2$ (also written $\tau_1 \mathbin{\&} \tau_2$) is the type of values that have \emph{both} type $\tau_1$ and type $\tau_2$.
+\end{definition}
+
+\begin{typerules}{Intersection Types}
+  \typerule{Intro}{\Gamma \vdash e : \tau_1 \quad \Gamma \vdash e : \tau_2}
+            {\Gamma \vdash e : \tau_1 \wedge \tau_2} \\[6pt]
+  \typerule{Elim-L}{\Gamma \vdash e : \tau_1 \wedge \tau_2}
+            {\Gamma \vdash e : \tau_1} \\[6pt]
+  \typerule{Elim-R}{\Gamma \vdash e : \tau_1 \wedge \tau_2}
+            {\Gamma \vdash e : \tau_2}
+\end{typerules}
+
+Intersection types arise naturally in type inference for overloaded functions and in the analysis of object-oriented programs.
+
+\subsection{Union Types}\label{sec:union-types}
+
+\begin{definition}[Union Type]\label{def:union-type}
+The union type $\tau_1 \vee \tau_2$ (also written $\tau_1 \mid \tau_2$) is the type of values that have \emph{either} type $\tau_1$ or type $\tau_2$.
+\end{definition}
+
+\begin{typerules}{Union Types}
+  \typerule{Intro-L}{\Gamma \vdash e : \tau_1}
+            {\Gamma \vdash e : \tau_1 \vee \tau_2} \\[6pt]
+  \typerule{Intro-R}{\Gamma \vdash e : \tau_2}
+            {\Gamma \vdash e : \tau_1 \vee \tau_2} \\[6pt]
+  \typerule{Elim}{\Gamma \vdash e : \tau_1 \vee \tau_2 \quad
+                   \Gamma, x : \tau_1 \vdash e_1 : \tau \quad
+                   \Gamma, x : \tau_2 \vdash e_2 : \tau}
+            {\Gamma \vdash \mathtt{match}\; e\; \mathtt{with}\; x \to e_1 \mid x \to e_2 : \tau}
+\end{typerules}
+
+Union types appear in TypeScript, Ceylon, and increasingly in modern language designs. They provide a principled alternative to tagged unions for handling heterogeneous data.
+
+\subsection{Distributivity}\label{sec:distributivity}
+
+Intersection and union types distribute over function types:
+\begin{align*}
+  (\tau_1 \wedge \tau_2) \to \tau &\equiv (\tau_1 \to \tau) \vee (\tau_2 \to \tau) \\
+  \tau \to (\tau_1 \vee \tau_2) &\equiv (\tau \to \tau_1) \vee (\tau \to \tau_2) \\
+  (\tau_1 \vee \tau_2) \to \tau &\equiv (\tau_1 \to \tau) \wedge (\tau_2 \to \tau)
+\end{align*}
+
+These equivalences are the type-theoretic counterpart of the logical relationships between conjunction and disjunction.
+
+%% ============================================================
+%% Section 46.5
+%% ============================================================
+\section{Decidability of Subtyping}\label{sec:decidability}
+
+The decidability of the subtyping relation depends on the type system features.
+
+\subsection{Decidable Cases}\label{sec:decidable-cases}
+
+\begin{itemize}
+  \item \textbf{Structural subtyping with records and variants.} Decidable by a simple recursive algorithm.
+  \item \textbf{Nominal subtyping with single inheritance.} Decidable by following the inheritance chain.
+  \item \textbf{Nominal subtyping with multiple inheritance.} Decidable if the inheritance graph is a DAG (no cycles); undecidable in the presence of certain forms of mixin composition.
+  \item \textbf{Subtyping with bounded quantification (F$_{<:}$).} Decidable for the kernel fragment; the full system's decidability was a long-standing open problem, resolved by Pierce~\cite{pierce1992}.
+\end{itemize}
+
+\subsection{Undecidable Cases}\label{sec:undecidable-cases}
+
+\begin{itemize}
+  \item \textbf{Subtyping with recursive types and contravariance.} The combination of equi-recursive types and contravariant function types can lead to undecidability~\cite{pierce1992}.
+  \item \textbf{Subtyping with intersection types and unrestricted use.} Full intersection type systems can encode arbitrary computations, making subtyping undecidable.
+\end{itemize}
+
+\subsection{Algorithmic Subtyping}\label{sec:algorithmic-subtyping}
+
+For decidable subtyping relations, an \emph{algorithmic} presentation eliminates the transitivity rule (which is non-syntax-directed) and replaces it with syntax-directed rules:
+
+\begin{typerules}{Algorithmic Subtyping for Records}
+  \typeaxiom{Top}{\Gamma \vdash \tau <: \top} \\[6pt]
+  \typerule{Refl}{\overline{\Gamma \vdash \alpha <: \alpha}}{for type variables} \\[6pt]
+  \typerule{Record}{\forall l_i \in \{l_1', \ldots, l_m'\}.\, \exists l_j \in \{l_1, \ldots, l_n\}.\, l_i = l_j \wedge \Gamma \vdash \tau_j <: \tau_i'}
+            {\Gamma \vdash \{l_1 : \tau_1, \ldots, l_n : \tau_n\} <: \{l_1' : \tau_1', \ldots, l_m' : \tau_m'\}} \\[6pt]
+  \typerule{Arrow}{\Gamma \vdash \tau_1' <: \tau_1 \quad \Gamma \vdash \tau_2 <: \tau_2'}
+            {\Gamma \vdash \tau_1 \to \tau_2 <: \tau_1' \to \tau_2'}
+\end{typerules}
+
+\begin{theorem}[Equivalence of Declarative and Algorithmic Subtyping]\label{thm:algo-subtyping}
+The algorithmic subtyping relation coincides with the declarative relation (with reflexivity and transitivity) for all standard type systems.
+\end{theorem}
+
+%% ============================================================
+%% Section 46.6
+%% ============================================================
+\section{Implementation: Coercion vs. Subsumption}\label{sec:coercion-vs-subsumption}
+
+There are two fundamentally different ways to implement subtyping in a compiler.
+
+\subsection{Coercion-Based Implementation}\label{sec:coercion-impl}
+
+In the coercion-based approach, subtyping is implemented by inserting explicit \emph{coercion} operations that convert a value from the subtype to the supertype.
+
+\begin{example}[Coercion for subtyping]\label{ex:coercion}
+If $\mathrm{int} <: \mathrm{float}$, then the expression $3.14 + 42$ is compiled as $3.14 + \mathrm{int\_to\_float}(42)$. The coercion $\mathrm{int\_to\_float}$ is an explicit conversion function.
+\end{example}
+
+Coercions can change the runtime representation: an \texttt{int} (32 bits) is converted to a \texttt{float} (64 bits). This is sometimes called \emph{coercive subtyping} or \emph{conversion-based subtyping}.
+
+\subsection{Subsumption-Based Implementation}\label{sec:subsumption-impl}
+
+In the subsumption-based approach, subtyping is a purely static relation: a value of the subtype \emph{is} a value of the supertype, with no runtime conversion. This requires that the runtime representation of the subtype be compatible with the supertype.
+
+\begin{example}[Subsumption for objects]\label{ex:subsumption}
+If \texttt{Dog} $<:$ \texttt{Animal}, then a \texttt{Dog} object can be used wherever an \texttt{Animal} is expected, because the \texttt{Dog} object's memory layout includes all the fields and methods of \texttt{Animal}. No conversion is needed; only the static type changes.
+\end{example}
+
+\subsection{Comparison}\label{sec:coercion-vs-subsumption-comparison}
+
+\begin{table}[htbp]
+\centering
+\caption{Coercion vs. subsumption}\label{tab:coercion-subsumption}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Aspect} & \textbf{Coercion} & \textbf{Subsumption} \\
+\hline
+Runtime cost & Conversion function call & None (static only) \\
+Representation change & Yes & No \\
+Example & $\mathrm{int} <: \mathrm{float}$ & $\mathrm{Dog} <: \mathrm{Animal}$ \\
+Transitivity & Compose coercions & Transitive relation \\
+Type safety & Must verify round-trip & Guaranteed by layout \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Hybrid Approaches}\label{sec:hybrid}
+
+Many languages use a hybrid approach:
+\begin{itemize}
+  \item \textbf{Java.} Uses subsumption for reference types (no conversion needed) but coercion for primitive types (\texttt{int} to \texttt{long}).
+  \item \textbf{TypeScript.} Uses subsumption for structural types (no runtime representation) since TypeScript erases all types.
+  \item \textbf{Scala.} Uses subsumption for class hierarchies but implicit conversions (a form of coercion) for ad hoc subtyping relationships.
+\end{itemize}
+
+\begin{historical}
+The theory of subtyping was developed in the context of the FORTE project at Carnegie Mellon in the late 1980s and early 1990s. Cardelli's work on Amber~\cite{cardelli1988} introduced the first comprehensive subtyping theory for object-oriented languages. Pierce's study of F$_{<:}$~\cite{pierce1992} revealed the subtle interactions between bounded quantification and subtyping, leading to the distinction between kernel and full F$_{<:}$. The modern understanding of variance, due to Igarashi and Pierce~\cite{igarashi2001}, provides a clean framework for reasoning about generic types in the presence of subtyping.
+\end{historical}
+
+%% ============================================================
+%% Section 46.7
+%% ============================================================
+\section{Advanced Topics in Subtyping}\label{sec:subtyping-advanced}
+
+\subsection{Decidability of Algorithmic Subtyping}\label{sec:algo-subtyping-decidable}
+
+The algorithmic subtyping relation must be decidable for the type checker to terminate. The key results are:
+
+\begin{theorem}[Decidability for Structural Subtyping]\label{thm:dec-structural}
+Algorithmic subtyping for structural types (records, variants, functions) is decidable in polynomial time. The algorithm proceeds by structural recursion on the types.
+\end{theorem}
+
+\begin{theorem}[Decidability for F$_{<:}$]\label{thm:dec-fsub}
+The kernel fragment of F$_{<:}$ (bounded quantification with subtyping) has a decidable subtyping relation. The full system's decidability was established by Pierce~\cite{pierce1992} through a careful analysis of the interaction between bounded quantification and contravariance.
+\end{theorem}
+
+\begin{proof}[Proof sketch for kernel F$_{<:}$]
+The kernel fragment restricts the subtyping rule for universal types to be syntax-directed:
+\[
+  \typerule{Forall-Kernel}{\Gamma \vdash \tau_1 <: \sigma_1 \quad \Gamma, \alpha <: \sigma_1 \vdash \tau_2 <: \tau_1[\alpha/\beta]}
+            {\Gamma \vdash \forall \alpha <: \tau_1.\, \tau_2 <: \forall \beta <: \sigma_1.\, \tau_1}
+\]
+This restriction eliminates the need for the non-syntax-directed ``all'' rule, making the algorithm terminating. \qed
+\end{proof}
+
+\subsection{Recursive Types and Subtyping}\label{sec:recursive-subtyping}
+
+Recursive types (equi-recursive or iso-recursive) interact subtly with subtyping.
+
+\begin{definition}[Equi-Recursive Subtyping]\label{def:equi-recursive-sub}
+For equi-recursive types, $\mu \alpha.\, \tau$ is identified with $\tau[\mu \alpha.\, \tau / \alpha]$. Subtyping is defined on the infinite unfoldings:
+\[
+  \mu \alpha.\, \tau <: \mu \beta.\, \sigma \iff \mathrm{unfold}(\mu \alpha.\, \tau) <: \mathrm{unfold}(\mu \beta.\, \sigma)
+\]
+\end{definition}
+
+\begin{example}[Recursive record types]\label{ex:recursive-record}
+A linked list node can be typed as a recursive record:
+\[
+  \mathrm{Node} = \mu \alpha.\, \{\mathrm{val} : \mathrm{int},\, \mathrm{next} : \alpha\}
+\]
+The subtyping $\mathrm{Node} <: \{\mathrm{val} : \mathrm{int}\}$ holds by width subtyping on the unfolded type.
+\end{example}
+
+\begin{caution}
+The combination of equi-recursive types and contravariant function types can make subtyping undecidable. The issue is that the subtyping check for $\mu \alpha.\, \tau_1 <: \mu \beta.\, \tau_2$ may generate an infinite sequence of unfolding steps that never terminates. Pierce's analysis identifies the precise conditions under which this occurs.
+\end{caution}
+
+\subsection{Intersection and Union Types in Practice}\label{sec:intersection-union-practice}
+
+Intersection and union types have found increasing use in modern programming languages.
+
+\begin{example}[TypeScript intersection types]\label{ex:ts-intersection}
+\begin{verbatim}
+  type Named = { name: string };
+  type Aged = { age: number };
+  type Person = Named & Aged;  // intersection: has both name and age
+
+  function greet(p: Person) {
+    console.log(`Hello, ${p.name}, age ${p.age}`);
+  }
+\end{verbatim}
+\end{example}
+
+\begin{example}[TypeScript union types with narrowing]\label{ex:ts-union}
+\begin{verbatim}
+  type Result = Success | Failure;
+  type Success = { ok: true; value: string };
+  type Failure = { ok: false; error: string };
+
+  function handle(r: Result) {
+    if (r.ok) {
+      // TypeScript narrows r to Success
+      console.log(r.value);
+    } else {
+      // TypeScript narrows r to Failure
+      console.log(r.error);
+    }
+  }
+\end{verbatim}
+\end{example}
+
+\subsection{Flow Typing and Subtyping}\label{sec:flow-typing}
+
+\emph{Flow typing} (as in TypeScript and Flow) combines subtyping with \emph{type narrowing}: the type of a variable can be refined at specific program points based on control-flow analysis.
+
+\begin{verbatim}
+  let x: string | number = getValue();
+  if (typeof x === "string") {
+    // x : string (narrowed from string | number)
+    x.toUpperCase();
+  } else {
+    // x : number (narrowed from string | number)
+    x.toFixed(2);
+  }
+\end{verbatim}
+
+\begin{definition}[Type Narrowing]\label{def:type-narrowing}
+\emph{Type narrowing} is the process of refining a variable's type at a program point based on a condition. If $x : \tau_1 \vee \tau_2$ and a test confirms $x : \tau_1$, then $x$ is narrowed to $\tau_1$ in the then-branch and to $\tau_2$ in the else-branch.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Subtyping features across modern languages}\label{tab:subtyping-languages}
+\begin{tabular}{lccccc}
+\hline
+\textbf{Language} & \textbf{Nominal} & \textbf{Structural} & \textbf{Union} & \textbf{Intersection} & \textbf{Flow} \\
+\hline
+Java & Yes & No & No & No & No \\
+TypeScript & No & Yes & Yes & Yes & Yes \\
+Scala & Yes & Partial & Yes & Yes & No \\
+Ceylon & Yes & No & Yes & Yes & No \\
+Kotlin & Yes & No & Yes & No & Yes \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Subtyping and Parametricity}\label{sec:subtyping-parametricity}
+
+The combination of subtyping and parametric polymorphism raises subtle issues. In System~F$_{<:}$, parametricity is weakened: a polymorphic function $\forall \alpha <: T.\, \alpha \to \alpha$ is not fully parametric because $\alpha$ ranges only over subtypes of $T$.
+
+\begin{insight}
+The tension between subtyping and parametricity is fundamental. Subtyping introduces a non-trivial lattice structure on types, while parametricity requires uniform behavior across all types. The resolution in practice is to use subtyping for nominal hierarchies (class-based) and parametricity for generic programming (type-parameterized), keeping the two mechanisms separate.
+\end{insight}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (top) {$\top$ (Any)};
+  \node[block, below left=1.2cm and 0.5cm of top] (animal) {Animal};
+  \node[block, below right=1.2cm and 0.5cm of top] (shape) {Shape};
+  \node[block, below=1cm of animal] (dog) {Dog};
+  \node[block, below=1cm of shape] (circle) {Circle};
+  \node[block, below=1cm of dog] (bot) {$\bot$ (Never)};
+
+  \draw[arrow] (dog) -- (animal);
+  \draw[arrow] (animal) -- (top);
+  \draw[arrow] (circle) -- (shape);
+  \draw[arrow] (shape) -- (top);
+  \draw[arrow] (bot) -- (dog);
+\end{tikzpicture}
+\caption{A subtyping lattice. $\top$ is the supertype of all types; $\bot$ is the subtype of all types. Dog $<:$ Animal $<:$ $\top$.}\label{fig:subtyping-lattice}
+\end{figure}
+
+%% ============================================================
+%% Section 46.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-46}
+
+Subtyping and variance are fundamental to the design of modern type systems. The subtyping relation determines which types are interchangeable, while variance determines how subtyping propagates through type constructors. The implementation of subtyping---whether by coercion or by subsumption---has profound implications for runtime performance and type safety.
+
+For further reading, we recommend Cardelli's type systems tutorial~\cite{cardelli1997}, Pierce's comprehensive treatment~\cite{pierce2002}, and the collected papers on subtyping edited by Pierce~\cite{pierce2000}.

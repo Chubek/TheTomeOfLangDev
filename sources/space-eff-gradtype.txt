@@ -1,0 +1,1544 @@
+Higher-Order Symb Comput (2010) 23:167–189
+DOI 10.1007/s10990-011-9066-z
+
+Space-efficient gradual typing
+David Herman · Aaron Tomb · Cormac Flanagan
+
+Published online: 21 October 2011
+© Springer Science+Business Media, LLC 2011
+
+Abstract Gradual type systems offer a smooth continuum between static and dynamic typing by permitting the free mixture of typed and untyped code. The runtime systems for these
+languages, and other languages with hybrid type checking, typically enforce function types
+by dynamically generating function proxies. This approach can result in unbounded growth
+in the number of proxies, however, which drastically impacts space efficiency and destroys
+tail recursion.
+We present a semantics for gradual typing that is based on coercions instead of function
+proxies, and which combines adjacent coercions at runtime to limit their space consumption. We prove bounds on the space consumed by coercions as well as soundness of the
+type system, demonstrating that programmers can safely mix typing disciplines without incurring unreasonable overheads. Our approach also detects certain errors earlier than prior
+work.
+Keywords Gradual typing · Coercions · Casts · Type dynamic
+
+David Herman was supported by a grant from the Mozilla Corporation. Cormac Flanagan was supported
+by a Sloan Fellowship and by NSF grant CCS-0341179. Aaron Tomb was also supported by NSF grant
+CCS-0341179. For Herman, most of this work was done at Northeastern University, Boston, MA.
+D. Herman ()
+Mozilla Research, 650 Castro St, Mountain View, CA 94116, USA
+e-mail: dherman@mozilla.com
+A. Tomb · C. Flanagan
+Computer Science Department, School of Engineering, University of California at Santa Cruz, 1156
+High Street, Santa Cruz, CA 95064, USA
+A. Tomb
+e-mail: atomb@soe.ucsc.edu
+C. Flanagan
+e-mail: cormac@ucsc.edu
+
+168
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+1 Gradual typing for software evolution
+Dynamically typed languages have always excelled at exploratory programming. Languages
+such as Lisp, Scheme, Smalltalk, and JavaScript support quick early prototyping and incremental development without the overhead of documenting (often-changing) structural
+invariants as types. For large applications, however, static type systems have proven invaluable. They are crucial for understanding and enforcing key program invariants and abstractions, and they catch many errors early in the development process.
+Given these different strengths, it is not uncommon to encounter the following scenario:
+a programmer builds a prototype in a dynamically-typed scripting language, perhaps even
+in parallel to a separate, official software development process with an entire team. The
+team effort gets mired in process issues and over-engineering, and the prototype ends up
+in production use. Before long, this hastily conceived prototype grows into a full-fledged
+production system, but without the structure or guarantees provided by static types. The
+system becomes unwieldy and bugs are cropping up faster than the team can reproduce
+them. Ultimately, they decide to port the application to a statically typed language, requiring
+a complete rewrite of the entire system.
+The cost of cross-language migration is huge and often insupportable. But the scenario
+above is avoidable. Several languages combine static and dynamic typing, among them Boo
+[11], Visual Basic.NET [26], Sage [20], Clean [5, 29], and Racket [34, 35]. This approach
+of hybrid typing, where types are enforced with a combination of static and dynamic checks,
+has begun to gain attention in the research community [4, 8, 20, 26, 32, 34, 35]. Recently,
+Siek and Taha [32, 33] coined the slogan gradual typing for this important application of
+hybrid typing: the ability to implement both partially-conceived prototypes and mature, production systems in the same programming language by gradually introducing type discipline. Gradual typing offers the possibility of continuous software evolution from prototype
+to product, thus avoiding the huge costs of language migration.
+Our experience in the technical committee working on the JavaScript [13] language specification provides a more concrete example. JavaScript is a dynamically-typed, higher-order
+programming language and a key enabling technology for interactive web applications.
+JavaScript is used both for very simple scripts and for mature, large-scale applications.
+The enormous popularity of the language is due in no small part to its low barrier to entry; anyone can write a JavaScript program by copying and pasting code from one web page
+to another. Its dynamic type system and fail-soft runtime semantics allow programmers to
+produce useful programs with a minimum of effort. The increasing complexity of modern
+web applications, however, has motivated the desire for more robust mechanisms to support
+programming in the large. In past years, the technical committee considered the design of
+a hybrid type system for JavaScript, which would allow the mixing of dynamic and static
+typing disciplines, to support gradual typing [12]. Gradual typing is still a relatively new
+research area, however, and so the technical committee would prefer further experimental
+validation before considering incorporating gradual typing into JavaScript.
+This paper extends our earlier conference paper [23] with additional context and perspective on the relationship of our contributions with prior and subsequent work on hybrid and
+gradual typing.
+1.1 The cost of gradual typing
+The interaction between typed and untyped code imposes certain requirements on the design
+of the runtime semantics of gradually-typed languages. Gradually-typed languages support
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+169
+
+both statically-typed and dynamically-typed code, and include runtime checks (or type casts)
+at the boundaries between these two typing disciplines, to guarantee that dynamically-typed
+code cannot violate the invariants of statically-typed code.
+To illustrate this idea, consider the following code fragment, which passes a dynamicallytyped variable x into a variable y of type Int:
+let x : Dyn = true in
+let y : Int = x in
+...
+During compilation, the type checker inserts a dynamic type cast Int to enforce the type
+invariant on y, yielding the “compiled” code:
+let x : Dyn = true in
+let y : Int = Int x in
+...
+At runtime, this Int cast detects the attempted type violation, since x contains true:
+let x : Dyn = true in let y : Int = Int x in . . .
+−→ let y : Int = Int true in . . .
+−→ Error : “failed cast”
+Unfortunately, even these simple, first-order type checks can impose unexpected costs,
+as in the following example, where a programmer has added some type annotations to a
+previously untyped program:
+even : Dyn → Dyn
+
+def
+
+= λn:Dyn. if (n = 0) then true else odd (n − 1)
+
+def
+
+odd : Int → Bool = λn:Int. if (n = 0) then false else even (n − 1)
+This program seems innocuous, but suffers from a subtle space leak. Since even is dynamically typed, the result of each call to even must be implicitly cast to Bool. That is, after the
+type checker inserts the necessary casts, the compiled version oddc of odd is:
+def
+
+oddc : Int → Bool = λn:Int. if (n = 0)
+then false else Bool (even (Dyn (n − 1)))
+These implicit casts result in unbounded growth in the control stack and so destroy tail
+recursion.
+Additional complications arise when first-class functions cross the boundaries between
+typing disciplines. In general, it is not possible to check if an untyped function satisfies a
+particular static type. A natural solution is to wrap the function in a proxy that, whenever
+it is applied, casts its argument and result values appropriately, ensuring that the function is
+only observed with its expected type. This proxy-based approach was formalized by Findler
+and Felleisen [15] and widely used in subsequent literature [16, 20, 25, 32], but it has serious
+consequences for space efficiency.
+As a simple example, consider the following program in continuation-passing style,
+where both mutually recursive functions take a continuation argument k, but only one of
+
+170
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+these arguments is annotated with a precise type:
+evenk : Int → Bool
+
+def
+
+oddk : Int → Bool
+
+def
+
+= λn:Int. λk :(Dyn → Dyn).
+if (n = 0) then (k true) else oddk (n − 1) k
+= λn:Int. λk :(Bool → Bool).
+if (n = 0) then (k false) else evenk (n − 1) k
+
+During compilation, the type checker inserts a dynamic type cast on the continuation argument k, yielding the compiled code:
+evenkc : Int → Bool
+
+def
+
+oddkc : Int → Bool
+
+def
+
+= λn:Int. λk :(Dyn → Dyn).
+if (n = 0)
+then Bool (k (Dyn true))
+else oddkc (n − 1) (Bool → Bool k)
+= λn:Int. λk :(Bool → Bool).
+if (n = 0)
+then (k false)
+else evenkc (n − 1) (Dyn → Dyn k)
+
+Applying these functions to a sufficiently large n reveals the impact on space consumption of performing repeated function casts to k:
+(Dyn → Dyn (λx :Bool. x))
+evenkc n
+(λz1 :Dyn. Dyn ((λx :Bool. x) (Bool z1 )))
+−→∗ evenkc n
+−→∗ oddkc (n − 1) (Bool → Bool (λz1 :Dyn. Dyn ((λx :Bool. x) (Bool z1 ))))
+−→∗ oddkc (n − 1) (λz2 :Bool. Bool
+(λz1 :Dyn. Dyn ((λx :Bool. x) (Bool z1 ))
+(Dyn z2 ))
+−→∗ evenkc (n − 2) (Dyn → Dyn
+λz2 :Bool. Bool
+(λz1 :Dyn. Dyn ((λx :Bool. x) (Bool z1 ))
+(Dyn z2 )))
+−→∗ evenkc (n − 2) (λz3 :Dyn. Dyn
+(λz2 :Bool. Bool
+(λz1 :Dyn. Dyn ((λx :Bool. x) (Bool z1 ))
+(Dyn z2 ))
+(Bool z3 )))
+−→∗ . . .
+The recursive calls to oddkc and evenkc quietly cast the continuation argument k with higherorder casts Bool → Bool and Dyn → Dyn, respectively. This means that the function
+argument k is wrapped in an additional function proxy at each recursive call! Despite the
+fact that the function argument is only used at a total of two different types, its size grows in
+proportion to the depth of the recursion, due to these dynamically generated proxies.
+These examples demonstrate that naïve gradual typing violates space safety of functional programming languages by incurring surprising and unnecessary changes in asymptotic space consumption of programs. The purpose of gradual typing is to support the seamless integration of typing disciplines, especially for the common use case of simple scripts
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+171
+
+that mature into large applications. Subtle, significant, and pervasive costs in resource consumption threaten to limit the utility of gradual typing for its intended use.
+Of course, if even and odd are in the same module or maintained by the same development team, a natural solution is to avoid mixing typing disciplines, and to consistently use
+static typing (or dynamic typing) for both functions. A more problematic situation, however, occurs at interfaces between different modules maintained by different teams, as for
+example between a GUI library that uses callbacks to a GUI application. In this situation,
+we might want to migrate the GUI library to be more statically typed, while still maintaining
+backward compatibility with pre-existing GUI applications.
+In short, the flexibility promised by gradual typing can only be achieved if programmers
+are free to decide how precisely to type various parts of a program. This flexibility is lost if
+adding type annotations can accidentally trigger drastic changes in its memory usage. The
+goal of this paper is to combine the flexibility and ease-of-use of gradual type systems with
+predictable resource consumption.
+1.2 Space-efficient gradual typing using coercions
+We present a semantics for gradual typing that overcomes these problems. Our approach
+hinges on the simple insight that when proxies accumulate at runtime, they often contain
+redundant information. In the higher-order example above, the growing chain of function
+proxies contains only two distinct components, Bool → Bool and Dyn → Dyn, which
+could be merged to the simpler but equivalent Bool → Bool.
+Type casts behave like error projections [14], which are closed under composition. However, the syntax of casts does not always compose; for example, there is no cast c such that
+c e = Int Bool e. Furthermore, projections are idempotent, which should allow us
+to eliminate duplicate casts. For example, the following equality holds in a semantic sense:
+Bool → Bool Bool → Bool e = Bool → Bool e
+But such transformations are inconvenient, if not impossible, with a representation of higherorder type casts as functions.
+Our formalization instead leverages Henglein’s coercion calculus [22], which provides
+a syntax for projections, called coercions, which are closed under a composition operator.
+This allows us to combine adjacent casts whenever they occur at runtime in order to eliminate redundant information and thus guarantee clear bounds on space consumption. The
+details of combining and simplifying coercions are presented in Sect. 6. By eagerly combining coercions, we can also detect certain errors immediately as soon as a function cast is
+applied; in contrast, prior approaches would not detect these errors until the casted function
+is invoked.
+Our approach is applicable to many gradually- or hybrid-typed languages [16, 17, 19, 20]
+that use function proxies and hence are prone to space consumption problems. For clarity, we
+formalize our approach for the simply-typed λ-calculus with references. Of course, gradual
+typing is not restricted to simple type systems: the Sage language [20] incorporates gradual
+typing as part of a very expressive type system with polymorphic functions, type operators,
+first-class types, dependent types, general refinement types, etc. Concurrently, Siek and Taha
+[32] developed gradual typing for the simpler language λ?→ , which we use as the basis for
+this presentation.
+
+172
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+1.3 Early error detection
+A second contribution of this work is that it permits early detection of errors, and hence
+better test coverage. To illustrate this idea, consider the following code fragment, which
+erroneously attempts to convert an (Int → Int) function to have type (Bool → Int):
+let g : Dyn = (λx : Int. x) in
+let h : (Bool → Int) = g in . . .
+Most prior strategies for gradual typing would not detect this error until h is applied to a
+boolean argument, causing the integer cast to fail.
+In contrast, our coercion-based implementation allows us to detect this error as soon as h
+is defined, which detects gradual typing errors earlier and in more situations. We believe that
+the eager approach better fits the philosophy of gradual typing, which is to permit maximum
+flexibility while still detecting errors as early as possible.
+1.4 Outline
+The presentation of our results proceeds as follows. The following section provides some
+perspective on related work done prior to and following the original publication of this work.
+Section 3 reviews the syntax and type system of λ?→ . Section 4 introduces the coercion
+algebra underlying our approach. Section 5 describes how we translate source programs
+into a target language with explicit coercions. Section 6 provides an operational semantics
+for that target language. Section 7 extends our approach to detect errors earlier and in more
+situations. Section 8 proves bounds on the space consumption. The last two sections discuss
+other items of related work and place our results into context.
+
+2 Context and perspective
+This paper is an extended version of an earlier conference paper [23] that provides additional
+context and perspective by relating our contributions with both prior and subsequent work
+in the general area of hybrid and gradual typing.
+Figure 1 summarizes some of the central characteristics of a few selected recent papers
+in this area. These papers vary in regards to whether they support each of the following
+features:
+– precise blame tracking;
+– the dynamic type Dyn;
+– predicate types, such as {x : Int | x ≥ 0}, which denotes non-negative integers;
+– early detection of nonsensically-composed function casts at run-time, before the function
+is applied; and
+– guarantees of space efficiency.
+The final column in Fig. 1 describes the representation of function casts, either as: functions
+(λx. · · ·); as casts of the form S ⇐ T  converting from type T to type S; as Henglein’s
+coercions; or as Threesomes [30]. We discuss these papers and characterizations in more
+detail below.
+All of these papers leverage and extend the general technique of higher-order casts formalized by Findler and Felleisen [15]. This technique dynamically enforces contracts on
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+Paper
+
+173
+
+Higher
+Pred- Early
+Dyn
+Space
+Cast
+Order Blame
+icate Error
+Type
+Efficient Represent.
+Casts
+Types Checks
+
+Contract Systems:
+Findler and Felleisen [15]
+
+X
+
+X
+
+Function
+
+Hybrid Type Systems:
+Flanagan [16]
+Knowles and Flanagan [24]
+Gronski et al. [20]
+Greenberg et al. [19]
+
+X
+X
+X
+X
+
+X
+X
+
+X
+X
+X
+X
+
+Function
+Function
+Function
+Cast
+
+Gradual Type Systems:
+Siek and Taha [32, 33]
+Herman et al. [23]
+Siek et al. [31]
+Siek and Wadler [30]
+
+X
+X
+X
+X
+
+X
+X
+
+X
+X
+X
+X
+
+X
+X
+X
+
+X
+X
+X
+
+Cast
+Coercion
+Coercion
+Threesome
+
+Fig. 1 A comparison of hybrid and gradual typing system
+
+functions by creating wrapper function proxies, which check that the appropriate contracts
+hold on all function arguments and results, in a lazy manner. A key contribution of this work
+was a mechanism for tracking blame through these function wrappers and for assigning
+blame for any contract failure back to a particular contract in the source program. This technique of higher-order wrappers (both with and without blame) was subsequently applied in
+a number of domains.
+Hybrid type checking uses higher-order casts to overcome decidability and expressiveness limitations of traditional static type systems. The initial presentation [16] developed
+these ideas for an extension of the simply-typed lambda calculus with predicate types, where
+a base type such as Int is refined by an arbitrary boolean expression, to yield a predicate
+type such as {x : Int | x ≥ 0}. In combination with dependent function types, predicate
+types permit the specification of rather precise function interfaces, which facilitate modular
+software development. Ou et al. [28] earlier explored similar ideas for interoperation between precisely and coarsely typed code. Subsequent work added a variety of extensions,
+including a dynamic type Dyn [20], clarifications to the metatheory [24], and extensions to
+support blame tracking and other properties [19].
+Concurrently, Siek and Taha used higher-order wrappers to permit convenient interoperation between statically- and dynamically-typed code, targeting both functional [32] and
+object-oriented [33] languages. The omission of predicate types resulted in a significantly
+simpler language semantics and metatheory.
+This paper (and our earlier conference paper [23]) introduces and satisfies two additional
+desiderata. Most critical is space efficiency, without which gradually-typed programs can be
+prone to unexpected blow-ups in stack and heap space requirements. An additional desideratum is early detection of errors, which was lacking in several earlier papers. We leverage
+Henglein’s coercions [22] to represent higher-order casts at run-time, which facilitates cast
+normalization for space efficiency.
+
+174
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+Subsequently, Siek and Taha [31] successfully extended these ideas with blame tracking,
+while still preserving the eager error detection and space efficiency properties. In addition,
+their paper also clarified several other aspects of the design space for gradual typing systems.
+Henglein’s coercions provide a convenient run-time representation for higher-order casts,
+since sequences of coercions can be combined or normalized at runtime, which ensures the
+desired space efficiency guarantee. However, coercions are a rather low-level and indirect
+representation of the casts that originated in the source program. To avoid this indirect representation, Siek and Taha [30] introduced the notion of a threesome as a replacement for
+a normalized sequence of coercions. In particular, a threesome T3 ⇐ T2 ⇐ T1  is essentially a downcast from a type T1 to T2 followed by an upcast from T2 to T3 . Note that this
+threesome is not equivalent to a conventional type cast T3 ⇐ T1  from T1 to T3 , since the intermediate downcast to T2 may fail on more argument values. This threesome representation
+corresponds to normalized coercions, and so can achieve similar space efficiency guarantees
+while still reasoning at the level of types and casts, rather than using lower-level coercions.
+Figure 1 provides an overall comparison between the features supported by various hybrid and gradual typed systems. In general, gradual typing avoids the complex metatheory
+associated with predicate types—this simpler setting has allowed gradual type systems to
+innovate and explore in other directions, namely space efficiency and early error detection.
+We suggest that a fruitful avenue for future research is to merge these two closely related
+research directions by developing a flexible and expressive type system that supports static,
+dynamic, and predicate types, with a space-efficient run-time that tracks blame and performs
+early error checks. We suspect that an appropriate strategy is to appropriately extend the
+threesome cast representation to support predicate types. Additional directions for future
+work are discussed in Sect. 10.
+
+3 Gradually-typed lambda calculus
+This section reviews the gradually-typed λ-calculus λ?→ that we use to formalize our ideas.
+This language is essentially the simply-typed λ-calculus extended with the type Dyn to
+represent dynamic types; it also includes mutable reference cells to demonstrate the gradual typing of assignments. We refer the interested reader to Siek and Taha’s work [32] for
+motivations regarding the design of this language and its type system.
+Typing environments:
+Terms:
+Types:
+
+E
+::= ∅ | E, x : T
+e
+::= k | x | λx :T . e | e e | ref e | !e | e := e
+S, T ::= B | T → T | Dyn | Ref T
+
+Terms include the usual constants, variables, abstractions, and applications, as well as reference allocation, dereference, and assignment. Types include the dynamic type Dyn, function types T → T , reference types Ref T , and some collection of ground or base types B
+(such as Int or Float).
+The λ?→ type system is a little unusual in that it is based on an intransitive consistency
+relation S ∼ T instead of the more conventional transitive subtyping relation S <: T . Any
+type is consistent with the type Dyn, from which it follows that, for example, Bool ∼ Dyn
+and Dyn ∼ Int. However, booleans cannot be used directly as integers, which is why the
+consistency relation is not transitively closed. We do not assume the consistency relation is
+symmetric, since our language allows coercions from integers to floats but not vice-versa.
+The consistency relation is defined in Fig. 2. Rules [C-DYN L] and [C-DYN R] allow all
+coercions to and from type Dyn. The rule [C-F LOAT] serves as an example of asymmetry by
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+175
+
+S∼T
+
+Consistency rules
+[C-R EFL ]
+
+[C-DYN R]
+
+[C-DYN L]
+
+[C-F LOAT ]
+
+T ∼T
+
+T ∼ Dyn
+
+Dyn ∼ T
+
+Int ∼ Float
+
+[C-F UN ]
+
+[C-R EF ]
+
+T1 ∼ S 1
+
+S2 ∼ T 2
+
+T ∼S
+
+(S1 → S2 ) ∼ (T1 → T2 )
+
+S∼T
+
+Ref S ∼ Ref T
+
+Type rules
+
+E
+
+[T-VAR ]
+
+[T-F UN ]
+
+(x : T ) ∈ E
+E
+
+[T-C ONST ]
+
+E, x : S
+
+x :T
+
+E
+
+e:T
+
+(λx :S. e) : (S → T )
+
+k : ty(k)
+
+E
+
+[T-A PP 1]
+
+E
+
+[T-A PP 2]
+
+e1 : (S → T )
+
+S ∼S
+
+E
+
+[T-D EREF 1]
+
+e:T
+
+e : Ref T
+
+E
+
+ref e : Ref T
+
+E
+
+e2 : S
+
+(e1 e2 ) : Dyn
+
+[T-D EREF 2]
+
+E !e : T
+
+[T-A SSIGN 1]
+
+E
+
+e1 : Dyn
+
+E
+
+(e1 e2 ) : T
+
+E
+E
+
+e2 : S
+
+E
+
+[T-R EF ]
+
+E
+
+e:T
+
+E
+
+e : Dyn
+
+E !e : Dyn
+[T-A SSIGN 2]
+
+e1 : Ref T
+E
+
+E
+
+e2 : S
+
+e1 := e2 : S
+
+S∼T
+
+E
+
+e1 : Dyn
+E
+
+E
+
+e2 : T
+
+e1 := e2 : Dyn
+
+Fig. 2 Source language type system
+
+allowing coercion from Int to Float but not the reverse. The rule [C-F UN] is reminiscent
+of the contravariant/covariant rule for function subtyping. We extend the invariant reference
+cells of λ?→ to allow coercion from Ref S to Ref T via rule [C-R EF], provided S and
+T are symmetrically consistent. Unlike functions, reference cells do not distinguish their
+output (“read”) type from their input (“write”) type, so coercion must be possible in either
+direction. For example, the two reference types Ref Int and Ref Dyn are consistent.
+Figure 2 also presents the type rules for the source language. Notice the presence of
+two separate procedure application rules. Rule [T-A PP 1] checks statically-typed functions;
+in this case, the argument may have any type consistent with the function’s domain. Rule
+[T-A PP 2] handles the case where the operator is dynamically-typed; in this case the argument may be of any type. The assignment rules follow an analogous pattern, accepting a
+consistent type when the left-hand side is known to have type Ref T , and any type when
+the left-hand side is dynamically-typed. Similarly, dereferences only produce precise types
+for reference types.
+
+4 Coercions
+To achieve a space-efficient implementation, we elaborate source programs into a target language with explicit type casts, which allow expressions of one type to be used at any consis-
+
+176
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+tent type. Our representation of casts is based on coercions, drawn from Henglein’s theory
+of dynamic typing [22]. The key benefit of coercions over prior proxy-based representations
+is that they are combinable; if two coercions are wrapped around a function value, then they
+can be safely combined into a single coercion, thus reducing the space consumption of the
+program without changing its semantic behavior.
+The coercion language and its typing rules are both defined in Fig. 3. The coercion judgment c : S  T states that coercion c serves to coerce values from type S to type T (but
+may fail on some values of type S that are not coerceable to type T ). The identity coercion
+I always succeeds, and has type c : T  T for any T . Conversely, the failure coercion
+Fail always fails, but can relate any two types S and T , and so Fail : S  T . For
+each base type B, the coercion B? “downcasts” a value of type Dyn to type B, and so
+has type B? : Dyn  B. Conversely, the tagging coercion B! has type B! : B  Dyn.
+Similarly, the function checking coercion Fun? converts a value of type Dyn to have the
+dynamic function type Dyn → Dyn. If a more precise function type is required, this value
+can be further coerced via a function coercion Fun c d, where c coerces function arguments and d coerces results. For example, the coercion (Fun Int? Int!) coerces from
+Dyn → Dyn to Int → Int, by untagging function arguments (via Int?) and tagging
+function results (via Int!). Conversely, the tagging coercion Fun! coerces a dynamic function of type Dyn → Dyn to type Dyn. Like function coercions, reference coercions also
+contain two components: the first for coercing values put into the reference cell; the second for coercing values read from the cell. Finally, the coercion c; d represents coercion
+composition, i.e., the coercion c followed by coercion d.
+This coercion language is sufficient to translate between all consistent types: if types S
+and T are consistent, then the following partial function coerce(S, T ) is defined and returns
+the appropriate coercion between these types.
+coerce : Type × Type → Coercion
+coerce(T , T ) = I
+coerce(B, Dyn) = B!
+coerce(Dyn, B) = B?
+coerce(Int, Float) = IntFloat
+coerce(S1 → S2 , T1 → T2 ) = Fun coerce(T1 , S1 ) coerce(S2 , T2 )
+coerce(Dyn, T1 → T2 ) = Fun?; coerce(Dyn → Dyn, T1 → T2 )
+coerce(T1 → T2 , Dyn) = coerce(T1 → T2 , Dyn → Dyn); Fun!
+coerce(Ref S, Ref T ) = Ref coerce(T , S) coerce(S, T )
+coerce(Dyn, Ref T ) = Ref?; coerce(Ref Dyn, Ref T )
+coerce(Ref T , Dyn) = coerce(Ref T , Ref Dyn); Ref!
+Coercing a type T to itself produces the identity coercion I . Coercing base types B to type
+Dyn requires a tagging coercion B!, and coercing Dyn to a base type B requires a runtime
+check B?. Function coercions work by coercing their domain and range types. The type
+Dyn is coerced to a function type via a two-step coercion: first the value is checked to be a
+function and then coerced from the dynamic function type Dyn → Dyn to T1 → T2 . Dually,
+typed functions are coerced to type Dyn via coercion to a dynamic function type followed
+by the function tag Fun!. Coercing a Ref S to a Ref T entails coercing all writes from T
+to S and all reads from S to T . Coercing reference types to and from Dyn is analogous to
+function coercion.
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+177
+
+Syntax
+Coercions:
+Dynamic tags:
+
+c, d ::= I | Fail | G! | G? | IntFloat | Fun c c | Ref c c | c; c
+G ::= B | Fun | Ref
+c:S T
+
+Coercion rules
+[C-I D ]
+
+[C-FAIL ]
+
+I :T T
+
+[C-B !]
+
+Fail : S  T
+
+[C-B ?]
+
+B! : B  Dyn
+
+[C-F UN !]
+
+B? : Dyn  B
+
+[C-F UN ?]
+
+Fun! : (Dyn → Dyn)  Dyn
+
+Fun? : Dyn  (Dyn → Dyn)
+
+[C-F UN ]
+
+c1 : T1  T1
+
+c2 : T2  T2
+
+(Fun c1 c2 ) : (T1 → T2 )  (T1 → T2 )
+[C-R EF !]
+
+[C-R EF ?]
+
+Ref! : (Ref Dyn)  Dyn
+
+Ref? : Dyn  (Ref Dyn)
+
+[C-R EF ]
+
+c:T S
+
+d :ST
+
+(Ref c d) : (Ref S)  (Ref T )
+[C-C OMPOSE ]
+
+c1 : T  T1
+
+c2 : T1  T2
+
+(c1 ; c2 ) : T  T2
+
+[C-F LOAT ]
+
+IntFloat : Int  Float
+
+Fig. 3 Coercion language and type rules
+
+Lemma 1 (Well-typed coercions)
+1. S ∼ T iff coerce(S, T ) is defined.
+2. If c = coerce(S, T ) then c : S  T .
+Proof Inductions on the derivations of S ∼ T and coerce(S, T ).
+
+
+
+Example Consider again the continuation-passing definition of evenk in Sect. 1.1, which
+passes its continuation argument k to oddk. Because oddk expects a continuation argument
+of type Bool → Bool but k has type Dyn → Dyn, the type checker must insert a cast
+around the use of k. Note that the types Bool → Bool and Dyn → Dyn are consistent,
+from which it follows by Lemma 1 that coerce is defined on these arguments:
+coerce(Dyn → Dyn, Bool → Bool)
+= Fun coerce(Bool, Dyn) coerce(Dyn, Bool)
+= Fun Bool! Bool?
+
+178
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+Syntax
+s, t ::= x | u | t t | ref t | !t | t := t | c t
+v ::= u | vc u
+u ::= λx :T . t | k | a
+vc ::= G! | Fun c d | Ref c d | vc; c
+σ ::= ∅ | σ [a := v]
+E ::= ∅ | E, x : T
+ ::= ∅ | , a : T
+
+Terms:
+Values:
+Uncoerced values:
+Value coercions:
+Stores:
+Typing environments:
+Store typings:
+Type rules for terms
+[T-VAR ]
+
+[T-F UN ]
+
+(x : t) ∈ E
+
+E; 
+
+[T-R EF ]
+
+E; 
+
+t :T
+
+t :T
+
+E; 
+
+ref t : Ref T
+
+E; 
+
+E; 
+
+k : ty(k)
+
+E; 
+
+t2 : S
+
+(t1 t2 ) : T
+
+[T-A SSIGN ]
+
+t : Ref T
+
+E; 
+
+E;  !t : T
+
+t1 : Ref T
+E; 
+
+[T-C AST ]
+[T-C ONST ]
+
+t1 : (S → T )
+
+E; 
+
+(λx :S. t) : (S → T )
+[T-D EREF ]
+
+E; 
+
+t :T
+
+[T-A PP ]
+
+E, x : S; 
+
+x :T
+
+E; 
+
+E; 
+
+E; 
+
+t2 : T
+
+t1 := t2 : T
+
+[T-A DDR ]
+
+c:ST
+
+E; 
+
+E; 
+
+c t : T
+
+t :S
+
+(a : T ) ∈ 
+E; 
+
+a : Ref T
+
+Type rules for stores
+
+E; 
+
+σ
+
+[T-S TORE ]
+
+dom(σ ) = dom()
+∀a ∈ dom(σ ). E;  σ (a) : (a)
+E; 
+
+σ
+
+Fig. 4 Target language syntax and type rules
+
+Furthermore, the resulting coercion has the expected type according to the coercion rules of
+Fig. 3:
+Bool! : Bool  Dyn
+
+Bool? : Dyn  Bool
+
+(Fun Bool! Bool?) : (Dyn → Dyn)  (Bool → Bool)
+
+5 Target language and cast insertion
+During compilation, we simultaneously type-check the source program and insert explicit
+type casts to convert between consistent types where necessary. The target language of this
+cast insertion process is essentially the same as the source, except that it uses explicit casts
+of the form c t as the only mechanism for connecting terms of type Dyn and terms of other
+types. For example, the term Int? x has type Int, provided that x has type Dyn. The
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+179
+
+Cast insertion rules
+
+E
+
+[C-VAR ]
+
+[C-F UN ]
+
+(x : T ) ∈ E
+E
+
+e → t : T
+
+E, x : S
+
+[C-C ONST ]
+
+x → x : T
+
+k → k : ty(k)
+
+E
+
+E
+
+e → t : T
+
+(λx :S. e) → (λx :S. t) : (S → T )
+
+[C-A PP 1]
+
+E
+
+e1 → t1 : (S → T )
+E
+
+E
+
+e2 → t2 : S
+
+c = coerce(S , S)
+
+e1 e2 → (t1 (c t2 )) : T
+
+[C-A PP 2]
+
+E
+
+e1 → t1 : Dyn
+
+e2 → t2 : S
+
+E
+
+[C-R EF ]
+
+[C-D EREF 1]
+
+e → t : T
+
+E
+E
+
+c = coerce(S , Dyn)
+
+e1 e2 → ((Fun? t1 ) (c t2 )) : Dyn
+
+E
+
+E
+
+ref e → ref t : Ref T
+
+[C-D EREF 2]
+
+e → t : Ref T
+E !e → !t : T
+
+E
+
+e → t : Dyn
+
+E !e → !(Ref? t) : Dyn
+
+[C-A SSIGN 1]
+
+E
+
+e1 → t1 : Ref S
+E
+
+E
+
+e2 → t2 : T
+
+c = coerce(T , S)
+
+e1 := e2 → (t1 := (c t2 )) : S
+
+[C-A SSIGN 2]
+
+E
+
+e1 → t1 : Dyn
+E
+
+E
+
+e2 → t2 : T
+
+c = coerce(T , Dyn)
+
+e1 := e2 → ((Ref? t1 ) := (c t2 )) : Dyn
+
+Fig. 5 Cast insertion rules
+
+language syntax and type rules are defined in Fig. 4, and are mostly straightforward. The
+values include “uncoerced values” u, consisting of abstractions, constants, and references.
+The latter are represented as addresses a in the global store σ . A value may also be wrapped
+with a value coercion vc. Value coercions are the subset of coercions that begin with either
+a tag G! or a higher-order coercion Fun c d or Ref c d.
+The process of type checking and inserting coercions is formalized via the cast insertion
+judgment:
+E
+
+e → t : T
+
+Here, the type environment E provides types for free variables, e is the original source program, t is a modified version of the original program with additional coercions, and T is
+the inferred type for t . The rules defining the cast insertion judgment are shown in Fig. 5,
+and they rely on the partial function coerce to compute coercions between types. For example, rule [C-A PP 1] compiles an application expression where the operator has a function
+type S → T by casting the argument expression to type S. Rule [C-A PP 2] handles the case
+where the operator is dynamically-typed by inserting a Fun? check to ensure the operator evaluates to a function, and casting the argument to type Dyn to yield a tagged value.
+Rules [C-R EF] and [C-D EREF 1] handle typed reference allocation and dereference. Rule
+[C-D EREF 2] handles dynamically-typed dereference by inserting a runtime Ref? check.
+Rule [C-A SSIGN 1] handles statically-typed assignment, casting the right-hand side to the
+expected type of the reference cell, and [C-A SSIGN 2] handles dynamically-typed assignment, casting the left-hand side with a runtime Ref? check and the right-hand side with a
+tagging coercion to type Dyn.
+
+180
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+Returning to the continuation-passing evenk and oddk functions, the cast insertion judgment produces the following compiled program (which differs somewhat from the compiled
+version in the introduction because of our use of coercions to represent casts):
+evenkc : Int → Bool
+
+def
+
+oddkc : Int → Bool
+
+def
+
+= λn:Int. λk :(Dyn → Dyn).
+if (n = 0)
+then Bool? (k (Bool! true))
+else oddkc (n − 1) (Fun Bool! Bool? k)
+= λn:Int. λk :(Bool → Bool).
+if (n = 0)
+then (k false)
+else evenkc (n − 1) (Fun Bool? Bool! k)
+
+Compilation succeeds on all well-typed source programs, and produces only well-typed
+target programs.
+Theorem 1 (Well-typed programs compile) For all E, e, and T , the following statements
+are equivalent:
+1. E e : T
+2. ∃ t such that E
+
+e → t : T
+
+Theorem 2 (Compiled programs are well-typed) For all E, e, t , and T , if E
+T then E; ∅ t : T
+
+e → t :
+
+Proof Inductions on the cast insertion and source language typing derivations.
+
+
+
+6 Operational semantics
+We now consider how to implement the target language in a manner that limits the space
+consumed by coercions. The key idea is to combine adjacent casts at runtime to eliminate
+redundant information while preserving the behavior of programs.
+Figure 6 provides the definitions and reduction rules for the target language, using a
+small-step operational semantics with evaluation contexts. The grammar of evaluation contexts C is defined in terms of contexts D, which cannot begin with a cast. This prevents
+nesting of adjacent casts and allows the crucial [E-CC AST] reduction rule to ensure that
+adjacent casts in the program term are always merged.
+In order to maintain bounds on their size, coercions are maintained normalized throughout evaluation according to the following rules:
+I;c = c
+c; I = c
+Fail; c = Fail
+c; Fail = Fail
+
+G!; G? = I
+if G = G
+G!; G ? = Fail
+(Fun c1 c2 ); (Fun d1 d2 ) = Fun (d1 ; c1 ) (c2 ; d2 )
+(Ref c1 c2 ); (Ref d1 d2 ) = Ref (d1 ; c1 ) (c2 ; d2 )
+(c1 ; c2 ); c3 = c1 ; (c2 ; c3 )
+
+This normalization is applied in a transitive, compatible manner whenever the rule
+[E-CC AST] is applied, thus bounding the size of coercions during evaluation. Normalized
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+181
+
+Syntax
+Evaluation Contexts:
+Non-cast Contexts:
+
+C ::= D | c D
+D ::= • | (C t) | (v C) | ref C | !C | C := t | v := C
+
+Evaluation rules
+C[(λx :S. t) v], σ −→ C[t[x := v]], σ
+[E-B ETA]
+C[ref v], σ −→ C[a], σ [a := v]
+for a ∈ dom(σ )
+[E-N EW]
+C[!a], σ −→ C[σ (a)], σ
+if a ∈ dom(σ )
+[E-D EREF]
+C[a := v], σ −→ C[v], σ [a := v]
+if a ∈ dom(σ )
+[E-A SSIGN]
+C[k v], σ −→ C[δ(k, v)], σ
+[E-P RIM]
+C[(Fun c d u) v], σ −→ C[d (u (c v))], σ
+[E-CB ETA]
+C[!(Ref c d a)], σ −→ C[d !a], σ
+[E-CD EREF]
+C[(Ref c d a) := v], σ −→ C[d (a := c v)], σ
+[E-CA SSIGN]
+[E-I D]
+C[I  u], σ −→ C[u], σ
+if C = C [c •]
+[E-FC AST]
+C[IntFloat n], σ −→ C[nearestFloat(n)], σ if C = C [c •]
+C[c (d t)], σ −→ C[nc t], σ
+if d;c = nc
+[E-CC AST]
+Fig. 6 Operational semantics
+
+coercions satisfy the following grammar (where [—] denotes an optional component):
+nc ::= I | Fail | G? | G! | G?; G!
+| [Int?; ] IntFloat [; Float!]
+| [Fun?; ] Fun nc nc [; Fun!]
+| [Ref?; ] Ref nc nc [; Ref!]
+Most of the remaining reduction rules are straightforward. Rules [E-B ETA], [E-N EW],
+[E-D EREF], and [E-A SSIGN] are standard. The rule [E-P RIM] relies on a function δ : Term ×
+Term → Term to define the semantics of constant functions. For simplicity, we assume each
+δ to be defined for all constants k and arguments v. Rule [E-CB ETA] applies function casts
+by casting the function argument and result. Rule [E-CD EREF] casts the result of reading
+a cell and [E-CA SSIGN] casts the value written to a cell and casts the value again to the
+expected output type. Rules [E-I D] and [E-FC AST] respectively perform the identity and
+float coercions, and are restricted to non-cast contexts to prevent overlap with [E-CC AST].
+6.1 Space-efficient coercions
+Using these evaluation rules, the continuation-passing evenkc and oddkc functions of
+Sect. 1.1 now maintain normalized coercions during evaluation:
+(Fun Bool? Bool! λx :Bool. x)
+evenkc n
+−→∗ oddkc (n − 1) (Fun Bool! Bool? Fun Bool? Bool! λx :Bool. x)
+−→ oddkc (n − 1) ((Fun Bool? Bool!);
+[E-CC AST]
+(Fun Bool! Bool?) λx :Bool. x)
+=
+oddkc (n − 1) (Fun (Bool!; Bool?) (Bool!; Bool?) λx :Bool. x)
+=
+oddkc (n − 1) (Fun I I  λx :Bool. x)
+−→∗ evenkc (n − 2) (Fun Bool? Bool! Fun I I  λx :Bool. x)
+=
+evenkc (n − 2) (Fun Bool? Bool! λx :Bool. x)
+−→∗ . . .
+
+182
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+Note the crucial role played by rule [E-CC AST] in this reduction sequence to combine the
+adjacent function casts. Once these casts are combined, the coercion normalization rules
+simplify them down to (Fun I I ) at each subsequent invocation of oddkc .
+(Fun Bool? Bool!); (Fun Bool! Bool?)
+= Fun (Bool!; Bool?) (Bool!; Bool?)
+= Fun I I
+6.2 Tail recursion
+Consider the compiled version of the direct-style even and odd functions:
+evenc : Dyn → Dyn
+
+def
+
+= λn:Dyn.
+if (Int? n) = 0
+then Bool! true
+else Bool! (oddc ((Int? n) − 1)))
+
+def
+
+oddc : Int → Bool = λn:Int.
+if (n = 0)
+then false
+else Bool? (evenc (Int! (n − 1)))
+In the following evaluation sequence, the definition of evaluation contexts forces the evaluation of rule [E-CC AST] before reducing the application of odd. In other words, tail calls
+are evaluated only after normalizing the cast at the top of the program stack. Thus, as shown
+below, there is no unbounded growth in the control stack.
+Bool? (evenc (Int! 4))
+−→∗ Bool? Bool! (oddc 3)
+−→ Bool!; Bool? (oddc 3)
+=
+I  (oddc 3)
+−→∗ Bool? (evenc (Int! 2))
+−→∗ . . .
+6.3 Type soundness
+Evaluation satisfies the usual preservation and progress lemmas.
+Theorem 3 (Soundness of evaluation) If ∅; ∅
+1. t, ∅ diverges,
+2. t, ∅ −→∗ C[Fail u], σ or
+3. t, ∅ −→∗ v, σ and ∃  such that ∅; 
+
+t : T then either
+
+v : T and ∅; 
+
+σ.
+
+Proof Via standard subject reduction and progress lemmas in the style of Wright and
+Felleisen [37].
+
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+183
+
+7 Early error detection
+Our coercion-based implementation of casts allows the runtime to detect errors earlier in
+the evaluation sequence and in more situations than earlier systems for gradual typing. To
+illustrate this idea, consider the following code fragment, which erroneously attempts to
+convert an (Int → Int) function to have type (Bool → Int):
+let f : (Int → Int) = (λx : Int. x) in
+let h : (Bool → Int) = f in . . .
+Most gradual type systems (including ours) will detect this error at compile time, since these
+types are not consistent: (Int → Int) ∼ (Bool → Int). However, the introduction of an
+additional variable of type Dyn into the data-flow path hides this error from the type system,
+since (Int → Int) ∼ Dyn ∼ (Bool → Int):
+let f : (Int → Int) = (λx : Int. x) in
+let g : Dyn = f in
+let h : (Bool → Int) = g in . . .
+For this revised example, the function representation of higher-order casts would not detect
+this error until h is applied to a boolean argument, causing the integer cast to fail.
+In contrast, our coercion-based implementation allows us to detect this error as soon as
+h is initialized. After cast insertion and evaluation, the value of h is
+h = (Fun Bool! Int?); (Fun Int? Int!) (λx : Int. x)
+= Fun (Int?; Bool!) (Int?; Int!) (λx : Int. x)
+= Fun Fail I  (λx : Int. x)
+where the domain coercion Fail explicates the inconsistency of the two domain types Int
+and Bool. We can modify our semantics to halt as soon as such inconsistencies are detected,
+by adding the following coercion normalization rules to lift this failure to the top level:
+Fun c Fail = Fail
+Fun Fail c = Fail
+
+Ref c Fail = Fail
+Ref Fail c = Fail
+
+Under these additional normalization rules, we have:
+h = Fun Fail I  (λx : Int. x)
+= Fail (λx : Int. x)
+which is not a value, and so evaluation gets stuck.
+Using these rules, our implementation strategy halts as soon as h is initialized, resulting
+in earlier runtime error detection and the detection of errors in more situations than under
+the function representation of higher-order casts. We believe that the eager approach better
+fits the philosophy of gradual typing, which is to permit maximum flexibility while still
+detecting errors as early as possible.
+
+8 Space efficiency
+We now consider how much space coercions consume at runtime, beginning with an analysis
+of how much space each individual coercion can consume.
+
+184
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+8.1 Space consumption
+The size of a coercion size(c) is defined as the size of its abstract syntax tree representation.
+When two coercions are sequentially composed and normalized during evaluation, the size
+of the normalized, composed coercion may of course be larger than either of the original
+coercions. In order to reason about the space required by such composed coercions, we
+introduce a notion of the height of a coercion:
+height(I ) = height(Fail) = height(G!) = height(G?) = 1
+height(Ref c d) = height(Fun c d) = 1 + max(height(c), height(d))
+height(c; d) = max(height(c), height(d))
+Notably, the height of a composed coercion is bounded by the maximum height of its constituents. In addition, normalization never increases the height of a coercion. Thus, the height
+of any coercion created during program evaluation is never larger than the height of some
+coercion in the original elaborated program.
+Furthermore, this bound on the height of each coercion in turn guarantees a bound on the
+coercion’s size, according to the following lemma. In particular, even though the length of
+a coercion sequence c1 ; . . . ; cn does not contribute to its height, the restricted structure of
+well-typed, normalized coercions constrains the length (and hence size) of such sequences.
+Lemma 2 For all well-typed normalized coercions c, size(c) ≤ 5(2height(c) − 1).
+Proof Induction on c. Assume c = c1 ; . . . ; cn , where each ci is not a sequential composition.
+Suppose some ci = Ref d1 d2 . So ci : Ref S  Ref T . Hence ci can be preceded only
+by Ref?, which must be the first coercion in the sequence, and similarly can be followed
+only by Ref!, which must be the last coercion in the sequence. Thus in the worst case
+c = Ref?; Ref d1 d2 ; Ref! and size(c) = 5 + size(d1 ) + size(d2 ). Applying the induction
+hypothesis to the sizes of d1 and d2 yields:
+size(c) ≤ 5 + 2(5(2height(c)−1 − 1)) = 5(2height(c) − 1)
+The case for Fun d1 d2 is similar. The coercions I and Fail can only appear alone.
+Finally, coercions of the form G?; G! are valid. However, composition of a coercion c
+matching this pattern with one of the other valid coercions is either ill-typed or triggers
+a normalization that yields a coercion identical to c.
+
+In addition, the height of any coercion created during cast insertion is bounded by the
+height of some type in the typing derivation (where the height of a type is the height of its
+abstract syntax tree representation).
+Lemma 3 If c = coerce(S, T ), then height(c) ≤ max(height(S), height(T )).
+Proof Induction on the structure of coerce(S, T ).
+Theorem 4 (Size of coercions) For any e0 , c such that
+1. ∅ e0 → t0 : T and
+2. t0 , ∅ −→∗ t, σ and
+3. c occurs in (t, σ ),
+
+
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+185
+
+there exists some type S in the derivation of ∅
+height(S) and size(c) ≤ 5(2height(S) − 1).
+
+e0 → t0 : T such that height(c) ≤
+
+Proof Induction on the length of the reduction sequence. The base case proceeds by
+induction on the derivation of ∅
+e0 → t0 : T . In cases [C-A PP 1], [C-A PP 2],
+[C-D EREF 2], [C-A SSIGN 1], and [C-A SSIGN 2], the new coercions are introduced by applications of coerce(S, T ) for types S and T in the derivation. In each such case,
+Lemma 3 guarantees that height(c) ≤ max(height(S), height(T )), and by Lemma 2,
+size(c) ≤ 5(2height(max(height(S),height(T ))) − 1). The remaining cases are trivial inductions.
+If the reduction sequence is non-empty, we have t0 , ∅ −→k t , σ −→ t, σ . If c occurs
+in t , σ then by induction, there exists an S in the derivation of ∅ e0 → t0 : T such that
+height(c) ≤ height(S) and size(c) ≤ 5(2height(S) − 1). Otherwise, the only reduction rules that
+produce fresh coercions are [E-CB ETA], [E-CD EREF], [E-CA SSIGN], all of which produce
+strictly smaller coercions, and [E-CC AST]. In the latter case, the fresh coercion c = c1 ; c2
+is synthesized from coercions c1 and c2 in the redex. By induction, there are types S1 and
+S2 in the derivation of ∅ e0 → t0 : T such that height(ci ) ≤ height(Si ) and size(ci ) ≤
+5(2height(Si ) − 1) for i ∈ 1, 2. Since height(c) = max(height(c1 ), height(c2 )), let S be the
+taller of the two types. Then height(c) ≤ height(S ) and by Lemma 2, size(c) ≤ 5(2height(c) −
+
+1), so size(c) ≤ 5(2height(S ) − 1).
+We now bound the total cost of maintaining coercions in the space-efficient semantics.
+We define the size of a program state inductively as the sum of the sizes of its components.
+In order to construct a realistic measure of the store, we count only those cells that an
+idealized garbage collector would consider live by restricting the size function to the domain
+of reachable addresses.
+size(t, σ ) =
+size(t) + size(σ |reachable(t) )
+size(σ ) = a∈dom(σ ) (1 + size(σ (a)))
+size(k) = size(a) = size(x) = 1
+size(λx :T . t) = 1 + size(T ) + size(t)
+size(ref t) = size(!t) = 1 + size(t)
+size(t1 := t2 ) = size(t1 t2 ) = 1 + size(t1 ) + size(t2 )
+size(c t) = 1 + size(c) + size(t)
+To show that coercions occupy bounded space in the model, we compare the size of program
+states in reduction sequences to program states in an “oracle” semantics where coercions
+require no space. The oracular measure sizeOR is defined similarly to size, but without a cost
+for maintaining coercions; that is, sizeOR (c) = 0. The following theorem then bounds the
+fraction of the program state occupied by coercions in the space-efficient semantics.
+Theorem 5 (Space consumption) If ∅
+ists some type S in the derivation of ∅
+sizeOR (t , σ )).
+
+e → t : T and t, ∅ −→∗ t , σ , then there exe → t : T such that size(t , σ ) ∈ O(2height(S) ·
+
+Proof During evaluation, the [E-CC AST] rule prevents nesting of adjacent coercions in any
+term in the evaluation context, redex, or store. Thus the number of coercions in the program
+state is proportional to the size of the program state. By Theorem 4 the size of each coercion
+
+is in O(2height(S) ) for the largest S in the typing of e.
+
+186
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+8.2 Implementing tail recursion
+Theorem 5 has the important consequence that coercions do not affect the control space
+consumption of tail-recursive programs. This important property is achieved by always combining adjacent coercions on the stack via the [E-CC AST] rule. This section sketches three
+implementation techniques for this rule.
+Coercion-passing style This approach is similar to security-passing style [36], which adds
+an extra argument to every procedure representing its security context; in this case, the
+argument represents the result coercion. Thus the representation of a function type is
+S → T  = S × Coercion → T 
+Tail calls coalesce but do not perform coercions, instead passing them along to the next
+function. Coercions are instead discharged when a value is returned to a context with a
+non-trivial coercion.
+Trampoline A trampoline [18] is a well-known technique for implementing tail-recursive
+languages where tail calls are implemented by returning a thunk to a top-level loop. Tailrecursive functions with coercions return both a thunk and a coercion to the driver loop,
+which accumulates and coalesces returned coercions. The representation of a function type
+is then
+S → T  = S → (T  + ((1 → T ) × Coercion))
+Continuation marks Continuation marks [9, 10] allow programs to annotate continuation
+frames with arbitrary data. When a marked frame performs a tail call, the subsequent frame
+can inherit and modify the destroyed frame’s marks. Coercions on the stack are stored as
+marks and coalesced on tail calls. In this approach, the representation of a function type is
+direct:
+S → T  = S → T 
+since the presence of continuation marks makes the target language expressive enough to
+store coercions on the stack. However, the implementation of tail calls requires a protocol
+for coalescing coercions, so compilation is still required.
+
+9 Related work
+There is a large body of work combining static and dynamic typing. The simplest approach is
+to use reflection with the type Dyn, as in Amber [6]. Since case dispatch cannot be precisely
+type-checked with reflection alone, many languages provide statically-typed typecase on
+dynamically-typed values, including Simula-67 [2] and Modula-3 [7].
+For dynamically-typed languages, soft typing systems provide type-like static analyses
+for optimization and early error reporting [37]. These systems may provide static type information but do not allow explicit type annotations, whereas enforcing documented program
+invariants (i.e., types) is a central feature of gradual typing.
+Similarly, Henglein’s theory of dynamic typing [22] provides a framework for static type
+optimizations but only in a purely dynamically-typed setting. We use Henglein’s coercions
+instead for structuring the algebra of our cast representation. Our application is essentially
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+187
+
+different: in the gradually-typed setting, coercions serve to enforce explicit type annotations,
+whereas in the dynamically-typed setting, coercions represent checks required by primitive
+operations.
+None of these approaches facilitates migration between dynamically and statically-typed
+code, at best requiring hand-coded interfaces between them. The gradually-typed approach,
+exemplified by Sage [20] and λ?→ [32], lowers the barrier for code migration by allowing
+mixture of expressions of type Dyn with more precisely-typed expressions. Our work improves gradual typing by eliminating the drastic effects on space efficiency subtly incurred
+by crossing the boundary between typing disciplines. Siek and Taha’s subsequent work on
+gradual typing for objects [33] merges some casts at runtime, but they do not address tail
+recursion and so the remaining casts may still occupy unbounded space. In particular, our
+Space Consumption Theorem does not hold in their setting.
+In earlier work in this area, [28] explored similar ideas in the context of dependent type
+systems. Their approach uses function proxies to support clean interoperation and hence
+migration between simply-typed code and dependently-typed code. Several other systems
+employ dynamic function proxies, including hybrid type checking [16], software contracts
+[15], and recent work on software migration by Tobin-Hochstadt and Felleisen [34, 35]. We
+believe our approach to coalescing redundant proxies could improve the efficiency of all of
+these systems.
+Minamide and Garrigue [27] address a similar issue with unbounded proxies but in the
+context of specialization of polymorphic functions rather than general type conversions.
+Their approach does not handle tail calls correctly and only addresses runtime complexity.
+Our work presents a representation of casts as coercions in order to improve the memory
+guarantees of gradual typing. Nevertheless, our representation appears to improve the runtime efficiency similarly to Minamide and Garrigue’s work. We intend to explore the runtime
+improvements of our approach as well.
+
+10 Conclusion
+We have presented a space-efficient implementation strategy for the gradually-typed λcalculus. By ensuring that the presence of coercions does not asymptotically affect the space
+consumption of programs, we guarantee that programmers can gradually annotate programs
+with types without inadvertently introducing significant changes in resource consumption.
+Since the publication of our original conference results [23], other researchers have extended these ideas to support blame tracking [31] and to express normalized coercions as
+more elegant threesomes [30].
+Most work on hybrid and gradual type systems to date has been developed in the context of rather idealized languages. The motivation for these idealized languages has been to
+enable researchers to focus on some of the essential and theoretical complexities of these
+type systems. However, some systems do not support side effects, and others, such as [19],
+assume the language is strongly-normalizing.
+There remain some difficulties in scaling up these ideas to realistic languages with fullfeatured type systems that include features such as classes, subtyping, method overriding,
+recursive types, or polymorphism, particularly while preserving the desirable property of
+space efficiency.
+Polymorphic types present some challenges for maintaining constant bounds on the
+size of coercions, in part because polymorphic types require representation of data structures with binders. The integration of polymorphism into various contract systems and hybrid/gradual type systems has been a topic of active research over the last several years.
+
+188
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+Polymorphism was incorporated into dynamic contracts by Guha et al. [21]. More recently,
+gradual typing was extended to support polymorphism, using dynamic sealing to ensure
+that values of polymorphic type satisfy relational parametricity [1]. Neither of these results
+investigate space overheads.
+Predicate types pose additional challenges for bounding the size of coercions, and may
+require additional assumptions, such as a bound on the number of predicates used in types.
+Combining polymorphism with predicate types may be tricky, and most research restricts
+predicates to base types. Some systems support predicates on non-base types (see for example, [3, 20, 38]), and this generalization seems necessary to support polymorphism, since
+predicates could be used to refine polymorphic arguments. In particular, the programming
+language S AGE [20] was an experiment at applying hybrid typing to a rich type system with
+first-class types. First-class types can then be used to express explicit polymorphism, where
+type parameters are passed explicitly, just like other parameters. Unfortunately, the lack of
+type inference in S AGE made type annotations and explicit type parameters somewhat burdensome. There was no evaluation of the space overheads in S AGE.
+The integration of recursive types into hybrid/gradual type systems also deserves further
+study. Contract systems have long supported recursive contracts (for example, a list contract). S AGE’s first-class types can express recursive types, but there are no results on the
+space overheads of the resulting coercions. It appears fairly plausible that the recursive types
+can be supported in a gradual type system in a space-efficient manner, although the details
+remain to be worked out.
+In addition to the technical difficulties of scaling gradual and hybrid types to rich languages in a space-efficient manner, another key challenge for future work is to demonstrate
+the software engineering benefits of these techniques for code development and evolution.
+
+References
+1. Ahmed, A., Findler, R.B., Matthews, J., Wadler, P.: Blame for all. In: Workshop on Script to Program
+Evolution (2009)
+2. Birtwhistle, G.M., et al.: Simula Begin. Chartwell-Bratt Ltd., Bromley (1979)
+3. Blume, M., McAllester, D.: Sound and complete models of contracts. J. Funct. Program. 16(4–5), 375–
+414 (2006). ISSN 0956-7968. doi:10.1007/s10990-011-9066-z
+4. Bracha, G.: Pluggable type systems. In: Workshop on Revival of Dynamic Languages, October 2004
+5. Brus, T., van Eekelen, M., van Leer, M., Plasmeijer, M.: Clean nnn a language for functional graph
+rewriting. In: Kahn, G. (ed.) Functional Programming Languages and Computer Architecture. Lecture
+Notes in Computer Science, vol. 274, pp. 364–384. Springer, Berlin (1987)
+6. Cardelli, L.: Amber. In: Spring School of the LITP on Combinators and Functional Programming Languages, pp. 21–47 (1986)
+7. Cardelli, L., Donahue, J., Glassman, L., Jordan, M., Kalsow, B., Nelson, G.: Modula-3 report (revised).
+Technical Report 52, DEC SRC (1989)
+8. Chambers, C.: The Cecil Language Specification and Rationale: Version 3.0. University of Washington
+(1998)
+9. Clements, J.: Portable and high-level access to the stack with Continuation Marks. PhD thesis, Northeastern University (2005)
+10. Clements, J., Felleisen, M.: A tail-recursive machine with stack inspection. ACM Trans. Program. Lang.
+Syst. 26(6), 1029–1052 (2004)
+11. de Oliveira, R.B.: The Boo programming language (2005)
+12. ECMAScript Edition 4 group wiki. Ecma International (2007)
+13. ECMAScript Language Specification. Ecma International, 5th edn. (2009). URL http://www.
+ecma-international.org/publications/files/ECMA-ST/ECMA-262.pdf
+14. Findler, R.B., Blume, M.: Contracts as pairs of projections. In: Proceedings of the International Symposium on Functional and Logic Programming (FLOPS), pp. 226–241 (2006)
+15. Findler, R.B., Felleisen, M.: Contracts for higher-order functions. In: Proceedings of the ACM SIGPLAN
+International Conference on Functional Programming (ICFP), pp. 48–59, October 2002
+
+Higher-Order Symb Comput (2010) 23:167–189
+
+189
+
+16. Flanagan, C.: Hybrid type checking. In: Proceedings of the ACM SIGPLAN-SIGACT Symposium on
+Principles of Programming Languages (POPL), pp. 245–256 (2006)
+17. Flanagan, C., Freund, S.N., Tomb, A.: Hybrid types, invariants, and refinements for imperative objects. In: The International Workshop on Foundations and Developments of Object-Oriented Languages
+(FOOL/WOOD) (2006)
+18. Ganz, S.E., Friedman, D.P., Wand, M.: Trampolined style. In: Proceedings of the ACM SIGPLAN International Conference on Functional Programming (ICFP), pp. 18–27 (1999)
+19. Greenberg, M., Pierce, B., Weirich, S.: Contracts made manifest. In: Proceedings of the ACM SIGPLANSIGACT Symposium on Principles of Programming Languages (POPL) (2010)
+20. Gronski, J., Knowles, K., Tomb, A., Freund, S.N., Flanagan, C.: Sage: Hybrid checking for flexible
+specifications. In: Scheme and Functional Programming Workshop, September 2006
+21. Guha, A., Matthews, J., Findler, R.B., Krishnamurthi, S.: Relationally-parametric polymorphic contracts.
+In: DLS, pp. 29–40 (2007)
+22. Henglein, F.: Dynamic typing: Syntax and proof theory. Sci. Comput. Program. 22(3), 197–230 (1994)
+23. Herman, D., Tomb, A., Flanagan, C.: Space-efficient gradual typing. In: Trends in Functional Programming (TFP) (2007)
+24. Knowles, K.W., Flanagan, C.: Hybrid type checking. ACM Trans. Program. Lang. Syst. 32(2) (2010)
+25. Matthews, J., Findler, R.B.: Operational semantics for multi-language programs. In: Proceedings of the
+ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages (POPL) (2007)
+26. Meijer, E., Drayton, P.: Static typing where possible, dynamic typing when needed. In: Workshop on
+Revival of Dynamic Languages (2005)
+27. Minamide, Y., Garrigue, J.: On the runtime complexity of type-directed unboxing. In: Proceedings of the
+ACM SIGPLAN International Conference on Functional Programming (ICFP), pp. 1–12 (1998)
+28. Ou, X., Tan, G., Mandelbaum, Y., Walker, D.: Dynamic typing with dependent types. In: Proceedings of
+the IFIP International Conference on Theoretical Computer Science, pp. 437–450 (2004)
+29. Pil, M.: First class file I/O. In: IFL ’96: Selected Papers from the 8th International Workshop on Implementation of Functional Languages, pp. 233–246, London, UK. Springer, Berlin (1997). ISBN 3-54063237-9
+30. Siek, J., Wadler, P.: Exploring the design space of higher-order casts. In: Proceedings of the ACM
+SIGPLAN-SIGACT Symposium on Principles of Programming Languages (POPL) (2010)
+31. Siek, J., Garcia, R., Taha, W.: Exploring the design space of higher-order casts. In: Proceedings of the
+European Symposium on Programming Languages and Systems (ESOP), pp. 17–31. Springer, Berlin
+(2009)
+32. Siek, J.G., Taha, W.: Gradual typing for functional languages. In: Scheme and Functional Programming
+Workshop, September 2006
+33. Siek, J.G., Taha, W.: Gradual typing for objects. In: Proceedings of the European Conference on ObjectOriented Programming (ECOOP), Berlin, Germany, July 2007
+34. Tobin-Hochstadt, S., Felleisen, M.: Interlanguage migration: From scripts to programs. In: Dynamic
+Languages Symposium, October 2006
+35. Tobin-Hochstadt, S., Felleisen, M.: The design and implementation of typed scheme. In: Proceedings
+of the ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages (POPL), pp.
+395–406 (2008)
+36. Wallach, D.S.: A New Approach to Mobile Code Security. PhD thesis, Princeton University, Department
+of Computer Science (1999)
+37. Wright, A.K.: Practical Soft Typing. PhD thesis, Rice University (August 1998)
+38. Xu, D.N., Peyton Jones, S.L., Claessen, K.: Static contract checking for Haskell. In: POPL, pp. 41–52
+(2009)
+
+

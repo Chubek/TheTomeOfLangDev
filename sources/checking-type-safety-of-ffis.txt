@@ -1,0 +1,2505 @@
+Checking Type Safety of Foreign Function Calls∗
+Michael Furr
+University of Maryland, College Park
+furr@cs.umd.edu
+
+Jeffrey S. Foster
+University of Maryland, College Park
+jfoster@cs.umd.edu
+
+November 23, 2004
+
+Abstract
+
+This paper presents a multi-lingual type inference system to check type and garbage collection safety across
+foreign function calls. Our system targets the OCaml
+[13] foreign function interface to C [1], though we believe
+that our ideas are adaptable to other FFIs.
+In the OCaml FFI, most of the work is done in C “glue”
+code, which uses various macros and functions to pull
+apart and translate OCaml data to and from C representations. It is easy to make mistakes in this code, which is
+fairly low-level, because there is no checking that OCaml
+data is used at the right type. Our type inference system prevents these kinds of errors, using an extended,
+multi-lingual type language that embeds OCaml types in
+C types and vice-versa.
+One interesting feature of the OCaml FFI is that C
+programs can observe that many OCaml types have the
+same physical representation. For example, the value of
+type unit has the same representation as the OCaml integer 0, nullary data constructors are represented using
+integers, and records and tuples can be injected into sum
+types if they have the right dynamic tag. Thus to model
+OCaml data from the C perspective, we introduce representational types that can model any or all of these
+possibilities (Section 2).
+Additionally, C programs can perform tag tests at
+runtime and compute offsets into the middle of OCaml
+records and tuples.
+Thus in addition to standard
+unification-style type inference, our type system includes
+a dataflow analysis to track offset and tag information precisely within a function body (Section 3). Our
+dataflow analysis is fairly simple, which turns out to be
+sufficient in practice because most programs use the FFI
+in a simple way (in part to avoid making mistakes). We
+have proven that a restricted version of our type system
+is sound (Section 4), modulo certain features of C such as
+out-of-bounds array accesses or type casting.
+Finally, recall that OCaml is a garbage-collected language. To avoid memory corruption problems, before a
+C program calls OCaml (which might invoke the garbage
+collector), it must notify the OCaml runtime system of
+any pointers it has to the OCaml heap. This is easy to
+forget to do, especially when the OCaml runtime is called
+indirectly. Our type system includes effects to track functions that may invoke the OCaml GC and ensure that
+
+We present a multi-lingual type inference system for
+checking type safety across a foreign function interface.
+The goal of our system is to prevent foreign function calls
+from introducing type and memory safety violations into
+an otherwise safe language. Our system targets OCaml’s
+FFI to C, which is relatively lightweight and illustrates
+some interesting challenges in multi-lingual type inference. The type language in our system embeds OCaml
+types in C types and vice-versa, which allows us to track
+type information accurately even through the foreign language, where the original types are lost. Our system uses
+a representational type that can model multiple OCaml
+types, because C programs can observe that many OCaml
+types have the same physical representation. Furthermore, because C has a low-level view of OCaml data,
+our inference system includes a dataflow analysis to track
+memory offsets and tag information. Finally, our type
+system includes garbage collection information to ensure
+that pointers from the FFI to the OCaml heap are tracked
+properly. We have implemented our inference system and
+applied it to a small set of benchmarks. Our results show
+that programmers do misuse these interfaces, and our
+implementation has found several bugs and questionable
+coding practices in our benchmarks.
+
+1
+
+Introduction
+
+Many programming languages contain a foreign function
+interface (FFI) that allows programs to invoke functions
+written in other languages. Such interfaces are important for accessing system-wide libraries and other components, but they are difficult to use correctly, especially
+when there are mismatches between native and foreign
+type systems, data representations, and run-time environments. In all of the FFIs we are aware of, there is little or
+no consistency checking between foreign and native code
+[2, 6, 12, 13, 14]. As a consequence, adding an FFI to a
+safe language potentially provides a rich source of operations that can violate safety in subtle and difficult-to-find
+ways.
+∗
+This research was supported in part by NSF CCF-0346982 and
+CCF-0430118
+
+1
+
+mltype
+
+S
+
+::
+
+void | int | value | ctype *
+
+constructors S, which may optionally take an argument.
+OCaml also includes types for updatable references and
+functions. C (Figure 1b) includes types void, int, and
+the type value, to which all OCaml data is assigned (see
+below). C also includes pointer types, constructed with
+*, and functions.
+To invoke a C function called c name, the OCaml program must contain a declaration of the form
+
+|
+
+ctype × . . . × ctype → ctype
+
+external f : mltype = “c name”
+
+::=
+
+unit | int | mltype × mltype
+
+|
+
+S + · · · + S | mltype ref
+
+|
+
+mltype → mltype
+
+::=
+
+Constr | Constr of mltype
+
+(a) OCaml Type Grammar
+ctype
+
+(b) C Type Grammar
+
+where mltype is an OCaml function type. Calling f will
+invoke the C function declared as
+
+Figure 1: Source Type Languages
+
+value c name(value arg1, . . ., value argn);
+
+As this example shows, all OCaml data is given the single type value in C. However, different OCaml types have
+various physical representations that must be treated differently, and there is no protection in C from mistakenly
+using OCaml data at the wrong type. As a motivating
+example, consider the following OCaml sum type declaration:
+
+pointers to the OCaml heap are registered as necessary.
+To test our ideas, we have implemented our inference
+system and applied it to a small set of benchmarks. In
+our experiments we have found a number of outright bugs
+in FFI code, as well as several examples of questionable
+coding practice. Our results suggest that multi-lingual
+type inference is a beneficial addition to an FFI system.
+In summary, the contributions of this work as are follows:
+
+type t = A of int | B | C of int * int | D
+
+This type has nullary (no-argument) constructors B and
+D and non-nullary constructors A and C.
+Each nullary constructor in a sum type is numbered
+from 0, and is represented in memory directly as that integer. Thus to C functions, nullary constructors look just
+like OCaml ints, e.g., B and int 0 are identical. Additionally, the value of type unit is also represented by the
+integer 0.
+The low-order bit of such unboxed values is always set to
+1 to distinguish them from pointers. C routines use the
+macro Val int to convert to such tagged integers and
+Int val to convert back. There are no checks, however,
+to ensure that these macros are used correctly or even at
+all. In particular, in the standard OCaml distribution the
+type value is a typedef (alias) of long. Thus one could
+mistakenly apply Int val to a boxed value (see below),
+or dually apply Val int to a value. In fact, we found
+several examples of this mistake in our benchmarks (see
+Section 5.2).
+Each non-nullary constructor in a sum type is also numbered separately from 0. These constructors are represented as boxed values or pointers to structured blocks on
+the heap. A structured block is an array of values preceded by a header, which contains, among other things, a
+tag with the constructor number. For example, the constructor C of type t is represented as
+
+• We develop a multi-lingual type inference system for
+a foreign function interface that mutually embeds the
+type system of each language within the other. Using
+this information, we are able to track type information across foreign function calls.
+• Our type system uses representational types to model
+the multiple physical representations of the same
+type. In order to be precise enough in practice,
+our analysis tracks offset and tag information flowsensitively, and it uses effects to ensure that garbage
+collector invariants are obeyed in the foreign language. We have proven that a restricted version of
+our system is sound.
+• We describe an implementation of our system for the
+OCaml to C foreign function interface. In our experiments, we found a number of bugs and questionable
+practices in a small benchmark suite.
+
+2
+
+Multi-Lingual Types
+
+We begin by describing OCaml’s foreign function interface
+to C and developing a grammar for multi-lingual types.
+In a typical use of the OCaml FFI, an OCaml program invokes a C routine, which in turn invokes a system
+or user library routine. The C routine contains “glue”
+code to manipulate structured OCaml types and translate between the different data representations of the two
+languages.
+Figure 1 shows the source language types. OCaml (Figure 1a) includes unit and int types, product types (records
+or tuples), and sum types. Sums are composed of type
+
+tag=1
+
+O
+
+int
+
+int
+
+Pointer
+
+Products that are not part of a sum are represented as
+structured blocks with tag 0.
+Boxed values are manipulated using the macro
+Field(x,i), which expands to *((value*)x+i), i.e., it accesses the ith element in the structured block pointed to
+2
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+if(Is long(x)) {
+switch(Int val(x)) {
+case 0: /* B */ break;
+case 1: /* D */ break;
+} } else {
+switch(Tag val(x)) {
+case 0: /* A */ break;
+case 1: /* C */ break;
+} }
+
+be a variable ψ. The Σ component of a representational
+type describes the boxed values, if any. Σ is a sequence
+of products Π, one for each non-nullary constructor of
+the type. The position of each Π in the sequence corresponds to the constructor tag number, and each Π itself
+contains the types of the elements of the structured block.
+For example, the OCaml type t has representational type
+(2, (>, ∅) + (>, ∅) × (>, ∅)))).
+Notice in Figure 2 that our code to examine a value of
+type t does not by itself fully specify the type of x. For
+example, the type could have another nullary constructor
+or non-nullary constructor that simply is not checked for.
+Thus our grammars for Σ and Π include variables σ and
+π that range over sums and products [18], which we use
+to allow sum and product types to grow during inference.
+Only when an inferred type is unified with an OCaml type
+can we know its size exactly.
+In addition to using OCaml data at the correct type,
+C FFI functions that call the OCaml runtime must notify the garbage collector of any C pointers to the OCaml
+heap. To do so, C functions use macros CAMLparam and
+CAMLlocal to register parameters and locals, respectively.
+If a function registers any such pointers, it must call
+CAMLreturn upon exiting to release the pointers. It is
+easy to forget to use these macros, especially when functions only indirectly call the OCaml runtime, as we have
+found in our experiments (Section 5.2). Thus in our type
+language, we annotate each function type with a garbage
+collection effect GC, either a variable γ, gc if the function
+may invoke the garbage collector, or nogc if it definitely
+will not. GC naturally forms the two-point lattice with
+order nogc v gc (note we reserve ≤ for the total ordering
+over the integers and use v for partial orders over any
+other lattice). Our type system ensures that all necessary
+variables are registered before calling a function with effect gc.
+Finally, sometimes it is useful to pass C data and pointers to OCaml. For example, glue code for a windowing library might return pointers representing windows or buttons to OCaml. It is up to the programmer to assign
+such data appropriate (distinct) opaque OCaml types, but
+there is no guarantee that different C types will not be
+conflated, and perhaps misused. Thus our grammar for
+OCaml types mt includes types ct custom that track the
+C type of embedded data. Our inference system checks
+that OCaml code faithfully distinguishes the C types, so
+that it is not possible to perform a C type cast by passing
+a pointer through OCaml.
+
+Figure 2: Code to Examine a Value of Type t
+ct
+
+::=
+
+void | int | mt value | ct *
+
+|
+
+ct × · · · × ct →GC ct
+
+::=
+
+γ | gc | nogc
+
+mt
+
+::=
+
+α | mt → mt | ct custom | (Ψ, Σ)
+
+Ψ
+Σ
+Π
+
+::=
+::=
+::=
+
+ψ|n|>
+σ |∅|Π+Σ
+π | ∅ | mt × Π
+
+GC
+
+Figure 3: Multi-Lingual Type Language
+by x. There are no checks to prevent a programmer from
+applying Field to an unboxed value or from accessing
+past the end of a block.
+Clearly a value of type t may have many different representations, depending on its constructor. OCaml provides
+a series of macros for testing tags and for determining the
+boxedness of a value. For example, code to examine a
+value of type t is shown in Figure 2. Here, Is long() on
+line 1 checks whether a value is a pointer. If it is unboxed,
+Int val() on line 2 is used to extract the tag, otherwise
+Tag val() is used on line 6 where x is known to be boxed.
+Our goal is to accept this kind of code and infer the possible OCaml types for x. Figure 3 contains our combined,
+multi-lingual type language that integrates and generalizes the types in Figure 1.
+Our grammar for C types ct embeds extended OCaml
+types mt in the type value, so that we can track OCaml
+type information through C. Additionally, we augment
+function types with an effect GC, discussed below.
+Our grammar for OCaml types mt includes type variables α as well as function types and custom types (see
+below). Note that α is a monomorphic type variable, and
+our system does not support polymorphic OCaml types,
+since they seem to be uncommon in foreign functions in
+practice (see Section 5.1).
+All of the other OCaml types from Figure 1a—unit, integer, products, sums, and references—are modeled with
+a representational type (Ψ, Σ). In this type, Ψ bounds the
+unboxed values of the type. For a sum type, Ψ is an exact
+value n counting the number of nullary constructors of the
+type. Integers have the same physical representation but
+could have any value, so for this case Ψ is >. Ψ may also
+
+3
+
+Type System
+
+In this section, we present our multi-lingual type inference
+system. Our inference system takes as input a program
+written in both OCaml and C and proceeds in two stages.
+We begin by analyzing the OCaml source code and converting the source types of FFI functions into our multi3
+
+Φ(external mltype 1 → · · · → mltype n ) =
+ρ(mltype 1 ) value × · · · × ρ(mltype n−1 ) value →g
+ρ(mltype n ) value
+g fresh
+ρ(unit) = (1, ∅)
+ρ(int) = (>, ∅)
+ρ(mltype ref) = (0, ρ(mltype))
+ρ(mltype 1 → mltype 2 ) = ρ(mltype 1 ) → ρ(mltype 2 )
+ρ(L1 | L2 of mltype) = (1, ρ(mltype))
+ρ(mltype 1 × mltype 2 ) = (0, ρ(mltype 1 ) × ρ(mltype 2 ))
+
+e
+
+::=
+
+n | lval | *e | e aop e | e +p e | (ct) e | Val int e | Int val e
+
+lval
+
+::=
+
+x | *(e +p n)
+
+aop
+
+::=
+
++ | - | * | == | · · ·
+
+s
+
+::=
+
+s ; s | return e | CAMLreturn(e) | lval := f (e, . . . , e)
+
+|
+
+lval := e | L: s | goto L | if e then L
+
+|
+|
+
+if unboxed(x) then L | if sum tag(x) == n then L
+if int tag(x) == n then L
+
+d
+
+::=
+
+ctype x = e | CAMLprotect(x)
+
+f
+
+::=
+
+function ctype f (ctype x, . . . , ctype x) d∗ s
+
+|
+
+function ctype f (ctype x, . . . , ctype x)
+
+p
+
+::=
+
+f∗
+
+Figure 4: Translation Rules for OCaml Types
+
+lingual types (Section 3.1). The second stage of inference
+begins with a type environment containing the converted
+types and applies our type inference algorithm to the C
+source code to detect any type errors (Section 3.3).
+
+3.1
+
+Figure 5: Simplified C Grammar
+
+3.2
+
+C Source
+
+After we have applied the rules in Figure 4 to the OCaml
+source code, we begin the second phase of our system,
+which infers types for C source code using the information
+gathered in the first phase. We present our algorithm for
+the C-like language shown in Figure 5, based on the intermediate representation of CIL [17], which we used to construct our implementation. In this language, expressions
+e are side-effect free and contain the usual constructs. We
+include pointer arithmetic e1 +p e2 for computing the address of offset e2 from the structured block pointed to by
+e1 . Pointer arithmetic can be distinguished from other
+forms using standard C type information. Our system allows values to be treated directly as pointers, though in
+actual C source code they are first cast to value *. Our
+system includes type casts (ct) e, which casts e to type
+ct. Our formal system only allows certain casts to and
+from value types; other casts are modeled using heuristics in the implementation. We include as primitives the
+Val int and Int val conversion functions. Note that we
+omit the address-of operation &. Variables whose address
+is taken are treated as globals by the implementation, and
+uses of & that interact with * are simplified away by CIL.
+L-values lval are the restricted subset of expressions that
+can appear on the left-hand side of an assignment.
+Statements s can be associated with a label L. We include as primitives three conditional tests for inspecting
+a value at run time. The conditional if sum tag(x) tests
+the runtime tag of a structured block pointed to by x.
+Similarly, the conditional if int tag(x), used for nullary
+constructors, tests the runtime value of unboxed variable
+x. In actual C source code, these tests are made by applying Tag val or Int val, respectively, and then checking
+the result. The conditional if unboxed(x) checks to see
+whether x is not a pointer.
+Statements also include the special form CAMLreturn
+for returning from a function, releasing all variables
+registered with the garbage collector. This statement
+should be used in place of return if and only if lo-
+
+Type Inference for OCaml Source Code
+
+The first stage of our algorithm is to translate each
+external function type declared in OCaml into our multilingual types. Restricting ourselves to the type information from OCaml is sufficient for checking that C code
+uses OCaml data correctly. We then combine the converted types into an initial type environment ΓI , which
+feeds into the second stage.
+We construct ΓI using the type translation function Φ
+given in Figure 4. In this definition, we implicitly assume
+that mltype n is not constructed with →, i.e., that the
+arity of the function whose type is being translated is n.
+In Figure 4, ρ gives unit and int both pure unboxed
+types, with no Σ component. Since unit is a singleton
+type, we know its value is 0, and we assign it type (1, ∅).
+This is the same as the representational type for a degenerate sum type with no non-nullary constructors and
+exactly one nullary constructor. This is correct because
+that one nullary constructor has the same representation
+as unit. In contrast, int may represent any integer, and so
+it is not compatible with any sum types.
+The ρ function encodes mutable references as a boxed
+type with a single non-nullary constructor of size 1. Regular function types are converted to mt function types.
+Finally, rather than give the general case for sums and
+products, we illustrate the translation with two sample
+cases. Sum types are handled by counting the nullary
+constructors and mapping each non-nullary constructor
+to a product type representing its arguments. In the definition of ρ in Figure 4, we show the translation of a sum
+type with one nullary constructor and one non-nullary
+constructor. Product types are handled by making an
+appropriate boxed type with no nullary constructors and
+a single non-nullary constructor of the appropriate size.
+4
+
+We say that a value is safe if it is either unboxed or
+a pointer to the first element of a structured block, and
+we say that any other ct that is not value is also safe.
+Intuitively, a safe value can be used directly at its type,
+and for boxed types the header can be checked with our
+regular dynamic tests. This is not true of a value that
+points into the middle of a structured block. Our type
+system only allows offsets into OCaml data to be calculated locally within a function, and so we require that any
+data passed to another function or stored in the heap is
+safe. Notice that in our system, data with a type where
+I = 0 is safe. Additionally, none of our type rules allow
+I = >, and if that occurs during iteration the program
+will not type check.
+Type environments Γ map variables to types
+ct[B{I}]{T }. Judgments also include a protection set P ,
+which contains those variables that have been registered
+with the garbage collector by CAMLprotect. We split the
+type inference rules into expressions and statements, and
+discuss each in turn.
+
+cal variables have been registered by declaring them
+with CAMLprotect, our formalism for CAMLlocal and
+CAMLparam.
+Programs p consist of a sequence of function declarations and definitions f . We omit global variables, since
+our implementation forbids values from being stored in
+them (see Section 5.1). We assume all local variables are
+defined at the top-level of the function.
+
+3.3
+
+Type Inference for C Source Code
+
+The second phase of our type inference system takes as
+input C source code and the initial environment ΓI from
+the first phase of the analysis (Section 3.1). Recall the example code in Figure 2 for testing the tags of a value. In
+order to analyze such a program, we need to track precise
+information about values of integers, offsets into structured blocks, and dynamic type tags for sum types. Thus
+our type system infers types of the form ct[B{I}]{T },
+where B tracks boxedness (i.e., the result of if unboxed),
+I tracks an offset into a structured block, and T tracks
+the type tag or value of an integer. In our type system,
+B, I, and T are computed flow-sensitively, while ct is
+flow-insensitive. B, I, and T are given by the following
+grammar:
+B
+
+::=
+
+boxed | unboxed | > | ⊥
+
+I, T
+
+::=
+
+n|>|⊥
+
+3.3.1
+
+Expressions
+
+Figure 6 gives our type rules for expressions. This system
+proves judgments of the form Γ, P ` e : ct[B{I}]{T },
+meaning that in type environment Γ, the C expression e
+has type ct, boxedness B, offset I, and value/tag T .
+We discuss the rules briefly. In all of the rules, we assume that the program is correct with respect to the standard C types, and that full C type information is available. Thus some of the rules apply to the same source
+construct but are distinguished by the C types of the
+subexpressions.
+The rule (Int Exp) gives an integer the appropriate
+type, and (Var Exp) is standard. (Val Deref Exp) extracts a field from a structured block. To assign a type to
+the result, the sum must have a known tag m and offset
+n, and we use unification to extract the field type. Notice that the resulting B and T information is >, since
+they are unknown, but the offset is 0, since we will get
+back safe OCaml data. This rule, however, cannot handle
+the case when records or tuples that are not part of sums
+are passed to functions, because their boxedness is not
+checked before dereferencing. We use (Val Deref Tuple
+Exp) in this case, where B is >. This rule requires that
+the type have one, non-nullary constructor. Note that
+since this rule generates more restrictive constraints than
+(Val Deref Exp), fixpoint iteration still converges. Our
+implementation includes similar rules for using pointer
+arithmetic or reading unboxed data without a boxedness
+test, which we omit due to lack of space.
+The rule (C Deref Exp) follows a C pointer. Notice that
+the resulting B and T are >. (AOP Exp) performs the
+aop operation on T and T 0 in the types. (Add Val Exp)
+is similar to (Val Deref Exp). Notice that it must be
+possible to dereference the resulting pointer. While this
+is not strictly necessary (we could wait until the actual
+
+I and T are lattices with order ⊥ v n v >, and we extend
+arithmetic on integers to I as > aop I = >, ⊥ aop I = ⊥,
+and similarly for T . B also forms a lattice with order
+⊥ v boxed v > and ⊥ v unboxed v >. We define
+ct[B{I}]{T } v ct 0 [B 0 {I 0 }]{T 0 } if ct = ct 0 , B v B 0 , I v
+I 0 , and T v T 0 . We use t to denote the least upper bound
+operator, and we extend t to types similarly. Notice that
+B, I, and T do not appear in the grammar for ct in
+Figure 3, and thus our analysis does not try to track them
+for values stored in the heap. In our experience, this is
+sufficient in practice. In our type rules, we allow T to
+form constraints with Ψ from our representational types;
+the main difference between them is that Ψ may be a
+variable.
+The meaning of ct[B{I}]{T } depends on ct. If ct is
+value, then B represents whether the data is boxed or
+unboxed. If B is unboxed, then T represents the value of
+the data (which is either an integer or nullary constructor), and I is always 0. If B is boxed, then T represents
+the tag of the structured block and I represents the offset
+into the block. For example, on line 8 of Figure 2, x would
+have type ct[boxed{0}]{1} since it represents constructor
+C.
+Otherwise, if ct is int, then B is >, I is 0, and T tracks
+the value of the integer, either ⊥ for unreachable code, a
+known integer n, or an unknown value >. For example,
+the C integer 5 would have type int[>{0}]{5}. Finally,
+for all other ct types, B = T = > and I = 0.
+5
+
+dereference to enforce the size requirement), it seems like
+good practice not to form invalid pointers.
+(Custom Exp) casts C pointer to a value type, and
+the result is given a ct custom value type with unknown
+boxedness and tag. (Val Cast Exp) allows a custom type
+to be extracted from a value of a known type ct. Notice
+that this is the only rule that allows casts from value,
+which are otherwise forbidden. We omit other type casts
+from our formal system; they are handled with heuristics
+in our implementation (Section 5.1).
+(Val Int Exp) and (Int Val Exp) translate between C
+integers and OCaml integers. When a C integer is turned
+into an OCaml integer with Val int , we do not yet know
+whether the result represents an actual int or whether it
+is a nullary constructor. Thus we assign it a fresh representational type (ψ, σ), where T + 1 ≤ ψ. This constraint
+models the fact that e can only be a constructor of a sum
+with at least T nullary constructors.
+The (App) rule models a function call. Technically,
+function calls are not expressions in our grammar, but we
+put this rule here to make the rules for statements a bit
+more compact. To invoke a function, the actual types and
+the formal types are unified; notice that the Bi and Ti are
+discarded, but we require that all actual arguments are
+safe. Additionally, we require that GC 0 v GC, since if
+f might call the garbage collector, so might the current
+function.
+The last hypothesis in this rule is a constraint that
+requires that if the function may call the garbage collector, every variable which points into the OCaml heap
+and is still live must have been registered with a call to
+CAMLprotect. Here ValPtrs(Γ) is the set of all variables
+in Γ with a type (Ψ, Σ) value where |Σ| > 0, i.e., the set
+of all variables that are pointers into the OCaml heap.
+(These sets are computed after unification is complete.)
+The set live(Γ) is all variables live at the program point
+corresponding to Γ. We omit the computation of live,
+since it is standard.
+
+Int Exp
+Γ, P ` n : int[>{0}]{n}
+Var Exp
+x ∈ dom(Γ)
+Γ, P ` x : Γ(x)
+Val Deref Exp
+Γ, P ` e : mt value[boxed{n}]{m}
+mt = (ψ, π0 + · · · + πm + σ)
+πm = α 0 × . . . × α n × π
+ψ, πi , σ, αi , π fresh
+Γ, P ` *e : αn value[>{0}]{>}
+Val Deref Tuple Exp
+Γ, P ` e : mt value[>{n}]{T }
+mt = (0, σ)
+σ = α0 × · · · × αn × π
+σ, αi , π fresh
+Γ, P ` *e : αn value[>{0}]{>}
+C Deref Exp
+Γ, P ` e : ct *[>{0}]{>}
+Γ, P ` *e : ct[>{0}]{>}
+AOP Exp
+Γ, P ` e1 : int[>{0}]{T }
+Γ, P ` e2 : int[>{0}]{T 0 }
+Γ, P ` e1 aop e2 : int[>{0}]{T aop T 0 }
+Add Val Exp
+Γ, P ` e1 : mt value[boxed{n}]{n0 }
+Γ, P ` e2 : int[>{0}]{m}
+mt = (ψ, π0 + · · · + πn0 + σ)
+πn0 = α0 × · · · × αn+m × π
+ψ, πi , σ, αi , π fresh
+Γ, P ` e1 +p e2 : (ψ, mt) value[boxed{n + m}]{n0 }
+Add C Exp
+Γ, P ` e1 : ct *[>{0}]{>}
+Γ, P ` e2 : int[>{0}]{T }
+Γ, P ` e1 +p e2 : ct *[>{0}]{>}
+Custom Exp
+Γ, P ` e : ct *[>{0}]{>}
+Γ, P ` (value)e : ct * custom value[>{0}]{>}
+Val Cast Exp
+Γ, P ` e : mt value[B{I}]{T }
+mt = ct custom
+Γ, P ` (ct) e : ct[>{0}]{>}
+
+3.3.2
+Val Int Exp
+Γ, P ` e : int[>{0}]{T }
+T +1≤ψ
+ψ, σ fresh
+Γ, P ` Val int e : (ψ, σ) value[unboxed{0}]{T }
+
+Statements
+
+Judgments for statements are flow-sensitive, which we
+model by allowing the type environment to vary from one
+statement to another, even in the same scope. Intuitively,
+this allows us to track dataflow facts about local variables.
+In order to support branches, our rules will use a label
+environment G mapping labels to type environments. In
+particular, G(L) is the type environment at the beginning
+of statement L. As inference proceeds, the type rules may
+update G, which we write with the := operator; our analysis iteratively applies the type rules to a function body
+until G has reached a fixpoint.
+Since type environments are flow-sensitive, some of our
+type rules will need to constrain type environments to be
+compatible with each other. We define Γ v Γ0 if Γ(x) v
+Γ0 (x) for all x ∈ dom(Γ) ∪ dom(Γ0 ), and we define Γ t Γ0
+as Γ(x) t Γ0 (x) for all x ∈ dom(Γ) ∪ dom(Γ0 ). For the fall-
+
+Int Val Exp
+Γ, P ` e : mt value[unboxed{0}]{T }
+Γ, P ` Int val e : int[>{0}]{T }
+App
+
+Γ, P ` f : ct 01 × · · · × ct 0n →GC 0 ct
+Γ, P ` ei : ct i [Bi {0}]{Ti }
+ct i = ct 0i
+i ∈ 1..n
+Γ, P ` cur f unc : · →GC ·
+0
+GC v GC
+gc v GC ⇒ (ValPtrs(Γ) ∩ live(Γ)) ⊆ P
+Γ, P ` f (e1 , . . . , en ) : ct[>{0}]{>}
+
+Figure 6: Type Inference for C Expressions
+
+6
+
+Seq Stmt
+Γ, G, P ` s1 , Γ0
+Γ0 , G, P ` s2 , Γ00
+Γ, G, P ` s1 ; s2 , Γ00
+
+Lbl Stmt
+G(L), G, P ` s, Γ0
+Γ v G(L)
+Γ, G, P ` L: s, Γ0
+
+Goto Stmt
+G := G[L 7→ G(L) t Γ]
+Γ, G, P ` goto L, reset(Γ)
+
+Ret Stmt
+Γ, P ` e : ct[B{0}]{T }
+Γ ` cur f unc : · →· ct 0
+ct = ct 0
+P =∅
+Γ, G, P ` return e, reset(Γ)
+
+CAMLReturn Stmt
+Γ, P ` e : ct[B{0}]{T }
+Γ, P ` cur f unc : · →· ct 0
+ct = ct 0
+P 6= ∅
+Γ, G, P ` CAMLreturn(e), reset(Γ)
+
+If Stmt
+Γ, P ` e : int[>{0}]{T }
+G := G[L 7→ G(L) t Γ]
+Γ, G, P ` if e then L, Γ
+
+LSet Stmt
+Γ, P ` *(e1 +p n) : ct[>{0}]{>}
+Γ, P ` e2 : ct 0 [B{0}]{T }
+ct = ct 0
+Γ, G, P ` *(e1 +p n) := e2 , Γ
+
+VSet Stmt
+Γ, P ` e : ct[B{I}]{T }
+Γ, G, P ` x := e, Γ[x 7→ ct[B{I}]{T }]
+
+CAMLProtect Var
+Γ, P ` x : ct[B{I}]{T }
+P := P ∪ {x}
+Γ, G, P ` CAMLprotect(x), Γ
+
+If unboxed Stmt
+Γ, P ` x : mt value[B{0}]{T }
+Γ0 = Γ[x 7→ mt value[unboxed{0}]{T }]
+G := G[L 7→ G(L) t Γ0 ]
+Γ, G, P ` if unboxed(x) then L, Γ[x 7→ mt value[boxed{0}]{T }]
+
+Var Decl
+Γ, P ` e : ct[B{I}]{T }
+ct = η(ctype)
+Γ, P ` ctype x = e, Γ[x 7→ ct[B{I}]{T }]
+
+If int tag Stmt
+Γ, P ` x : mt value[unboxed{0}]{T }
+mt = (ψ, σ)
+n+1≤ψ
+Γ0 = Γ[x 7→ mt value[unboxed{0}]{n}]
+G := G[L 7→ G(L) t Γ0 ]
+ψ, σ fresh
+Γ, G, P ` if int tag(x) == n then L, Γ
+
+Fun Decl
+let ct = η(ctype 1 ) × . . . × η(ctype n ) → η(ctype)
+f ∈ dom(Γ) ⇒ ct = Γ(f )
+Γ ` function ctype f (ctype 1 x, . . . , ctype n x), Γ0 [f 7→ ct]
+
+If sum tag Stmt
+Γ, P ` x : mt value[boxed{0}]{T }
+mt = (ψ, π0 + · · · + πn + σ)
+Γ0 = Γ[x 7→ mt value[boxed{0}]{n}]
+G := G[L 7→ G(L) t Γ0 ]
+ψ, πi , σ fresh
+Γ, G, P ` if sum tag(x) == n then L, Γ
+
+Fun Defn
+Γ0 = Γ[xi 7→ η(ctype i )[>{0}]{>}, cur f unc 7→ Γ(f )]
+Γi−1 , P ` di , Γi
+i ∈ 1..m
+P fresh
+P := ∅
+∀L ∈ body of f , G0 (L) := reset(Γm )
+Γm , G0 , P ` s, Γ0
+Γ ` function ctype f (ctype 1 x1 , . . . , ctype n xn )d1 . . . dm ; s, Γ
+
+Figure 7: Type Inference for C Statements
+we add L to our standard fixpoint worklist so that we continue iterating. (Ret Stmt) unifies the type of e with the
+return type of the current function. We also require that
+e is safe and that P be empty so that any variables registered with the garbage collector are released. (CAMLReturn Stmt) is identical to (Ret Stmt) except that we
+require P to be non-empty. In each of (Goto Stmt), (Ret
+Stmt), and (CAMLReturn Stmt), we use reset to compute a new, unconstrained type environment following
+these statements, since these are unconditional branches.
+
+through case for an unconditional branch our rules need
+to reset all flow-sensitive information to ⊥. We define
+reset(Γ)(x) = ct[⊥{⊥}]{⊥} where Γ(x) = ct[B{I}]{T }.
+Finally, recall that only plain ctypes are available in
+the source code. Hence, analogously to Φ in Figure 4, we
+define a function η to translate ctypes to cts:
+η(void)
+η(int)
+η(value)
+η(ctype *)
+
+=
+=
+=
+=
+
+void
+int
+α value
+η(ctype) *
+
+α fresh
+
+The rule (If Stmt) models a branch on a C integer.
+(If unboxed Stmt) models one of our three dynamic tag
+tests. At label L, we know that local variable x is unboxed,
+and in the else branch (the fall-through case), we know
+x is boxed. We can only apply if unboxed to expressions
+known to be safe expressions. In particular, in the else
+branch we must know the offset of the boxed data is 0,
+which will enable us to do further tag tests.
+
+We do not translate C function types because they are
+not first class in our language.
+Figure 7 gives our type rules for statements, which
+prove judgments of the form Γ, G, P ` s, Γ0 , meaning that
+in type environment Γ, label environment G, and protection set P , statement s type checks, and after statement
+s the new environment is Γ0 .
+The (Seq Stmt) rule is straightforward, and the (Lbl
+Stmt) rule constrains the type environment G(L) to be
+compatible with the current environment Γ. The (Goto
+Stmt) rule updates G if necessary. If G is updated at L,
+
+Similarly, in (If sum tag) we set x to have tag n at label
+L. Notice that this test is only valid if we already know
+(e.g., by calling if unboxed) that x is boxed and at offset
+0, since otherwise the header cannot be read. In the else
+7
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+
+branch, nothing more is known about x. In either case, we
+require that if this test is performed, then mt must have
+at least n possible tags. (We could also omit this last
+requirement.) In (If int tag Stmt), variable x is known to
+have value n at label L. Analogously with the previous
+rule, we require x to be unboxed, and with the constraint
+n + 1 ≤ ψ we require that x must have at least n + 1
+nullary constructors (ψ is the count of the constructors,
+which are numbered from 0).
+(LSet Stmt) typechecks writes to memory. We abuse
+notation slightly and allow e2 on the right-hand side to be
+either an expression or a function call, which is checked
+with rule (App) in Figure 6. Notice that since we do
+not model such heap writes flow-sensitively, we require
+that the type of e2 is safe and that the output type environment is the same as the input environment. In contrast, (VSet Stmt) models writes to local variables, which
+are modeled flow-sensitively. Again, we abuse notation
+and allow the right-hand side to be a function application
+checked with (App). (CAMLProtect Var) takes a variable
+in the environment and adds it to the protection set P .
+Recall that this can only occur at the top-level of a function, and therefore P is constant throughout the body of
+a function.
+Finally, rules (Var Decl), (Fun Decl), and (Fun Defn)
+bind names in the environment. All of these rules use
+our mapping η to generate ct types from ctypes. Notice
+that in (Fun Defn), the function type is not added to
+the environment; for simplicity, we assume all functions
+are declared before they are used. We also assume that
+all parameters are safe, which is enforced in (App). The
+label environment G0 is initialized to fresh copies of Γm
+for each label in the function body, and P is initialized to
+the empty set.
+
+Figure 8: Example with types
+
+a fixpoint. This computation will clearly terminate because updates monotonically increase facts about B, I,
+and T , and those lattices have finite height, and because
+re-applying the type inference rules produces strictly more
+unification constraints.
+Finally, we are left with constraints GC v GC 0 . These
+atomic subtyping constraints can be solved via graph
+reachability. Intuitively, we can think of the constraint
+GC v GC 0 as an edge from GC to GC 0 . Such edges
+form a call graph, i.e., there is an edge from GC to GC 0
+if the function with effect GC is called by the function
+with effect GC 0 . To determine whether a function with
+effect variable γ may call the garbage collector, we simply
+check whether there is a path from gc to γ in this graph,
+and using this information we ensure that any conditional
+constraints from (App) are satisfied for gc functions.
+
+3.4
+3.3.3
+
+// x : α value[>{0}]{>}
+if unboxed(x) {
+// α = (ψ, σ) value
+// x : α value[unboxed{0}]{>}
+if int tag(x) == 0 // 1 ≤ ψ
+/* B */
+// x : α value[unboxed{0}]{0}
+if int tag(x) == 1 // 2 ≤ ψ
+/* D */
+// x : α value[unboxed{0}]{1}
+} else {
+// x : α value[boxed{0}]{>}
+if sum tag(x) == 0 // σ = π0 + σ 0
+/* A */
+// x : α value[boxed{0}]{0}
+if sum tag(x) == 1 // σ 0 = π1 + σ 00
+/* C */
+// x : α value[boxed{0}]{1}
+} // x : α value[>{0}]{>}
+
+Applying the Type Inference Rules
+
+Example
+
+In Figure 8, we present the example from Section 2 written in our grammar. To enhance readability we omit labels and jumps, and instead show control-flow with indentation. We have annotated the example with the types
+assigned by our inference rules. The variable x begins on
+line 1 with an unknown type α value. Upon seeing the
+if unboxed call, α unifies with the representational type
+(ψ, σ). On the true branch, we give x an unboxed type
+but still an unknown tag. Line 4 checks the unboxed constructor for x and adds the constraint that 1 ≤ ψ. Thus
+on line 5, x is now fully known and can be safely used as
+the nullary type constructor B. Similarly, on line 7, x is
+known to be the constructor D.
+On the false branch of the if unboxed test, our rule
+gives x a boxed type with offset 0. After testing the tag
+of x against 0 on line 10, we know that x has at least
+one non-nullary constructor, which we enforce with the
+constraint σ = π0 + σ 0 . On line 11, then, x can be safely
+treated as the constructor A, and if we access fields of x
+in this branch they will be given types according to π0 .
+Similarly, on line 13 we know that x has constructor C.
+
+We apply the type rules in Figures 6 and 7 to C source
+code beginning in type environment ΓI from phase one.
+There are three components to applying the type rules.
+First, the rules generate equality constraints ct = ct 0 and
+mt = mt 0 , which are solved with ordinary unification.
+When solving a constraint (Ψ, ·) = (Ψ0 , ·), we require that
+Ψ and Ψ0 are the same, i.e., n does not unify with >. We
+are left with constraints of the form T + 1 ≤ Ψ from
+(Val Int Exp) and (If int tag). Recall that these ensure
+that nullary constructors can only be used with a sum
+type that is large enough. Thus in this constraint, if T is
+negative, we require Ψ = >, since negative numbers are
+never constructors. After unification and fixpoint iteration (see below), we can simply walk through the list of
+these constraints and check whether they are satisfied.
+Next, when computing Γ ` f, Γ0 for a function definition f , recall that label environment G may be updated. When this happens for G(L), we add L to a worklist of statements. We iterative re-apply the type inferences rules to statements on the worklist until we reach
+8
+
+At line 14, we join all of the branches together and lose
+information about the boxedness and tag of x, and we
+have α = (ψ, π0 + π1 + σ 00 ) with 2 ≤ ψ, which correctly
+unifies with our original type t. When this unification
+takes place, we will also discover σ 00 = ∅.
+
+4
+
+4. For all x ∈ V , Γ ` V (x) : Γ(x)
+
+Definition 2 A statement store D is said to Lcompatible with a label environment G, written D ∼L G,
+if for all L ∈ D there exists Γ such that G(L), G `
+D(L), Γ.
+
+Soundness
+
+Definition 3 D is said to be well formed if for all L ∈ D,
+D(L) is a statement of the form L : s.
+
+We now sketch a proof of soundness for a slightly simplified version of our multi-lingual type system that omits
+function calls, casting operations, and CAMLprotect and
+CAMLreturn. Full details are presented in the appendix.
+We believe these features can be added without difficulty,
+though with more tedium. Thus our proof focuses on
+checking the sequence of statements that forms the body
+of a function, with branches but no function calls.
+The first step is to extend our grammar for expressions
+to include C locations l, OCaml integers {n}, and OCaml
+locations {l + n} (a pointer on the OCaml heap with base
+address l and offset n). We write {l + −1} for the location
+of the type tag in the header block. We define the syntactic values v to be these three forms plus C integers n. As
+is standard, in our soundness proof we overload Γ so that
+in addition to containing types for variables, it contains
+types for C locations and OCaml locations. We also add
+the empty statement () to our grammar for statements.
+Our operational semantics uses three stores to model
+updatable references: SC maps C locations to values,
+SM L maps OCaml locations to values, and V maps local variables to values. In order to model branches, we
+also include a statement store D, which maps labels L, to
+statements s. Due to lack of space, we omit our small-step
+operational semantics, which define a reduction relation
+of the form
+
+The standard approach to proving soundness is to show
+that reduction of a well-typed term does not become
+stuck. In our system, this corresponds to showing that
+every statement either diverges or eventually reduces to
+(), which we prove in the appendix.
+Theorem 1 (Soundness) If Γ
+`
+s, Γ0 , Γ
+∼
+hSC , SM L , V i, D ∼L G and D is well formed, then
+either hSC , SM L , V, si diverges, or hSC , SM L , V, si →∗
+0
+0
+0
+hSC
+, SM
+L , V , ()i.
+
+5
+5.1
+
+Implementation and Experiments
+Implementation
+
+We have implemented the inference system described in
+Section 3. Our implementation consists of two separate
+tools, one for each language.
+The first tool, based on the camlp4 preprocessor, analyzes OCaml source programs and extracts the type signatures of any foreign functions. Because ultimately C
+foreign functions will see the physical representations of
+OCaml types, the tool resolves all types to a concrete
+form. In particular, type aliases are replaced by their
+base types, and opaque types are replaced by the types
+they hide (when available). As each OCaml source file
+is analyzed, the tool incrementally updates a central type
+repository with the newly extracted type information, beginning with a pre-generated repository from the standard
+OCaml library. Once this first phase is complete, the central repository contains the equivalent of the initial environment ΓI , which is fed into the second tool.
+The second tool, built using CIL [17], performs the bulk
+of the analysis. This tool takes as input the central type
+repository and a set of C source programs to which it applies the rules in Figures 6 and 7. The tool uses syntactic
+pattern matching to identify tag and boxedness tests in
+the code.
+One feature of C that we have not fully discussed is the
+address-of operator. Our implementation models addressof in different ways, depending on the usage. Any local
+variable with an integer type (or local structure with a
+integer field) that has its address computed is given the
+type int[>{0}]{>} everywhere. This conservatively models the fact that the variable may be updated arbitrarily
+through other aliases. It has been our experience that
+variables used for indexing into value types rarely have
+their address taken, so this usually does not affect our
+
+0
+0
+0 0
+hSC , SM L , V, si → hSC
+, SM
+L, V , s i
+
+Here, a statement s in state SC ,SM L , and V , reduces to
+0
+0
+, SM
+a new statement s0 and yields new stores SC
+L , and
+0
+∗
+V . We define → as the reflexive, transitive closure of
+→.
+To show soundness, we require that upon entering a
+function, the stores are compatible with the current type
+environment:
+Definition 1 (Compatibility) Γ is said to be compatible
+with SC , SM L , and V (written Γ ∼ hSC , SM L , V i) if
+1. dom(Γ) = dom(SC ) ∪ dom(SM L ) ∪ dom(V )
+2. For all l ∈ SC there exists ct such that Γ ` l :
+ct *[>{0}]{>} and Γ ` SC (l) : ct[>{0}]{>}.
+3. For all {l + n} ∈ SM L there exist Ψ, Σ, j, k, m,
+Π0 , . . . , Πj , mt 0 , . . . , mt k such that
+• Γ ` {l + n} : (Ψ, Σ) value[boxed{n}]{m}
+• Σ = Π0 + · · · + Πj , m ≤ j
+• Πm = mt 0 × · · · × mt k , n ≤ k
+• Γ ` SM L ({l + n}) : mt n value[>{0}]{>}
+• SM L ({l + −1}) = m
+
+9
+
+references to the OCaml heap before invoking the OCaml
+runtime. This accounts for one error in each of ftplib,
+lablgl, and lablgtk. Similarly, the one error in each of
+ocaml-mad and ocaml-vorbis was registering a local parameter with the garbage collector but then forgetting to
+release it, thus possibly leaking memory or causing subtle
+memory corruption.
+The 19 remaining errors are type mismatches between
+the C code and the OCaml code. For instance, 5 of the
+lablgtk errors and all ocaml-glpk and ocaml-ssl errors were
+due to using Val int instead of Int val or vice-versa.
+Another error was due to one FFI function mistreating
+an optional argument as a regular argument by directly
+accessing the option block as if it were the expected type
+rather than an option sum type. Thus, the C code will
+most likely violate type safety. The other type errors are
+similar.
+In addition to the 24 errors, our tool reported 22 warnings corresponding to questionable coding practices. A
+common mistake is declaring the last parameter in an
+OCaml signature as type unit even though the corresponding C function omits that parameter in its declaration.
+While this does not usually cause problems on most systems, it is not good practice, since the trailing unit parameter is placed on the stack. The warnings reported for
+ftplib, ocaml-glpk, ocaml-ssl, lablgl, and lablgtk were all
+due to this case.
+The warning in gz is an interesting abuse of the OCaml
+type system. The gz program contains an FFI function
+to seek (set the file position) on file streams, which have
+either type input channel or output channel. However,
+instead of taking a sum type as a parameter (to allow
+both kinds of arguments), the function is declared with
+the polymorphic type ’a as its parameter. Clearly this is
+very dangerous, because OCaml will allow any argument
+to be passed to this function. In this case, however, only
+the right types are passed to the function, and it is encapsulated so no other code can access the function, and
+so we classify this as questionable programming practice
+rather than an error.
+Our tool also reported a number of false positives, i.e.,
+warnings for code that seems correct. One source of false
+positives is due to polymorphic variants, which we do not
+handle. The other main source of false positives is due to
+pointer arithmetic disguised as integer arithmetic. Recall
+that the type value is actually a typedef for long. Therefore if v has type t ∗ custom, then both ((t∗)v + 1) and
+(t∗)(v + sizeof(t∗)) are equivalent. However, our system
+infers v to have a custom pointer type in the first case,
+and a custom integer type in the second case, creating a
+unification error.
+Finally, in several of the benchmarks there are a number of places where our tool issues a warning because it
+does not have precise enough information to compute a
+type. For instance, this may occur when computing the
+type of e1 +p e2 if e2 has the type int[>{0}]{>}, since the
+
+analysis. Similar, we produce a warning for any variable
+of type value whose address is taken (or any variable
+containing a field of type value), as well as for any global
+variable of type value. When encountering a call through
+an unknown C function pointer, our tool currently issues
+a warning and does not generate typing constraints on
+the parameters or return type.
+We also treat unsafe type casts specially in our implementation. Our system tries to warn programmers about
+casts involving value types, but in order to reduce false
+positives we use heuristics rather than be fully sound.
+For instance, any cast through a void * type is ignored,
+as well as any differences in the sign of a type.
+In addition to the types we have described so far,
+OCaml also includes objects and polymorphic variants.
+Our implementation treats object types in the same way
+as opaque types, with no subtyping between different object types. We have not seen objects used in FFI C code.
+Our implementation does not handle polymorphic variants, which are used in FFI code, and this leads to some
+false positives in our experiments (Section 5.2).
+Finally, recall that our analysis of C functions is
+monomorphic. Thus we cannot infer quantified types for
+C functions that are polymorphic in OCaml value parameters. Instead, we allow them to be hand-annotated
+as polymorphic. Such C functions appear to be rare in
+practice, as we only added these annotations 4 times in
+our benchmark suite.
+
+5.2
+
+Experiments
+
+We ran our tool on several programs that utilize the
+OCaml foreign function interface. The programs we
+looked at are actually glue libraries that provide an
+OCaml API for system and third-party libraries. All of
+the programs we analyzed were from a tested, released
+version, though we believe our tool is also useful during
+development.
+Figure 9 gives a summary of our benchmarks and results. For each program, we list the lines of C and OCaml
+code, and the running time (three run average) for our
+analysis on a 2GHz Pentium IV Xeon Processor with 2GB
+of memory. Recall from Section 3.1 that we do not directly analyze OCaml function bodies. Thus the bulk of
+the time is spent analyzing C code. Also, our analysis
+is done as the program is compiled, so these figures also
+include compilation time.
+The next three columns list the number of errors found,
+the number of warnings for questionable programming
+practice, and the number of false positives, i.e., warnings for code that appears to be correct. The last column
+shows the number of places where the implementation
+warned that it did not have precise flow-sensitive information (see below). The total number of warnings is the
+sum of these four columns.
+We found a total of 24 outright errors in the benchmarks. One source of errors was forgetting to register C
+10
+
+Program
+apm-1.00
+camlzip-1.01
+ocaml-mad-0.1.0
+ocaml-ssl-0.1.0
+ocaml-glpk-0.1.1
+gz-0.5.5
+ocaml-vorbis-0.1.1
+ftplib-0.12
+lablgl-1.00
+cryptokit-1.2
+lablgtk-2.2.0
+
+C loc OCaml loc
+124
+156
+139
+820
+139
+38
+187
+151
+305
+147
+572
+192
+1183
+443
+1401
+21
+1586
+1357
+2173
+2315
+5998
+14847
+Total
+
+Time (s)
+1.3
+1.7
+4.2
+1.5
+1.3
+2.2
+2.8
+1.7
+7.5
+5.4
+61.3
+
+Errors
+0
+0
+1
+4
+4
+0
+1
+1
+4
+0
+9
+24
+
+Warnings
+0
+0
+0
+2
+1
+1
+0
+2
+5
+0
+11
+22
+
+False Pos
+0
+0
+0
+0
+0
+0
+0
+0
+140
+0
+74
+214
+
+Imprecision
+0
+1
+0
+0
+1
+1
+2
+1
+20
+1
+48
+75
+
+Figure 9: Experimental Results
+preserving the languages’ semantics, which differs from
+our goal of checking types and GC properties in FFIs.
+Systems like COM [9] and SOM [10] provide interoperability between object-oriented frameworks. Essentially,
+they are foreign function interfaces that incorporate an
+object model. Typically these systems include dynamic
+type information that is checked at runtime and used to
+find methods and fields. We leave the problem of statically checking such object FFIs to future work.
+Our type system bears some resemblance to systems
+that use physical type checking for C [3, 16], in that
+both need to be concerned with memory representations
+and offsets. However, our system is considerably simpler
+than full-fledged physical type checking systems simply
+because OCaml data given type value is typically only
+used in restricted ways.
+One way to avoid foreign function interfaces completely
+is to compile all programs down to a common intermediate representation. For example, the Microsoft commonlanguage runtime (CLR) [11, 15] includes a strong type
+system and is designed as the target of compilers for multiple different languages. While this solution avoids the
+kinds of programming difficulties that can arise with FFIs,
+it does not solve the issue of interfacing with programs
+in non-CLR languages or with unmanaged (unsafe) CLR
+code.
+
+analysis cannot determine the new offset. We also classify
+warnings about global value types and the use of function
+pointers as imprecision warnings. However, these did not
+occur very often, only 10 and 8 times respectively. One
+interesting direction for future work would be eliminating
+these warnings and instead adding run-time checks to the
+C code for these cases.
+
+6
+
+Related Work
+
+Most languages include a foreign function interface, typically to C, since it runs on many platforms. For languages
+with semantics and runtime systems that are close to C,
+“foreign function” calls to C can typically be made using
+simple interfaces. For languages that are further from C,
+FFIs are more complicated, and there are many interesting design points with different tradeoffs [2, 6, 12, 13, 14].
+For example, Blume [2] proposes a system allowing arbitrary C data types to be accessed by OCaml. Fisher et al
+[7] have developed a framework that supports exploration
+of many different foreign interface policies. While various
+interfaces allow more or less code to be written natively
+(and there is a trend towards more native code rather
+than glue code), the problem of validating usage of the
+interface on the foreign language side still remains. As
+far as we are aware, our paper is the first that attempts
+checking richer properties on the foreign language side
+between two general purpose programming languages.
+Recently, researchers have developed systems to check
+that dynamically-generated SQL queries are well-formed
+[4, 5, 8]. In a sense, these systems are checking a foreignfunction interface between SQL and the source language.
+In order to model SQL queries, the systems focus on string
+manipulations rather than standard type structure, and
+so they are considerably different than our type system.
+Trifonov and Shao [19] use effects to reason about the
+safety of interfacing multiple safe languages with different
+runtime resource requirements in the same address space.
+Their focus is on ensuring that code fragments in the various languages have access to necessary resources while
+
+7
+
+Conclusion
+
+We have presented a multi-lingual type inference system
+for checking type and GC safety across the OCaml-to-C
+foreign function interface. Our system embeds the types
+of each language into the other, using representational
+types to model the overlapping physical representations in
+C of different OCaml types. Our type inference algorithm
+uses a combination of unification to infer OCaml types
+and dataflow analysis to track offset and tag information.
+We use effects to track garbage collection information and
+to ensure that C pointers to the OCaml heap registered
+with the garbage collector. Using an implementation of
+11
+
+our algorithm, we found several errors and questionable
+coding practices in a small benchmark suite. We think
+our results suggest that multi-lingual type inference can
+be an important part of foreign function interfaces, and
+we believe these same techniques can be extended and
+applied to other FFIs.
+
+References
+[1] ANSI. Programming languages – C, 1999.
+9899:1999.
+
+ISO/IEC
+
+[2] M. Blume. No-Longer-Foreign: Teaching an ML compiler to speak C “natively”. In BABEL’01, volume 59
+of Electronic Notes in Theoretical Computer Science,
+Firenze, Italy, Sept. 2001. http://www.elsevier.nl/
+locate/entcs/volume59.html.
+
+v
+
+::=
+
+n | l | {n} | {l + n}
+
+e
+
+::=
+
+v | x | ∗e | e aop e | e +p e
+
+|
+
+Val int e | Int val e
+
+lval
+
+::=
+
+x | ∗(e +p n)
+
+s
+
+::=
+
+() | L: s | s ; s | goto L
+
+|
+
+lval := e | if e then L
+
+|
+
+if sum tag(x) == n then L
+
+|
+
+if int tag(x) == n then L
+
+|
+
+if unboxed(x) then L
+
+Figure 10: Simplified Grammar for Expressions and
+Statements
+
+[3] S. Chandra and T. W. Reps. Physical Type Checking for
+C. In PASTE’99, pages 66–75, Toulouse, France, Sept.
+1999.
+[4] A. S. Christensen, A. Møller, and M. I. Schwartzbach.
+Precise Analysis of String Expressions. In SAS’03, pages
+1–18, San Diego, CA, USA, June 2003.
+
+[18] D. Rémy. Typechecking records and variants in a natural extension of ML. In POPL’89, pages 77–88, Austin,
+Texas, Jan. 1989.
+
+[5] R. DeLine and M. Fähndrich. The Fugue Protocol
+Checker: Is your software Baroque? Technical Report
+MSR-TR-2004-07, Microsoft Research, Jan. 2004.
+
+[19] V. Trifonov and Z. Shao. Safe and Principled Language
+Interoperation. In ESOP’99, pages 128–146, Amsterdam,
+The Netherlands, Mar. 1999.
+
+[6] S. Finne, D. Leijen, E. Meijer, and S. P. Jones. Calling
+hell from heaven and heaven from hell. In ICFP’99, pages
+114–125, Paris, France, Sept. 1999.
+
+A
+
+[7] K. Fisher, R. Pucella, and J. Reppy. A framework
+for interoperability. In BABEL’01, volume 59 of Electronic Notes in Theoretical Computer Science, Firenze,
+Italy, Sept. 2001.
+http://www.elsevier.nl/locate/
+entcs/volume59.html.
+
+Soundness Proof
+
+In this appendix we develop a proof of soundness for a
+slightly simplified version of our multi-lingual type system. Our modified source language is shown in Figure
+10. We have removed functions, casting operations, and
+CAMLprotect and CAMLreturn. We believe these features
+can be added without difficulty, though with more tedium. Thus we focus on checking the sequence of statements that forms the body of a function, with branches
+but no function calls. We have added to our grammar the
+empty statement () and a new non-terminal v for syntactic values, which are C integers n, C pointers l, OCaml
+integers {n}, and OCaml pointers {l + n} (a pointer to
+base address l on the OCaml heap and offset n).
+Our small-step semantics uses three stores SC , SM L ,
+and V to model updatable references. Here, SC maps C
+pointers l to values, SM L maps OCaml pointers {l + n} to
+values, and V maps variables x to values. Recall that a
+pointer into the OCaml heap points to a structured block
+just past the header. We therefore extend the definition
+of SM L so that SM L ({l+−1}) is defined to be the runtime
+tag of the block pointed to by l. We define a configuration
+to be a tuple hSC , SM L , V, si, meaning that statement s
+is being evaluated in the context of stores SC , SM L , and
+V . In order to enhance readability, we also allow configurations to contain expressions: hSC , SM L , V, ei. To
+model branches, we define a mapping D from labels to
+the sequence of statements beginning at that label. Thus
+a branch to a label L results in the program evaluating
+statement D(L) next.
+
+[8] C. Gould, Z. Su, and P. Devanbu. Static Checking of Dynamically Generated Queries in Database Applications. In
+ICSE’04, pages 645–654, Edinburgh, Scotland, UK, May
+2004.
+[9] D. N. Gray, J. Hotchkiss, S. LaForge, A. Shalit, and
+T. Weinberg. Modern Languages and Microsoft’s Component Object Model. CACM, 41(5):55–65, May 1998.
+[10] J. Hamilton. Interlanguage Object Sharing with SOM. In
+Usenix’96, San Diego, California, Jan. 1996.
+[11] J. Hamilton. Language Integration in the Common Language Runtime. ACM SIGPLAN Notices, 38(2):19–28,
+Feb. 2003.
+[12] L. Huelsbergen. A Portable C Interface for Standard ML
+of New Jersey. http://www.smlnj.org//doc/SMLNJ-C/
+smlnj-c.ps, 1996.
+[13] X. Leroy. The Objective Caml system, Aug. 2004.
+[14] S. Liang. The Java Native Interface: Programmer’s
+Guide and Specification. Addison-Wesley, 1999.
+[15] E. Meijer, N. Perry, and A. van Yzendoorn. Scripting
+.NET using Mondrian. In ECOOP 2001, pages 150–164,
+Budapest, Hungary, June 2001.
+[16] G. Necula, S. McPeak, and W. Weimer. CCured: TypeSafe Retrofitting of Legacy Code. In POPL’02, pages
+128–139, Portland, Oregon, Jan. 2002.
+[17] G. C. Necula, S. McPeak, S. P. Rahul, and W. Weimer.
+CIL: Intermediate Language and Tools for Analysis and
+Transformation of C Programs. In CC’02, pages 213–228,
+Grenoble, France, Apr. 2002.
+
+12
+
+R
+
+::=
+
+3. For all {l + n} ∈ SM L there exist Ψ, Σ, j, k, m,
+Π0 , . . . , Πj , mt 0 , . . . , mt k such that
+
+[] | ∗R | R aop e | v aop R | R +p e
+
+|
+
+v +p R | Val int R | Int val R
+
+|
+
+R ; s | if R then L
+
+|
+
+R := e | v := R
+
+• Γ ` {l + n} : (Ψ, Σ) value[boxed{n}]{m}
+• Σ = Π0 + · · · + Πj , m ≤ j
+• Πm = mt 0 × · · · × mt k , n ≤ k
+• Γ ` SM L ({l + n}) : mt n value[>{0}]{>}
+• SM L ({l + −1}) = m
+
+Figure 11: Reduction Context
+
+4. For all x ∈ V , Γ ` V (x) : Γ(x)
+As is standard, we define reduction contexts R in Figure
+11 to specify the order of evaluation in our semantics.
+Here, each expression contains a hole [] which shows what
+must be evaluated next. We therefore use the notation
+R[e] to mean the reduction context R where the hole is
+replaced by e.
+Our small-step operational semantics are shown in Figure 12. These rules define a reduction relation of the form
+
+We begin by showing that given any well typed expression that is not a value, one of the reduction rules from
+Figure 12(a) applies and the result of the reduction preserves the type of the expression.
+Lemma 1 (Subject Reduction for Expressions) If
+Γ ` e : ct[B{I}]{T } and Γ ∼ hSC , SM L , V i, then either e
+is a value or there exists e0 such that
+
+0
+0
+0 0
+hSC , SM L , V, si → hSC
+, SM
+L, V , s i
+0
+Here, a statement s paired with stores SC ,SM L , and V , (1) hSC , SM L , V, ei → hSC , SM L , V, e i, and
+0
+, (2) Γ ` e0 : ct[B{I}]{T }
+reduces to a new statement s0 and yields new stores SC
+0
+0
+,
+and
+V
+.
+Note
+that
+in
+Figure
+12(a)
+reducing
+expresSM
+L
+sions does not yield any new stores since expressions in Proof: Proceed by induction on the structure of e:
+our language are side-effect free. We define →∗ to be the
+case n, l, {n}, {l+n}: These are values, so there is nothing
+reflexive, transitive closure of →.
+to prove.
+Most of the rules in Figure 12 are straightforward. In
+order to preserve soundness, we only allow trivial pointer case x: Since Γ ` x : ct[B{I}]{T }, x must be in the
+arithmetic on C pointers in o-c-add and o-c-assign. In
+domain of Γ. Since Γ ∼ hSC , SM L , V i, x is also in
+rules o-ifsum and o-ifsum2, recall that SM L ({l + −1})
+the domain of V . Therefore we can apply the rule
+represents the run-time type tag of a structured block at
+o-var to show (1), letting e0 = V (x). And then by
+location l.
+compatibility, Γ ` V (x) : ct[B{I}]{T }, showing (2).
+We will prove soundness of the type checking versions
+of our rules shown in Figures 13 and 14. In Figure 13, case *e1 : Note that either the type rule C Deref Exp
+we have added rules to type check C locations l, OCaml
+or Val Deref Exp may apply. First consider the
+integers {n}, and OCaml locations {l+n}. Since these are
+former case. Since Γ ` *e1 : ct[B{I}]{T }, C Deref
+checking rules, we assume that a label environment G has
+Exp states that B = T = >, I = 0, and Γ ` e1 :
+already been computed. In order to maintain soundness,
+ct *[>{0}]{>}. If e1 is not a value, then by inwe have also restricted e2 to have value 0 in Add C Exp,
+duction there exists e2 such that hSC , SM L , V, e1 i →
+since SC does not track the sizes of C memory blocks.
+hSC , SM L , V, e2 i and Γ ` e2 : ct *[>{0}]{>}. So
+Our soundness proof will follow the usual pattern,
+taking e0 = *e2 , we have satisfied (1). Also, by apshowing subject reduction lemmas for statements and explying the type rule C Deref Exp to *e2 , we see
+pressions. In our proof, as is standard, we will overload
+that Γ ` *e2 : ct[>{0}]{>} and thus (2) is satisfied.
+Γ so that in addition to containing types for variables, it
+For the remaining cases in this proof we can make a
+will also contain types for C locations and ML locations.
+similar argument for the inductive case, and so rather
+We define a compatibility relationship to define when a
+than repeat this argument we will implicitly assume
+type environment Γ assigns correct types to the values
+that all sub-expressions are values.
+stored in SC , SM L , and V :
+Now consider the case where C Deref Exp applies
+Definition 4 (Compatibility) Γ is said to be compatand e1 is a value. Recall that Γ ` e1 : ct *[>{0}]{>}
+ible with SC , SM L , and V (written Γ ∼ hSC , SM L , V i)
+and by examining the type rules, we see that the only
+if
+rule which applies to a value with type ct * is Loc
+Exp. Therefore e1 must be a location l and the rule
+1. dom(Γ) = dom(SC ) ∪ dom(SM L ) ∪ dom(V )
+o-c-deref applies. Thus if we set e0 = SC (l), then
+(1) is satisfied. Also, since Γ ∼ hSC , SM L , V i and
+2. For all l ∈ SC there exists ct such that Γ ` l :
+Γ ` l : ct *[>{0}]{>} then Γ ` SC (l) : ct[>{0}]{>}
+ct *[>{0}]{>} and Γ ` SC (l) : ct[>{0}]{>}.
+
+13
+
+(o-var)
+(o-ml-add)
+(o-c-add)
+(o-c-deref)
+(o-ml-deref)
+(o-aop)
+(o-valint)
+(o-intval)
+
+hSC , SM L , V, R[x]i
+hSC , SM L , V, R[{l + n1 } +p n2 ]i
+hSC , SM L , V, R[l +p 0]i
+hSC , SM L , V, R[∗l]i
+hSC , SM L , V, R[∗{l + n}]i
+hSC , SM L , V, R[n1 aop n2 ]i
+hSC , SM L , V, R[Val int n]i
+hSC , SM L , V, R[Int val {n}]i
+
+→
+→
+→
+→
+→
+→
+→
+→
+
+hSC , SM L , V, R[v]i
+hSC , SM L , V, R[{l + n}]i
+hSC , SM L , V, R[l]i
+hSC , SM L , V, R[v]i
+hSC , SM L , V, R[v]i
+hSC , SM L , V, R[n]i
+hSC , SM L , V, R[{n}]i
+hSC , SM L , V, R[n]i
+
+V (x) = v
+n = n1 + n2
+SC (l) = v
+SM L ({l + n}) = v
+n = n1 aop n2
+
+(a) Small-step Semantics for Expressions
+(o-label)
+(o-goto)
+(o-c-assign)
+(o-ml-assign)
+(o-var-assign)
+(o-if)
+(o-if2)
+(o-ifsum)
+
+hSC , SM L , V, L : s; s0 i
+hSC , SM L , V, goto L; si
+hSC , SM L , V, ∗(l +p 0) := v; si
+hSC , SM L , V, ∗({l + n}) := v; si
+hSC , SM L , V, x := v; si
+hSC , SM L , V, if n then L; si
+hSC , SM L , V, if n then L; si
+hSC , SM L , V, if sum tag(x) == n then L; si
+
+→
+→
+→
+→
+→
+→
+→
+→
+
+(o-ifsum2)
+
+hSC , SM L , V, if sum tag(x) == n then L; si
+
+→
+
+(o-ifi)
+(o-ifi2)
+(o-iflong)
+(o-iflong2)
+
+hSC , SM L , V, if int tag(x) == n2 then L; si
+hSC , SM L , V, if int tag(x) == n2 then L; si
+hSC , SM L , V, if unboxed(x) then L; si
+hSC , SM L , V, if unboxed(x) then L; si
+
+→
+→
+→
+→
+
+hSC , SM L , V, s; s0 i
+hSC , SM L , V, D(L)i
+hSC [l 7→ v], SM L , V, si
+hSC , SM L [{l + n} 7→ v], V, si
+hSC , SM L , V [x 7→ v], si
+hSC , SM L , V, D(L)i
+if n 6= 0
+hSC , SM L , V, si
+if n = 0
+hSC , SM L , V, D(L)i
+if (SM L ({l + −1})) = n
+V (x) = {l + 0}
+hSC , SM L , V, si
+if (SM L ({l + −1})) 6= n
+V (x) = {l + 0}
+hSC , SM L , V, D(L)i
+if n1 = n2
+V (x) = {n1 }
+hSC , SM L , V, si
+if n1 6= n2
+V (x) = {n1 }
+hSC , SM L , V, D(L)i
+V (x) = {n}
+hSC , SM L , V, si
+V (x) = {l + 0}
+
+(b) Small-step Semantics for Statements
+Figure 12: Small-step Semantics Rules
+by compatibility. Therefore Γ0 ` e0 : ct[>{0}]{>}
+and (2) is satisfied.
+
+and thus we have satisfied (1). Also, by Add C Exp,
+Γ ` l : ct *[>{0}]{>} and thus we have satisfied (2).
+
+Finally, consider the case where Val Deref Exp applies and e1 is a value. Here, Val Deref Exp states
+
+Now assume that Add Val Exp applies. Therefore, Γ ` e1 : (Ψ, Σ)[boxed{n}]{n1 } and Γ ` e2 :
+int[>{0}]{m}. By examining the type rules, the
+only value with a boxed type is an ML location, so
+e1 must be of the form {l + n}. Similarly, e2 must be
+an integer m. Therefore the rule o-ml-add applies
+and hSC , SM L , V, e1 +p e2 i → hSC , SM L , V, {l + n0 }i
+where n0 = n+m and we have satisfied (1). By again
+examining the type rules, we see that Γ ` {l + n0 } :
+(Ψ, Σ)[boxed{n0 }]{n1 } and thus (2) is satisfied.
+
+Γ ` e1 : (Ψ, Σ) value[boxed{n}]{m}
+Σ = Π0 + · · · + Πk
+m≤k
+Πm = mt 0 × · · · × mt j
+n≤j
+Γ ` *e1 : mt n value[>{0}]{>}
+
+Since e1 has a boxed value type, it must be an ML location {l+n} by the ML Loc Exp type rule. By compatibility, {l + n} ∈ dom(SM L ), and hence the rule
+o-ml-deref applies. Setting e0 = SM L ({l+n}), (1) is
+satisfied. Also by compatibility, SM L ({l + −1}) = m case e1 aop e2 : By examining the type rules, we see that
+the only rule that applies is AOP Exp and thus Γ `
+and Γ ` SM L ({l + n}) : mt n value[>{0}]{>}, and
+e1 aop e2 : int[>{0}]{T }, Γ ` e1 : int[>{0}]{T1 }
+thus (2) is satisfied.
+and Γ ` e2 : int[>{0}]{T2 } where T = T1 aop T2 .
+case e1 +p e2 : Here, the either Add C Exp or Add Val
+By again looking at the type rules, we see that the
+only values which have type int are integer values
+Exp may apply. In the former case, we see that
+by Int Exp, therefore e1 and e2 must be some values
+Γ ` e1 : ct *[>{0}]{>} and Γ ` e2 : int[>{0}]{0}.
+n1 and n2 , respectively, with n1 v T1 and n2 v T2 .
+Therefore by inspecting the type rules, the only value
+Thus the rule o-aop applies and we can let e0 = n
+with a pointer type is a location l and thus e1 = l
+where n = n1 aop n2 and (1) is satisfied. Also, the
+and similarly, e2 = 0. Therefore the rule o-c-add
+rule Int Exp again applies since n v T and thus
+applies and hSC , SM L , V, e1 +p e2 i → hSC , SM L , V, li
+14
+
+Γ ` n : int[>{0}]{T } and (2) is satisfied.
+case Val int e1 : By inspecting the type rules, we see that
+the only rule that applies is Val Int Exp:
+Γ ` e1 : int[>{0}]{T }
+
+Int Exp
+0vI
+nvT
+Γ ` n : int[>{I}]{T }
+Loc Exp
+Γ(l) = ct *[>{I}]{>}
+Γ ` l : Γ(l)
+
+Γ ` Val int e1 : (Ψ, Σ) value[unboxed{0}]{T }
+Therefore since e1 is a value, it must be some number n with n v T by Int Exp. Thus the rule
+o-valint applies with e0 = {n} and (1) is satisfied. If T is >, then Ψ must be ∞ and we can
+show Γ ` {n} : (∞, Σ) value[unboxed{0}]{>} by
+ML Int Exp. If T is some number m then Int
+Exp states that n = m. Therefore we can show
+Γ ` {n} : (Ψ, Σ) value[unboxed{0}]{n} by ML Int
+Exp. Note that T can not be ⊥ since it is a value.
+Therefore we have exhausted all cases for T and (2)
+is satisfied.
+
+0vI
+
+ML Int Exp
+n+1≤Ψ
+unboxed v B
+0vI
+nvT
+Γ ` {n} : (Ψ, Σ) value[B{I}]{T }
+ML Loc Exp
+Γ({l + n}) = (Ψ, Σ)[B{I}]{T }
+boxed v B
+nvI
+mvT
+Σ = Π0 + · · · + Πj
+m≤j
+Πm = mt 0 × · · · × mt k
+n≤k
+Γ ` {l + n} : Γ({l + n})
+Var Exp
+x ∈ dom(Γ)
+Γ ` x : Γ(x)
+
+T +1≤Ψ
+
+case Int val e1 : By inspecting the type rules, we see that
+the only rule that applies is Int Val Exp:
+Γ ` e1 : mt value[unboxed{0}]{T }
+Γ ` Int val e1 : int[>{0}]{T }
+
+Add Val Exp
+Γ ` e1 : (Ψ, Σ) value[boxed{n}]{n0 }
+Γ ` e2 : int[>{0}]{m}
+Σ = Π0 + · · · + Πk
+n0 ≤ k
+Πn0 = mt 0 × · · · × mt j
+n + m ≤t otj
+Γ ` e1 +p e2 : (Ψ, Σ) value[boxed{n + m}]{n0 }
+
+Since e1 is a value, it must have the form {n} by ML
+Int Exp. Therefore the rule o-intval applies and
+setting e0 = n satisfies (1). If T = > then clearly
+Γ ` n : int[>{0}]{>} by Int Exp. If T = m then
+ML Int Exp states that n = m and thus Γ ` n :
+int[>{0}]{n}. Note that T can not be ⊥ since it is
+a value. Therefore we have exhausted all cases for T
+and (2) is satisfied.
+
+Add C Exp
+Γ, P ` e1 : ct *[>{0}]{>}
+Γ, P ` e2 : int[>{0}]{0}
+Γ, P ` e1 +p e2 : ct *[>{0}]{>}
+Val Deref Exp
+Γ ` e1 : (Ψ, Σ) value[boxed{n}]{m}
+Σ = Π0 + · · · + Πk
+m≤k
+Πm = mt 0 × · · · × mt j
+n≤j
+Γ ` *e : mt n value[>{0}]{>}
+
+2
+We next show subject reduction for statements. Recall
+that typing judgments for statements include label environments G. Thus we introduce a notion of compatibility
+of G with our statement store D, similar to the ∼ relation
+defined above:
+
+C Deref Exp
+Γ ` e : ct *[>{0}]{>}
+Γ ` *e : ct[>{0}]{>}
+
+Definition 5 (L-Compatibility) A statement store D
+is said to L-compatible with a label environment G, written D ∼L G, if for all L ∈ D there exists Γ such that
+G(L), G ` D(L), Γ.
+
+AOP Exp
+Γ ` e1 : int[>{0}]{T }
+Γ ` e2 : int[>{0}]{T 0 }
+Γ ` e1 aop e2 : int[>{0}]{T aop T 0 }
+Val Int Exp
+Γ ` e : int[>{0}]{T }
+T +1≤Ψ
+Γ ` Val int e : (Ψ, Σ) value[unboxed{0}]{T }
+
+As we said above, whenever we branch to a label L,
+the next statement to be evaluated is D(L). This is only
+valid if the statement to which D maps L is a labeled
+statement. Formally:
+
+Int Val Exp
+Γ ` e : mt value[unboxed{0}]{T }
+Γ ` Int val e : int[>{0}]{T }
+
+Definition 6 (Well Formedness of D) D is said to
+be well formed if for all L ∈ D, D(L) is a statement
+of the form L : s.
+
+Figure 13: Type Checking Rules for C Expressions
+
+Recall from Section 3.3.2 that we define Γ v Γ0 if
+Γ(x) v Γ0 (x) for all x ∈ dom(Γ)∪dom(Γ0 ). Since compatibility is an important property to preserve in our subject
+reduction lemma for statements, we first present a result
+that shows that store compatibility follows this relation.
+15
+
+Empty Stmt
+Γ, G ` (), Γ
+
+Seq Stmt
+Γ, G ` s1 , Γ0
+Γ0 , G ` s2 , Γ00
+Γ, G ` s1 ; s2 , Γ00
+
+Lbl Stmt
+G(L), G ` s, Γ0
+Γ v G(L)
+Γ, G ` L: s, Γ0
+
+Goto Stmt
+Γ v G(L)
+Γ, G ` goto L, reset(Γ)
+
+If Stmt
+Γ ` e : int[>{0}]{T }
+Γ v G(L)
+Γ, G ` if e then L, Γ
+
+Γ, G ` x : mt[B{0}]{T }
+Γ0 = Γ[x 7→ mt value[unboxed{0}]{T }]
+Γ0 v G(L)
+Γ, G ` if unboxed(x) then L, Γ[x 7→ mt value[boxed{0}]{T }]
+
+If sum tag Stmt
+Γ ` x : mt value[boxed{0}]{T }
+mt = (C, Π0 + · · · + Πn + Σ)
+Γ0 = Γ[x 7→ mt value[boxed{0}]{n}]
+Γ0 v G(L)
+Γ, G ` if sum tag(x) == n then L, Γ
+
+If int tag Stmt
+Γ ` x : mt value[unboxed{0}]{T }
+mt = (Ψ, Σ)
+n+1≤Ψ
+Γ0 = Γ[x 7→ mt value[unboxed{0}]{n}]
+Γ0 v G(L)
+Γ, G ` if int tag(x) == n then L, Γ
+
+LSet Stmt
+Γ ` *(e1 +p n) : ct[>{0}]{>}
+Γ ` e2 : ct[B{0}]{T }
+Γ, G ` *(e1 +p n) := e2 , Γ
+
+If unboxed Stmt
+
+VSet Stmt
+Γ ` e : ct[B{I}]{T }
+Γ, G ` x := e, Γ[x 7→ ct[B{I}]{T }]
+
+Figure 14: Type Checking Rules for C Statements
+0 v I 0 and thus Γ2 will again assign a compatible type
+in this case. If V (x) = {n} then ML Int Exp applies
+and since unboxed v B and B v B 0 , then unboxed v B 0 .
+Similarly 0 v I 0 and n v T 0 and thus Γ2 will assign a
+compatible type. Finally, if V (x) = {l + n}, then since
+boxed v B and B v B 0 , then boxed v B 0 . Similarly
+0 v I 0 and n v T 0 . Thus in all cases Γ2 will assign a
+compatible type to V (x).
+2
+Several of our statements given in Figure 10 contain a
+label L which the program may branch to. Therefore we
+first present a lemma for this common case:
+
+Lemma 2 If Γ1 v Γ2 and Γ1 ∼ hSC , SM L , V i then Γ2 ∼
+hSC , SM L , V i
+Proof: Let l ∈ dom(SC ). Then by compatibility, there
+exists ct such that Γ1 ` SC (l) : ct[>{0}]{>}. Since Γ1 v
+Γ2 , then Γ2 ` SC (l) : ct[>{I}]{>} where 0 v I. Since
+SC maps locations to values, SC (l) could be one of n, l,
+{n}, or {l + n}. By examining the type rules, we see that
+Int Exp, Loc Exp, and ML Int Exp can assign I = 0
+in the first three cases. Therefore consider when SC (l) =
+{l0 + n}. Since Γ1 ` {l0 + n} : ct[>{0}]{>}, then n = 0
+by ML Loc Exp. Therefore Γ2 ` {l0 + 0} : ct[>{0}]{>}
+by ML Loc Exp. Thus Γ2 is compatible with SC .
+Let {l + n} ∈ dom(SM L ). Then by compatibility, there
+exists ct such that Γ1 ` SM L ({l + n}) : ct[>{0}]{>}.
+Since Γ1 v Γ2 , then Γ2 ` SM L ({l + n}) : ct[>{I}]{>}
+where 0 v I. Since SM L maps locations to values, I = 0
+by a parallel argument to the above case and thus Γ2 `
+SM L ({l+n}) : ct[>{0}]{>}. Since Γ1 and Γ2 only differ in
+the tags which they assign {l + n} and not the ct type, we
+see that Γ2 trivially satisfies the remaining compatibility
+requirements with SM L .
+Finally, let x ∈ dom(V ). Since Γ1 is compatible with
+V , there exists ct, B, I, T such that Γ1 ` x : ct[B{I}]{T }
+and Γ1 ` V (x) : ct[B{I}]{T }. Since Γ1 v Γ2 , Γ2 `
+x : ct[B 0 {I 0 }]{T 0 } where B v B 0 , I v I 0 , and T v T 0 .
+Since V maps variables to values, V (x) must be one of
+n, {n}, l, or {l + n}. If V (x) = n, then Int Exp applies
+and B = B 0 = >. Since I v I 0 and 0 v I, then 0 v I 0 .
+Similarly, since T v T 0 and n v T then n v T 0 . Therefore
+Int Exp again applies and we see that Γ2 will assign a
+compatible type. If V (x) = l, then Loc Exp applies and
+B = B 0 = T = T 0 = >. Since 0 v I and I v I 0 , then
+
+Lemma 3 If Γ1 ∼ hSC , SM L , V i, D ∼L G, D is well
+formed, and Γ1 v G(L), then for any statement s such
+that Γ1 , G ` s, Γ2 and
+0
+0
+0
+hSC , SM L , V, si → hSC
+, SM
+L , V , D(L)i
+
+there exist Γ3 , s0 such that
+(I) hSC , SM L , V, si → hSC , SM L , V, L : s0 i,
+(II) G(L) ∼ hSC , SM L , V i, and
+(III) G(L), G ` L : s0 , Γ3
+Proof: Since D is well formed, there exists s0 such that
+hSC , SM L , V, si → hSC , SM L , V, L : s0 i
+thus showing (I). Also, since D ∼L G, there exists Γ3
+such that G(L), G ` L : s0 , Γ3 satisfying (II). Since Γ1 v
+G(L) then by Lemma 2, G(L) ∼ hSC , SM L , V i. (3).
+2
+Finally, we show subject reduction for statements. All
+of our statements will be reduced in one of three ways
+16
+
+which correspond to the three possible conclusions below. case e1 := e2 In this case, we have several sub-cases depending on whether e1 or e2 is a value or not and
+Either the statement contains a sub-expression which can
+which type rule applies. First consider the case
+be reduced, the statement is part of a sequence s1 ; s2 and
+where e2 is not a value and thus we will show (1).
+reduces to the second statement, or the statement makes
+Note that either VSet Stmt or LSet Stmt can apa branch to a label. Note that certain statements may
+ply. First consider the case where the rule VSet
+support more than one conclusion (if a sequence contains
+Stmt applies. Here, there must exist ct, B, I, T such
+a label statement), which is allowed since we only require
+that Γ1 ` e2 : ct[B{I}]{T }. Since e2 is not a
+at least one conclusion to hold. Each conclusion is similar
+value, Lemma 1 states there exists an e02 such that
+in that it ensures that at every step of the program: (a) it
+hSC , SM L , V, e2 i → hSC , SM L , V, e02 i with Γ1 ` e02 :
+is possible to take a step, (b) the stores are still compatible
+ct[B{I}]{T }. Therefore
+with the type environments at that step, and (c) the new
+statement is still well typed.
+hSC , SM L , V, e1 := e2 ; s0 i → hSC , SM L , V, e1 := e02 ; s0 i
+Lemma 4 (Subject Reduction for Statements)
+and we have satisfied (a).
+Since Γ1 ` e02 :
+If s is a statement, Γ1 , G ` s, Γ2 , Γ1 ∼ hSC , SM L , V i,
+0
+ct[B{I}]{T } then Γ1 , G ` e1 := e2 ; s0 , Γ2 and thus we
+D ∼L G, and D is well formed then either s = () or
+have shown (b). (1) can also be shown when LSet
+s = s1 ; s2 and one of the following must hold:
+Stmt applies (and e2 not a value) by a parallel argument.
+(1) There exist Γ01 , s01 such that
+Now we will consider the cases when e2 is a value.
+Note that according to our grammar e1 can either be
+of the form x or *(e3 +p n).
+
+(a) hSC , SM L , V, s1 ; s2 i → hSC , SM L , V, s01 ; s2 i
+(b) Γ01 ∼ hSC , SM L , V i
+(c) Γ01 , G ` s01 ; s2 , Γ2
+(2)
+
+If e1 = x then we will show conclusion (2). Here, the
+rule o-var-assign applies and thus
+
+0
+0
+0
+, SM
+There exist Γ01 , SC
+L , V such that
+
+hSC , SM L , V, x := v; si → hSC , SM L , V 0 , si
+
+0
+0
+0
+, SM
+(a) hSC , SM L , V, s1 ; s2 i → hSC
+L , V , s2 i
+
+where V 0 = V [x 7→ v] and so conclusion (a) is satisfied.
+
+0
+0
+0
+, SM
+(b) Γ01 ∼ hSC
+L, V i
+
+(c) Γ01 , G ` s2 , Γ2
+
+Furthermore, the type rule VSet Stmt applies and
+thus there exist ct, B, I, T such that Γ1 ` e2 :
+ct[B{I}]{T }. The rule also states that Γ1 , G ` x :=
+e2 , Γ01 where Γ01 = Γ1 [x 7→ ct[B{I}]{T }. Therefore Γ01 ` V 0 (x) : Γ01 (x). Since SC and SM L are
+unchanged, then Γ01 ∼ hSC , SM L , V 0 i and we have
+shown (b).
+
+(3) There exist Γ4 , s3 such that
+(a) hSC , SM L , V, s1 ; s2 i → hSC , SM L , V, L : s3 i
+(b) G(L) ∼ hSC , SM L , V i
+(c) G(L), G ` L : s3 , Γ4
+Proof: By induction on the structure of s1 :
+
+Recall from our hypothesis that Γ1 , G ` s1 ; s2 , Γ2
+and thus Γ1 , G ` x := e2 ; s2 , Γ2 . Here, the type rule
+Seq Stmt applies and since Γ1 , G ` x := e2 , Γ01 , then
+Γ01 , G ` s2 , Γ2 and thus we have shown (c).
+
+0
+
+case L: s In this case, the rule o-label applies and thus
+hSC , SM L , V, L : s0 ; s2 i → hSC , SM L , V, s0 ; s2 i
+
+Now consider the case where e1 has the form of
+*(e3 +p n). If e3 is not a value, then we can show
+that (1) holds by a parallel argument to the case
+where e2 was not a value. If e3 is a value, then the
+rule LSet Stmt applies and we will show (2). Recall
+that LSet Stmt states that there exists ct such that
+Γ1 ` *(e3 +p n) : ct[>{0}]{>}. By examining the
+type rules, we see that either C Deref Exp or Val
+Deref Exp may apply.
+
+and so we are in case (1) and (a) has been satisfied.
+Further, the type rule Lbl Stmt applies and thus
+Γ1 v G(L) and
+G(L), G ` s0 , Γ2
+Thus selecting Γ01 = G(L) satisfies (c). Note also
+that since Γ1 v Γ01 , Γ01 ∼ hSC , SM L , V i by Lemma 2
+and (b) is satisfied.
+
+First consider the case when C Deref Exp applies
+and therefore Γ1 ` (e3 +p n) : ct *[>{0}]{>}. The
+only type rule which applies to (e3 +p n) is Add C
+Exp and therefore Γ1 ` e3 : ct *[>{0}]{>} and Γ1 `
+n : int[>{0}]{0}. By again examining the type rules,
+the only value with a C pointer type is a location l
+and therefore since e3 is a value, e3 = l. Similarly, we
+
+case goto L In this case, the rule o-goto applies and thus
+0
+0
+0
+hSC , SM L , V, goto L; s2 i → hSC
+, SM
+L , V , D(L)i
+
+Note also that the type rule Goto Stmt applies and
+thus Γ1 v G(L). Therefore by Lemma 3 we have
+shown conclusion (3).
+17
+
+see that n must be 0. Therefore the rule o-c-assign case if e then L Note that the type rule If Stmt applies
+applies and thus
+and thus Γ1 v G(L) and there exists T such that
+Γ1 ` e : int[>{0}]{T } . If e is not a value, then we
+0
+hSC , SM L , V, *(l +p 0) := e2 ; s0 i → hSC
+, SM L , V, s0 i
+are in case (1). By Lemma 1 there exists e0 such that
+Γ1 ` e0 : int[>{0}]{T } and
+0
+where SC
+= SC [l 7→ e2 ] and thus we have shown
+(a). Since Γ1 ` e2 : ct[B{0}]{T } then Γ1 ` e2 :
+hSC , SM L , V, ei → hSC , SM L , V, e0 i
+ct[>{0}]{>}. Since SM L and V are unchanged then
+Γ1 ∼ hSc , SM L , V i and thus we have shown concluTherefore Γ1 , G ` if e0 then L, Γ2 and
+sion (b).
+hSC , SM L , V, if e then L; s0 i →
+Recall from our hypothesis that Γ1 , G ` s1 ; s2 , Γ2 and
+hSC , SM L , V, if e0 then L; s0 i
+thus Γ , G ` *(e + n) := e ; s , Γ . Here, the type
+1
+
+3
+
+p
+
+2
+
+2
+
+2
+
+rule Seq Stmt applies and since Γ1 , G ` *(e3 +p
+n) := e2 , Γ1 , then Γ1 , G ` s2 , Γ2 and thus we have
+shown (c), concluding the case where C Deref Exp
+applies.
+
+and thus we have shown conclusion (a). Since Γ1 `
+e0 : int[>{0}]{T }, then Γ1 , G ` if e0 then L; s0 , Γ1
+which satisfies (c). Since our output environment is
+unchanged, then clearly (b) is satisfied.
+
+Finally, consider the case where e1 has the form
+*(e3 +p n), e3 is a value, and Val Deref Exp applies to *(e3 +p n). Here, we will show conclusion (2).
+Recall type rule Val Deref Exp:
+
+If e is a value, then by inspecting the type rules, the
+only values with type int are numbers, so e must be
+some number n. If n 6= 0 then the rule o-if applies
+and thus
+
+Γ1 ` (e3 +p n) : (Ψ, Σ) value[boxed{n1 }]{m}
+Σ = Π0 + · · · + Πk
+m≤k
+Πm = mt 0 × · · · × mt j
+n1 ≤ j
+
+hSC , SM L , V, if e then L; s0 i → hSC , SM L , V, D(L)i
+Since we have Γ1 v G(L) from above, Lemma 3 can
+be applied and conclusion (3) is satisfied.
+
+Γ1 ` *(e3 +p n) : mt n1 value[>{0}]{>}
+
+If n = 0 then the rule o-if2 applies and we will show
+(2). Since o-if2 applies, then
+
+(and thus ct = mt n1 ). Therefore, by LSet Stmt,
+Γ1 ` e2 : mt n1 value[B{0}]{T }. Note that the only
+rule which applies to (e3 +p n) in this situation is
+Add Val Exp:
+
+hSC , SM L , V, if e then L; s0 i → hSC , SM L , V, s0 i
+which satisfies (a). Since s1 has not updated the
+environment, then (b) holds trivially. Finally, since
+Γ1 , G ` s1 ; s2 , Γ2 , and Γ1 , G ` if e then L, Γ1 , then
+Γ1 , G ` s2 , Γ2 by Seq Stmt and thus (2) is satisfied.
+
+Γ1 ` e3 : (Ψ, Σ) value[boxed{n2 }]{m}
+Γ1 ` n : int[>{0}]{n}
+Σ = Π0 + · · · + Πk
+m≤k
+Πm = mt 0 × · · · × mt j
+n + n2 ≤ j
+Γ1 ` e3 +p n : (Ψ, Σ) value[boxed{n2 + n}]{m}
+
+case if sum tag(x) == n then L Note that the type
+rule If sum tag Stmt applies and thus Γ01 v G(L).
+Also by If sum tag Stmt, there exist mt, T such
+that Γ1 ` x : mt value[boxed{0}]{T }. Since
+Γ1 is compatible with V , then Γ1 ` V (x) :
+mt value[boxed{0}]{T }. Since V (x) must be value,
+0
+0
+hSC , SM L , V, *(e3 +p n) := e2 ; s0 i → hSC , SM
+then by inspecting the type rules, the only values
+L , V, s i
+with type mt value[boxed{0}]{T } are ML locations,
+0
+where SM
+L = SM L [{l + n1 } 7→ e2 ] and thus we have
+so V (x) must be some location {l + 0}. Also, note
+shown (a).
+that {l + 0} ∈ SM L and thus SM L ({l + −1}) = m by
+compatibility.
+Since Γ1 ` e2 : mt n1 [B{0}]{T }, then all of the bullets in requirement (3.) of compatibility are still satIf m = n then since Γ01 ` x : mt value[boxed{0}]{n},
+isfied except for the fourth. However, Since Γ1 ` e2 :
+then Γ01 ∼ hSC , SM L , V i. Also the rule o-ifsum apct[B{0}]{T } then clearly Γ1 ` e2 : ct[>{0}]{>} and
+plies and thus
+0
+thus Γ1 is compatible with SM
+L . Therefore, since
+0
+SC and V have not changed, Γ1 ∼ hSC , SM
+L , V i and
+hSC , SM L , V, if sum tag(x) == n then L; s0 i →
+thus (b) holds.
+hSC , SM L , V, D(L)i
+Recall from our hypothesis that Γ1 , G ` s1 ; s2 , Γ2 and
+Since we showed Γ01 v G(L) above and Γ01 ∼
+thus Γ1 , G ` *(e3 +p n) := e2 ; s2 , Γ2 . Here, the type
+hSC , SM L , V i, we can apply Lemma 3 and thus conrule Seq Stmt applies and since Γ1 , G ` *(e3 +p
+clusion (3) is satisfied.
+n) := e2 , Γ1 , then Γ1 , G ` s2 , Γ2 and thus we have
+shown (c).
+If m 6= n then the rule o-ifsum2 applies and thus
+
+(and note n1 = n+n2 ). By again examining the type
+rules, we see that the only value with an ML pointer
+type is an ML location, and thus e3 = {l + n2 }.
+Therefore the rule o-ml-assign applies and thus
+
+18
+
+hSC , SM L , V, if sum tag(x) == n then L; s0 i →
+hSC , SM L , V, s0 i
+
+hSC , SM L , V, if unboxed(x) then L; s0 i →
+hSC , SM L , V, D(L)i
+
+and (2a) is satisfied. Since s1 has not updated
+the environment, compatibility holds trivially and
+thus (2b) is satisfied. Finally, recall from our hypothesis that Γ1 , G ` s1 ; s2 , Γ2 and thus Γ1 , G `
+if sum tag(x) == n then L; s2 , Γ2 . Here, the
+type rule Seq Stmt applies and since Γ1 , G `
+if sum tag(x) == n then L, Γ1 , then Γ1 , G ` s2 , Γ2
+and thus we have shown (2c).
+
+Since we showed Γ1 v G(L) by If unboxed Stmt,
+we can apply Lemma 3 and thus conclusion (3) is
+satisfied.
+If V (x) = {l + 0} then let
+Γ001 = Γ1 [x 7→ mt value[boxed{0}]{T }]
+By examining the type rules, we see that Γ001 `
+V (x) : Γ001 (x) by ML Loc Exp and thus Γ001 ∼
+hSC , SM L , V i which satisfies conclusion (2b). Also,
+the rule o-iflong2 applies and thus
+
+case if int tag(x) == n then L Note that the type
+rule If int tag Stmt applies and thus Γ01 v
+G(L) and there exist mt, T such that Γ1 `
+x : mt value[unboxed{0}]{T }.
+Also Γ1 `
+V (x) : mt value[unboxed{0}]{T } by compatibility. Since V (x) must be a value, then by inspecting the type rules, the only values with type
+mt value[unboxed{0}]{T } are ML numbers, so V (x)
+must be some number {m}. If n = m then since
+Γ01 ` x : mt value[unboxed{0}]{n}, then Γ01 ∼
+hSC , SM L , V i. Also, the rule o-ifi applies and thus
+
+hSC , SM L , V, if unboxed(e) then L; s0 i → hSC , SM L , V, s0 i
+which satisfies (2a).
+Finally, recall from our
+hypothesis that Γ1 , G ` s1 ; s2 , Γ2 and thus
+Γ1 , G ` if unboxed(x) then L; s2 , Γ2 . Here, the
+type rule Seq Stmt applies and since Γ1 , G `
+if unboxed(x) then L, Γ001 , then Γ001 , G ` s2 , Γ2 and
+thus we have shown (2c).
+2
+The standard approach to proving soundness is to show
+that if e →∗ v, then v is not stuck. Since statements in
+our language do not reduce to values, the only statement
+which is not stuck is the empty statement, (). Therefore it
+is sufficient to show that every statement either diverges
+or eventually reduces to ().
+
+0
+
+hSC , SM L , V, if int tag(x) == n then L; s i →
+hSC , SM L , V, D(L)i
+Since Γ01 v G(L) and Γ01 ∼ hSC , SM l , V i, then we can
+apply Lemma 3 and thus conclusion (3) is satisfied.
+If n 6= m then the rule o-ifi2 applies and thus
+hSC , SM L , V, if int tag(x) == n then L; s0 i →
+hSC , SM L , V, s0 i
+
+Theorem 2 (Soundness) If Γ
+`
+s, Γ0 , Γ
+∼
+hSC , SM L , V i, D ∼L G and D is well formed, then
+either hSC , SM L , V, si diverges, or hSC , SM L , V, si →∗
+0
+0
+0
+, SM
+hSC
+L , V , ()i.
+
+and thus conclusion (2a) is satisfied. Since s1
+has not updated the environment, then conclusion
+(2b) hold trivially. Finally, recall from our hypothesis that Γ1 , G ` s1 ; s2 , Γ2 and thus Γ1 , G `
+if int tag(x) == n then L; s2 , Γ2 . Here, the
+type rule Seq Stmt applies and since Γ1 , G `
+if int tag(x) == n then L, Γ1 , then Γ1 , G ` s2 , Γ2
+and thus we have shown (2c).
+
+Proof: By Lemma 4 we can continually reduce the statement and reestablish our compatibly assumptions. Therefore either this process will continue forever, or there ex0 0
+0
+0
+, SM
+ists s0 such that hSC , SM L , V, si →∗ hSC
+L , V , s i and
+0 00
+0
+00
+0
+0
+for all s , hSC , SM L , V, s i 6→ hSC , SM L , V , s i. Since s0
+is well typed by Lemma 4, it must be () or else we could
+apply Lemma 4 again and produce s00 .
+2
+
+case if unboxed(x) then L Note that the type rule
+If unboxed Stmt applies and thus there exist
+mt, B, T such that Γ1 ` x : mt value[B{0}]{T }.
+Also, Γ1 ` V (x) : mt value[B{0}]{T } by compatibility. Since V (x) must be a value, then by inspecting the type rules, the only values with type
+mt value[B{0}]{T } are ML numbers and ML locations. Therefore V (x) must be either a number
+{n} or a location {l + 0}. If V (x) = {n} then since
+Γ01 ` x : mt value[unboxed{0}]{T } then Γ01 is compatible with V by the type rule ML Int Exp and
+thus Γ01 ∼ hSC , SM L , V i. Also, the rule o-iflong
+applies and thus
+19
+
+

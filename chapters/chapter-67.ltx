@@ -1,0 +1,453 @@
+%%
+%% chapter-67.ltx — Alias Analysis
+%%
+
+\section{Introduction}\label{sec:alias-analysis-intro}
+
+Alias analysis determines whether two pointer expressions may refer to the same memory location at a given program point. While closely related to pointer analysis (Chapter~\ref{sec:pointer-analysis}), alias analysis answers a different question: rather than asking ``what does $p$ point to?'', it asks ``can $p$ and $q$ refer to the same location?'' This distinction matters because alias information is often what optimizations actually need, and it can sometimes be computed more efficiently than full points-to information.
+
+The alias analysis problem has a rich history in compiler research, dating back to the early work of Barth~\cite{barth1978efficient} (1978) and Burke, Cytron, and Cooper~\cite{burke1990interprocedural} (1990). Modern alias analyses range from simple type-based heuristics to sophisticated flow- and context-sensitive analyses built on abstract interpretation.
+
+\section{Alias Pairs and Must/May Alias}\label{sec:alias-pairs}
+
+\begin{definition}[Alias]\label{def:alias}
+Two memory accesses $a_1$ and $a_2$ are \textbf{aliased} if they may refer to the same memory location during some execution of the program.
+\end{definition}
+
+\begin{definition}[Must Alias]\label{def:must-alias}
+Two accesses $a_1$ and $a_2$ \textbf{must alias} if they are guaranteed to refer to the same memory location in every execution.
+\end{definition}
+
+\begin{definition}[May Alias]\label{def:may-alias}
+Two accesses $a_1$ and $a_2$ \textbf{may alias} if there exists some execution in which they refer to the same memory location.
+\end{definition}
+
+The distinction between must and may alias is critical for optimization:
+\begin{itemize}
+  \item If $a_1$ and $a_2$ \emph{must alias}, then a store through $a_1$ definitely affects a subsequent load through $a_2$.
+  \item If $a_1$ and $a_2$ \emph{may alias}, then a store through $a_1$ \emph{might} affect a subsequent load through $a_2$.
+  \item If $a_1$ and $a_2$ \emph{cannot alias} (no alias), then a store through $a_1$ definitely does not affect a load through $a_2$.
+\end{itemize}
+
+\begin{definition}[Alias Relation]\label{def:alias-relation}
+The \textbf{alias relation} at a program point $p$ is a symmetric relation $\mathit{Alias}(p) \subseteq \mathit{Accesses} \times \mathit{Accesses}$ where $(a_1, a_2) \in \mathit{Alias}(p)$ iff $a_1$ and $a_2$ may alias at $p$.
+\end{definition}
+
+\section{Type-Based Alias Analysis}\label{sec:tbaa}
+
+Type-based alias analysis (TBAA) uses the type system to determine that certain accesses cannot alias. This is a fast, conservative analysis that requires no dataflow computation.
+
+\begin{definition}[Type-Based Non-Aliasing]\label{def:tbaa}
+Two accesses $a_1$ of type $T_1$ and $a_2$ of type $T_2$ \textbf{cannot alias} if $T_1$ and $T_2$ are \textbf{incompatible types}: types that cannot occupy the same memory location.
+\end{definition}
+
+In C and C++, the type-based aliasing rules (the ``strict aliasing rule'') state that an object of type $T$ can only be accessed through:
+\begin{itemize}
+  \item A pointer of type $T$
+  \item A pointer to a type compatible with $T$
+  \item A pointer to a signed/unsigned variant of $T$
+  \item A pointer to \texttt{char} or \texttt{unsigned char}
+\end{itemize}
+
+\begin{example}[Type-Based Aliasing]\label{ex:tbaa}
+In C, given:
+\begin{verbatim}
+  int *p;
+  float *q;
+\end{verbatim}
+Under strict aliasing rules, \texttt{*p} and \texttt{*q} cannot alias because \texttt{int} and \texttt{float} are incompatible types. The compiler can use this to reorder loads and stores through \texttt{p} and \texttt{q}.
+\end{example}
+
+\subsection{Type DAG and Alias Queries}\label{sec:tbaa-dag}
+
+TBAA is typically implemented using a \emph{type directed acyclic graph} (type DAG) that represents the type hierarchy:
+
+\begin{definition}[Type DAG]\label{def:type-dag}
+The \textbf{type DAG} is a directed acyclic graph where:
+\begin{itemize}
+  \item Nodes represent types (scalar types, struct types, array types).
+  \item Edges represent containment: an edge from $T$ to $S$ means $T$ may contain a field of type $S$.
+  \item Each node is annotated with an offset range representing which bytes of the type are occupied.
+\end{itemize}
+\end{definition}
+
+An alias query between two accesses is answered by finding their types in the DAG and checking whether the types (at the given offsets) can overlap.
+
+\section{Location-Based Alias Analysis}\label{sec:lbaa}
+
+Location-based alias analysis partitions memory into \emph{locations} (or \emph{memory partitions}) and determines which pointers may access which locations.
+
+\begin{definition}[Memory Location]\label{def:memory-location}
+A \textbf{memory location} is an equivalence class of memory addresses. Common partitioning strategies include:
+\begin{itemize}
+  \item \textbf{Static variables}: Each global/static variable is its own location.
+  \item \textbf{Stack allocations}: Each local variable is its own location within its scope.
+  \item \textbf{Heap allocations}: Each allocation site (or group of sites) defines a location.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Location-Based Alias]\label{def:lb-alias}
+Two pointers $p$ and $q$ \textbf{may alias} if there exists a memory location $L$ such that both $p$ and $q$ may point to some address in $L$.
+\end{definition}
+
+\subsection{The Anderson--Heintze Approach}\label{sec:anderson-heintze}
+
+Location-based analysis can be formulated as a constraint system similar to Andersen's pointer analysis, but with the goal of computing alias pairs rather than points-to sets. The key insight is that two pointers alias if and only if their points-to sets intersect.
+
+\begin{definition}[Alias from Points-To]\label{def:alias-from-pts}
+Given points-to sets $\mathit{pts}(p)$ and $\mathit{pts}(q)$:
+\[
+\mathit{may\_alias}(p, q) \iff \mathit{pts}(p) \cap \mathit{pts}(q) \neq \emptyset
+\]
+\[
+\mathit{must\_alias}(p, q) \iff \mathit{pts}(p) = \mathit{pts}(q) = \{l\} \text{ for some single location } l
+\]
+\end{definition}
+
+\section{Region-Based Alias Analysis}\label{sec:region-alias}
+
+Region-based alias analysis groups memory locations into \emph{regions} and reasons about aliasing at the region level.
+
+\begin{definition}[Memory Region]\label{def:memory-region}
+A \textbf{memory region} is a set of memory locations that share a common property. Regions are typically defined by:
+\begin{itemize}
+  \item \textbf{Allocation site}: All objects allocated at a given site form a region.
+  \item \textbf{Procedure scope}: All stack-allocated objects in a procedure form a region.
+  \item \textbf{Data structure}: All nodes of a linked list form a region.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Region-Based Alias]\label{def:region-alias}
+Two pointers $p$ and $q$ \textbf{may alias at the region level} if they may point to the same region. They \textbf{cannot alias at the region level} if they point to different regions.
+\end{definition}
+
+Region-based analysis is less precise than location-based analysis but can be much faster, since the number of regions is typically much smaller than the number of locations.
+
+\subsection{Region Inference}\label{sec:region-inference}
+
+\emph{Region inference} is the process of automatically assigning memory locations to regions. Tofte and Talpin~\cite{tofte1997region} developed a region inference algorithm for ML-like languages that determines the lifetime of each region and enables region-based memory management.
+
+\section{Applications to Optimization}\label{sec:alias-optimization}
+
+\subsection{Memory Disambiguation}\label{sec:memory-disambiguation}
+
+The primary application of alias analysis is \emph{memory disambiguation}: determining whether two memory accesses can be reordered.
+
+\begin{definition}[Dependence Types]\label{def:dependence-types}
+Given two memory accesses $a_1$ (at program point $p_1$) and $a_2$ (at program point $p_2$) with $p_1$ before $p_2$:
+\begin{itemize}
+  \item \textbf{Raw} (Read-After-Write / true dependence): $a_1$ writes, $a_2$ reads, and they may alias.
+  \item \textbf{War} (Write-After-Read / anti-dependence): $a_1$ reads, $a_2$ writes, and they may alias.
+  \item \textbf{Waw} (Write-After-Write / output dependence): $a_1$ writes, $a_2$ writes, and they may alias.
+  \item \textbf{Rar} (Read-After-Read): always safe to reorder; no dependence.
+\end{itemize}
+\end{definition}
+
+\subsection{Loop Dependence Analysis}\label{sec:loop-dependence}
+
+In loops, alias analysis determines whether different iterations access the same memory locations. This is critical for loop parallelization and vectorization.
+
+\begin{definition}[Loop-Carried Dependence]\label{def:loop-carried}
+A \textbf{loop-carried dependence} exists between iterations $i$ and $j$ of a loop if an access in iteration $i$ and an access in iteration $j$ are aliased and at least one is a write.
+\end{definition}
+
+\subsection{Pointer Disambiguation in Superscalar Processors}\label{sec:hw-disambiguation}
+
+Modern processors use hardware alias disambiguation (store-to-load forwarding, memory disambiguation buffers) to speculatively execute loads before preceding stores are resolved. The processor predicts whether a load-store pair aliases and recovers if the prediction is wrong.
+
+\section{Connection to Pointer Analysis}\label{sec:alias-pointer-connection}
+
+Alias analysis and pointer analysis are complementary techniques:
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lp{6cm}}
+\hline
+\textbf{Aspect} & \textbf{Comparison} \\
+\hline
+Question & Pointer: ``What does $p$ point to?'' \\
+         & Alias: ``Can $p$ and $q$ refer to the same location?'' \\
+Output & Pointer: points-to sets \\
+       & Alias: alias pairs (or no-alias pairs) \\
+Precision & Pointer analysis can be more precise \\
+          & Alias analysis can be more efficient \\
+Usage & Pointer analysis for call graph construction, security \\
+      & Alias analysis for optimization, disambiguation \\
+\hline
+\end{tabular}
+\caption{Comparison of pointer analysis and alias analysis.}
+\label{tab:alias-pointer}
+\end{table}
+
+In practice, alias analysis is often implemented on top of pointer analysis: first compute points-to sets, then derive alias pairs by checking for intersection. However, direct alias analysis can be more efficient when only pairwise alias queries are needed.
+
+\begin{definition}[Direct Alias Analysis]\label{def:direct-alias}
+\textbf{Direct alias analysis} computes alias information without first computing full points-to sets. Instead, it reasons directly about whether two accesses can reach the same location, using constraint solving or abstract interpretation.
+\end{definition}
+
+\begin{insight}
+The relationship between pointer analysis and alias analysis is an instance of a more general principle: sometimes it is more efficient to compute the answer to a specific query directly than to compute a complete solution and then extract the answer. Direct alias analysis can avoid computing points-to information for pointers that are not involved in any alias query.
+\end{insight}
+
+\begin{historical}
+Alias analysis has been a central topic in compiler research since the late 1970s. Barth's 1978 paper~\cite{barth1978efficient} introduced interprocedural data flow analysis for alias computation. The 1990s saw the development of flow-sensitive alias analysis (Burke, Cytron, and Cooper~\cite{burke1990interprocedural}) and the recognition of the connection between alias analysis and pointer analysis. Wilson, Kaplan, and Smaragdakis~\cite{wilson2001practical} (2001) showed that simple, practical alias analyses can achieve surprisingly good results for optimization. Modern work focuses on integrating alias analysis with type systems (Rust's borrow checker is a compile-time alias analysis) and hardware (memory disambiguation in out-of-order processors).
+\end{historical}
+
+\section{Flow-Sensitive Alias Analysis}\label{sec:flow-sensitive-alias}
+
+\emph{Flow-sensitive} alias analysis takes the order of statements into account, producing more precise results than flow-insensitive analysis.
+
+\begin{definition}[Flow-Sensitive Alias]\label{def:flow-sensitive-alias}
+A \textbf{flow-sensitive} alias analysis computes, for each program point $p$, the set of alias pairs valid at $p$. The analysis respects the sequential order of statements: if $p = \&x$ appears before $p = \&y$, then at the point between them, $p$ aliases only $x$.
+\end{definition}
+
+Flow-sensitive alias analysis is more precise but also more expensive. The analysis must track how alias relationships change as the program executes, which requires a dataflow analysis over the CFG.
+
+\subsection{Alias Constraints}\label{sec:alias-constraints}
+
+\begin{definition}[Alias Constraints]\label{def:alias-constraints}
+Flow-sensitive alias analysis generates constraints at each program point:
+\begin{itemize}
+  \item \textbf{Assignment}: $p = q$ creates an alias between $p$ and $q$.
+  \item \textbf{Load}: $p = *q$ creates aliases between $p$ and all objects that $q$ may point to.
+  \item \textbf{Store}: $*p = q$ creates aliases between all objects that $p$ may point to and $q$.
+  \item \textbf{Kill}: $p = \&x$ destroys any previous alias between $p$ and other objects.
+\end{itemize}
+\end{definition}
+
+\section{Alias Analysis in Modern Compilers}\label{sec:modern-alias}
+
+\subsection{LLVM's Alias Analysis Infrastructure}\label{sec:llvm-aa}
+
+LLVM provides a layered alias analysis infrastructure:
+\begin{itemize}
+  \item \textbf{BasicAA}: Uses type-based and scope-based reasoning.
+  \item \textbf{TBAA}: Type-based alias analysis using metadata.
+  \item \textbf{ScopedNoAlias}: Uses scope information from LLVM's \texttt{scope} metadata.
+  \item \textbf{GlobalsAA}: Analyzes global variables.
+  \item \textbf{CFL-AA}: Context-free language-based alias analysis for field-sensitive reasoning.
+\end{itemize}
+
+\subsection{Rust's Borrow Checker}\label{sec:rust-borrow}
+
+Rust's borrow checker is a compile-time alias analysis that ensures memory safety without a garbage collector. It enforces the rule that at any point, there is either exactly one mutable reference or any number of immutable references to a given value---but never both.
+
+\begin{definition}[Rust's Alias Rule]\label{def:rust-alias}
+Rust's borrow checker enforces:
+\begin{itemize}
+  \item At most one \texttt{\&mut T} (mutable reference) to a value at any time.
+  \item Any number of \texttt{\&T} (immutable references) to a value at any time.
+  \item No mutable and immutable references to the same value simultaneously.
+\end{itemize}
+\end{definition}
+
+This is a \emph{must-not-alias} analysis: it proves that certain references cannot alias, enabling safe concurrent access without runtime checks.
+
+\section{Summary}\label{sec:alias-summary}
+
+Alias analysis determines whether memory accesses may refer to the same location, providing essential information for optimization and verification. The analysis ranges from simple type-based heuristics to sophisticated flow- and context-sensitive analyses. Key distinctions include must-alias vs.\ may-alias, and the tradeoff between precision and efficiency. Region-based and location-based approaches offer different levels of precision and scalability. The connection to pointer analysis is intimate: alias information can be derived from points-to sets, but direct alias analysis can be more efficient for specific queries. Flow-sensitive alias analysis provides higher precision at greater cost. Modern compilers like LLVM use layered alias analysis infrastructure combining multiple techniques. Rust's borrow checker demonstrates that compile-time alias analysis can ensure memory safety without runtime overhead.
+
+\section{Type-Based Alias Analysis}\label{sec:type-based-aa}
+
+\emph{Type-based alias analysis} (TBAA) uses the type system to determine that certain memory accesses cannot alias because they access objects of incompatible types.
+
+\begin{definition}[Type-Based Alias Rule]\label{def:tbaa-rule}
+Two memory accesses $*p$ and $*q$ \textbf{cannot alias} if the types of $p$ and $q$ are \emph{incompatible}: neither is a subtype of the other, and neither is a character type (\texttt{char*} in C can alias anything).
+\end{definition}
+
+\begin{example}[TBAA Example]\label{ex:tbaa}
+\begin{verbatim}
+  struct Point { int x, y; };
+  struct Color { int r, g, b; };
+  
+  void f(Point *p, Color *q) {
+    p->x = 5;    // Type: int
+    q->r = 10;   // Type: int, but different struct
+    // TBAA: p->x and q->r cannot alias (different base types)
+    // Therefore, the store to q->r does not affect p->x
+    // The compiler can reorder these stores or keep p->x in a register
+  }
+\end{verbatim}
+\end{example}
+
+\subsection{Type DAG for TBAA}\label{sec:type-dag}
+
+TBAA is implemented using a \emph{type DAG} (directed acyclic graph) that encodes the type compatibility relation:
+
+\begin{definition}[Type DAG]\label{def:type-dag}
+A \textbf{type DAG} is a directed acyclic graph where nodes represent types and edges represent the ``is a subtype of'' relation. Two types are compatible if and only if they share a common ancestor in the DAG (excluding the universal \texttt{char} type).
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{TBAA Alias Query}
+\label{alg:tbaa}
+\begin{algorithmic}[1]
+\Require Memory accesses $a_1$ at type $t_1$ and $a_2$ at type $t_2$
+\Ensure \textsc{NoAlias}, \textsc{MayAlias}, or \textsc{MustAlias}
+\State Compute type paths $P_1, P_2$ from $t_1, t_2$ to root in type DAG
+\If{$P_1 \cap P_2 = \emptyset$}
+  \State \Return \textsc{NoAlias}
+\ElsIf{$t_1 = t_2$ and offsets are compatible}
+  \State \Return \textsc{MustAlias} (if same offset) or \textsc{MayAlias}
+\Else
+  \State \Return \textsc{MayAlias}
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{C/C++ Strict Aliasing Rules}\label{sec:strict-aliasing}
+
+The C and C++ standards define \emph{strict aliasing rules} that specify which type combinations may alias:
+
+\begin{definition}[Strict Aliasing Rule]\label{def:strict-aliasing}
+An object of type $T$ shall only have its stored value accessed by an lvalue expression of type:
+\begin{itemize}
+  \item $T$ (the compatible type)
+  \item A type qualified version of $T$ (e.g., \texttt{const int})
+  \item A signed/unsigned version of $T$
+  \item An aggregate or union type that includes $T$
+  \item A character type (\texttt{char}, \texttt{unsigned char}, \texttt{std::byte})
+\end{itemize}
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lll}
+\hline
+\textbf{Access Type 1} & \textbf{Access Type 2} & \textbf{May Alias?} \\
+\hline
+\texttt{int*} & \texttt{float*} & No \\
+\texttt{int*} & \texttt{unsigned int*} & Yes \\
+\texttt{int*} & \texttt{char*} & Yes \\
+\texttt{Base*} & \texttt{Derived*} & Yes (if related) \\
+\texttt{struct A*} & \texttt{struct B*} & No (unrelated) \\
+\hline
+\end{tabular}
+\caption{C strict aliasing rules for common type combinations.}
+\label{tab:strict-aliasing}
+\end{table}
+
+\section{Region-Based Alias Analysis}\label{sec:region-based-aa}
+
+\emph{Region-based} alias analysis partitions memory into \emph{regions} and determines alias relationships at the region level.
+
+\begin{definition}[Memory Region]\label{def:memory-region}
+A \textbf{memory region} is a contiguous area of memory associated with a specific allocation or scope. Examples include:
+\begin{itemize}
+  \item The stack frame of a procedure
+  \item A heap allocation (\texttt{malloc} call)
+  \item A global variable
+  \item A field of a struct
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Region-Based Alias Analysis]\label{def:region-aa}
+\textbf{Region-based alias analysis} determines whether two memory accesses may alias by checking whether they access the same region and, within that region, whether the offsets overlap.
+\end{definition}
+
+\subsection{Region Hierarchy}\label{sec:region-hierarchy}
+
+Regions form a hierarchy based on containment:
+
+\begin{verbatim}
+  Global Region
+  ├── Stack Region (main)
+  │   ├── Stack Region (foo)
+  │   │   ├── Local variable x
+  │   │   └── Local variable y
+  │   └── Stack Region (bar)
+  │       └── Local variable z
+  └── Heap Region
+      ├── Allocation site 1 (object a)
+      └── Allocation site 2 (object b)
+\end{verbatim}
+
+\begin{theorem}[Region Disjointness]\label{thm:region-disjoint}
+Two memory accesses to different sibling regions (regions that are not ancestors or descendants of each other in the region hierarchy) cannot alias.
+\end{theorem}
+
+\subsection{Region-Based Analysis Algorithm}\label{sec:region-algorithm}
+
+\begin{algorithm}[H]
+\caption{Region-Based Alias Analysis}
+\label{alg:region-aa}
+\begin{algorithmic}[1]
+\Require Memory accesses $m_1$ and $m_2$ with regions $R_1, R_2$ and offsets $o_1, o_2$
+\Ensure Alias result
+\If{$R_1$ and $R_2$ are disjoint sibling regions}
+  \State \Return \textsc{NoAlias}
+\ElsIf{$R_1 = R_2$}
+  \If{$o_1$ and $o_2$ are known and non-overlapping}
+    \State \Return \textsc{NoAlias}
+  \ElsIf{$o_1 = o_2$ and sizes are known}
+    \State \Return \textsc{MustAlias}
+  \Else
+    \State \Return \textsc{MayAlias}
+  \EndIf
+\Else
+  \State \Return \textsc{MayAlias} (conservative)
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\section{Applications of Alias Analysis}\label{sec:alias-applications}
+
+Alias analysis enables numerous compiler optimizations and program transformations.
+
+\subsection{Store Motion and Load Elimination}\label{sec:store-motion}
+
+\begin{definition}[Store Motion]\label{def:store-motion}
+\textbf{Store motion} moves a store to a later program point when alias analysis proves that no intervening load can observe the stored value.
+\end{definition}
+
+\begin{definition}[Load Forwarding]\label{def:load-forwarding}
+\textbf{Load forwarding} replaces a load with a previously stored value when alias analysis proves that no intervening store can modify the loaded location.
+\end{definition}
+
+\begin{example}[Load Forwarding]\label{ex:load-forwarding}
+\begin{verbatim}
+  // Before:
+  *p = 42;
+  x = *p;    // Can forward: *p and *p must alias
+  y = *q;    // Can forward only if *p and *q must-alias or NoAlias with known value
+  
+  // After alias analysis determines *p and *q are NoAlias:
+  *p = 42;
+  x = 42;    // Forwarded from store
+  y = *q;    // Cannot forward (different location)
+\end{verbatim}
+\end{example}
+
+\subsection{Automatic Parallelization}\label{sec:alias-parallelization}
+
+Alias analysis is essential for determining whether loop iterations can execute in parallel:
+
+\begin{definition}[Parallelization Condition]\label{def:parallel-cond}
+A loop can be parallelized if alias analysis proves that no two iterations access the same memory location with at least one write. Formally, for all pairs of memory accesses $a_1$ in iteration $i$ and $a_2$ in iteration $j$ ($i \neq j$): if $a_1$ is a write or $a_2$ is a write, then $a_1$ and $a_2$ are \textsc{NoAlias}.
+\end{definition}
+
+\subsection{Memory Disambiguation in Superscalar Processors}\label{sec:mem-disambiguation}
+
+Hardware uses alias analysis (called \emph{memory disambiguation}) to determine whether loads and stores can be executed out of order:
+
+\begin{itemize}
+  \item \textbf{Store-to-load forwarding}: If a load follows a store to the same address, the processor forwards the stored value directly.
+  \item \textbf{Store-set prediction}: Predicts that a store will not alias with a subsequent load, allowing speculative execution.
+  \item \textbf{Alias prediction buffers}: Hardware structures that cache alias analysis results for frequently executed load-store pairs.
+\end{itemize}
+
+\section{Alias Analysis in the Polyhedral Model}\label{sec:alias-polyhedral}
+
+In the polyhedral model, alias analysis is performed using \emph{access relations} and \emph{dependence analysis}:
+
+\begin{definition}[Polyhedral Alias Test]\label{def:poly-alias}
+Two array accesses $A[f_1(\vec{i})]$ and $A[f_2(\vec{j})]$ may alias if and only if there exist iteration vectors $\vec{i}$ and $\vec{j}$ such that $f_1(\vec{i}) = f_2(\vec{j})$. This is checked by solving an integer linear program.
+\end{definition}
+
+\begin{example}[Polyhedral Alias]\label{ex:poly-alias}
+For accesses $A[i]$ and $A[2*j + 1]$ in the iteration domain $\{i : 0 \leq i < N\}$, $\{j : 0 \leq j < N\}$:
+\[
+i = 2j + 1 \implies \text{aliases exist when } i \text{ is odd}
+\]
+The alias test confirms that accesses overlap for $i \in \{1, 3, 5, \ldots\}$.
+\end{example}

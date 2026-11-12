@@ -1,0 +1,463 @@
+%%
+%% chapter-97.ltx — Query-Based Optimization
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:query-based}
+
+\section{Introduction}\label{sec:query-based-intro}
+
+Traditional compiler optimization is organized as a sequence of \emph{passes}: each pass transforms the IR in some way, and the passes are run in a fixed order. This pass-based architecture is simple and modular but has significant limitations: passes cannot easily share information, the order of passes matters and is hard to determine, and adding new optimizations requires understanding how they interact with all existing passes.
+
+\emph{Query-based optimization} offers an alternative: instead of running passes, the compiler maintains a database of facts about the program and answers queries about those facts. Optimizations are expressed as queries that pattern-match on the database and produce transformations. This approach enables more flexible, composable, and maintainable optimization pipelines.
+
+This chapter explores the application of database query techniques---particularly Datalog---to compiler optimization, and compares the query-based approach with traditional pass-based optimization.
+
+\section{Optimization as Query Answering}\label{sec:opt-as-query}
+
+\subsection{The Query Perspective}\label{sec:query-perspective}
+
+Every compiler optimization can be viewed as answering a question about the program:
+
+\begin{itemize}
+  \item \textbf{Constant propagation}: ``What is the value of variable $x$ at program point $p$?''
+  \item \textbf{Dead code elimination}: ``Is the result of instruction $i$ ever used?''
+  \item \textbf{Common subexpression elimination}: ``Is there another instruction that computes the same value as instruction $i$?''
+  \item \textbf{Loop-invariant code motion}: ``Does the value of expression $e$ change within loop $L$?''
+\end{itemize}
+
+In the query-based view, these questions are expressed as queries over a database of program facts, and the answers drive the transformations.
+
+\subsection{Facts and Rules}\label{sec:facts-rules}
+
+\begin{definition}[Program Facts]\label{def:program-facts}
+\emph{Program facts} are atomic statements about the program, such as:
+\begin{itemize}
+  \item \texttt{Defines(instr, var)}: instruction \texttt{instr} defines variable \texttt{var}.
+  \item \texttt{Uses(instr, var)}: instruction \texttt{instr} uses variable \texttt{var}.
+  \item \texttt{CfgEdge(bb1, bb2)}: there is a control-flow edge from \texttt{bb1} to \texttt{bb2}.
+  \item \texttt{Type(var, type)}: variable \texttt{var} has type \texttt{type}.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Derivation Rules]\label{def:derivation-rules}
+\emph{Derivation rules} (or \emph{inference rules}) derive new facts from existing ones:
+\begin{verbatim}
+  ReachesDef(instr1, var, instr2) :-
+    Defines(instr1, var),
+    Uses(instr2, var),
+    !KilledBetween(instr1, var, instr2).
+\end{verbatim}
+This rule says: \texttt{instr1}'s definition of \texttt{var} reaches \texttt{instr2} if \texttt{instr1} defines \texttt{var}, \texttt{instr2} uses \texttt{var}, and the definition is not killed between them.
+\end{definition}
+
+\section{Datalog for Program Analysis}\label{sec:datalog}
+
+\subsection{Datalog Basics}\label{sec:datalog-basics}
+
+\begin{definition}[Datalog]\label{def:datalog}
+\emph{Datalog} is a declarative logic programming language that is a subset of Prolog. It consists of:
+\begin{itemize}
+  \item \textbf{Facts}: ground atoms (e.g., \texttt{Edge(a, b)}).
+  \item \textbf{Rules}: implications of the form $\text{head} \gets \text{body}_1, \ldots, \text{body}_n$.
+  \item \textbf{Queries}: goals to be evaluated against the facts and rules.
+\end{itemize}
+Datalog programs are guaranteed to terminate (no function symbols, only finite domains) and their semantics is given by the least fixed point of the rules.
+\end{definition}
+
+\subsection{Datalog for Dataflow Analysis}\label{sec:datalog-dataflow}
+
+Dataflow analyses can be expressed naturally in Datalog:
+
+\begin{example}[Reaching Definitions in Datalog]\label{ex:reaching-datalog}
+\begin{verbatim}
+  % Base facts
+  Defines(i1, x). Uses(i2, x). CfgEdge(bb1, bb2).
+  InBlock(i1, bb1). InBlock(i2, bb2).
+
+  % Reaching definitions
+  ReachesDef(i1, x, i2) :-
+    Defines(i1, x), Uses(i2, x),
+    InBlock(i1, bb), InBlock(i2, bb),
+    DomBefore(bb, bb).  % i1 dominates i2's block
+
+  % Transitive reachability through CFG
+  ReachesDef(i1, x, i3) :-
+    ReachesDef(i1, x, i2),
+    CfgEdge(bb2, bb3),
+    InBlock(i2, bb2), InBlock(i3, bb3),
+    !Defines(i_kill, x), InBlock(i_kill, bb2).
+\end{verbatim}
+\end{example}
+
+\subsection{Datalog for Pointer Analysis}\label{sec:datalog-pointer}
+
+Pointer analysis is naturally expressed in Datalog:
+
+\begin{example}[Andersen's Pointer Analysis in Datalog]\label{ex:andersen-datalog}
+\begin{verbatim}
+  % Address-of: p = &q
+  PointsTo(p, q) :- AddrOf(p, q).
+
+  % Assignment: p = q
+  PointsTo(p, t) :- Assign(p, q), PointsTo(q, t).
+
+  % Store: *p = q
+  PointsTo(t, s) :- Store(p, q), PointsTo(p, t), PointsTo(q, s).
+
+  % Load: p = *q
+  PointsTo(p, t) :- Load(p, q), PointsTo(q, r), PointsTo(r, t).
+\end{verbatim}
+The least fixed point of these rules gives the points-to relation.
+\end{example}
+
+\section{Rewrite Rules as Queries}\label{sec:rewrite-rules}
+
+\subsection{Pattern Matching on IR}\label{sec:pattern-matching}
+
+Optimizations can be expressed as rewrite rules that pattern-match on the IR:
+
+\begin{definition}[Rewrite Rule]\label{def:rewrite-rule}
+A \emph{rewrite rule} is a pair $(pattern, replacement)$ where $pattern$ is a query that matches a subgraph of the IR and $replacement$ is a transformation that replaces the matched subgraph with an optimized version.
+\end{definition}
+
+\begin{example}[Algebraic Simplification as Rewrite Rules]\label{ex:algebraic-rewrite}
+\begin{verbatim}
+  ; Rule: x + 0 => x
+  Match: Add(x, Const(0)) => Replace(x)
+
+  ; Rule: x * 1 => x
+  Match: Mul(x, Const(1)) => Replace(x)
+
+  ; Rule: x * 0 => 0
+  Match: Mul(x, Const(0)) => Replace(Const(0))
+
+  ; Rule: x - x => 0
+  Match: Sub(x, x) => Replace(Const(0))
+\end{verbatim}
+\end{example}
+
+\subsection{Conditional Rewrites}\label{sec:conditional-rewrites}
+
+Rewrites may have side conditions:
+
+\begin{verbatim}
+  ; Rule: (x << n) >> n => x (if n < bitwidth and x is non-negative)
+  Match: Shr(Shl(x, Const(n)), Const(n))
+  Condition: n < bitwidth(x), isNonNegative(x)
+  Replace: x
+\end{verbatim}
+
+\section{Pattern Matching on IR Graphs}\label{sec:graph-matching}
+
+\subsection{Subgraph Isomorphism}\label{sec:subgraph-iso}
+
+Pattern matching on IR graphs is a form of \emph{subgraph isomorphism}: finding a mapping from the pattern graph to a subgraph of the IR graph that preserves edges and node labels.
+
+\begin{definition}[Subgraph Isomorphism]\label{def:subgraph-iso}
+Given a pattern graph $P$ and an IR graph $G$, a \emph{match} is an injective mapping $m: V(P) \to V(G)$ such that:
+\begin{itemize}
+  \item For each node $v \in V(P)$, $\text{label}(v) = \text{label}(m(v))$.
+  \item For each edge $(u, v) \in E(P)$, $(m(u), m(v)) \in E(G)$.
+\end{itemize}
+\end{definition}
+
+Subgraph isomorphism is NP-complete in general, but IR patterns are typically small and tree-like, making practical matching efficient.
+
+\subsection{Tree Pattern Matching}\label{sec:tree-matching}
+
+For tree-structured patterns (which cover most algebraic simplifications), matching can be done in linear time using tree pattern matching algorithms:
+
+\begin{itemize}
+  \item \textbf{Top-down}: match the root, then recursively match children.
+  \item \textbf{Bottom-up}: assign states to nodes using a tree automaton.
+  \item \textbf{LMN (Lloyd-Lloyd-McKeeman)}: a bottom-up algorithm used in instruction selection.
+\end{itemize}
+
+\section{Soufflé and Other Datalog Engines}\label{sec:datalog-engines}
+
+\subsection{Soufflé}\label{sec:souffle}
+
+\begin{definition}[Soufflé]\label{def:souffle}
+\emph{Soufflé} is a high-performance Datalog engine designed for program analysis. It compiles Datalog programs to optimized C++ code and supports both in-memory and out-of-core execution.
+\end{definition}
+
+Soufflé's features include:
+\begin{itemize}
+  \item \textbf{Type system}: ensures that relations are used consistently.
+  \item \textbf{Aggregates}: count, min, max, sum over relations.
+  \item \textbf{Functors}: call external C++ functions from Datalog rules.
+  \item \textbf{Parallelism}: automatic parallelization of rule evaluation.
+  \item \textbf{Component system}: modular Datalog programs.
+\end{itemize}
+
+\subsection{Other Datalog Engines}\label{sec:other-engines}
+
+\begin{itemize}
+  \item \textbf{DOOP}: a points-to analysis framework built on Datalog.
+  \item \textbf{LogicBlox}: a commercial Datalog engine with incremental evaluation.
+  \item \textbf{Racket's datalog}: a Datalog implementation embedded in Racket.
+  \item \textbf{Galois}: a graph analytics platform that can express Datalog-like queries.
+\end{itemize}
+
+\subsection{Applying Datalog to Compiler Optimization}\label{sec:datalog-opt}
+
+Several research projects have applied Datalog to compiler optimization:
+
+\begin{itemize}
+  \item \textbf{Optix} (2017): expresses optimizations as Datalog rules over a program database.
+  \item \textbf{Bril/Datalog}: uses Datalog for analysis and optimization of the Bril educational IR.
+  \item \textbf{Relational compiler frameworks}: represent the entire compilation pipeline as Datalog rules.
+\end{itemize}
+
+\section{Comparison with Traditional Pass-Based Optimization}\label{sec:comparison}
+
+\subsection{Pass-Based Architecture}\label{sec:pass-based}
+
+\begin{itemize}
+  \item \textbf{Structure}: a sequence of passes, each transforming the IR.
+  \item \textbf{Communication}: passes communicate through the IR (implicit) and pass-specific data structures (explicit).
+  \item \textbf{Ordering}: the order of passes matters and is determined empirically.
+  \item \textbf{Modularity}: each pass is independent, but interactions are hard to reason about.
+\end{itemize}
+
+\subsection{Query-Based Architecture}\label{sec:query-based-arch}
+
+\begin{itemize}
+  \item \textbf{Structure}: a database of facts and a set of queries/rules.
+  \item \textbf{Communication}: all information flows through the database (explicit).
+  \item \textbf{Ordering}: rules are evaluated to a fixed point; order does not matter.
+  \item \textbf{Modularity}: rules are independent and composable; interactions are through shared facts.
+\end{itemize}
+
+\begin{table}[htbp]
+\centering
+\caption{Pass-based vs.\ query-based optimization}
+\label{tab:pass-vs-query}
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Pass-Based} & \textbf{Query-Based} \\
+\hline
+Composition & Sequential & Declarative \\
+Iteration & Fixed pipeline & Fixed point \\
+Information sharing & Implicit (IR) & Explicit (database) \\
+Adding optimizations & New pass & New rule \\
+Performance & Predictable & Depends on engine \\
+Debugging & Step through passes & Query the database \\
+Scalability & Good & Depends on engine \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Hybrid Approaches}\label{sec:hybrid}
+
+In practice, the best systems may combine both approaches:
+\begin{itemize}
+  \item Use Datalog for analyses (pointer analysis, call graph construction, dataflow analysis).
+  \item Use traditional passes for transformations (instruction selection, register allocation).
+  \item Use equality saturation (\cref{ch:equality-saturation}) for local optimizations.
+\end{itemize}
+
+\section{Advanced Datalog for Compilers}\label{sec:advanced-datalog}
+
+\subsection{Interprocedural Analysis in Datalog}\label{sec:interprocedural-datalog}
+
+Datalog excels at interprocedural analysis because it naturally handles recursive relationships across function boundaries:
+
+\begin{example}[Interprocedural Reachability in Datalog]\label{ex:interprocedural-datalog}
+\begin{verbatim}
+  % Call graph edges
+  Calls(f, g) :- Instr(i, _, 'call', _), InFunc(i, f), Operand(i, _, g).
+  
+  % Interprocedural reaching definitions
+  InterReachesDef(i1, x, i2) :-
+    ReachesDef(i1, x, i2).  % Intraprocedural base case
+  
+  % Through call edges: definition reaches through a call if it reaches the call site
+  InterReachesDef(i1, x, i2) :-
+    InterReachesDef(i1, x, call_instr),
+    Calls(caller, callee),
+    InFunc(call_instr, caller),
+    InFunc(i2, callee),
+    IsParam(i2, x).  % x is a parameter of the callee
+  
+  % Through return edges: definition reaches back from callee to caller
+  InterReachesDef(i1, x, i2) :-
+    InFunc(i1, callee),
+    Calls(caller, callee),
+    InterReachesDef(i1, x, ret_instr),
+    InFunc(ret_instr, callee),
+    Uses(i2, x), InFunc(i2, caller),
+    Dominates(call_instr, i2).
+\end{verbatim}
+\end{example}
+
+\subsection{Demand-Driven Datalog Evaluation}\label{sec:demand-datalog}
+
+Instead of computing all facts (bottom-up evaluation), demand-driven Datalog computes only the facts that are actually queried:
+
+\begin{definition}[Demand-Driven Datalog]\label{def:demand-datalog}
+\emph{Demand-driven Datalog} evaluates rules top-down from a query, computing only the facts needed to answer the query. This is analogous to lazy evaluation in functional programming.
+\end{definition}
+
+Benefits for compilers:
+\begin{itemize}
+  \item Only the analysis results actually needed by the optimizer are computed.
+  \item Large programs with many functions do not require analyzing all functions.
+  \item Queries like ``does definition $d$ reach use $u$?'' can be answered without computing the full reaching-definitions relation.
+\end{itemize}
+
+\section{Advanced Pattern Matching on IR}\label{sec:advanced-pattern-matching}
+
+\subsection{Combinatorial Pattern Matching}\label{sec:combinatorial-matching}
+
+When multiple rewrite rules can apply to the same IR node, the compiler must decide which rule to apply. This is a form of \emph{pattern matching with priorities}:
+
+\begin{definition}[Combinatorial Pattern Matching]\label{def:combinatorial-matching}
+\emph{Combinatorial pattern matching} selects the best matching rule from a set of rules that may overlap, using priorities, costs, or other criteria.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Combinatorial Pattern Matching for Rewrites}
+\label{alg:combinatorial-matching}
+\begin{algorithmic}[1]
+\Procedure{SelectRewrite}{$\text{node}, \text{rules}$}
+  \Let{matches}{\emptyset}
+  \For{each rule $r$ in rules}
+    \If{\textsc{Matches}(r.pattern, node)}
+      \If{\textsc{CheckConditions}(r.conditions, node)}
+        \State $\text{matches} \gets \text{matches} \cup \{r\}$
+      \EndIf
+    \EndIf
+  \EndFor
+  \If{matches is empty}
+    \State \Return \textbf{no\_rewrite}
+  \EndIf
+  \State \Return \textsc{SelectBest}(matches, \text{cost\_model})
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Graph Grammar Matching}\label{sec:graph-grammar}
+
+For graph-structured IRs, pattern matching is based on \emph{graph grammars}:
+
+\begin{definition}[Graph Grammar]\label{def:graph-grammar}
+A \emph{graph grammar} is a set of rules of the form $L \to R$, where $L$ (the left-hand side) is a pattern graph and $R$ (the right-hand side) is a replacement graph. A rule applies if $L$ is isomorphic to a subgraph of the IR graph.
+\end{definition}
+
+Graph grammar matching is used in:
+\begin{itemize}
+  \item \textbf{Instruction selection}: tree-pattern matching on expression trees (the Burg framework).
+  \item \textbf{Peephole optimization}: matching small patterns in the instruction stream.
+  \item \textbf{Equality saturation}: matching e-graph patterns to discover equivalent expressions.
+\end{itemize}
+
+\subsection{Rewrite Rule Composition}\label{sec:rewrite-composition}
+
+Multiple rewrite rules can be composed into a single, more powerful rule:
+
+\begin{verbatim}
+  ; Rule 1: (x + y) + z => x + (y + z)  [associativity]
+  ; Rule 2: x + 0 => x                    [identity]
+  ; Composed: (x + y) + 0 => x + y        [compose 1 then 2]
+  ;
+  ; This composed rule can match in a single pass,
+  ; whereas applying rules 1 and 2 separately requires two passes.
+\end{verbatim}
+
+\section{Datalog for Whole-Program Optimization}\label{sec:datalog-whole-program}
+
+\subsection{Call Graph Construction}\label{sec:datalog-callgraph}
+
+The call graph is a fundamental whole-program structure that Datalog can compute declaratively:
+
+\begin{verbatim}
+  % Direct call graph
+  DirectCall(f, g) :-
+    Instr(i, _, 'call', _),
+    InFunc(i, f),
+    Operand(i, _, g),
+    Function(g, _, _).
+  
+  % Class hierarchy analysis (CHA) for virtual calls
+  CHACall(f, g) :-
+    Instr(i, _, 'invoke_virtual', _),
+    InFunc(i, f),
+    Operand(i, 0, recv),
+    Type(recv, class_C),
+    Method(g, class_D, name, _),
+    Subclass(class_D, class_C),  % class_D is a subclass of class_C
+    !Overrides(class_D, name, other_g),
+    other_g != g.
+  
+  % Transitively reachable functions
+  Reachable(f) :- EntryFunction(f).
+  Reachable(g) :- Reachable(f), DirectCall(f, g).
+  Reachable(g) :- Reachable(f), CHACall(f, g).
+\end{verbatim}
+
+\subsection{Devirtualization Queries}\label{sec:datalog-devirtualization}
+
+Datalog can identify virtual calls that can be devirtualized (converted to direct calls):
+
+\begin{verbatim}
+  % A virtual call can be devirtualized if there is exactly one target
+  Devirtualize(instr, target) :-
+    Instr(instr, _, 'invoke_virtual', _),
+    CHACall(func_of(instr), target),
+    count(CHACall(func_of(instr), _)) = 1.
+  
+  % A virtual call is dead if there are no possible targets
+  DeadVirtualCall(instr) :-
+    Instr(instr, _, 'invoke_virtual', _),
+    count(CHACall(func_of(instr), _)) = 0.
+\end{verbatim}
+
+\section{Practical Query-Based Optimization}\label{sec:practical-query}
+
+\subsection{Building a Query-Based Optimizer}\label{sec:building-query-opt}
+
+A practical query-based optimizer consists of:
+
+\begin{enumerate}
+  \item \textbf{Fact extraction}: convert the program's IR into a set of base facts (instructions, operands, CFG edges, types).
+  \item \textbf{Analysis rules}: Datalog rules that derive analysis facts (reaching definitions, live variables, points-to).
+  \item \textbf{Optimization rules}: rules that identify optimization opportunities (CSE candidates, dead code, strength reduction).
+  \item \textbf{Transformation engine}: applies the identified transformations to the IR.
+  \item \textbf{Iteration}: re-extract facts and re-evaluate rules until a fixed point is reached.
+\end{enumerate}
+
+\begin{verbatim}
+  ; Example: complete dead code elimination in Datalog
+  
+  % Base facts
+  Defines(i, v). Uses(i, v). Instr(i, b, op, ord).
+  
+  % An instruction is live if it has side effects or its result is used by a live instruction
+  Live(i) :- Instr(i, _, op, _), HasSideEffect(op).
+  Live(i) :- Defines(i, v), Uses(j, v), Live(j).
+  
+  % Dead instructions are those that are not live
+  Dead(i) :- Instr(i, _, _, _), !Live(i).
+\end{verbatim}
+
+\subsection{Performance Considerations}\label{sec:query-perf}
+
+Query-based optimization faces performance challenges:
+
+\begin{itemize}
+  \item \textbf{Fact extraction overhead}: converting the IR to facts takes time. Mitigation: maintain facts incrementally as the IR changes.
+  \item \textbf{Rule evaluation cost}: evaluating Datalog rules can be expensive for large programs. Mitigation: use optimized engines (Soufflé) with semi-naive evaluation.
+  \item \textbf{Memory usage}: storing all facts in memory can be expensive. Mitigation: use out-of-core evaluation or selective materialization.
+  \item \textbf{Fixed-point convergence}: some analyses may require many iterations. Mitigation: use worklist algorithms with priority ordering.
+\end{itemize}
+
+\section{Summary}\label{sec:query-summary}
+
+Query-based optimization offers a compelling alternative to traditional pass-based optimization. By expressing program analyses and optimizations as queries over a database of program facts, the compiler gains flexibility, composability, and clarity. Datalog provides a powerful and efficient foundation for this approach, with guaranteed termination and efficient evaluation. While query-based optimization is not yet mainstream in production compilers, it is an active area of research that may reshape how we think about compiler architecture.
+
+\begin{historical}
+The idea of using logic programming for compiler optimization dates back to the 1980s, with work on using Prolog for code generation and optimization. Datalog, developed in the late 1970s and 1980s, provided a more practical foundation. The application of Datalog to pointer analysis (Whaley and Lam, 2004) demonstrated its scalability for program analysis. Soufflé (2017) brought Datalog to practical performance levels, enabling its use in real compiler pipelines. The query-based view of optimization---where analyses are queries and transformations are driven by query results---has been explored in systems like Optix and in the equality saturation framework (\cref{ch:equality-saturation}). The convergence of database technology and compiler technology is an emerging trend that may lead to fundamentally new compiler architectures.
+\end{historical}

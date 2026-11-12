@@ -1,0 +1,692 @@
+%%
+%% chapter-89.ltx — Exception Handling
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:exception-handling}
+
+\section{Introduction}\label{sec:exception-intro}
+
+Exception handling is a language mechanism for dealing with exceptional conditions---errors, unexpected inputs, or unusual control flow---that disrupt the normal execution path. Rather than requiring every function to check return codes and propagate errors manually, exceptions provide a structured way to transfer control from the point where an error is detected to the point where it is handled, potentially across many intervening function calls.
+
+The implementation of exception handling is one of the most intricate tasks facing a compiler. It must support non-local control transfer, maintain the integrity of the runtime state during unwinding, and do so with minimal overhead in the common case where no exception is thrown. This chapter examines the models, mechanisms, and implementation strategies for exception handling across modern programming languages.
+
+\section{Exception Models: Termination vs.\ Resumption}\label{sec:exception-models}
+
+\subsection{Termination Semantics}\label{sec:termination}
+
+\begin{definition}[Termination Model]\label{def:termination}
+In the \emph{termination model} of exception handling, when an exception is raised, the stack is unwound to the nearest enclosing handler. The code that raised the exception does not resume; the exception \emph{terminates} the current computation and transfers control to the handler.
+\end{definition}
+
+Most modern languages use termination semantics: C++, Java, C\#, Python, Rust, and Go all use this model. Once an exception is caught, execution continues after the handler; the code that raised the exception is not resumed.
+
+\subsection{Resumption Semantics}\label{sec:resumption}
+
+\begin{definition}[Resumption Model]\label{def:resumption}
+In the \emph{resumption model} of exception handling, the handler may \emph{resume} the computation at the point where the exception was raised, after taking corrective action.
+\end{definition}
+
+Resumption semantics were used in early languages like CLU and are found in some specialized systems. They are more expressive but also more complex to implement and reason about.
+
+\subsection{Comparison}\label{sec:model-comparison}
+
+\begin{table}[htbp]
+\centering
+\caption{Termination vs.\ resumption exception models}
+\label{tab:exception-models}
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Termination} & \textbf{Resumption} \\
+\hline
+Stack state & Unwound to handler & Preserved \\
+Resumption & Not possible & Handler can resume \\
+Complexity & Lower & Higher \\
+Reasoning & Simpler & Harder (re-entrant) \\
+Languages & C++, Java, Python, Rust & CLU, Beta \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Zero-Cost Exceptions (Table-Based)}\label{sec:zero-cost}
+
+\subsection{The Zero-Cost Principle}\label{sec:zero-cost-principle}
+
+\begin{definition}[Zero-Cost Exceptions]\label{def:zero-cost}
+\emph{Zero-cost exceptions} are an implementation strategy where the normal (non-exceptional) execution path incurs no overhead from the exception handling mechanism. The cost of exception handling is paid only when an exception is actually thrown.
+\end{definition}
+
+The key insight is that the compiler knows, at compile time, exactly which instructions are covered by which exception handlers. This information can be encoded in static tables that are consulted only during exception handling.
+
+\subsection{Table-Based Implementation}\label{sec:table-based}
+
+In the table-based approach (used by Itanium C++ ABI, Rust, and others):
+
+\begin{enumerate}
+  \item The compiler generates \emph{exception tables} (also called \emph{landing pad tables} or \emph{ unwind tables}) that describe, for each instruction range, which handlers are active.
+  \item The normal code path contains no exception handling overhead---no checks, no setup, no teardown.
+  \item When an exception is thrown, the runtime walks the stack, consulting the tables at each frame to determine how to unwind and where to transfer control.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={draw, fill=TomeBg, minimum width=3cm, minimum height=0.6cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[block] (code) at (0, 3) {Normal Code};
+  \node[block, fill=TomeExBg] (table) at (4, 3) {Exception Table\\(.gcc\_except\_table)};
+  \node[block, fill=TomeDefBg] (ehframe) at (4, 1.5) {Unwind Info\\(.eh\_frame)};
+  \node[block, fill=TomeWarnBg] (throw) at (0, 1) {Exception Thrown};
+  \node[block, fill=TomeExBg] (unwind) at (0, -0.5) {Stack Unwinding\\(consult tables)};
+  \node[block, fill=TomeDefBg] (handler) at (0, -2) {Handler (Landing Pad)};
+
+  \draw[arr] (code) -- (throw);
+  \draw[arr] (throw) -- (unwind);
+  \draw[arr,dashed] (unwind) -- (table);
+  \draw[arr,dashed] (unwind) -- (ehframe);
+  \draw[arr] (unwind) -- (handler);
+\end{tikzpicture}
+\caption{Zero-cost exception handling: tables are consulted only during unwinding}
+\label{fig:zero-cost-exceptions}
+\end{figure}
+
+\subsection{Landing Pads}\label{sec:landing-pads}
+
+A \emph{landing pad} is a special code sequence that the compiler generates to handle the arrival of an exception at a particular function frame.
+
+\begin{definition}[Landing Pad]\label{def:landing-pad}
+A \emph{landing pad} is a code block within a function that is the target of exception-driven control transfer. When the unwinder determines that a handler exists in the current frame, it adjusts the stack and instruction pointer to the landing pad, which then:
+\begin{enumerate}
+  \item Receives the exception object (typically in designated registers).
+  \item Performs any necessary cleanup (calling destructors, releasing resources).
+  \item Either handles the exception (transferring control to the catch block) or resumes unwinding.
+\end{enumerate}
+\end{definition}
+
+\section{Stack Unwinding}\label{sec:stack-unwinding}
+
+\subsection{The Unwinding Process}\label{sec:unwinding-process}
+
+When an exception is thrown, the runtime must unwind the stack to find a handler:
+
+\begin{enumerate}
+  \item \textbf{Search phase}: walk the stack frames from the current frame upward, consulting the exception tables to find a matching handler.
+  \item \textbf{Cleanup phase}: walk the stack again, executing cleanup code (destructors, \texttt{finally} blocks) in each frame between the throw point and the handler.
+  \item \textbf{Transfer phase}: transfer control to the handler.
+\end{enumerate}
+
+\subsection{Personality Routines}\label{sec:personality-routines}
+
+Each function frame has an associated \emph{personality routine} that interprets the exception tables for that frame:
+
+\begin{definition}[Personality Routine]\label{def:personality}
+A \emph{personality routine} is a function called by the unwinder for each stack frame during exception handling. It determines:
+\begin{itemize}
+  \item Whether the current frame has a handler for the thrown exception.
+  \item What cleanup actions must be performed.
+  \item How to adjust the frame for the landing pad.
+\end{itemize}
+\end{definition}
+
+Different languages may use different personality routines. For example:
+\begin{itemize}
+  \item \texttt{\_\_gxx\_personality\_v0}: C++ personality, handles type-based matching.
+  \item \texttt{rust\_personality\_v0}: Rust personality, handles Rust's panic mechanism.
+  \item \texttt{\_\_gcc\_rust\_personality}: a newer Rust personality using the GCC infrastructure.
+\end{itemize}
+
+\subsection{Frame Unwinding}\label{sec:frame-unwinding}
+
+To unwind a frame, the runtime must:
+\begin{enumerate}
+  \item Determine the return address (the instruction that called the current function).
+  \item Restore the stack pointer to its value before the function's prologue.
+  \item Restore callee-saved registers.
+  \item Transfer control to the appropriate landing pad or continue unwinding.
+\end{enumerate}
+
+This information is encoded in the \texttt{.eh\_frame} section (ELF) or \texttt{.pdata}/\texttt{.xdata} (PE/Windows).
+
+\section{Exception Handling in Different Languages}\label{sec:exception-languages}
+
+\subsection{C++ Exceptions}\label{sec:cpp-exceptions}
+
+C++ uses zero-cost exceptions with type-based matching:
+\begin{itemize}
+  \item Exceptions are objects (of any type, but typically derived from \texttt{std::exception}).
+  \item Catch clauses match by type, with derived-to-base conversion.
+  \item Stack unwinding calls destructors for all automatic objects in unwound frames (\emph{stack unwinding}).
+  \item \texttt{noexcept} indicates that a function does not throw; violating this calls \texttt{std::terminate}.
+\end{itemize}
+
+\subsection{Java Exceptions}\label{sec:java-exceptions}
+
+Java uses zero-cost exceptions with checked and unchecked exception types:
+\begin{itemize}
+  \item \textbf{Checked exceptions}: must be declared in the method signature or caught. Enforced at compile time.
+  \item \textbf{Unchecked exceptions}: \texttt{RuntimeException} and its subclasses; need not be declared.
+  \item \textbf{Finally blocks}: executed whether or not an exception is thrown.
+  \item \textbf{Try-with-resources}: automatic resource management (auto-closeable).
+\end{itemize}
+
+\subsection{Rust Panics}\label{sec:rust-panics}
+
+Rust uses a panic mechanism for unrecoverable errors:
+\begin{itemize}
+  \item \texttt{panic!} aborts the current thread after unwinding.
+  \item \texttt{catch\_unwind} can intercept panics (but is discouraged).
+  \item \texttt{Drop} implementations run during unwinding.
+  \item \texttt{panic = "abort"} disables unwinding entirely (smaller code, no exception tables).
+  \item Recoverable errors use \texttt{Result<T, E>} rather than exceptions.
+\end{itemize}
+
+\subsection{Go: panic/recover}\label{sec:go-exceptions}
+
+Go's exception mechanism is deliberately minimal:
+\begin{itemize}
+  \item \texttt{panic} initiates panicking, running deferred functions.
+  \item \texttt{recover} (called in a deferred function) stops panicking and returns the panic value.
+  \item Normal errors use explicit error returns (\texttt{(result, error)}).
+  \item The runtime uses a linked list of \texttt{\_defer} structs on each goroutine's stack.
+\end{itemize}
+
+\section{Implementation: Landing Pads and Personality Routines}\label{sec:landing-pad-impl}
+
+\subsection{Landing Pad Code Generation}\label{sec:lp-codegen}
+
+The compiler generates landing pads as special basic blocks in the function's control-flow graph:
+
+\begin{enumerate}
+  \item Each \texttt{try} region is associated with one or more landing pads.
+  \item The landing pad receives the exception object and a selector indicating the exception type.
+  \item The landing pad contains cleanup code and a switch on the selector to dispatch to the appropriate catch clause.
+  \item If no catch matches, the landing pad resumes unwinding (calls \texttt{\_Unwind\_Resume}).
+\end{enumerate}
+
+\subsection{Exception Tables Format}\label{sec:eh-tables}
+
+The \texttt{.gcc\_except\_table} section encodes the mapping from instruction addresses to landing pads:
+
+\begin{itemize}
+  \item \textbf{Call-site table}: for each call instruction (or range of instructions), records the landing pad and the action table index.
+  \item \textbf{Action table}: a chain of (type filter, next action) pairs. A type filter of 0 means ``cleanup only''; a positive value indexes into the type table.
+  \item \textbf{Type table}: references to type info structures for type-based matching.
+\end{itemize}
+
+\section{Performance Considerations}\label{sec:exception-performance}
+
+\subsection{Zero-Cost Overhead Analysis}\label{sec:zero-cost-overhead}
+
+Zero-cost exceptions have the following overhead profile:
+
+\begin{table}[htbp]
+\centering
+\caption{Overhead of zero-cost exceptions}
+\label{tab:exception-overhead}
+\begin{tabular}{lcc}
+\hline
+\textbf{Phase} & \textbf{Normal Path} & \textbf{Exception Path} \\
+\hline
+Setup/teardown & None & N/A \\
+Code size & +10--30\% (tables, landing pads) & N/A \\
+Throw cost & N/A & Very high (stack walk, cleanup) \\
+Catch cost & N/A & Moderate (type matching) \\
+\hline
+\end{tabular}
+\end{table}
+
+The trade-off is clear: zero-cost exceptions optimize for the common case (no exception thrown) at the expense of the exceptional case. This is appropriate when exceptions are truly exceptional---rare, error-path events.
+
+\subsection{Setjmp/Longjmp Model}\label{sec:setjmp-model}
+
+An alternative to zero-cost exceptions is the \emph{setjmp/longjmp} model (used by older C++ implementations and some embedded systems):
+
+\begin{itemize}
+  \item On entering a \texttt{try} block, call \texttt{setjmp} to save the current context.
+  \item On throwing, call \texttt{longjmp} to restore the saved context.
+  \item The saved context is stored in a linked list on the stack.
+\end{itemize}
+
+This model has overhead on every \texttt{try} entry/exit but cheaper throws. It is appropriate when throws are frequent or when code size is critical.
+
+\subsection{When Exceptions Are Not Exceptional}\label{sec:not-exceptional}
+
+If exceptions are used for common control flow (e.g., iterator exhaustion, optional values), the zero-cost model becomes a liability. In such cases:
+\begin{itemize}
+  \item Use explicit error types (\texttt{Result}, \texttt{Option}) instead.
+  \item Use the setjmp/longjmp model if exceptions must be used.
+  \item Consider language-level alternatives (coroutines, pattern matching).
+\end{itemize}
+
+\section{Exception Handling in the IR}\label{sec:exception-ir}
+
+\subsection{Representing Exceptions in the IR}\label{sec:exception-ir-rep}
+
+The compiler's IR must represent exception handling constructs:
+
+\begin{itemize}
+  \item \textbf{Invoke instruction}: a call that can transfer control to a landing pad on exception.
+  \item \textbf{Landing pad}: a basic block that handles incoming exceptions.
+  \item \textbf{Resume instruction}: re-raises the current exception after cleanup.
+  \item \textbf{Catch switch}: dispatches to the appropriate catch handler based on exception type.
+  \item \textbf{Cleanup pad}: executes cleanup code (destructors, \texttt{finally} blocks).
+\end{itemize}
+
+\subsection{Exception Handling in LLVM IR}\label{sec:llvm-eh}
+
+LLVM's IR represents exception handling with several instructions:
+
+\begin{itemize}
+  \item \texttt{invoke}: like \texttt{call}, but with a normal destination and an unwind destination (landing pad).
+  \item \texttt{landingpad}: the entry point for exception handling in a function. Returns an exception value and a selector.
+  \item \texttt{resume}: re-raises the current exception.
+  \item \texttt{catchswitch}, \texttt{catchret}, \texttt{catchpad}: Windows-style exception handling.
+  \item \texttt{cleanuppad}, \texttt{cleanupret}: cleanup-only exception handling.
+\end{itemize}
+
+\subsection{Lowering Exceptions to Machine Code}\label{sec:exception-lowering}
+
+The lowering from IR to machine code involves:
+\begin{enumerate}
+  \item Converting \texttt{invoke} to \texttt{call} + branch on exception.
+  \item Generating landing pad code that receives the exception and dispatches.
+  \item Emitting exception tables (\texttt{.gcc\_except\_table}) that describe the mapping from code ranges to landing pads.
+  \item Emitting unwind information (\texttt{.eh\_frame}) for stack traversal.
+\end{enumerate}
+
+\section{Alternatives to Exceptions}\label{sec:exception-alternatives}
+
+\subsection{Result Types}\label{sec:result-types}
+
+Many modern languages use explicit result types instead of exceptions:
+
+\begin{itemize}
+  \item \textbf{Rust}: \texttt{Result<T, E>} for recoverable errors, \texttt{panic!} for unrecoverable errors.
+  \item \textbf{Go}: explicit error returns \texttt{(T, error)}.
+  \item \textbf{Swift}: \texttt{throws} functions with \texttt{do/catch} (similar to exceptions but with compile-time checking).
+  \item \textbf{Haskell}: \texttt{Either e a} monad for error handling.
+\end{itemize}
+
+\subsection{Effect Handlers}\label{sec:effect-handlers}
+
+Effect handlers provide a general mechanism for handling exceptional behavior:
+
+\begin{definition}[Effect Handler]\label{def:effect-handler}
+An \emph{effect handler} is a mechanism for intercepting and handling computational effects (including exceptions, state, I/O) in a composable way. The handler can resume the computation, provide an alternative result, or propagate the effect.
+\end{definition}
+
+Effect handlers generalize exceptions by allowing:
+\begin{itemize}
+  \item Multiple handlers for the same effect.
+  \item Resumption (like resumption exceptions).
+  \item Composable effect handling (handlers can be stacked).
+\end{itemize}
+
+%% ============================================================
+%% Section: Zero-Cost Exception Implementation Details
+%% ============================================================
+\section{Zero-Cost Exception Implementation Details}\label{sec:zero-cost-details}
+
+The zero-cost exception model is the dominant implementation strategy in modern systems languages. This section provides a detailed examination of how it works at the machine level.
+
+\subsection{The Exception Table Format}\label{sec:eh-table-format}
+
+The \texttt{.gcc\_except\_table} section encodes the mapping from code ranges to exception handlers using a compact binary format:
+
+\begin{verbatim}
+  .gcc_except_table layout:
+  +---------------------------+
+  | Header (LP start, TT base)|
+  +---------------------------+
+  | Call-site table header    |
+  |   (format, length)        |
+  +---------------------------+
+  | Call-site entry 0:        |
+  |   (start, len, landing    |
+  |    pad, action index)     |
+  +---------------------------+
+  | Call-site entry 1:        |
+  |   ...                     |
+  +---------------------------+
+  | Action table:             |
+  |   (type filter, next      |
+  |    action offset)         |
+  +---------------------------+
+  | Type table:               |
+  |   (typeinfo pointers)     |
+  +---------------------------+
+\end{verbatim}
+
+\begin{definition}[Call-Site Entry]\label{def:call-site}
+Each call-site entry $(\mathrm{start}, \mathrm{length}, \mathrm{lp}, \mathrm{action})$ specifies:
+\begin{itemize}
+  \item $\mathrm{start}$: the start address of the code range (relative to the function's start).
+  \item $\mathrm{length}$: the length of the code range.
+  \item $\mathrm{lp}$: the landing pad address (relative to the function's start), or 0 if no handler.
+  \item $\mathrm{action}$: an index into the action table (1-based), or 0 for cleanup-only, or $-1$ for no action.
+\end{itemize}
+\end{definition}
+
+\subsection{The Unwinding Protocol}\label{sec:unwinding-protocol}
+
+The Itanium C++ ABI defines a two-phase unwinding protocol:
+
+\begin{algorithm}[H]
+\caption{Two-Phase Exception Unwinding}\label{alg:two-phase}
+\begin{algorithmic}[1]
+\State \textbf{Phase 1: Search}
+\State $\mathrm{context} \gets \mathrm{current\_frame}$
+\While{$\mathrm{context} \neq \mathrm{null}$}
+  \State $\mathrm{personality} \gets \mathrm{get\_personality}(\mathrm{context})$
+  \State $\mathrm{result} \gets \mathrm{personality}(\mathrm{SEARCH}, \mathrm{exception}, \mathrm{context})$
+  \If{$\mathrm{result} = \mathrm{HANDLER\_FOUND}$}
+    \State \textbf{break} \Comment{Handler found; proceed to Phase 2}
+  \ElsIf{$\mathrm{result} = \mathrm{CONTINUE\_SEARCH}$}
+    \State $\mathrm{context} \gets \mathrm{next\_frame}(\mathrm{context})$
+  \EndIf
+\EndWhile
+\If{$\mathrm{context} = \mathrm{null}$}
+  \State \textbf{abort} \Comment{No handler found}
+\EndIf
+\State
+\State \textbf{Phase 2: Cleanup and Transfer}
+\State $\mathrm{context} \gets \mathrm{current\_frame}$
+\While{$\mathrm{context} \neq \mathrm{handler\_frame}$}
+  \State $\mathrm{personality} \gets \mathrm{get\_personality}(\mathrm{context})$
+  \State $\mathrm{personality}(\mathrm{CLEANUP}, \mathrm{exception}, \mathrm{context})$ \Comment{Run destructors}
+  \State $\mathrm{context} \gets \mathrm{next\_frame}(\mathrm{context})$
+\EndWhile
+\State $\mathrm{Transfer\_to\_handler}(\mathrm{handler\_frame}, \mathrm{exception})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Personality Routine Implementation}\label{sec:personality-impl}
+
+The personality routine is the heart of the exception handling mechanism. It is called by the unwinder for each frame during both the search and cleanup phases:
+
+\begin{algorithm}[H]
+\caption{Personality Routine (Simplified)}\label{alg:personality}
+\begin{algorithmic}[1]
+\Function{PersonalityRoutine}{$\mathrm{version}, \mathrm{actions}, \mathrm{exception\_class}, \mathrm{exception}, \mathrm{context}$}
+  \State $\mathrm{ip} \gets \mathrm{get\_IP}(\mathrm{context})$
+  \State $\mathrm{func\_start} \gets \mathrm{get\_func\_start}(\mathrm{context})$
+  \State $\mathrm{except\_table} \gets \mathrm{get\_except\_table}(\mathrm{context})$
+  \State
+  \If{$\mathrm{actions} = \mathrm{SEARCH}$}
+    \State $\mathrm{entry} \gets \mathrm{find\_call\_site}(\mathrm{except\_table}, \mathrm{ip} - \mathrm{func\_start})$
+    \If{$\mathrm{entry}.\mathrm{lp} = 0$}
+      \State \Return $\mathrm{CONTINUE\_SEARCH}$
+    \EndIf
+    \State $\mathrm{action} \gets \mathrm{get\_action}(\mathrm{except\_table}, \mathrm{entry}.\mathrm{action})$
+    \While{$\mathrm{action} \neq \mathrm{null}$}
+      \If{$\mathrm{action}.\mathrm{type\_filter} > 0$}
+        \State $\mathrm{type} \gets \mathrm{type\_table}[\mathrm{action}.\mathrm{type\_filter}]$
+        \If{$\mathrm{matches}(\mathrm{exception}, \mathrm{type})$}
+          \State \Return $\mathrm{HANDLER\_FOUND}$
+        \EndIf
+      \ElsIf{$\mathrm{action}.\mathrm{type\_filter} = 0$}
+        \State \Return $\mathrm{HANDLER\_FOUND}$ \Comment{Cleanup handler}
+      \EndIf
+      \State $\mathrm{action} \gets \mathrm{action}.\mathrm{next}$
+    \EndWhile
+    \State \Return $\mathrm{CONTINUE\_SEARCH}$
+  \ElsIf{$\mathrm{actions} = \mathrm{CLEANUP}$}
+    \State $\mathrm{entry} \gets \mathrm{find\_call\_site}(\mathrm{except\_table}, \mathrm{ip} - \mathrm{func\_start})$
+    \State $\mathrm{set\_IP}(\mathrm{context}, \mathrm{func\_start} + \mathrm{entry}.\mathrm{lp})$
+    \State \Return $\mathrm{INSTALL\_CONTEXT}$
+  \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Landing Pad Code Structure}\label{sec:lp-structure}
+
+A landing pad is a special basic block that receives control from the unwinder. Its structure is:
+
+\begin{verbatim}
+  landing_pad:
+    ; Receive exception object and selector from unwinder
+    ; (typically in registers: %rdi = exception, %esi = selector)
+    %exc_ptr   = call i8* @llvm.eh.exception()
+    %selector  = call i32 @llvm.eh.selector()
+    
+    ; Check if this is a cleanup or a catch
+    %is_catch  = icmp sgt i32 %selector, 0
+    
+    ; If cleanup, run destructors then resume
+    br i1 %is_catch, label %check_type, label %cleanup
+    
+  check_type:
+    ; Switch on selector to dispatch to the right catch clause
+    switch i32 %selector, label %no_match [
+      i32 1, label %catch_int      ; catch (int)
+      i32 2, label %catch_runtime  ; catch (std::runtime_error)
+      i32 3, label %catch_all      ; catch (...)
+    ]
+    
+  catch_int:
+    ; Handle integer exception
+    ...
+    br label %end_try
+    
+  cleanup:
+    ; Run destructors for automatic variables
+    call void @_ZN3FooD1Ev(%struct.Foo* %foo)  ; ~Foo()
+    ; Resume unwinding
+    call void @_Unwind_Resume(i8* %exc_ptr)
+    unreachable
+    
+  end_try:
+    ; Continue execution after the try block
+    ...
+\end{verbatim}
+
+\subsection{Exception Object Allocation}\label{sec:exception-alloc}
+
+The exception object must survive the stack unwinding, so it cannot be allocated on the stack:
+
+\begin{itemize}
+  \item \textbf{Heap allocation}: the \texttt{throw} expression allocates the exception object on the heap (using \texttt{\_\_cxa\_allocate\_exception}).
+  \item \textbf{Exception header}: a header is prepended to the exception object, containing the exception class, destructor pointer, and reference count.
+  \item \textbf{Reference counting}: the exception object is reference-counted; it is deallocated when the last catch clause releases it.
+  \item \textbf{Rethrow}: when an exception is rethrown (\texttt{throw;} in C++), the same object is propagated without copying.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={draw, minimum width=4cm, minimum height=0.5cm, font=\small, align=center},
+]
+  \node[block, fill=TomeExBg] (header) at (0, 2) {Exception Header\\(class, destructor, refcount)};
+  \node[block, fill=TomeBg] (object) at (0, 1) {Exception Object\\(user data)};
+  \node[block, fill=TomeDefBg] (padding) at (0, 0.2) {Padding (alignment)};
+  
+  \node[right=0.3cm of header, font=\small\itshape, text=TomeRule] {Managed by runtime};
+  \node[right=0.3cm of object, font=\small\itshape, text=TomeRule] {User's exception};
+\end{tikzpicture}
+\caption{Exception object layout in memory (Itanium C++ ABI)}
+\label{fig:exception-layout}
+\end{figure}
+
+%% ============================================================
+%% Section: Exception Handling Across Language Boundaries
+%% ============================================================
+\section{Exception Handling Across Language Boundaries}\label{sec:cross-language-eh}
+
+When programs consist of code compiled by different compilers or in different languages, exception handling must work correctly across the boundaries.
+
+\subsection{The Foreign Exception Problem}\label{sec:foreign-exceptions}
+
+When an exception passes through a frame compiled by a different compiler (or in a different language), the personality routine must handle it correctly:
+
+\begin{itemize}
+  \item \textbf{C++ through C}: C frames have no personality routine; the unwinder skips them. But C frames may hold resources (file handles, locks) that need cleanup.
+  \item \textbf{C++ through Rust}: Rust's personality routine (\texttt{rust\_personality\_v0}) handles Rust panics but must also forward foreign exceptions.
+  \item \textbf{Java through JNI}: Java exceptions passing through native code require explicit handling.
+\end{itemize}
+
+\subsection{Exception Class and Identification}\label{sec:exception-class}
+
+The Itanium ABI uses an \emph{exception class} (an 8-byte identifier) to distinguish exceptions from different languages:
+
+\begin{table}[htbp]
+\centering
+\caption{Exception class identifiers}
+\label{tab:exception-class}
+\begin{tabular}{lll}
+\hline
+\textbf{Language} & \textbf{Exception Class} & \textbf{Encoding} \\
+\hline
+C++ & \texttt{GNUCC++\textbackslash 0} & \texttt{0x474E5543432B2B00} \\
+Java & \texttt{GNUJAVA\textbackslash 0} & \texttt{0x474E554A41564100} \\
+Rust & \texttt{MOZRS\textbackslash 0\textbackslash 0\textbackslash 0} & (implementation-defined) \\
+D & \texttt{DNDD\textbackslash 0\textbackslash 0\textbackslash 0\textbackslash 0} & (implementation-defined) \\
+\hline
+\end{tabular}
+\end{table}
+
+The personality routine checks the exception class to determine whether it can handle the exception. If it cannot, it returns \texttt{CONTINUE\_SEARCH}, allowing the unwinder to continue to the next frame.
+
+\subsection{Cross-Language Exception Handling in Practice}\label{sec:cross-lang-practice}
+
+Modern systems handle cross-language exceptions as follows:
+
+\begin{itemize}
+  \item \textbf{C++/Rust interop}: Rust's \texttt{extern "C"} functions catch panics at the boundary and convert them to C error codes (since C has no exception mechanism).
+  \item \textbf{Java/native interop}: JNI functions catch Java exceptions and store them in the JVM thread state; native code checks for pending exceptions.
+  \item \textbf{WebAssembly}: Wasm uses a \texttt{try/catch} proposal that maps to the host's exception mechanism.
+\end{itemize}
+
+%% ============================================================
+%% Section: Performance Engineering for Exceptions
+%% ============================================================
+\section{Performance Engineering for Exception Handling}\label{sec:exception-perf}
+
+\subsection{Measuring Exception Overhead}\label{sec:measuring-overhead}
+
+The overhead of exception handling can be measured at several levels:
+
+\begin{table}[htbp]
+\centering
+\caption{Exception overhead measurements (representative)}
+\label{tab:exception-measurements}
+\begin{tabular}{lccc}
+\hline
+\textbf{Metric} & \textbf{Zero-cost} & \textbf{Setjmp/longjmp} & \textbf{Error codes} \\
+\hline
+Normal path overhead & 0\% & 5--15\% & 1--3\% \\
+Code size increase & 10--30\% & 2--5\% & 5--10\% \\
+Throw cost (stack depth 10) & 1--5 $\mu$s & 0.1--0.5 $\mu$s & N/A \\
+Throw cost (stack depth 100) & 10--50 $\mu$s & 0.1--0.5 $\mu$s & N/A \\
+Throw cost (stack depth 1000) & 100--500 $\mu$s & 0.1--0.5 $\mu$s & N/A \\
+\hline
+\end{tabular}
+\end{table}
+
+The zero-cost model's throw cost scales with the stack depth because the unwinder must walk every frame. This makes exceptions unsuitable for high-frequency error paths.
+
+\subsection{Optimizing Exception-Heavy Code}\label{sec:optimizing-eh-code}
+
+When exceptions are used more frequently than intended, several optimizations can help:
+
+\begin{itemize}
+  \item \textbf{Exception coalescing}: combine multiple throw sites that share a handler into a single throw.
+  \item \textbf{Inlining landing pads}: inline the landing pad code at the call site to avoid the overhead of an indirect jump.
+  \item \textbf{Cold code layout}: place landing pads and exception tables in cold sections to improve instruction cache behavior for the hot path.
+  \item \textbf{Profile-guided optimization}: use profiling data to determine which throw sites are hot and optimize them specifically.
+\end{itemize}
+
+\subsection{When to Use Error Codes Instead}\label{sec:error-codes-vs-exceptions}
+
+The decision between exceptions and error codes depends on the expected frequency of errors:
+
+\begin{definition}[Exception vs.\ Error Code Threshold]\label{def:eh-threshold}
+Let $p$ be the probability of an error at a given call site, and $C_t$ be the cost of throwing an exception, $C_e$ be the cost of checking an error code. Exceptions are preferable when:
+\[
+  p \times C_t < C_e
+\]
+For zero-cost exceptions, $C_e \approx 0$ on the normal path, so exceptions are preferable when $p \times C_t$ is small---i.e., when errors are rare.
+\end{definition}
+
+%% ============================================================
+%% Section: Modern Exception Designs
+%% ============================================================
+\section{Modern Exception Designs}\label{sec:modern-exception}
+
+\subsection{Zig's Error Handling}\label{sec:zig-errors}
+
+Zig uses a novel approach to error handling that combines the ergonomics of exceptions with the explicitness of error codes:
+
+\begin{verbatim}
+  // Zig error handling
+  const FileError = error {
+      NotFound,
+      PermissionDenied,
+      OutOfMemory,
+  };
+  
+  fn readFile(name: []const u8) FileError![]u8 {
+      const file = open(name) catch |err| {
+          return err;  // Propagate error
+      };
+      defer close(file);
+      return read(file);
+  }
+  
+  // Usage:
+  const contents = readFile("data.txt") catch |err| {
+      switch (err) {
+          .NotFound => return defaultData(),
+          else => return err,
+      }
+  };
+\end{verbatim}
+
+Zig's approach has several advantages:
+\begin{itemize}
+  \item Errors are part of the type system: the return type \texttt{FileError![]u8} explicitly indicates that the function can fail.
+  \item No hidden control flow: error propagation uses \texttt{catch} and \texttt{try}, which are explicit in the source.
+  \item Zero overhead: errors are represented as error set values (small integers); no stack unwinding is needed.
+  \item Exhaustive handling: the compiler ensures that all error cases are handled.
+\end{itemize}
+
+\subsection{Swift's Typed Throws}\label{sec:swift-throws}
+
+Swift 6.0 introduced typed throws, allowing functions to specify the exact error type they can throw:
+
+\begin{verbatim}
+  // Swift typed throws
+  func parse(_ input: String) throws(ParseError) -> AST {
+      // Can only throw ParseError
+  }
+  
+  // Callers know the exact error type:
+  do {
+      let ast = try parse(source)
+  } catch .syntaxError(let pos) {
+      // Handle specific error
+  }
+\end{verbatim}
+
+\subsection{Effect Handlers as the Future}\label{sec:effect-handlers-future}
+
+Effect handlers (Section~\ref{sec:effect-handlers}) generalize exceptions by providing a composable mechanism for handling all kinds of computational effects. In the effect handler model:
+
+\begin{itemize}
+  \item Exceptions are just one kind of effect (the \emph{error} effect).
+  \item Other effects include state, I/O, concurrency, and non-determinism.
+  \item Handlers can be composed: a handler for one effect can be layered on top of a handler for another.
+  \item Handlers can resume the computation, providing more flexibility than termination-only exceptions.
+\end{itemize}
+
+Languages like Eff, Koka, and Unikum explore effect handlers as a unified approach to exception handling and other computational effects.
+
+\section{Summary}\label{sec:exception-summary}
+
+Exception handling is a fundamental language feature that enables structured error handling and non-local control transfer. The zero-cost (table-based) implementation is the dominant approach in modern systems, providing no overhead on the normal path at the cost of expensive exception propagation. The compiler's role is to generate the exception tables, landing pads, and personality routines that enable the runtime to correctly unwind the stack and transfer control to the appropriate handler.
+
+\begin{historical}
+Exception handling has evolved from the ad hoc error codes of early systems to the sophisticated zero-cost mechanisms of modern languages. PL/I (1966) introduced one of the first exception handling mechanisms.CLU (1975) pioneered the termination model with handlers. C++ adopted exceptions in 1989, using the zero-cost table-based approach defined by the Itanium C++ ABI. Java (1995) added checked exceptions, which proved controversial and were not adopted by subsequent languages. The modern trend is toward minimal exception mechanisms (Rust's panics, Go's panic/recover) with explicit error types for recoverable errors, reflecting a growing understanding that exceptions should be reserved for truly exceptional situations.
+\end{historical}

@@ -1,0 +1,411 @@
+%%
+%% chapter-107.ltx — Translation Validation
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:tv-intro}
+
+Compiler optimizations are among the most complex and error-prone components of
+modern software systems.  An optimizing compiler transforms a source program
+through a long pipeline of passes, each of which must preserve the program's
+semantics.  When an optimization pass contains a bug, it can silently introduce
+incorrect behavior---generating code that computes the wrong result without any
+warning or error message.  Such bugs are particularly insidious because they
+violate the programmer's trust in the compiler.
+
+\emph{Translation validation}~\cite{pnueli1998translation,pnueli2001translation}
+is a technique for verifying that each compiler transformation preserves the
+program's semantics.  Rather than verifying the compiler itself (which is the
+approach of compiler verification, \cref{ch:compiler-verification}), translation
+validation verifies each \emph{individual compilation}: after the compiler runs,
+a validator checks that the output program is semantically equivalent to the
+input program.
+
+Translation validation was pioneered by Pnueli, Siegel, and
+Singerman~\cite{pnueli1998translation} in 1998 and has since been applied to
+verify optimizations in production compilers, including
+LLVM~\cite{lopes2015alive2,bhargava2020towards}.  The technique provides a
+practical middle ground between full compiler verification (which is extremely
+expensive) and no verification at all.
+
+In this chapter, we develop the theory and practice of translation validation.
+We begin with the fundamental concepts (\cref{sec:tv-concepts}), examine
+equivalence checking techniques (\cref{sec:tv-equivalence}), discuss SMT-based
+approaches (\cref{sec:tv-smt}), describe the Alive2 system for LLVM
+(\cref{sec:tv-alive2}), and conclude with integration into optimization
+pipelines (\cref{sec:tv-integration}).
+
+% ============================================================
+% What is Translation Validation?
+% ============================================================
+\section{What is Translation Validation?}\label{sec:tv-concepts}
+
+\subsection{The Problem}\label{sec:tv-problem}
+
+\begin{definition}[Translation Validation]\label{def:tv}
+\emph{Translation validation} is the problem of verifying, for a specific
+compilation run, that the output program $P'$ is semantically equivalent to the
+input program $P$.  Formally, given $P$ and $P'$, decide whether:
+\[
+\forall \sigma.\; \SemBrack{P}(\sigma) = \SemBrack{P'}(\sigma)
+\]
+where $\SemBrack{\cdot}$ denotes the denotational semantics of the program and
+$\sigma$ ranges over all possible initial states.
+\end{definition}
+
+Translation validation differs from compiler verification in a crucial way:
+\begin{itemize}
+\item \textbf{Compiler verification} proves that the compiler is correct for
+      \emph{all} inputs (a universal property).
+\item \textbf{Translation validation} proves that a \emph{specific} compilation
+      is correct (an instance property).
+\end{itemize}
+
+This makes translation validation more practical: it does not require a formal
+model of the entire compiler, only a formal model of the source and target
+languages.
+
+\subsection{Validation vs.\ Verification}\label{sec:tv-vs-verify}
+
+\begin{table}[htbp]
+\caption{Translation Validation vs.\ Compiler Verification}\label{tab:tv-vs-verify}
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Translation Validation} & \textbf{Compiler Verification} \\
+\hline
+Scope & Per-compilation & Universal (all compilations) \\
+Cost & Proportional to program size & Proportional to compiler size \\
+Trust base & Source/target semantics & Compiler implementation \\
+False positives & Possible (incomplete validator) & None (if sound) \\
+Applicability & Any compiler & Requires formal compiler model \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Soundness and Completeness}\label{sec:tv-soundness}
+
+\begin{definition}[Soundness and Completeness of Validators]\label{def:tv-sound}
+A translation validator is:
+\begin{itemize}
+\item \textbf{Sound:} If the validator accepts, then $P$ and $P'$ are truly
+      equivalent.  (No false positives.)
+\item \textbf{Complete:} If $P$ and $P'$ are truly equivalent, then the
+      validator accepts.  (No false negatives.)
+\end{itemize}
+\end{definition}
+
+In practice, validators are typically sound but incomplete: they may reject some
+valid translations (false negatives) but never accept an invalid one.
+
+% ============================================================
+% Equivalence Checking
+% ============================================================
+\section{Equivalence Checking}\label{sec:tv-equivalence}
+
+\subsection{Semantic Equivalence}\label{sec:tv-semantic}
+
+Two programs are \emph{semantically equivalent} if they produce the same
+observable behavior for all inputs.
+
+\begin{definition}[Semantic Equivalence]\label{def:semantic-equiv}
+Programs $P$ and $P'$ are \emph{semantically equivalent}, written $P \equiv P'$,
+if for all initial states $\sigma$:
+\begin{enumerate}
+\item $P$ terminates on $\sigma$ iff $P'$ terminates on $\sigma$.
+\item If $P$ terminates on $\sigma$ with final state $\sigma'$, then $P'$
+      terminates on $\sigma$ with the same final state $\sigma'$.
+\end{enumerate}
+\end{definition}
+
+For programs with side effects (I/O, system calls), equivalence must also
+account for the observable effects.
+
+\subsection{Structural Equivalence}\label{sec:tv-structural}
+
+In some cases, equivalence can be established by \emph{structural comparison}:
+showing that the two programs have the same structure after accounting for
+renaming, reordering, and other syntactic transformations.
+
+\begin{itemize}
+\item \textbf{Alpha-equivalence:} Programs are equivalent up to variable renaming.
+\item \textbf{Commutativity:} Independent operations can be reordered.
+\item \textbf{Algebraic identities:} $x + 0 = x$, $x \times 1 = x$, etc.
+\end{itemize}
+
+Structural equivalence is efficient to check but incomplete: many semantically
+equivalent programs are not structurally equivalent.
+
+% ============================================================
+% Bounded Equivalence
+% ============================================================
+\section{Bounded Equivalence}\label{sec:tv-bounded}
+
+\subsection{Bounded Translation Validation}\label{sec:tv-bounded-def}
+
+\emph{Bounded translation validation} checks equivalence only for inputs of
+bounded size or for executions of bounded length.
+
+\begin{definition}[Bounded Equivalence]\label{def:bounded-equiv}
+Programs $P$ and $P'$ are \emph{$k$-equivalent} if for all initial states
+$\sigma$ with $|\sigma| \leq k$:
+\[
+\SemBrack{P}(\sigma) = \SemBrack{P'}(\sigma)
+\]
+where $|\sigma|$ is some measure of the size of the state (e.g., the magnitude
+of integer values, the length of arrays).
+\end{definition}
+
+Bounded equivalence is decidable (for finite bounds) and can be checked by
+enumerating inputs or by symbolic execution with bounded path length.
+
+\subsection{Unrolling-Based Validation}\label{sec:tv-unrolling}
+
+For programs with loops, bounded equivalence can be checked by unrolling loops
+up to a fixed bound and checking the resulting loop-free programs for
+equivalence.  This is the basis of bounded model checking applied to translation
+validation.
+
+% ============================================================
+% SMT-Based Approaches
+% ============================================================
+\section{SMT-Based Approaches}\label{sec:tv-smt}
+
+\subsection{Encoding Equivalence as SMT}\label{sec:tv-smt-encoding}
+
+The most powerful approach to translation validation uses SMT solvers to check
+equivalence.  The idea is to encode the negation of equivalence as an SMT
+formula and check its satisfiability:
+
+\[
+\phi_{\mathit{diff}} = \exists \sigma.\; \SemBrack{P}(\sigma) \neq \SemBrack{P'}(\sigma)
+\]
+
+If $\phi_{\mathit{diff}}$ is unsatisfiable, the programs are equivalent.  If it
+is satisfiable, the satisfying assignment provides a counterexample input.
+
+\subsection{Lockstep Simulation}\label{sec:tv-lockstep}
+
+\emph{Lockstep simulation} encodes both programs in a common SMT formula,
+executing them in lockstep and asserting that their outputs differ at some point.
+
+\begin{algorithm}[htbp]
+\caption{SMT-Based Translation Validation}\label{alg:tv-smt}
+\begin{algorithmic}[1]
+\Require Source program $P$, target program $P'$
+\Ensure ``Valid'' or counterexample
+\State Encode $P$ as SMT formula $\phi_P$ (using symbolic inputs)
+\State Encode $P'$ as SMT formula $\phi_{P'}$ (using same symbolic inputs)
+\State $\phi_{\mathit{diff}} \gets \phi_P \land \phi_{P'} \land (\mathit{output}_P \neq \mathit{output}_{P'})$
+\If{$\mathrm{SMT.Solve}(\phi_{\mathit{diff}}) = \mathit{unsat}$}
+  \State \Return ``Valid''
+\Else
+  \State $\sigma \gets \mathrm{SMT.Solve}(\phi_{\mathit{diff}})$
+  \State \Return ``Invalid: counterexample $\sigma$''
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Handling Non-Determinism}\label{sec:tv-nondet}
+
+When programs contain non-determinism (e.g., from undefined behavior in C),
+equivalence must account for the non-deterministic choices.  Two approaches:
+\begin{itemize}
+\item \textbf{Refinement:} $P'$ refines $P$ if every behavior of $P'$ is an
+      allowed behavior of $P$.  This is appropriate when $P$ has undefined
+      behavior that $P'$ resolves in a specific way.
+\item \textbf{Equivalence of non-deterministic programs:} $P$ and $P'$ are
+      equivalent if they have the same set of allowed behaviors.
+\end{itemize}
+
+\subsection{Memory Equivalence}\label{sec:tv-memory}
+
+Equivalence checking for programs with memory requires reasoning about the
+contents of memory at each program point.  The standard approach is to use the
+theory of arrays to model memory:
+
+\begin{itemize}
+\item Each memory state is an array mapping addresses to values.
+\item Load and store operations are modeled using $\mathit{read}$ and
+      $\mathit{write}$ on arrays.
+\item Equivalence requires that corresponding memory locations contain the same
+      values at corresponding program points.
+\end{itemize}
+
+% ============================================================
+% Alive2 for LLVM
+% ============================================================
+\section{Alive2 for LLVM}\label{sec:tv-alive2}
+
+\subsection{Background: Alive}\label{sec:tv-alive}
+
+Alive~\cite{lopes2015alive} is a domain-specific language for specifying LLVM
+optimizations, together with a verifier that checks each optimization for
+correctness.  Each Alive optimization is specified as a pair of LLVM IR
+fragments (source and target), and the verifier checks that the target refines
+the source for all possible inputs.
+
+Alive identified several bugs in LLVM's optimization passes and in the official
+documentation of LLVM's instructions.  However, Alive operates on \emph{hand-written}
+optimization specifications; it does not validate the optimizations actually
+performed by the LLVM compiler.
+
+\subsection{Alive2}\label{sec:tv-alive2-system}
+
+Alive2~\cite{lopes2015alive2} extends Alive to perform \emph{automated}
+translation validation of LLVM IR transformations.  It intercepts the
+optimization pipeline, captures the IR before and after each pass, and checks
+equivalence using an SMT-based validator.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, draw=TomeInk, fill=TomeBg, thick, minimum width=2.5cm, minimum height=0.8cm, align=center, rounded corners=2pt},
+  arr/.style={->, thick, TomeInk},
+  vbox/.style={rectangle, draw=TomeGold, fill=TomeExBg, thick, minimum width=2cm, minimum height=0.8cm, align=center, rounded corners=2pt}
+]
+  \node[box] (ir1) {IR before pass};
+  \node[box, right=1.5cm of ir1] (pass) {Optimization\\ Pass};
+  \node[box, right=1.5cm of pass] (ir2) {IR after pass};
+  \node[vbox, below=1cm of pass] (alive2) {Alive2\\Validator};
+
+  \draw[arr] (ir1) -- (pass);
+  \draw[arr] (pass) -- (ir2);
+  \draw[arr] (ir1) -- (alive2);
+  \draw[arr] (ir2) -- (alive2);
+  \node[below=0.3cm of alive2] {\texttt{Valid} / \texttt{Invalid}};
+\end{tikzpicture}
+\caption{Alive2 integrated into the LLVM optimization pipeline}\label{fig:alive2-pipeline}
+\end{figure}
+
+\subsection{Key Challenges in Alive2}\label{sec:tv-alive2-challenges}
+
+Alive2 must handle several challenging aspects of LLVM IR:
+
+\begin{itemize}
+\item \textbf{Undefined behavior (UB):} LLVM IR has many forms of UB (signed
+      overflow, null dereference, use-after-free, etc.).  An optimization that
+      removes UB is valid only if the original program was already guaranteed
+      to be free of that UB.
+\item \textbf{Poison values:} LLVM distinguishes \emph{undef} (any value) and
+      \emph{poison} (a value that makes any use of it UB).  Correct reasoning
+      about poison is essential for validating optimizations involving vector
+      operations and bit manipulation.
+\item \textbf{Memory model:} LLVM's memory model includes allocation,
+      deallocation, and aliasing rules that must be faithfully modeled.
+\item \textbf{Scalability:} The validator must handle large IR functions
+      efficiently, requiring careful encoding strategies.
+\end{itemize}
+
+\subsection{Results}\label{sec:tv-alive2-results}
+
+Alive2 has discovered dozens of bugs in LLVM's optimization passes, including:
+\begin{itemize}
+\item Incorrect handling of undefined behavior in dead code elimination.
+\item Incorrect constant folding for floating-point operations.
+\item Incorrect handling of \texttt{poison} in vector optimizations.
+\item Incorrect loop unrolling that changed the semantics of programs with
+      signed integer overflow.
+\end{itemize}
+
+% ============================================================
+% Integration with Optimization Pipelines
+% ============================================================
+\section{Integration with Optimization Pipelines}\label{sec:tv-integration}
+
+\subsection{Where to Validate}\label{sec:tv-where}
+
+Translation validation can be applied at different points in the compilation
+pipeline:
+
+\begin{itemize}
+\item \textbf{After each pass:} Validates each individual transformation.
+      Provides fine-grained error localization but increases overhead.
+\item \textbf{After groups of passes:} Validates batches of transformations.
+      Reduces overhead but makes error localization harder.
+\item \textbf{At the end of compilation:} Validates the entire compilation.
+      Lowest overhead but hardest to debug when validation fails.
+\end{itemize}
+
+\subsection{Performance Overhead}\label{sec:tv-overhead}
+
+The performance overhead of translation validation depends on:
+\begin{itemize}
+\item The size of the programs being validated.
+\item The complexity of the equivalence checking algorithm.
+\item Whether validation is done online (during compilation) or offline (after
+      compilation, as a separate step).
+\end{itemize}
+
+For Alive2, the overhead is typically 2--10x the compilation time, depending on
+the optimization pass and the size of the function being optimized.  This is
+acceptable for debugging and testing but too expensive for production use.
+
+\subsection{Selective Validation}\label{sec:tv-selective}
+
+To reduce overhead, selective validation validates only the most error-prone
+passes or only the transformations that are most likely to be incorrect.
+Heuristics for selecting which transformations to validate include:
+\begin{itemize}
+\item Validate passes that modify control flow (most error-prone).
+\item Validate passes that reason about undefined behavior.
+\item Skip validation for simple, well-tested passes (e.g., constant folding
+      of integer arithmetic).
+\end{itemize}
+
+\subsection{Continuous Validation}\label{sec:tv-continuous}
+
+Translation validation can be integrated into the compiler's test suite and
+continuous integration pipeline.  Every change to the compiler is tested by
+compiling a large corpus of programs with validation enabled, catching
+regressions before they reach users.
+
+\begin{insight}
+Translation validation embodies a profound shift in how we think about compiler
+correctness.  Rather than proving the compiler correct once and for all, we
+verify each compilation individually.  This is analogous to the shift from
+static typing (proving all programs correct at compile time) to dynamic checking
+(verifying each execution at run time).  The advantage is practicality: we can
+validate any compiler, even one that we cannot formally model.  The disadvantage
+is that we can never be sure we have found all bugs---only that the programs we
+have compiled so far are correct.
+\end{insight}
+
+\begin{historical}
+Translation validation was introduced by Pnueli, Siegel, and
+Singerman~\cite{pnueli1998translation} in 1998, in the context of verifying
+reactive systems.  The idea was adapted to compiler optimization by
+Necula~\cite{necula2000translation} in 2000, who proposed validating
+optimizations in the Proof-Carrying Code framework.  The first practical
+translation validator for a production compiler was the work of
+Bhargava et al.~\cite{bhargava2020towards} on LLVM, building on the Alive
+framework~\cite{lopes2015alive}.  Alive2~\cite{lopes2015alive2} has become the
+standard tool for validating LLVM optimizations and has discovered dozens of
+real-world compiler bugs.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:tv-summary}
+
+Translation validation provides a practical approach to ensuring compiler
+correctness.  By verifying each individual compilation rather than the compiler
+as a whole, it sidesteps the enormous difficulty of formal compiler verification
+while still providing strong guarantees about the correctness of compiled code.
+
+Key open challenges include:
+\begin{itemize}
+\item \textbf{Scaling to whole-program validation:} Current tools validate
+      individual functions; extending to whole programs requires handling
+      inter-procedural optimizations.
+\item \textbf{Handling complex language semantics:} Languages like C++ have
+      extremely complex semantics that are difficult to model precisely.
+\item \textbf{Reducing overhead:} Making translation validation fast enough for
+      production use remains an open challenge.
+\item \textbf{Integration with compiler development:} Making translation
+      validation a standard part of the compiler development workflow.
+\end{itemize}

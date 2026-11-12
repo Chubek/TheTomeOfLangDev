@@ -1,0 +1,516 @@
+%%
+%% chapter-60.ltx — Memory Models in IR
+%%
+
+\label{ch:memory-models}
+
+The memory model defines the contract between a program and its execution environment regarding how memory operations (loads, stores, atomics) behave. A compiler's IR must represent memory operations precisely enough to enable optimization while faithfully preserving the semantics required by the source language and the target hardware. This chapter explores how IRs represent memory, from explicit memory SSA to alias analysis, and how they bridge the gap between high-level language memory models and hardware memory models.
+
+%% ============================================================
+%% Section 60.1
+%% ============================================================
+\section{Memory as Explicit Values (Memory SSA)}\label{sec:memory-ssa}
+
+Memory SSA treats the entire memory state as a virtual value that flows through the program. Each memory operation takes the current memory state as input and produces a new memory state.
+
+\subsection{Memory States}\label{sec:memory-states}
+
+\begin{verbatim}
+  // Memory SSA:
+  mem0 = initial_memory
+  mem1 = store(mem0, ptr_a, value_1)    // write to ptr_a
+  mem2 = store(mem1, ptr_b, value_2)    // write to ptr_b
+  val = load(mem2, ptr_a)               // read from ptr_a (returns value_1)
+\end{verbatim}
+
+Each memory operation is explicitly ordered by its memory state input. The memory state at any point represents the cumulative effect of all preceding memory operations.
+
+\subsection{Memory Phi Functions}\label{sec:memory-phi}
+
+At control-flow join points, memory states are merged with phi functions:
+
+\begin{verbatim}
+  B1: mem1 = store(mem0, ptr, v1); goto B3
+  B2: mem2 = store(mem0, ptr, v2); goto B3
+  B3: mem3 = phi(mem1, mem2)  // memory state depends on path
+      val = load(mem3, ptr)   // val is v1 or v2 depending on path
+\end{verbatim}
+
+\subsection{Advantages of Memory SSA}\label{sec:memory-ssa-advantages}
+
+\begin{itemize}
+  \item \textbf{Explicit dependencies.} Memory dependencies are represented as data dependencies on the memory state.
+  \item \textbf{SSA benefits.} All SSA optimizations (CSE, DCE, code motion) apply to memory operations.
+  \item \textbf{Alias analysis integration.} The memory state can be split by alias analysis to reduce unnecessary dependencies.
+\end{itemize}
+
+%% ============================================================
+%% Section 60.2
+%% ============================================================
+\section{Alias Analysis in IR}\label{sec:alias-analysis}
+
+Alias analysis determines whether two pointers may refer to the same memory location. It is essential for optimizing memory operations.
+
+\subsection{Alias Query}\label{sec:alias-query}
+
+\begin{definition}[Alias Query]\label{def:alias-query}
+Given two memory accesses $a_1$ and $a_2$, alias analysis returns one of:
+\begin{itemize}
+  \item \textbf{NoAlias.} $a_1$ and $a_2$ definitely access different locations.
+  \item \textbf{MayAlias.} $a_1$ and $a_2$ may access the same location.
+  \item \textbf{MustAlias.} $a_1$ and $a_2$ definitely access the same location.
+\end{itemize}
+\end{definition}
+
+\subsection{Alias Analysis Techniques}\label{sec:alias-techniques}
+
+\begin{itemize}
+  \item \textbf{Type-based.} Pointers of different types do not alias (strict aliasing rule in C/C++).
+  \item \textbf{Scope-based.} Local variables do not alias with each other or with globals.
+  \item \textbf{Flow-insensitive.} Andersen's analysis: computes a points-to set for each pointer, ignoring control flow.
+  \item \textbf{Flow-sensitive.} Steensgaard's analysis (with merging) or more precise analyses that track points-to information along control-flow paths.
+\end{itemize}
+
+\subsection{Alias Analysis in LLVM}\label{sec:alias-llvm}
+
+LLVM uses a layered alias analysis framework:
+
+\begin{verbatim}
+  // Alias analysis pipeline:
+  1. BasicAA: simple rules (type-based, scope-based, GEP analysis)
+  2. CFL-AA: context-free language-based analysis (more precise)
+  3. TBAA: type-based alias analysis (uses type metadata)
+  4. Scoped-noalias: uses scope metadata from source language
+\end{verbatim}
+
+%% ============================================================
+%% Section 60.3
+%% ============================================================
+\section{Memory Dependencies and Ordering}\label{sec:memory-dependencies}
+
+Memory dependencies determine which memory operations can be reordered.
+
+\subsection{Dependency Types}\label{sec:dep-types}
+
+\begin{itemize}
+  \item \textbf{Raw (Read-After-Write).} A read depends on a preceding write to the same location.
+  \item \textbf{War (Write-After-Read).} A write must not overtake a preceding read to the same location.
+  \item \textbf{Waw (Write-After-Write).} Two writes to the same location must maintain their order.
+\end{itemize}
+
+\subsection{Reordering Rules}\label{sec:reordering-rules}
+
+Two memory operations can be reordered if and only if they do not alias (or if the reordering preserves the semantics for all possible aliasing scenarios).
+
+\begin{verbatim}
+  // Can reorder (no alias):
+  store ptr_a, v1    // write to a
+  store ptr_b, v2    // write to b (different from a)
+
+  // Cannot reorder (may alias):
+  store ptr_a, v1    // write to a
+  load ptr_b         // read from b (may be same as a)
+\end{verbatim}
+
+%% ============================================================
+%% Section 60.4
+%% ============================================================
+\section{Hardware Memory Models}\label{sec:hardware-memory-models}
+
+Modern processors do not guarantee sequential consistency: memory operations may appear to execute in a different order than the program specifies.
+
+\subsection{Sequential Consistency}\label{sec:sequential-consistency}
+
+\begin{definition}[Sequential Consistency]\label{def:seq-cst}
+A system is \emph{sequentially consistent} if the result of any execution is the same as if all processors' operations were executed in some sequential order, and each processor's operations appear in the order specified by its program.
+\end{definition}
+
+Sequential consistency is the simplest memory model but is not provided by modern hardware (for performance reasons).
+
+\subsection{Relaxed Memory Models}\label{sec:relaxed-models}
+
+Modern architectures provide relaxed memory models:
+
+\begin{table}[htbp]
+\centering
+\caption{Hardware memory models}\label{tab:hw-memory-models}
+\begin{tabular}{lp{8cm}}
+\hline
+\textbf{Architecture} & \textbf{Memory Model} \\
+\hline
+x86-TSO & Total Store Order: stores are not reordered with stores; loads may be reordered with stores \\
+ARM & Weakly ordered: all reorderings are permitted unless explicitly prevented \\
+POWER & Weakly ordered: similar to ARM, with additional complexities \\
+RISC-V & RVWMO: weakly ordered, with explicit fence instructions \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Implications for IR}\label{sec:hw-implications}
+
+The IR must represent enough information for the backend to generate correct code for the target's memory model:
+\begin{itemize}
+  \item \textbf{Ordering constraints.} The IR must record which memory operations must be ordered.
+  \item \textbf{Fences.} The IR must insert fence instructions where needed.
+  \item \textbf{Atomics.} The IR must represent atomic operations with their required ordering guarantees.
+\end{itemize}
+
+%% ============================================================
+%% Section 60.5
+%% ============================================================
+\section{Sequential Consistency vs. Relaxed Models}\label{sec:seq-vs-relaxed}
+
+The gap between the source language's memory model (typically sequential consistency) and the hardware's memory model (typically relaxed) must be bridged by the compiler.
+
+\subsection{The Compiler's Role}\label{sec:compiler-role}
+
+The compiler must:
+\begin{enumerate}
+  \item Preserve the source language's memory model semantics.
+  \item Generate code that is correct for the target hardware's memory model.
+  \item Insert fences and barriers where needed to prevent hardware reordering.
+\end{enumerate}
+
+\subsection{Mapping Source to Hardware}\label{sec:source-to-hardware}
+
+\begin{verbatim}
+  // Source (C++11):
+  x.store(1, std::memory_order_seq_cst);  // sequentially consistent
+  y.store(2, std::memory_order_relaxed);  // relaxed
+
+  // IR:
+  store.atomic x, 1, seq_cst    // must not be reordered
+  store.atomic y, 2, relaxed    // can be reordered
+
+  // Target (x86):
+  mov [x], 1          // x86 TSO: stores are ordered
+  mfence              // seq_cst requires a fence on x86
+  mov [y], 2          // relaxed: no fence needed
+
+  // Target (ARM):
+  str 1, [x]
+  dmb ish             // seq_cst requires a barrier on ARM
+  str 2, [y]          // relaxed: no barrier needed
+\end{verbatim}
+
+%% ============================================================
+%% Section 60.6
+%% ============================================================
+\section{IR Support for Atomics and Fences}\label{sec:atomics-fences}
+
+The IR must provide operations for atomic memory access and synchronization fences.
+
+\subsection{Atomic Operations}\label{sec:atomic-ops}
+
+\begin{verbatim}
+  // Atomic load:
+  %val = load.atomic i32* %ptr, seq_cst
+
+  // Atomic store:
+  store.atomic i32 %val, i32* %ptr, release
+
+  // Atomic read-modify-write:
+  %old = atomicrmw add i32* %ptr, 1 seq_cst  // atomic increment
+
+  // Compare-and-swap:
+  %result = cmpxchg i32* %ptr, %expected, %desired seq_cst seq_cst
+\end{verbatim}
+
+\subsection{Memory Ordering}\label{sec:memory-ordering}
+
+Atomic operations carry a memory ordering that specifies their synchronization guarantees:
+
+\begin{itemize}
+  \item \textbf{relaxed.} No ordering guarantees beyond atomicity.
+  \item \textbf{acquire.} Subsequent reads/writes cannot be reordered before this operation.
+  \item \textbf{release.} Preceding reads/writes cannot be reordered after this operation.
+  \item \textbf{acq\_rel.} Both acquire and release.
+  \item \textbf{seq\_cst.} Acquire + release + total ordering with other seq\_cst operations.
+\end{itemize}
+
+\subsection{Fence Instructions}\label{sec:fences}
+
+Fences enforce ordering between memory operations:
+
+\begin{verbatim}
+  // Full fence: no memory operation can cross the fence
+  fence seq_cst
+
+  // Acquire fence: subsequent operations cannot move before the fence
+  fence acquire
+
+  // Release fence: preceding operations cannot move after the fence
+  fence release
+\end{verbatim}
+
+\subsection{IR Representation}\label{sec:ir-atomics}
+
+The IR represents atomics and fences as special operations with explicit ordering annotations. The backend lowers these to the appropriate hardware instructions (e.g., \texttt{mfence} on x86, \texttt{dmb} on ARM).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.5cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.8cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (source) {Source Language\\(C11/Java/Rust)};
+  \node[block, below=of source] (ir) {IR\\(Atomics + Fences)};
+  \node[block, below left=1.5cm and 0.5cm of ir] (x86) {x86 Code\\(TSO + mfence)};
+  \node[block, below right=1.5cm and 0.5cm of ir] (arm) {ARM Code\\(Weak + dmb)};
+
+  \draw[arrow] (source) -- (ir);
+  \draw[arrow] (ir) -- (x86);
+  \draw[arrow] (ir) -- (arm);
+\end{tikzpicture}
+\caption{Memory model lowering: the source language's memory model is represented in the IR using atomics and fences; the backend lowers these to hardware-specific instructions.}\label{fig:memory-lowering}
+\end{figure}
+
+\begin{historical}
+The study of memory models began with Lamport's definition of sequential consistency~\cite{lamport1979}. The discovery that hardware does not provide sequential consistency (for performance) led to the development of relaxed memory models and the associated programming challenges. The C11/C++11 memory model~\cite{boehm2008} was the first to provide a standardized, hardware-independent memory model for a mainstream language. The implementation of these models in compilers (LLVM, GCC) required careful design of the IR to represent atomic operations, fences, and ordering constraints. The ongoing challenge is to balance the programmer's need for simplicity (sequential consistency) with the hardware's need for performance (relaxed models).
+\end{historical}
+
+%% ============================================================
+%% Section 60.7
+%% ============================================================
+\section{Memory Model Verification}\label{sec:memory-verification}
+
+Verifying that a compiler correctly implements a memory model is a significant challenge. Recent work has focused on formal verification of memory model implementations.
+
+\subsection{Litmus Tests}\label{sec:litmus-tests}
+
+\emph{Litmus tests} are small programs that test specific memory model behaviors:
+
+\begin{verbatim}
+  // Litmus test: Store buffering (x86-TSO allows this)
+  // Thread 1:          Thread 2:
+  // [x] = 1            [y] = 1
+  // r1 = [y]           r2 = [x]
+  //
+  // Question: Can r1 = 0 and r2 = 0?
+  // Answer on x86: Yes (stores can be reordered with subsequent loads)
+  // Answer on SC: No (sequential consistency forbids this)
+\end{verbatim}
+
+Litmus tests are used to validate both the compiler's memory model implementation and the hardware's actual behavior.
+
+\subsection{Formal Memory Models}\label{sec:formal-memory-models}
+
+Formal memory model specifications (e.g., the C11 memory model, the Java Memory Model) define the set of allowed behaviors for a program. A compiler is correct if every behavior of the compiled code is an allowed behavior of the source program.
+
+\begin{definition}[Memory Model Correctness]\label{def:mm-correct}
+A compiler $C$ is \emph{memory-model correct} if for every source program $P$ and every execution $E$ of $C(P)$, there exists an execution $E'$ of $P$ under the source memory model such that $E$ and $E'$ produce the same observable behavior.
+\end{definition}
+
+\subsection{Optimization Under Relaxed Memory Models}\label{sec:opt-relaxed}
+
+Optimizations that are safe under sequential consistency may be unsafe under relaxed memory models. For example:
+
+\begin{itemize}
+  \item \textbf{Store elimination.} Eliminating a store is safe only if no other thread can observe the store.
+  \item \textbf{Load hoisting.} Hoisting a load above a synchronization point may violate the memory model.
+  \item \textbf{Speculative loads.} Speculatively loading from a pointer that may be null is unsafe if the load has visible side effects (e.g., page faults).
+\end{itemize}
+
+\begin{caution}
+Optimizing code with atomics and synchronization requires extreme care. An optimization that is valid for ordinary memory operations may violate the memory model when applied to atomic operations. Compilers must use conservative alias analysis and respect the ordering constraints of atomic operations.
+\end{caution}
+
+%% ============================================================
+%% Section 60.8
+%% ============================================================
+\section{Advanced Alias Analysis and Hardware Memory Models}\label{sec:alias-hardware-advanced}
+
+\subsection{Points-To Analysis Algorithms}\label{sec:points-to-algorithms}
+
+Points-to analysis determines which memory locations a pointer may refer to. Different algorithms offer different trade-offs between precision and cost.
+
+\begin{table}[htbp]
+\centering
+\caption{Points-to analysis algorithms compared}\label{tab:points-to-algorithms}
+\begin{tabular}{p{2.5cm}p{2cm}p{2cm}p{2cm}p{3cm}}
+\hline
+\textbf{Algorithm} & \textbf{Flow?} & \textbf{Context?} & \textbf{Cost} & \textbf{Precision} \\
+\hline
+Naive & No & No & $O(n)$ & Very low \\
+Steensgaard & No & No & $O(n \alpha(n))$ & Low \\
+Andersen & No & No & $O(n^3)$ & Medium \\
+Cycle-collecting & No & No & $O(n^3)$ & Medium-High \\
+Flow-sensitive & Yes & No & $O(n^4)$ & High \\
+Context-sensitive & No & Yes & $O(n^3 \cdot c)$ & High \\
+Both & Yes & Yes & Exponential & Very high \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{algorithm}[H]
+\caption{Andersen's Points-To Analysis}\label{alg:andersen}
+\begin{algorithmic}[1]
+\Function{AndersenAnalysis}{$\mathrm{program}$}
+  \State \Comment{Initialize points-to sets}
+  \For{each pointer variable $p$}
+    \State $\mathrm{pts}(p) \gets \emptyset$
+  \EndFor
+  \State \Comment{Generate constraints from program}
+  \For{each assignment $p = \&x$}
+    \State Add constraint: $\{x\} \subseteq \mathrm{pts}(p)$
+  \EndFor
+  \For{each assignment $p = q$}
+    \State Add constraint: $\mathrm{pts}(q) \subseteq \mathrm{pts}(p)$
+  \EndFor
+  \For{each assignment $*p = q$}
+    \State Add constraint: $\forall r \in \mathrm{pts}(p).\, \mathrm{pts}(q) \subseteq \mathrm{pts}(r)$
+  \EndFor
+  \For{each assignment $p = *q$}
+    \State Add constraint: $\forall r \in \mathrm{pts}(q).\, \mathrm{pts}(r) \subseteq \mathrm{pts}(p)$
+  \EndFor
+  \State \Comment{Solve constraints (least fixed point)}
+  \Repeat
+    \State $\mathrm{changed} \gets \mathrm{false}$
+    \For{each constraint}
+      \State Apply constraint; update points-to sets
+      \If{any set changed}
+        \State $\mathrm{changed} \gets \mathrm{true}$
+      \EndIf
+    \EndFor
+  \Until{$\neg \mathrm{changed}$}
+  \State \Return $\mathrm{pts}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Alias Analysis for Optimization}\label{sec:alias-for-optimization}
+
+Alias analysis results directly enable optimizations:
+
+\begin{verbatim}
+  // Before alias analysis:
+  *p = 1;
+  x = *q;  // must read from memory (p and q may alias)
+
+  // After alias analysis (p and q do NOT alias):
+  *p = 1;
+  x = *q;  // can use cached value of *q (no alias with p)
+  // -> load hoisted before the store
+
+  // After alias analysis (p and q MUST alias):
+  *p = 1;
+  x = *q;  // x is definitely 1 (p == q)
+  // -> replaced with: x = 1
+\end{verbatim}
+
+\subsection{Hardware Memory Models in Detail}\label{sec:hardware-models-detail}
+
+Different processor architectures provide different memory consistency guarantees:
+
+\begin{verbatim}
+  // x86-TSO (Total Store Order):
+  // - Loads are not reordered with loads
+  // - Stores are not reordered with stores
+  // - Loads MAY be reordered with earlier stores (to different locations)
+  // - Each processor sees its own writes in order
+
+  // ARM (Weakly ordered):
+  // - Loads MAY be reordered with loads
+  // - Stores MAY be reordered with stores
+  // - Loads MAY be reordered with stores
+  // - Explicit barriers (DMB, DSH) needed for ordering
+
+  // RISC-V (RVWMO):
+  // - Similar to ARM: weakly ordered
+  // - FENCE instruction for ordering
+  // - LR/SC for atomic read-modify-write
+\end{verbatim}
+
+\begin{table}[htbp]
+\centering
+\caption{Memory model reorderings permitted by different architectures}\label{tab:hw-reorderings}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Reordering} & \textbf{x86} & \textbf{ARM} & \textbf{POWER} & \textbf{RISC-V} \\
+\hline
+Load-Load & No & Yes & Yes & Yes \\
+Load-Store & No & Yes & Yes & Yes \\
+Store-Store & No & Yes & Yes & Yes \\
+Store-Load & Yes & Yes & Yes & Yes \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Mapping Source Memory Model to Hardware}\label{sec:source-to-hw-mapping}
+
+The compiler must insert appropriate fences to bridge the gap between the source language's memory model and the hardware's:
+
+\begin{verbatim}
+  // Source (C++11 sequentially consistent):
+  x.store(1, seq_cst);  // must be totally ordered
+  r1 = y.load(seq_cst);
+
+  // On x86 (TSO):
+  mov [x], 1      // store (naturally ordered on x86)
+  mfence           // seq_cst fence needed (prevents store-load reordering)
+  mov r1, [y]     // load
+
+  // On ARM (weakly ordered):
+  str 1, [x]       // store
+  dmb ish          // full barrier (prevents all reorderings)
+  ldr r1, [y]     // load
+
+  // On x86, relaxed operations need no fences:
+  // x.store(1, relaxed);
+  mov [x], 1      // no fence needed
+  // y.load(relaxed);
+  mov r1, [y]     // no fence needed
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (source) {Source Model\\(C11/Rust/Java)};
+  \node[block, below=of source] (ir) {IR\\(Atomics + Ordering)};
+  \node[block, below left=1.5cm and 0.5cm of ir] (x86) {x86\\(TSO + mfence)};
+  \node[block, below=1.5cm of ir] (arm) {ARM\\(Weak + dmb)};
+  \node[block, below right=1.5cm and 0.5cm of ir] (riscv) {RISC-V\\(RVWMO + fence)};
+
+  \draw[arrow] (source) -- (ir);
+  \draw[arrow] (ir) -- (x86);
+  \draw[arrow] (ir) -- (arm);
+  \draw[arrow] (ir) -- (riscv);
+
+  \node[font=\small, left=0.5cm of ir, align=right] {
+    Ordering annotations\\
+    preserved in IR
+  };
+\end{tikzpicture}
+\caption{Memory model lowering pipeline. The source language's memory model is encoded in the IR using atomic operations with ordering annotations. The backend maps these to hardware-specific instructions and fences.}\label{fig:memory-model-pipeline}
+\end{figure}
+
+\subsection{Optimization Under Memory Models}\label{sec:opt-under-mm}
+
+Certain optimizations that are safe for ordinary memory operations become unsafe under relaxed memory models:
+
+\begin{itemize}
+  \item \textbf{Store forwarding.} Replacing a load with a previously stored value is safe only if no other thread can observe the store.
+  \item \textbf{Load elimination.} Removing a redundant load is safe only if no intervening store from another thread can change the value.
+  \item \textbf{Speculative loads.} Speculatively loading from a pointer is unsafe if the load can trigger a page fault that is observable by other threads.
+  \item \textbf{Store merging.} Merging two consecutive stores to the same location is safe only if no other thread can read the intermediate value.
+\end{itemize}
+
+\begin{caution}
+The interaction between optimization and memory models is one of the most subtle areas in compiler design. An optimization that is valid under sequential consistency may introduce bugs under relaxed memory models. The compiler must track the memory ordering of each operation and respect the constraints imposed by the source language's memory model.
+\end{caution}
+
+%% ============================================================
+%% Section 60.9
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-60}
+
+Memory models in IRs must bridge the gap between the source language's memory semantics and the target hardware's memory behavior. Memory SSA makes memory dependencies explicit; alias analysis determines which operations may conflict; and atomic/fence operations represent synchronization. The compiler's role is to preserve the source language's guarantees while generating efficient code for the target hardware.
+
+Litmus tests and formal memory model specifications provide tools for verifying compiler correctness. The ongoing challenge is to enable aggressive optimization while respecting the subtle constraints of relaxed memory models.
+
+For further reading, we recommend the C11/C++11 memory model paper~\cite{boehm2008}, the LLVM atomics documentation~\cite{llvm2024}, and Adve and Boehm's survey of memory models~\cite{adve2010}. The work by Batty et al.~\cite{batty2011} on the formalization of the C11 memory model provides a rigorous foundation for memory model verification.

@@ -1,0 +1,4101 @@
+c The Author(s), 2022. Published by Cambridge University Press. This is an Open 1
+JFP 32, e12, 53 pages, 2022. 
+Access article, distributed under the terms of the Creative Commons Attribution licence (https://creativecommons.org/
+licenses/by/4.0/), which permits unrestricted re-use, distribution, and reproduction in any medium, provided the
+original work is properly cited.
+doi:10.1017/S0956796822000090
+
+ANF preserves dependent types up to extensional
+equality
+PAULETTE KORONKEVICH
+University of British Columbia, Vancouver, British Columbia, Canada
+(e-mail: pletrec@cs.ubc.ca)
+
+RAMON RAKOW
+University of British Columbia, Vancouver, British Columbia, Canada
+(e-mail: ramon.rakow@alumni.ubc.ca)
+
+AMAL AHMED
+Northeastern University, Boston, MA 02115, USA
+(e-mail: amal@ccs.neu.edu)
+
+WILLIAM J. BOWMAN
+University of British Columbia, Vancouver, British Columbia, Canada
+(e-mail: wjb@williamjbowman.com)
+
+Abstract
+Many programmers use dependently typed languages such as Coq to machine-verify high-assurance
+software. However, existing compilers for these languages provide no guarantees after compiling,
+nor when linking after compilation. Type-preserving compilers preserve guarantees encoded in types
+and then use type checking to verify compiled code and ensure safe linking with external code.
+Unfortunately, standard compiler passes do not preserve the dependent typing of commonly used
+(intensional) type theories. This is because assumptions valid in simpler type systems no longer hold,
+and intensional dependent type systems are highly sensitive to syntactic changes, including compilation. We develop an A-normal form (ANF) translation with join-point optimization—a standard
+translation for making control flow explicit in functional languages—from the Extended Calculus of
+Constructions (ECC) with dependent elimination of booleans and natural numbers (a representative
+subset of Coq). Our dependently typed target language has equality reflection, allowing the type system to encode semantic equality of terms. This is key to proving type preservation and correctness
+of separate compilation for this translation. This is the first ANF translation for dependent types.
+Unlike related translations, it supports the universe hierarchy, and does not rely on parametricity or
+impredicativity.
+
+1 Introduction
+Dependently typed languages such as Coq, Agda, Idris, and F* allow programmers to
+write full-functional specifications for a program (or program component), implement the
+program, and prove that the program meets its specification. These languages have been
+widely used to build formally verified high-assurance software including the CompCert C
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+2
+
+P. Koronkevich et al.
+
+compiler (Leroy, 2009), the CertiKOS operating system kernel (Gu et al., 2015, 2016), and
+cryptographic primitives (Appel, 2015) and protocols (Barthe et al., 2009).
+Unfortunately, even these machine-verified programs can misbehave when executed due
+to errors introduced during compilation and linking. For example, suppose we have a program component S written and proven correct in a source language like Coq. To execute
+S, we first compile S from Coq to a component T in OCaml. If the compiler from Coq to
+OCaml introduces an error, we say that a miscompilation error occurs. Now T contains an
+error despite S being verified. Because S and T are not whole programs, T will be linked
+with some external (i.e., not verified in Coq) code C to form the whole program P. If C violates the original specification of S, then we say a linking error occurs and P may contain
+safety, security, or correctness errors.
+A verified compiler prevents miscompilation errors, since it is proven to preserve the
+run-time behavior of a program, but it cannot prevent linking errors. Note that linking
+errors can occur even if S is compiled with a verified compiler, since the external code we
+link with, C, is outside of the control of either the source language or the verified compiler. Ongoing work on CertiCoq (Anand et al., 2017) seeks to develop a verified compiler
+for Coq, but it cannot rule out linking with unsafe target code. One can develop simple
+examples in Coq that, once compiled to OCaml and linked with an unverified OCaml
+component, jump to an arbitrary location in memory—despite the Coq component being
+proven memory safe. We provide an example of this in the supplementary materials.
+To rule out both miscompilation and linking errors, we could combine compiler verification with type-preserving compilation. A type-preserving compiler preserves types,
+representing specifications, into a target typed intermediate language (IL). The IL uses
+type checking at link time to enforce specifications when linking with external code, essentially implementing proof-carrying code (Necula, 1997). After linking in the IL, we have
+a whole program, so we can erase types and use verified compilation to machine code. To
+support safe linking with untyped code, we could use gradual typing to enforce safety at the
+boundary between the typed IL and untyped components (Ahmed, 2015; Lennon-Bertrand
+et al., 2022). Applied to Coq, this technique would provide significant confidence that the
+executable program P is as correct as the verified program S.
+We consider this particular application of type preservation important for compiler verification and for protecting the trusted computing base when working in a dependently
+typed language, but type preservation has other long studied applications. Type-preserving
+compilers can provide a lightweight verification procedure using type-directed proof
+search (Chlipala, 2007), can be better equipped to handle optimizations and changes than
+a certified compiler (Tarditi et al., 1996; Chen et al., 2008), and can support debugging
+internal compiler passes (Peyton Jones, 1996).
+Unfortunately, dependent-type preservation is difficult because compilation that preserves the semantics of the program may disrupt the syntax-directed typing of the program.
+This is particularly problematic with dependent types since expressions from a program
+end up in specifications expressed in the types. As the compiler transforms the syntax of
+the program, the expressions in types can become “out of sync” with the expressions in the
+compiled program.
+To preserve dependent typing, the type system of the IL needs access to the semantic
+equivalences relied upon by compilation. Past work has used strong axioms, including
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+3
+
+parametricity and impredicativity, to recover these equivalences (Bowman et al., 2018).
+However, this approach does not support all dependent type system features, particularly
+predicative universe hierarchies (which are anti-impredicative) or ad hoc polymorphism
+and type quotation (which is anti-parametric) (Boulier et al., 2017). Dependently typed
+languages, such as Coq, restrict impredicative quantification as it is inconsistent with other
+features and axioms, such as excluded middle and large elimination. Restricting impredicativity restricts type-level abstraction, so such languages often add a predicative universe
+hierarchy—abstractions over types live in a higher universe than the parameter, and so
+on. Higher universes enable recovering the ability to abstract over types and the types
+of types, etc., which is useful for generic programming and abstract mathematics. This
+means reliance on parametricity and impredicativity restrict which source programs can be
+compiled and thus cannot be applied in practice. To scale to a realistic dependently typed
+language such as Coq, we must encode these semantic equivalences in the type system
+without restricting core features.
+To preserve dependent types, the compiler IL must encode the semantic equivalences
+relied upon by compilation. In this work, we do this using extensionality, which allows
+the type system to consider two types (or two terms embedded in a type) definitionally
+equivalent if the program contains an expression representing a proof that the two types
+(or terms) are equal. Using this feature, the translation can insert hints for the type system
+about which terms it can assume to be equivalent and provide proofs of those facts elsewhere to discharge these assumptions. This approach scales to higher universes and other
+features that prior work could not handle and does so without relying on parametricity or
+impredicativity in the target IL. Relying on extensionality has one key downside: decidable type checking becomes more complex. We discuss how to mitigate this downside in
+Section 7.
+We present a dependent-type-preserving translation to A-normal form (ANF), a compiler intermediate representation that makes control flow explicit and facilitates optimizations (Sabry & Felleisen, 1992; Flanagan et al., 1993). The source of this translation is
+ECC, the Extended Calculus of Constructions with dependent elimination of booleans and
+natural numbers. ECC represents a significant subset of Coq. The translation supports all
+core features of dependency, including higher universes, without relying on parametricity
+or impredicativity, in contrast to prior work (Bowman et al., 2018; Cong & Asai, 2018a).
+This ensures that the translation works for existing dependently typed languages and that
+we can reuse existing work on ANF translations, such as join-point optimization. This
+work provides substantial evidence that dependent-type preservation can, in theory, scale
+to the practical dependently typed languages currently used for high-assurance software.
+Our translation targets our typed IL CCAe , the ANF-restricted extensional Calculus of
+Constructions. CCAe features a machine-like semantics for evaluating ANF terms, and
+we prove correctness of separate compilation with respect to this machine semantics.
+To support the type-preserving translation of dependent elimination for booleans, CCAe
+uses two extensions to ECC: it records propositional equalities in typing derivations and
+applies equality reflection to access these equalities. These extensions make type checking
+undecidable. We discuss how to recover decidability in Section 7.
+Our ANF translation is useful as a compiler pass, but it also provides insights into
+dependent-type preservation and ANF translations. The target IL is designed to express
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+4
+
+P. Koronkevich et al.
+
+and check semantic equivalences that the translation relies on for correctness. This lesson
+likely extends to other translations in a type-preserving compiler for dependent types.
+We also develop a new proof architecture for reasoning about the ANF translation. This
+proof architecture is useful when ANF is achieved through a translation rather than a reduction system. Our translation is indexed by a continuation, a program with a hole, to build
+up the translated term. Thus, the type of the translated term can only be determined when
+the hole is filled with a well-typed term. Mirroring the translation, we use the type of the
+continuation to build up a proof of type-preservation.
+This paper includes key definitions and proof cases; extended figures and proofs are
+available in Appendix 1.
+
+2 Main ideas
+ANF 101. A-normal form (ANF)1 is a syntactic form that makes control flow explicit in
+the syntax of a program (Sabry & Felleisen, 1992; Flanagan et al., 1993). ANF encodes
+computation (e.g., reducing an expression to a value) as a sequence of primitive intermediate computations composed through intermediate variables, similar to how all computation
+works in an assembly language.
+For example, to reduce snd e, which projects the second element of a pair, we need to
+describe the evaluation order and control flow of each language primitive. We evaluate
+e to a value, and then, we project out the second component. ANF makes control flow
+explicit in the syntax by decomposing snd e into the series of primitive computations that
+the machine must execute, sequenced by let. Roughly, we can think of the ANF translation snd e as let x = e in snd x. However, e could also be a deeply nested expression
+in the source language. In general, the ANF translation reassociates all the intermediate computations from e so there are no nested let expressions, and we end up with
+let x1 = N1 ...xn = Nn in snd xn .
+Once in ANF, it is simple to formalize a machine semantics to implement evaluation.
+Each let-bound computation xi = Ni is some primitive machine step, performing the
+computation Ni and binding the value to xi . In this way, control flow has been compiled
+into data flow. The machine proceeds by always reducing the left-most machine step,
+which will be a primitive operation with values for operands. For a lazy semantics, we
+can instead delay each machine step and begin forcing the inner-most body (right-most
+expression).
+Why Translation Disrupts Typing and How to Fix it. The problem with dependenttype preservation has little to do with ANF itself and everything to do with dependent types.
+Transformations which ought to be fine are not because the type theory is so beholden
+to details of syntax. This is essentially the problem of commutative cuts in type theory (Herbelin, 2009; Boutillier, 2012). Transformations that change the structure (syntax)
+1
+
+The A in A-normal form has no further meaning. The name originates in a study of the (informal notion of)
+administrative redexes in CPS and formalizes these as a set A of source-to-source rewrites. The name A-normal
+form refers to the normal form with respect to the A reductions; the form is A normal. We emphasize this point
+because it is useful to think of ANF as syntactic form normal with respect to particular set of rewrites and not
+necessarily the output of a particular translation; we revisit this perspective in Section 7.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+5
+
+of a program can disrupt dependencies. By dependency, we mean an expression e whose
+type and evaluation depends on a sub-expression e. We call a sub-expression such as e
+depended upon. These dependencies occur in dependent elimination forms, such as application, projection, and if expressions. Transforming a dependent elimination can disrupt
+dependencies.
+For example, the dependent type of a second projection of a dependent pair e :  x : A. B
+is typed as follows:
+snd e : B[x := fst e]
+
+Notice that the depended upon sub-expression e is copied into the type, indicated by the
+solid line arrow. Dependent pairs can be used to define refinement types, such as encoding
+a type that guarantees an index is in bounds:  x : Int. 0 < x < len e . Then, the second projection snd e : 0 < fst e < len e represents an explicit proof about first projection. Unfortunately,
+transforming the expression snd e can easily change its type.
+For example, suppose we have the nested expression f (snd e) : C, and we want to let-bind
+all intermediate computations (which, incidentally, ANF does).
+let y = e :  x : A. B
+where f : (B[x := fst e]) → C
+z = snd y : B[x := fst y] in
+fz
+
+This is not well typed, even with the following dependent-let rule (treated as syntactic
+sugar for dependent application):
+e:A
+
+, y : A  e : B
+
+  let y = e in e : B[y := e]
+
+The problem now is the dependent elimination snd y is let-bound and then used, changing
+the type to B[x := fst y]. This means the equality y = e is missing,2 but is needed to type
+check this term (indicated by the dotted line arrow). This fails since f expects z : B[x := fst e],
+but is applied to z : B[x := fst y]. The typing rule essentially forgets that, by the time snd y
+happens, the machine will have performed the step of computation let y = e, forcing y to
+take on the value of e, so it ought to be safe to assume that y = e in the types. When
+type checking in linearized machine languages, we need to record these machine steps
+throughout the typing derivation.
+The above explanation applies to all dependent eliminations of negative types, such as
+dependently typed functions and compound data structures (modeled as  and  types).
+An analogous problem occurs with dependent elimination of positive types, which
+include data types eliminated through branching such as booleans with if expressions. In
+the dependent typing rule for if, the types of the branches learn whether the predicate of the
+if is either true or false. This allows the type system to statically reflect information from
+dynamic control flow.
+ e1 : B[x := true]
+
+ e2 : B[x := false]
+
+ if e then e1 else e2 : B[x := e]
+
+Now consider an if expression and a function f . The expression f (if e then e1 else e2 ) is
+well typed, but if we want to push the application into the branches to make if behave a
+little more like goto (like the ANF translation does), this result is not well typed.
+2
+
+This missing equality is added to most modern proof assistants, as explained further in the section.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+6
+
+P. Koronkevich et al.
+where f : (B[x := e]) → C
+if e then (f e1 )
+e1 : B[x := true]
+else (f e2 ) : C[x := e]
+e2 : B[x := false]
+
+This transformation fails when type checking the applications of f to the branches e1 and
+e2 . The function f is expecting an argument of type B[x := e] but is applied to arguments of
+type B[x := true] and B[x := false]. The type system cannot prove that e is equal to both true
+and false. In essence, this transformation relies on the fact that, by the time the expression
+f e1 executes, the machine has evaluated e to true (and, analogously, e to false in the other
+branch), but the type system has no way to express this.
+We design a target language type system in which we can express these intuitions and
+recover type preservation of these kinds of transformations. We use two extensions to ECC:
+one for negative types ( and  in ECC) and one for positive types (booleans and natural
+numbers in ECC).
+For negative types, it suffices to use definitions (Severi & Poll, 1994), a standard
+extension to type theory that changes the typing rule for let to thread equalities into
+sub-derivations and resolve dependencies. The relevant typing rule is:
+e:A
+
+δ
+
+, x = e : A  e : A
+
+  let x = e in e : A [x := e]
+δ
+
+The highlighted part, x = e : A, is the only difference from the standard dependent typing
+rule. This definition is introduced when type checking the body of the let and can be used
+to solve type equivalence in sub-derivations, instead of only in the substitution A [x := e] in
+the “output” of the typing rule. While this is an extension to the type theory, it is a standard
+extension that is admissible in any Pure Type System (PTS) (Severi & Poll, 1994) and is a
+feature already found in dependently typed languages such as Coq. With this addition, the
+transformation of (f (snd e)) type checks in the target language by recording the definition
+δ
+y = e : A while type checking the body of a let expression.
+For positive types, we record a propositional equality between the term being eliminated
+and its value. For booleans, we need the following typing rule for if.3
+  e : Bool
+
+, x : Bool  B : Type i
+, p : e ≡ true  e1 : B[x := true]
+, p : e ≡ false  e2 : B[x := false]
+  if e then e1 else e2 : B[x := e]
+
+The two highlighted portions of the rule are modifications over the standard typing rule.
+This rule introduces a propositional equality p between the term e that appears in the calling
+context’s type to the value known in the branches. This represents an assumption that e and
+true (or false) are equal in the type system and allows pushing the context surrounding the
+if expression into the branches.
+Like definitions, propositional equalities thread “machine steps” into the typing derivations of e1 and e2 . In contrast, these equalities are accessed through an additional type
+3
+
+This rule essentially implements the convoy pattern (Chlipala, 2013). This pattern is common in dependent types; for example, transformation into the convoy pattern is used by Sozeau (2008) to implement the
+Program vernac in Coq to simplify reasoning with equality in function definitions.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+7
+
+equivalence rule [≡-REFLECT], which states that an equivalence holds between two terms
+if some proof of equality exists between them.
+  p : e1 ≡ e2
+  e1 ≡ e2
+
+[≡-REFLECT]
+
+Our earlier example if expression now type checks using the modified typing rule for if
+and [≡-REFLECT]. We thread the equivalence e ≡ true (respectively e ≡ false) which allows
+f to be applied to e1 (respectively e2 ) at the correct type.
+Equality reflection is not a perfect solution, as adding this type equivalence rule
+can introduce undecidable type checking. While equality reflection allows definitions
+δ
+like x = e : A to be subsumed by a propositional equality x ≡ e, we use definitions when
+sufficient (such as for negative types) to avoid undecidable type checking. We discuss
+how to recover decidability of CCAe in Section 7; however, this would distract us from the
+ANF translation in the present work.
+Formalizing Type-Preserving ANF Translation. Despite these simple extensions to
+CCAe , formalizing the ANF type-preservation argument is still tricky. In the source, looking
+at an expression such as snd e, we do not know whether the expression is embedded in a
+larger context. To formalize the ANF translation, it helps to have a compositional syntax
+for translating and reasoning about the types of an expression and the unknown context.
+To make the translation compositional, we index the ANF translation by a target language (non-first-class) continuation K representing the rest of the computation in which a
+translated expression will be used.4 A continuation K is a program with a hole (single linear
+variable) [·] and can be composed with a computation N, written K[N], to form a program M.
+Keeping continuations non-first-class ensures that continuations must be used linearly and
+avoids control effects, which cause inconsistency with dependent types (Barthe & Uustalu,
+2002; Herbelin, 2005). In ANF, there are only two continuations: either [·] or let x = [·] in M.
+Using continuations, we define ANF translation for  types and second projections as
+follows. We use e as shorthand for translating e with an empty continuation, e [·].
+ x : A. B K = K[ x : A. B]
+snd e K = e (let y = [·] in K[snd y])
+
+This allows us to focus on composing the primitive operations instead of reassociating let
+bindings.
+For compositional reasoning, we develop a type system for continuations. The key
+typing rule is the following.
+  M : A
+
+δ
+
+, y = M : A  M : B
+
+  let y = [·] in M : (M : A) ⇒ B
+
+[K-BIND]
+
+The type (M : A) ⇒ B of continuations describes that the continuation must be composed
+with the term M of type A, and the result will be of type B. Note that this type allows us
+δ
+to introduce the definition y = M : A via the type, before we know how the continuation
+4
+
+This is how ANF translation is implemented in Scheme by Flanagan et al. (1993), although their formal model
+is as a reduction system. An alternative implementation technique avoids continuations and instead returns a
+list of new declarations, similar to the allocation pass of Morrisett et al. (1999).
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+8
+
+P. Koronkevich et al.
+Universes
+Expressions
+
+U ::=
+e, A, B ::=
+|
+|
+|
+|
+
+Environments
+
+
+
+::=
+
+Prop | Type i
+x | U |  x : A. B | λ x : A. e | e e
+ x : A. B | e1 , e2 as  x : A. B | fst e
+snd e | let x = e in e | Bool
+true | false | if e then e1 else e2
+Nat | zero | succ e | indnat A e e1 e2
+δ
+
+· | , x : A | , x = e : A
+
+Fig. 1: ECC syntax.
+is used.5 We discuss this rule further in Section 4, and how continuation typing is not an
+extension to the target type theory.
+The key lemma to prove type preservation is the following.
+Lemma 2.1. If   e : A and  ,    K : (e : A) ⇒ B, then  ,    e K : B.
+The intuition behind this lemma shows that type preservation follows if every time we construct a continuation K, we show that K is well typed. The translation starts with an empty
+continuation K, which is trivially well typed. We systematically build up the translation
+of e in K by recurring on sub-expressions of e and building up a new continuation K. If
+each time we can show that this K is well typed, then by induction, the whole translation is
+type preserving. This lemma is indexed by an additional environment   and answer type
+B. Intuitively, this is because it is the continuation K, not the expression e, that dictates the
+final answer type B of the translation, and the environment will provide some additional
+equalities and definitions in   under which we can type check the transformed e.
+
+3 Source: ECC with definitions
+Our source language, ECC, is Luo’s Extended Calculus of Constructions (ECC) (Luo,
+1990) extended with dependent elimination of booleans, natural numbers with the recursive eliminator, and definitions (Severi & Poll, 1994). This language is a subset of CIC
+and is based on the presentation given in the Coq reference manual6 ; Timany & Sozeau
+(2017) give a recent account of the metatheory for the CIC, including all the features of
+ECC. We typeset ECC in a non-bold, blue, sans-serif font. We present the syntax of ECC in
+Figure 1. ECC extends the Calculus of Constructions (CC) (Coquand & Huet, 1988) with
+ types (strong dependent pairs) and an infinite predicative hierarchy of universes. There
+is no explicit phase distinction; that is, there is no syntactic distinction between terms,
+which represent run-time expressions, and types, which classify terms. However, we usually use the meta-variable e to evoke a term and the meta-variables A and B to evoke a
+type. The language includes one impredicative universe, Prop , and an infinite hierarchy
+of predicative universes Type i . The syntax of expressions e includes names x, universes
+U, dependent function types  x : A. B, functions λ x : A. e, application e1 e2 , dependent pair
+5
+6
+
+This is essentially a singleton type, but we avoid explicit encoding with singleton types to focus on the
+intuition—machine steps—and avoid complicating the IL syntax.
+The Coq reference manual, https://coq.inria.fr/distrib/current/refman/language/cic.html,
+accessed 2021-07-07.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+9
+
+types  x : A. B, dependent pairs e1 , e2 as  x : A. B, first fst e and second snd e projections
+of dependent pairs, dependent let let x = e in e , the boolean type Bool, the boolean values
+true and false, dependent if if e then e1 else e2 , the natural number type Nat, the natural number values zero and succ e, and the recursive eliminator for natural numbers indnat A e e1 e2 .
+For brevity, we omit the type annotation on dependent pairs, as in e1 , e2 . Note that letbound definitions do not include type annotations; this is not standard, but type checking is
+still decidable (Severi & Poll, 1994), and it simplifies our ANF translation. As is standard,
+we assume uniqueness of names and consider syntax up to α -equivalence.
+The following table summarizes the judgments for ECC and the new notation introduced, in particular the notation for definitions in contexts and substitution of variables for
+expressions.
+Judgment Meaning
+
+The environment  is well formed
+e:A
+The expression e has type A under environment 
+  A B The type A is a subtype of B under environment 
+  e ≡ e
+The expressions e and e are judgmentally equivalent under environment 
+  e ∗ e The expression e multi-steps to e under environment 
+  e  e
+The expression e single-steps to e under environment 
+Notation Meaning
+δ
+
+, x = e : A
+e [x := e]
+
+The variable x is defined to be e of type A (in some environment  )
+Substitute the expression e for the variable x in the expression e
+
+In Figure 2, we give the reductions   e  e for ECC, which are entirely standard. We
+extend reduction to conversion by defining   e ∗ e to be the reflexive, transitive, compatible closure of reduction . The conversion relation is used to compute equivalence
+between types, but we can also view it as the operational semantics for the language. We
+define eval(e) as the evaluation function for whole programs using conversion, which we
+use in our compiler correctness proof.
+In Figure 3, we define definitional equivalence (or just equivalence)   e ≡ e as conversion up to η-equivalence. We use the notation e1 ≡ e2 for equivalence, eliding the
+environment when it is obvious or unnecessary. We also define cumulativity (subtyping)
+  A B, to allow types in lower universes to inhabit higher universes.
+We define the type system for ECC in Figure 4, which is mutually defined with wellformedness of environments. The typing rules are entirely standard for a dependent type
+system. Note that types themselves, such as  x : A. B, have types (called universes), and
+universes also have types which are higher universes. In [AX-PROP], the type of Prop
+is Type 0 , and in [AX-TYPE], the type of each universe Type i is the next higher universe
+Type i+1 . Note that we have impredicative function types in Prop , given by [PROD-PROP].
+For this work, we ignore the Set versus Prop distinction used in some type theories, such
+as Coq’s, although adding it causes no difficulty. Note that the rules for second projection,
+[SND], let, [LET], if, [IF], and the eliminator for natural numbers [ELIMNAT] substitute subexpressions into the type system. These are the key typing rules that introduce difficulty in
+type-preserving compilation for dependent types.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+10
+
+P. Koronkevich et al.
+4 Target: ECC with ANF support
+
+Our target language, CCAe , is a variant of ECC with a modified typing rule for dependent if
+that introduces propositional equalities between terms and equality reflection for accessing
+assumed equalities. The type system of CCAe is not particularly novel as its type theory is
+adapted from the extensional Calculus of Constructions (Oury, 2005). While CCAe supports
+ANF syntax, the full language is not ANF-restricted; it has the same syntax as ECC. We do
+not restrict the full language because maintaining ANF while type checking adds needless
+complexity, especially when checking for equality since conversion often breaks ANF.
+Instead, we show that our compiler generates only ANF restricted terms in CCAe and define
+a separate ANF-preserving machine-like semantics for evaluating programs in ANF. We
+typeset CCAe in a bold, red, serif font; in later sections, we reserve this font exclusively for
+the ANF restricted CCAe . This ability to break ANF locally to support reasoning is similar
+to the language FJ of Maurer et al. (2017), which does not enforce ANF syntactically, but
+supports ANF transformation and optimization with join points.
+We can imagine the compilation process as either (1) generating ANF syntax in CCAe
+from ECC or (2) as first embedding ECC in CCAe and then rewriting CCAe terms into ANF.
+In Section 5, we present the compiler as process (1), a compiler from ECC to ANF CCAe .
+In this section, we develop most of the supporting metatheory necessary for ANF as intralanguage equivalences and process (2) may be a more helpful intuition.
+We give the ANF syntax for CCAe in Figure 5(a). We impose a syntactic distinction
+between values V which do not reduce, computations N which eliminate values and can
+be composed using continuations K, and configurations M which represent the machine
+configurations executed by the ANF machine semantics. We add the identity type V ≡ V
+  e  e
+x
+(λ x : A. e1 ) e2
+fst e1 , e2
+snd e1 , e2
+let x = e1 in e2
+if true then e1 else e2
+if false then e1 else e2
+indnat A zero e1 e2
+indnat A (succ e) e1 e2
+
+δ
+β
+ σ1
+ σ2
+ζ
+B1
+B2
+ι1
+ι2
+
+e
+e1 [x := e2 ]
+e1
+e2
+e2 [x := e1 ]
+e1
+e2
+e1
+(e2 e) (indnat A e e1 e2 )
+
+δ
+
+where x = e : A ∈ 
+
+  e ∗ e
+δ
+
+, x = e : A  e1 ∗ e2
+···
+
+  let x = e in e1 ∗ let x = e in e2
+
+[RED-CONG-LET]
+
+eval(e) = v
+eval(e)
+
+=
+
+v
+
+where e ∗ v and v  v
+
+Fig. 2: ECC dynamic semantics (excerpt).
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+11
+
+  e ≡ e
+  e1 ∗ e
+
+  e2 ∗ e
+
+  e1 ≡ e2
+  e1 ∗ λ x : A. e
+
+  e2 ∗ e2
+
+[≡]
+
+, x : A  e ≡ e2 x
+
+  e1 ≡ e2
+  e1 ∗ e1
+
+  e2 ∗ λ x : A. e
+
+, x : A  e1 x ≡ e
+
+  e1 ≡ e2
+A
+
+[≡-η1 ]
+
+[≡-η2 ]
+
+B
+A≡B
+···
+
+A
+
+B
+
+[ -≡]
+
+  A1 ≡ A2
+
+  Type i
+, x1 : A2  B1
+
+   x1 : A1 . B1
+
+B2 [x2 := x1 ]
+
+ x2 : A2 . B2
+
+Type i+1
+
+[ -CUM]
+
+[ -PI]
+
+Fig. 3: ECC equivalence and subtyping (excerpt).
+and refl V to enable preserving dependent typing for if expressions and the join-point optimization, further described in Section 6. We do not require an elimination form for identity
+types; they are instead used via the restricted form of equality reflection in the equivalence
+judgment. A continuation K is a program with a hole and is composed K[N] with a computation N to form a configuration M. For example, (let x = [·] in snd x)[N] = (let x = N in snd x).
+Since continuations are not first-class objects, we cannot express control effects. Note
+that despite the syntactic distinctions, we still do not enforce a phase distinction—
+configurations (programs) can appear in types. Finally in Figure 5(b), we give the full
+non-ANF syntax, denoted by meta-variables e, A, and B. As done with ECC, we usually
+use the meta-variable e to evoke a term and the meta-variables A and B to evoke a type.
+To summarize, the meaning of the judgments of CCAe is the same as ECC. However,
+CCAe has additional syntax for the identity type.
+Judgment
+
+e:A
+A B
+  e ≡ e
+  e ∗ e
+  e  e
+
+Notation
+δ
+
+, x = e : A
+e [x := e]
+
+CCAe Syntax
+p : e ≡ e
+
+Meaning
+The environment  is well formed
+The expression e has type A under environment 
+The type A is a subtype of B under environment 
+The expressions e and e are judgmentally equivalent under 
+The expression e multi-steps to e under 
+The expression e single-steps to e under environment 
+Meaning
+The variable x is defined to be e of type A (in some environment  )
+Substitute the expression e for the variable x in the expression e
+Meaning
+p has the identity type e ≡ e , internalizing the judgment   e ≡ e
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+12
+
+P. Koronkevich et al.
+
+e:A
+
+···
+e:A
+
+  Prop : Type 0
+δ
+
+, x = e : A  e : B
+
+  let x = e in e : B[x := e]
+  A : Type i
+
+   x : A. B : Type i
+
+  Bool : Type 0
+, x : Bool  B : U
+
+[AX-TYPE]
+
+, x : A  B : Prop
+
+   x : A. B : Prop
+
+  true : Bool
+
+  e : Bool
+
+[PROD-PROP]
+
+  e :  x : A. B
+
+[PROD-TYPE]
+
+
+[BOOL]
+
+  Type i : Type i+1
+
+  A : Type i
+
+[LET]
+
+, x : A  B : Type i
+
+
+
+
+
+[AX-PROP]
+
+  snd e : B[x := fst e]
+
+
+[TRUE]
+
+  e1 : B[x := true]
+
+  false : Bool
+
+[FALSE]
+
+  e2 : B[x := false]
+
+  if e then e1 else e2 : B[x := e]
+e:A
+
+B:U
+
+A
+
+e:B
+
+  zero : Nat
+
+B
+
+
+
+[CONV]
+
+[ZERO]
+
+  Nat : Type 0
+  e : Nat
+  succ e : Nat
+
+[IF]
+
+[NAT]
+
+[SUCC]
+
+, x : Nat  A : U
+  e : Nat
+  e2 :  n : Nat.  r : A[x := n]. A[x := succ n]
+  e1 : A[x := zero]
+  indnat A e e1 e2 : A[x := e]
+
+[SND]
+
+[ELIMNAT]
+
+Fig. 4: ECC typing (excerpt).
+We give the new typing rules in Figure 6. The rules for the identity type are standard.
+The key change in CCAe is in the typing rule for if. The typing rule for if e then e1 else e2
+introduces a propositional equality into the typing environment for each branch. These
+record a machine step: the machine will have reduced e to true before jumping to the first
+branch and reduced e to false before jumping to the second branch. This is necessary to
+support the type-preserving ANF transformation of if.
+We require a new definition of equivalence to support extensionality, as shown in
+Figure 7. The rule [≡-REFLECT] is used to determine two terms are equivalent if there
+is a proof of their equality. In particular, we use this rule to access equalities in the context
+such as those introduced in the typing rule for if. We add congruence rules for all syntactic
+forms including the identity type. The rules [≡-SUBST]7 and [≡-STEP] state that equivalence is preserved under substitution and the standard reduction defined for ECC. We also
+include η-equivalence as defined for ECC and η-equivalences for booleans.
+To ensure reduction preserves ANF, we define composition of a continuation K and
+a configuration M, Figure 8, typically called renormalization in the literature (Sabry
+7
+
+Formally, this rule is admissible. However, we make it explicit as we tried several various simplifications
+of extensionality in which it is not admissible and find it useful to mark this requirement. We discuss on in
+Section 7.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+Continuations
+
+U ::=
+V ::=
+|
+|
+|
+N ::=
+|
+M ::=
+|
+K ::=
+
+Prop | Type i
+x | U | λ x : M. M |  x : M. M
+e, A, B
+ x : M. M | V, V | Bool
+true | false | Nat | zero
+succ V | refl V | V ≡ V
+V | V V | fst V | snd V
+indnat M V V V
+N | let x = N in M
+if V then M1 else M2
+[·] | let x = [·] in M
+
+Environments
+
+
+
+· | , x : V | , x = N : N
+
+Universes
+Values
+
+Computations
+Configurations
+
+::=
+
+δ
+
+::=
+|
+|
+|
+|
+|
+|
+|
+|
+|
+
+13
+
+x | U |  x : A. B
+λ x : A. e | e e
+ x : A. B
+e1 , e2  as  x : A. B
+fst e | snd e
+let x = e in e | Bool
+true | false
+if e then e1 else e2
+Nat | zero | succ e
+indnat A e e1 e2
+
+(b) Typing Syntax
+
+(a) Run-time Syntax
+
+Fig. 5: CCAe syntax.
+e:A
+···
+  e : Bool
+
+, x : Bool  B : U
+, p : e ≡ false  e2 : B[x := false]
+, p : e ≡ true  e1 : B[x := true]
+  if e then e1 else e2 : B[x := e]
+
+e:A
+  refl e : e ≡ e
+
+[REFL]
+
+  A : Type i
+
+  A : Type i
+
+
+  A ≡ A : Type i
+
+[IF]
+
+[EQUIV]
+
+Fig. 6: CCAe typing (excerpt).
+& Wadler, 1997; Kennedy, 2007). In ANF, all continuations are left associated, so the
+standard definition of substitution does not preserve ANF, unlike in alternatives such as
+CPS or monadic form. Note that β-reduction takes an ANF configuration K[(λ x : A. M) V]
+but would naïvely produce K[M[x := V]]. Substituting the term M[x := V], a configuration,
+into the continuation K could result in the non-ANF term let x = M in M . When composing
+a continuation with a configuration, KM, we unnest all continuations so they remain
+left associated. Note that these definitions rely on our uniqueness-of-names assumption.
+Digression on composition in ANF. In the literature, the composition operation KM
+is usually introduced as renormalization, as if the only intuition for why it exists is “well,
+it happens that ANF is not preserved under β-reduction.” It is not mere coincidence; the
+intuition for this operation is composition, and having a syntax for composing terms is not
+only useful for stating β-reduction, but useful for all reasoning about ANF. This should
+not come as a surprise—compositional reasoning is useful. The only surprise is that the
+composition operation is not the usual one used in programming language semantics, that
+is, substitution. In ANF, as in monadic normal form, substitution can be used to compose
+any expression with a value, since names are values and values can always be replaced by
+values. But substitution cannot just replace a name, which is a value, with a computation
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+14
+
+P. Koronkevich et al.
+
+e≡e
+  e : e1 ≡ e2
+  e1 ≡ e2
+
+  A ≡ B
+
+A≡B
+
+  e ≡ e
+
+[≡-REFLECT]
+
+
+
+
+
+  (A ≡ A ) ≡ (B ≡ B )
+
+  refl e ≡ refl e
+
+[≡-CONG-EQUIV]
+  e1 ≡ e2
+
+  e[x := e1 ] ≡ e[x := e2 ]
+  e1 ≡ λ x : A. e
+
+  e2 ≡ e
+
+[≡-CONG-REFL]
+
+  e  e
+  e ≡ e
+[≡-SUBST]
+
+, x : A  e ≡ e x
+
+  e1 ≡ e2
+  e1 ≡ e
+
+, x : A  e ≡ e x
+
+  e2 ≡ λ x : A. e
+  e1 ≡ e2
+
+  e ≡ true
+  if e then e1 else e2 ≡ e1
+
+[≡-STEP]
+
+[≡-η1 ]
+
+[≡-η2 ]
+
+  e ≡ false
+
+[≡-IF-β1 ]
+
+  if e then e1 else e2 ≡ e2
+
+  if e then e else e ≡ e
+
+[≡-IF2]
+
+[≡-IF-β2 ]
+
+···
+
+Fig. 7: CCAe equivalence (excerpt).
+KM = M
+def
+
+=
+
+K[N]
+
+Klet x = N in M
+
+def
+
+=
+
+let x = N in KM
+
+Kif V then M1 else M2 
+
+def
+
+if V then KM1  else KM2 
+
+KN
+
+=
+
+KK = K
+K[·]
+Klet x = [·] in M
+
+def
+
+=
+
+K
+
+def
+
+let x = [·] in KM
+
+=
+
+Fig. 8: Composition of configurations.
+
+or configuration. That would not be well typed. So how do we compose computations with
+configurations? We can use let, as in let y = N in M, which we can imagine as an explicit
+substitution. In monadic form, there is no distinction between computations and configurations, so the same term works to compose configurations. But in ANF, we have no
+object-level term to compose configurations or continuations. We cannot substitute a configuration M into a continuation let y = [·] in M , since this would result in the non-ANF
+(but valid monadic) expression let y = M in M . Instead, ANF requires a new operation to
+compose configurations: KM. This operation is more generally known as hereditary
+substitution (Watkins et al., 2003), a form of substitution that maintains canonical forms.
+So we can think of it as a form of substitution, or, simply, as composition.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+15
+
+M  → M
+ →β
+ →σ 1
+ →σ 2
+ →ι1
+ →ι2
+ →ζ
+ →B 1
+ →B 2
+
+K[(λ x : A. M) V]
+K[fst V1 , V2 ]
+K[snd V1 , V2 ]
+K[indnat M zero V1 V2 ]
+K[indnat M (succ V) V1 V2 ]
+let x = V in M
+if true then M1 else M2
+if false then M1 else M2
+
+KM[x := V]
+K[V1 ]
+K[V2 ]
+K[V1 ]
+let x1 = (V2 V) in let x2 = (indnat M V V1 V2 ) in K[x1 x2 ]
+M[x := V]
+M1
+M2
+
+M  →∗ M
+
+∗
+
+M → M
+
+[RED-REFL]
+
+M1  →∗ M
+
+M  → M1
+∗
+
+M  → M
+
+[RED-TRANS]
+
+eval(M) = V
+eval(M)
+
+=
+
+V
+
+where M  →∗ V and V  → V
+
+Fig. 9: CCAe evaluation.
+  K : (M : A) ⇒ B
+
+  [·] : (M : A) ⇒ A
+
+[K-EMPTY]
+
+  M : A
+
+δ
+
+, x = M : A  M : B
+
+  let x = [·] in M : (M : A) ⇒ B
+
+[K-BIND]
+
+Fig. 10: CCAe continuation typing.
+
+In Figure 9, we present the call-by-value (CBV) evaluation semantics for ANF CCAe
+terms. The semantics is only for the run-time evaluation of configurations; during type
+checking, we continue to use the conversion relation defined in Section 3. The semantics
+is essentially standard, but recall that β-reduction produces a configuration M which must
+be composed with the existing continuation K. To maintain ANF, the natural number eliminator for the succ case must first let-bind the intermediate application and recursive call
+before plugging the final application into the existing continuation K.
+4.1 Dependent continuation typing
+The ANF translation manipulates continuations K as independent entities. To reason about
+them, and thus to reason about the translation, we introduce continuation typing, defined in
+Figure 10. The type (M : A) ⇒ B of a continuation expresses that this continuation expects
+to be composed with a term equal to the configuration M of type A and returns a result of
+type B when completed. Normally, M is equivalent to some computation N, but it must
+be generalized to a configuration M to support typing if expressions. This type formally
+expresses the idea that M is depended upon in the rest of the computation. The [K-BIND]
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+16
+
+P. Koronkevich et al.
+
+rule ensures we have access to the specific M needed to type body of the let continuation
+and is similar to the rule [T-CONT] used in the type-preserving CPS translation by Bowman
+et al. (2018). The rule [K-EMPTY] has an arbitrary term M , since an empty continuation [·]
+has no “rest of the program” that could depend on anything.
+Intuitively, what we want from continuation typing is a compositionality property—that
+we can reason about the types of configurations K[N] (generally, for configurations KM)
+by composing the typing derivations for K and N. To get this property, a continuation type
+must express not merely the type of its hole A, but which term N will be bound in the hole.
+We see this formally from the typing rule [LET] (the same for CCAe as for ECC in Section 3),
+δ
+since showing that let y = N in M is well typed requires showing that y = N : A  M, that is,
+δ
+requires knowing the definition y = N : A. If we omit the expression N from the type of
+a continuation, we know there are some configurations K[N] that we cannot type check
+compositionally. Intuitively, if all we knew about y was its type, we would be in exactly
+the situation of trying to type check a continuation that has abstracted some dependent type
+that depends on the specific N into one that depends on an arbitrary y. We prove that our
+continuation typing is compositional in this way, Lemma 4.1 (Continuation Cut).
+Note that the result of a continuation type cannot depend on the term that will be plugged
+in for the hole, that is, for a continuation K : (M : A) ⇒ B, B does not depend on M . To see
+this, first note that the initial continuation must be empty and thus cannot have a result type
+that depends on its hole. The ANF translation will take this initial empty continuation and
+compose it with intermediate continuations K . Since composing any continuation K : (M :
+A) ⇒ B with any continuation K results in a new continuation with the final result type B,
+then the composition of any two continuations cannot depend on the type of the hole.
+To prove that continuation typing is not an extension to the type system—that is, is
+admissible—we prove Lemmas 4.1 and 4.3, that plugging a well-typed computation or
+configuration into a well-typed continuation results in a well-typed term of the expected
+type.
+We first show Lemma 4.1 (Continuation Cut), which is simple. This lemma tells us
+that our continuation typing allows for compositional reasoning about configurations K[N]
+whose result types do not depend on N.
+Lemma 4.1 (Continuation Cut). If   K : (N : A) ⇒ B and   N : A then   K[N] : B.
+Proof By cases on   K : (N : A) ⇒ B.
+Case:   [·] : (N : A) ⇒ A, trivial.
+Case:   let y = [·] in M : (N : A) ⇒ B
+We must show that   let y = N in M : B, which follows directly from [LET] since, by the
+δ
+continuation typing derivation, we have that , y = N : A  M : B and y ∈ fv(B).
+
+Continuation typing seems to require that we compose a continuation K : (N : A) ⇒ B
+syntactically with N, but we will need to compose with some N ≡ N. It is preferable to
+prove this as a lemma instead of building it into continuation typing to get a nicer induction property for continuation typing. The proof is essentially that substitution respects
+equivalence.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+17
+
+Lemma 4.2 (Continuation Cut Modulo Equivalence). If   K : (N : A) ⇒ B,   N : A,  
+N : A, and   N ≡ N , then   K[N ] : B.
+Proof By cases on the structure of K.
+Case: K = [·]. Trivial.
+Case: K = let x = [·] in M
+δ
+δ
+It suffices to show that: If , x = N : A  M : B then , x = N : A  M : B.
+δ
+δ
+Note that anywhere in the derivation , x = N : A  M : B that x = N : A is used, it must
+be used essentially as: A ≡ζ A[x := N]. We can replace any such use by A ≡ζ A[x := N ] ≡
+δ
+A[x := N] to construct a derivation for , x = N : A  M : B.
+
+Some presentations of context typing (Gordon, 1995)8 , in non-dependent settings, use a
+rule like the following.
+, x : A  E[x] : B
+E:A⇒B
+
+This suggests we could define continuation typing as follows.
+  K[N] : B
+  K : (N : A) ⇒ B
+
+[K-TYPE]
+
+That is, instead of adding separate rules [K-EMPTY] and [K-BIND], we define a welltyped continuation to be one whose composition with the expected term in the hole is
+well typed. Then, Lemma 4.1 (Continuation Cut) is definitional rather than admissible.
+This rule is somewhat surprising; it appears very much like the definition of [CUT], except
+the computation N being composed with the continuation comes from its type, and the
+continuation remains un-composed in what we would consider the output of the rule.
+The presentations are equivalent, but it is less clear how [K-TYPE] is related to the definitions we wish to focus on. It is exactly the premises of [K-BIND] that we need to recover
+type-preservation for ANF, so we choose the presentation with [K-BIND]. However, the
+rule [K-TYPE] is more general in the sense that the continuation typing does not need any
+changes as the definition of continuations change.
+The final lemma about continuation typing is also the key to why ANF is type preserving for if. The heterogeneous composition operations perform the ANF translation on if
+expressions by composing the branches with the current continuation, reassociating all
+intermediate computations. The following lemma states that if a configuration M is well
+typed and equivalent to another (well-typed) configuration M under an extended environment   , and the continuation K is well typed with respect to M , then the composition
+KM is well typed. We include the additional environment   , as this environment contains information about new variables introduced through the composition with M, such
+as definitions and propositional equalities. We choose to include an explicit extra environment   to avoid needing to prove tedious properties about individual environments. Thus,
+8
+
+This presentation of context typing goes back at least to Gordon (1995), and has seen much use in the literature
+on operational approaches to full abstraction, logical relations, and secure compilation. Pitts (1997) gives a
+summary of some of the early work and their application to program equivalence, particularly observation
+equivalence.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+18
+
+P. Koronkevich et al.
+
+the proof is simple, except for the if case, which essentially must prove that ANF is type
+preserving for if.
+Lemma 4.3 (Heterogeneous Continuation Cut). If   M : A, ,    M : A , and ,    K :
+(M : A ) ⇒ B such that ,    M ≡ M and ,    A ≡ A , then ,    KM : B.
+Proof By induction on   M : A.
+Case:   N : A, by Lemma 4.2.
+Case:   let x = N in M : B [x := N]
+Our goal follows by the induction hypothesis applied to the sub-expression M if we can
+δ
+show (1) M ≡ M and (2) B ≡ A under a context x = N : A.
+(1) follows by the following equations and transitivity of ≡:
+M ≡ let x = N in M
+
+by commutativity
+
+≡ M[x := N]
+
+by ζ and [≡-STEP]
+δ
+
+by δ , since we have x = N : A
+
+≡M
+
+For (2), note that B [x := N] ≡ A from our premises.
+A ≡ B [x := N]
+≡B
+
+by commutativity
+δ
+
+
+
+by δ since we have x = N : A
+
+Case:   if V then M1 else M2 : B [x := V]
+These follow by the induction hypotheses applied to the sub-expressions M1 and M2
+if we can show (1) M1 ≡ M and (2) B [x := true] ≡ A under a context p : V ≡ true
+(analogously for M2 and false).
+For (1), note that V ≡ true by [≡-REFLECT] and the typing rule [VAR].
+M1 ≡ if V then M1 else M2
+≡ M
+
+by [≡-IF-β1 ]
+by premise
+
+For (2), note that B [x := V] ≡ A from our premises and weakening. By [≡-SUBST], we
+know B [x := true] ≡ B [x := V] if V ≡ true, which follows by [≡-REFLECT] and the typing
+rule [VAR].
+
+4.2 Metatheory
+To demonstrate that the new typing rule for if is consistent, we develop a syntactic model
+of CCAe in extensional CIC (eCIC). We also prove subject reduction for CCAe . Subject
+reduction is valuable property for a typed IL to model various optimizations through the
+equational theory of the language, such as modeling inlining as β-reduction. If subject
+reduction holds, then all these optimizations are type preserving.
+4.2.1 Consistency
+Our syntactic model essentially implements the new if rule using the convoy pattern (Chlipala, 2013), but leaves the rest of the propositional equalities and equality
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+19
+
+Fig. 11: CCAe model in eCIC (excerpt).
+reflection essentially unchanged. Each if expression if e then e1 else e2 is modeled as an if
+expression that returns a function expecting a proof that the predicate e is equal to true
+in the first branch and false in the second branch. The function, after receiving that proof,
+executes the code in the branch. The model if expression is then immediately applied to
+refl, the canonical proof of the identity type. We could eliminate equality reflection using
+the translation of Oury (2005), but this is not necessary for consistency.
+The essence of the model is given in Figure 11. There is only one interesting rule, corresponding to our altered dependent if rule. The model relies on auxiliary definitions in CIC,
+including subst, if-eta1 and if-eta2, whose types are given as inference rules in Figure 11.
+Note that the model for CCAe ’s if is not valid ANF, so it does not suffice to merely use the
+convoy pattern if we want to take advantage of ANF for compilation.
+We show this is a syntactic model using the usual recipe, which is explained well by
+Boulier et al. (2017): we show the translation from CCAe to eCIC preserves equivalence,
+typing, and the definition of ⊥ (the empty type). This means that if CCAe were inconsistent,
+then we could translate the proof of ⊥ into a proof of ⊥ in eCIC, but no such proof exists
+in eCIC, so CCAe is consistent.
+We use the usual definition of ⊥ as  x : Prop . x, and the same in eCIC. It is trivial that
+the definition is preserved.
+Lemma 4.4 (Model Preserves Empty Type). ⊥M ≡ ⊥
+The essence of showing both that equivalence is preserved and that typing is preserved
+is in showing that the auxiliary definitions in Figure 11 exist and are well typed. We give
+these definitions in Coq in the supplementary materials, and the equivalences hold and are
+well typed without any additional axioms.
+Lemma 4.5 (Model Preserves Equivalence). If e1 ≡ e2 then e1 M ≡ e2 M .
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+20
+
+P. Koronkevich et al.
+
+Lemma 4.6 (Model Preserves Typing). If   e : A then M  eM : AM .
+Consistency tells us that there does not exist a closed term of the empty type ⊥. This
+allows us to interpret types as specifications and well-typed terms as proofs.
+Theorem 4.7 (Consistency). There is no e such that ·  e : ⊥
+4.2.2 Syntactic metatheory
+CCAe satisfies all the usual syntactic metatheory properties, but the main property of interest
+for developing our typed IL is subject reduction. We present the proof of subject reduction,
+which follows the structure presented by Luo (1990).
+Theorem 4.8 (Subject Reduction). If   e : A and   e ∗ e , then   e : A.
+Proof By induction on   e ∗ e .
+
+
+
+The proof of subject reduction relies on some additional lemmas. In particular, the proof
+relies on subject reduction for single step reduction (in the [RED-TRANS] case), and a lemma
+called Luo calls context replacement (in the [RED-CONG-LAM] and [RED-CONG-LET] cases).
+Lemma 4.9 (Single Step Subject Reduction). If   e : A and   e  e , then   e : A.
+Proof By cases on   e  e . Most cases are straightforward, except for β and ζ , which
+rely on Lemmas 4.12 and 4.13, respectively.
+
+Lemma 4.10 (Context Replacement). If , x : A,    e : C and   B
+, x : B,    e : C.
+Proof By (mutual) induction on , x : A,    e : C.
+
+A, then
+
+
+
+Because our typing contexts also contain definitions, we must also be able to replace
+a definition expression with an equivalent expression. This is required specifically for the
+[RED-CONG-LET] case in the proof of subject reduction.
+δ
+
+Lemma 4.11 (Context Definition Replacement). If , x = e : A,    e1 : C,   e : A and
+δ
+  e ≡ e , then , x = e : A,    e1 : C.
+δ
+
+Proof By (mutual) induction on , x = e : A,    e1 : C.
+
+
+
+Finally, the proof of single step subject reduction relies on a lemma Luo calls Cut, named
+after the cut rule in sequent calculus. We must also prove an additional similar lemma due
+to definitions in our context, specifically for the ζ case.
+Lemma 4.12 (Cut). If , x : A,    e : C
+C[x := e].
+
+and   e : A,
+
+Proof By (mutual) induction on , x : A,    e : C.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+then ,   [x := e]  e [x := e] :
+
+
+
+ANF preserves dependent types up to extensional equality
+
+21
+
+δ
+
+Lemma 4.13 (Cut With Definitions). If , x = e : A,    e : C, then ,   [x := e]  e [x := e] :
+C[x := e].
+δ
+
+Proof By (mutual) induction on , x = e : A,    e : C.
+
+
+
+The proofs of both versions of context replacement and Cut are done by mutual induction, because typing in CCAe is mutually defined with well-formedness of contexts. Typing
+also relies on subtyping in the [CONV] case, subtyping relies on equivalence, and equivalence now relies on typing due to the equality reflection rule [≡-REFLECT]. The mutual
+reliance of all these judgments requires that these lemmas be proven by mutual induction. The lemma statements above are not the full statement of the lemma, which we omit
+for brevity, but the corollaries are of interest. For example, the full lemma definition for
+Lemma 4.10 is as follows:
+Lemma 4.14 (Context Replacement (full definition)).
+1. If  , x : A,   and   B A, then  , x : B,   .
+2. If , x : A,    e : C and   B A, then , x : B,    e : C.
+3. If , x : A,    C C and   B A, then , x : B,    C C .
+4. If , x : A,    e ≡ e and   B A, then , x : B,    e ≡ e .
+5. If , x : A,    e ∗ e and   B A, then , x : B,    e ∗ e .
+6. If , x : A,    e  e and   B A, then , x : B,    e  e .
+The full definitions for Lemmas 4.11, 4.12, and 4.13 are included in Appendix 1.
+4.3 Correctness of ANF evaluation
+In CCAe , we have an ANF evaluation semantics for run time and a separate definitional
+equivalence and reduction system for type checking. We prove that these two coincide:
+running in our ANF evaluation semantics produces a value definitionally equivalent to the
+original term.
+When computing definitional equivalence, we end up with terms that are not in ANF
+and can no longer be used in the ANF evaluation semantics. This is not a problem—we
+could always ANF translate the resulting term if needed—but can be confusing when
+reading equations. When this happens, we wrap terms in a distinctive boundary such as
+N N (M[x := M ]) and N N (K[M]). The boundary indicates the term is not normal, that
+is, not in A-normal form. The boundary is only meant to communicate with the reader;
+formally, N N (e) = e.
+The heart of the correctness proof is actually naturality, a property found in the literature
+on continuations and CPS that essentially expresses freedom from control effects (e.g.,
+(Thielecke, 2003) explain this well). Lemma 4.15 is the formal statement of naturality in
+ANF: composing a term M with its continuation K in ANF is equivalent to running M to a
+value and plugging the result into the hole of the continuation K. Formally, this states that
+composing continuations in ANF is sound with respect to standard substitution. The proof
+follows by straightforward equational reasoning.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+22
+
+P. Koronkevich et al.
+
+Lemma 4.15 (Naturality). KM ≡ N N (K[M])
+Proof By induction on the structure of M.
+Case: M = let x = N in M
+Must show that
+
+let x = N in KM  ≡ N N (K[let x = N in M ]).
+let x = N in KM 
+≡ let x = N in K[M ]
+
+≡ N N (K[M ][x := N ])
+= N N (K[M [x := N ]])
+
+by induction
+by ζ and [≡-STEP]
+by uniqueness of names
+
+≡ N N (K[let x = N in M ])
+
+by ζ and [≡-STEP]
+
+Case: M = if V then M1 else M2
+Must show that
+if V then KM1  else KM2  ≡ N N (K[if V then M1 else M2 ]).
+
+This follows by induction if we can show
+N N (K[if V then M1 else M2 ]) ≡ if V then N N (K[M1 ]) else N N (K[M2 ]).
+
+We show this by cases on K.
+Case: K = [·] Trivial.
+Case: K = let x = [·] in M
+Must show that
+let x = if V then M1 else M2 in M ≡ if V then (let x = M1 in M) else (let x = M1 in M).
+if V then (let x = M1 in M) else (let x = M1 in M)
+≡ if V then M[x := M1 ] else M[x := M2 ]
+≡ if V then M[x := if V then M1 else M2 ]
+else M[x := if V then M1 else M2 ]
+
+by ζ and [≡-STEP]
+by [≡-IF-β] and [≡-SUBST]
+
+≡ let x = (if V then M1 else M2 ) in (if V then M else M)
+≡ let x = (if V then M1 else M2 ) in M
+
+by ζ and [≡-STEP]
+by [≡-IF2]
+
+
+Next we show that our ANF evaluation semantics are sound with respect to definitional
+equivalence. To do that, we first show that the small-step semantics are sound. Then, we
+show soundness of the evaluation function.
+Lemma 4.16 (Small-step soundness). If M → M then M ≡ M .
+Proof By cases on M → M . Most cases follow easily from the ECC reduction relation and
+congruence, except for →β which requires Lemma 4.15. We give representative cases.
+Case: K[(λ x : A. M1 ) V] →β KM1 [x := V]
+Must show that K[(λ x : A. M1 ) V] ≡ KM1 [x := V]
+K[(λ x : A. M1 ) V]
+∗ N N (K[M1 [x := V]])
+≡ KM1 [x := V]
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+by β and congruence
+by Lemma 4.15
+
+(4.1)
+(4.2)
+
+ANF preserves dependent types up to extensional equality
+Case: K[fst V1 , V2 ] →σ1 K[V1 ]
+Must show that K[fst V1 , V2 ] ≡ K[V1 ], which follows by σ1 and congruence.
+
+23
+
+
+
+Theorem 4.17 (Evaluation soundness).  eval(M) ≡ M
+Proof By induction on the length n of the reduction sequence given by eval(M). Note that,
+unlike conversion, the ANF evaluation semantics have no congruence rules.
+
+
+5 ANF translation
+The ANF translation is presented in Figure 12. The translation is standard, defined inductively over syntax and indexed by a current continuation. The continuation is used when
+translating a value and is composed together “inside-out” the same way continuation composition is defined in Section 4. When translating a value such as x, λ x : A. e, or Type i , we
+plug the value into the current continuation and recursively translate the sub-expressions
+of the value if applicable. For non-values such as application, we make sequencing explicit
+by recursively translating each sub-expression with a continuation that binds the result and
+performs the rest of the computation.
+We prove that the translation always produces syntax in ANF (Theorem 5.1). The proof
+is straightforward.
+Theorem 5.1 (ANF). For all e and K, e K = M for some M.
+Our goal is to prove type preservation: if e is well typed in the source, then e is well
+typed at a translated type in the target. But to prove type preservation, we must also preserve the rest of the judgmental and syntactic structure that the dependent type system
+relies on. The type judgment is defined mutually inductively only with well-formedness of
+environments; all other judgments relied on are defined inductively. We proceed top-down,
+starting from our main theorem, in order to motivate where each lemma comes into play.
+The full proof of type preservation is omitted for brevity but is included in Appendix 1.
+Type-preservation is stated below. We do not prove it directly. Since the ANF translation
+is indexed by a continuation K, we need a stronger induction hypothesis to reason about
+the type of the continuation K.
+Theorem 5.2 (Type Preservation). If   e : A then   e : A.
+Proof By Lemma 5.3, it suffices to show that   [·] : (e : A) ⇒ A, which follows by
+
+[K-EMPTY].
+To see why we need a stronger induction hypothesis, consider the snd e case of ANF
+def
+translation: snd e K = e let x = [·] in K[snd x]. The induction hypothesis for Theorem 5.2
+proves that e :  x : A. B, but this cannot be used to show that the translation of e with
+the new continuation let x = [·] in K[snd x] is well typed. We need the induction hypothesis
+to also include typing information for the new continuation that expects the translated subexpression e. Note the new continuation also composes the original continuation K with
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+24
+
+P. Koronkevich et al.
+
+e K = M
+e
+
+def
+
+=
+
+e [·]
+
+x K
+
+def
+
+Prop  K
+
+def
+
+Type i  K
+
+def
+
+=
+
+K[Type i ]
+
+ x : A. B K
+
+def
+
+=
+
+K[ x : A. B]
+
+λ x : A. e K
+
+def
+
+=
+
+K[λ x : A. e]
+
+e1 e2  K
+
+def
+
+=
+
+e1  let x1 = [·] in
+e2  (let x2 = [·] in K[x1 x2 ])
+
+ x : A. B K
+
+def
+
+=
+
+K[ x : A. B]
+
+e1 , e2 as A K
+
+def
+
+=
+
+e1  let x1 = [·] in
+e2  (let x2 = [·] in
+K[(x1 , x2  as A)])
+
+fst e K
+
+def
+
+=
+
+e let x = [·] in K[fst x]
+
+snd e K
+
+def
+
+=
+
+e let x = [·] in K[snd x]
+
+let x = e in e  K
+
+def
+
+e let x = [·] in e  K
+
+Bool K
+
+def
+
+=
+=
+
+=
+=
+
+K[x]
+K[Prop ]
+
+K[Bool]
+
+true K
+
+def
+
+false K
+
+def
+
+=
+
+K[false]
+
+if e then e1 else e2  K
+
+def
+
+e let x = [·] in
+if x then (e1  K) else (e2  K)
+
+Nat K
+
+def
+
+=
+=
+=
+
+K[true]
+
+K[Nat]
+
+zero K
+
+def
+
+=
+
+K[zero]
+
+succ e K
+
+def
+
+=
+
+e let x = [·] in K[succ x]
+
+indnat A e e1 e2  K
+
+def
+
+=
+
+e (let y = [·] in
+e1  (let x1 = [·] in
+e2  (let x2 = [·] in
+K[indnat A y x1 x2 ])))
+
+def
+
+=
+
+ , x : A
+
+def
+
+ , x = e : A
+
+· = ·
+, x : A
+
+
+
+δ
+, x = e : A
+
+=
+
+δ
+
+Fig. 12: Naïve ANF translation.
+
+a target computation snd x. Intuitively, the composition K[snd x] is well typed because it
+appears in a context where snd x is equivalent to the translation of the source expression
+snd e.
+We abstract this pattern into Lemma 5.3, which takes both a well-typed source term
+and a well-typed continuation as input, just like the translation. The ANF translation takes
+an accumulator (the continuation K) and builds up the translation in an accumulator as a
+procedure from values to ANF terms. The lemma builds up a proof of correctness as an
+accumulator as well. The accumulator is a proposition that if the computation it receives is
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+25
+
+well typed, then composing the continuation with the computation is well typed. Formally,
+we phrase this as: if we start with a well-typed term e, and a well-typed continuation K,
+then translating e with K results in a well-typed term. The continuation K expects a term
+that is the translation of the source expression directly, under an extended environment
+  . Intuitively, this extended environment   contains information about new variables
+introduced through the ANF translation, such as definitions and propositional equivalences.
+This lemma and its proof are main contributions of this work.
+Lemma 5.3.
+1. If   then  .
+2. If   e : A and  ,    K : (e : A) ⇒ B, then  ,    e K : B.
+Proof The proof is by induction on the mutually defined judgments   and   e : A.
+Cases [AX-PROP], [SND], [ELIMNAT], and [IF] are given, as they are representative.
+Note that for all sub-expressions, e of type A , e  : A  holds by instantiating the induction hypothesis with the empty continuation [·] : (e  : A ) ⇒ A . The general structure
+of each case is similar; we proceed by induction on a sub-expression and prove the new
+continuation K is well typed by applications of [K-BIND]. Proving the body of K is well
+typed requires using Lemma 4.3. This requires proving that K is composed with a configuration M equivalent to e, and showing their types are equivalent. To show M is equivalent
+to e, we use the Lemmas 5.4 and 4.15 to allow for composing configurations and continuations. Additionally, since several typing rules substitute sub-expressions into the type
+system, we use Lemma 5.5 in these cases to show the types of M and e are equivalent.
+Each non-value proof case focuses on showing these two equivalences.
+Case: [AX-PROP]
+We must show that  ,    K[Prop ] : B. This follows from Lemma 4.2.
+Case: [SND] Following our general structure, we must show (1) snd x1 ≡ snd e in an
+δ
+environment where x1 = e : A and (2) B [x := fst e] ≡ B [x := fst e].
+For goal (1), we focus on snd e:
+def
+
+snd e = e (let x1 = [·] in snd x1 )
+= let x1 = [·] in snd x1  e 
+≡ let x1 = e in snd x1
+
+by Lemma 5.4
+by Lemma 4.15
+
+ζ snd e
+δ snd x1
+
+For goal (2), since B [x := fst e] ≡ B [x := fst e] by Lemma 5.5, we focus on showing
+fst e ≡ fst e. Focusing on fst e, we have:
+def
+
+fst e = e (let x1 = [·] in fst x1 )
+= let x1 = [·] in fst x1  e 
+≡ let x1 = e in fst x1
+
+by Lemma 5.4
+by Lemma 4.15
+
+ζ fst e
+
+Case: [ELIMNAT] Following our general structure, we must show (1) indnat A y x1 x2 ≡
+indnat A e e1 e2  in an environment where
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+26
+
+P. Koronkevich et al.
+δ
+
+δ
+
+δ
+
+y = e : Nat , x1 = e1  : A[zero := x] , x2 = e2  :  n : Nat.  x : A[x := n]. A[x := succ n]
+and (2) A[x := y] ≡ A[x := e].
+For goal (1), we focus on indnat A e e1 e2 :
+indnat A e e1 e2 
+def
+
+= e (let y = [·] in e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A y x1 x2 )))
+= let y = [·] in e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A y x1 x2 )) e 
+by Lemma 5.4
+≡ let y = e in e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A y x1 x2 ))
+by Lemma 4.15
+ζ e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A e x1 x2 ))
+= let x1 = [·] in e2  (let x2 = [·] in indnat A e x1 x2 ) e1  
+by Lemma 5.4
+≡ let x1 = e1  in e2  (let x2 = [·] in indnat A e x1 x2 )
+by Lemma 4.15
+ζ e2  (let x2 = [·] in indnat A e e1  x2 )
+= let x2 = [·] in indnat A e e1  x2  e2  
+by Lemma 5.4
+≡ let x2 = e2  in indnat A e e1  x2
+by Lemma 4.15
+ζ indnat A e e1  e2 
+
+For goal (2), since A[x := e] ≡ A[x := e] by Lemma 5.5, and y ≡ e by the definition
+δ
+y = e : Nat, we conclude using [≡-SUBST].
+Case: [IF] Following our general structure, we must show (1) e1  ≡ if e then e1 else e2 
+δ
+in an environment where x = e : Bool, p : x ≡ true and (2) B [x := e] ≡ B [x := true]
+δ
+(and analogously for e2 where x = e : Bool, p : x ≡ false).
+Focusing on if e then e1 else e2  in goal (1), we have:
+if e then e1 else e2 
+def
+
+= e (let x = [·] in if x then e1  else e2 )
+= let x = [·] in if x then e1  else e2   e 
+≡ let x = e in if x then e1  else e2 
+ζ if e then e1  else e2 
+≡ e1 
+
+by Lemma 5.4
+by Lemma 4.15
+
+by [≡-IF-β1 ] since e ≡ true by [≡-REFLECT] and [VAR]
+
+For goal (2), B [x := e] ≡ B [x := true] by Lemma 5.5. Since e ≡ true we conclude
+with [≡-SUBST].
+
+Key steps in the proof require reasoning about equivalence of terms. To prove equivalence of terms, we need to know their syntax so a structural equivalence rule applies,
+which is not true of terms of the form e K. To reason about this term, we need to show an
+equivalence between the compiler and ANF-composition, so we can reason instead about
+K e , a definition we can unroll and we know is correct with respect to evaluation via
+Lemma 4.15 (Naturality). We prove this equivalence, Lemma 5.4 next. This essentially
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+27
+
+tells us that our compiler is compositional, that is, respects separate compilation and composition in the target language. We can either first translate a program e under continuation
+K and then compose it with a continuation K , or we can first compose the continuations K
+and K and then translate e under the composed continuation.
+Lemma 5.4 (Compositionality). K  e K = e K K.
+Proof By induction on the structure of e. All value cases are trivial. The cases for
+non-values are all similar, following by definition of composition for continuations or
+configurations.
+
+Corollary 5.4.1. K e  = e K.
+Similarly, at times we need to reason about the translation of terms or types that have
+a variable substituted, such as A[x := e ]. We often use induction on a judgment   e : A,
+which gives us the structure of the expression e but not much of the structure of the type A.
+The type A may have a term substituted, as A[x := e ], but we have no information about
+the structure of A itself. Since we cannot reason about A directly, we cannot obtain the
+final term after substitution, and thus, we do not know the syntax of the compilation of this
+arbitrary term. We show another kind of compositionality with respect to this substitution,
+Lemma 5.5, which shows that substitution is equivalent to composing via continuations.
+Since standard substitution does not preserve ANF, this lemma does not equate terms in
+ANF, but CCAe terms that are not normal. We again mark this shift with the boundary term
+N N ().
+Lemma 5.5 (Substitution). e[x := e ] K ≡ N N ((e K)[x := e ]).
+Our type system relies on a subtyping judgment, so we must show subtyping is preserved. The proof is uninteresting, except insofar as it is simple, while it seems to be
+impossible in prior work for CPS translation (Bowman et al., 2018).
+Lemma 5.6. If   e
+
+e then   e
+
+e .
+
+Subtyping relies on type equivalence (but not vice versa), so we must also show the
+equivalence judgment is preserved. This lemma is also useful as a kind of compiler correctness property, ensuring that our notion of program equivalence (since types and terms
+are the same) is preserved through compilation.
+Lemma 5.7. If   e ≡ e then   e ≡ e .
+Since equivalence is defined in terms of reduction and conversion, we must also show
+reduction and conversion are preserved up to equivalence in the target language. This is
+convenient, since reduction and conversion also define the dynamic semantics of programs.
+These proofs correspond to a forward simulation proof up to target language equivalence
+and also imply compiler correctness. The proofs are straightforward; intuitively, ANF is
+just adding a bunch of ζ -reductions.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+28
+
+P. Koronkevich et al.
+
+v≈V
+true ≈ true
+
+false ≈ false
+
+v≈V
+
+zero ≈ zero
+
+succ v ≈ succ V
+
+γ
+e:A
+
+γ
+
+δ
+
+·∅
+
+, x = e : A  γ [x  → γ (e)]
+
+e:A
+
+γ
+
+, x : A  γ [x  → γ (e)]
+
+Fig. 13: Separate compilation definitions.
+Lemma 5.8. If   e  e then   e ≡ e .
+Lemma 5.9. If   e ∗ e then   e ≡ e .
+Proof By induction on the structure of   e ∗ e .
+
+
+
+As a result of proving that ANF preserves the judgmental and syntactic structure that a
+dependent type system relies on, we can also easily prove correctness of separate compilation (with respect to the ANF evaluation semantics). To do this, we must define linking and
+a specification of when outputs are related across languages, independent of the compiler.
+We define an independent specification relating observation across languages, which
+allows us to understand the correctness theorem without reading the compiler. We define
+the relation v ≈ V to compare ground values in Figure 13.
+We define linking as substitution with well-typed closed terms and define a closing
+substitution γ with respect to the environment  (also in Figure 13). Linking is defined by
+closing a term e such that   e : A with a substitution   γ , written γ (e). Any γ is valid for
+ if it maps each x : A ∈  to a closed term e of type A. For definitions in  , we require that
+δ
+if x = e : A ∈  , then γ [x → γ (e)], that is, the substitution must map x to a closed version of
+its definition e. We lift the ANF translation to substitutions.
+Correctness of separate compilation says that we can either link then run a program in the
+source language semantics, that is, using the conversion semantics, or separately compile
+the term and its closing substitution then run in the ANF evaluation semantics. Either way,
+we get equivalent terms. The proof is straightforward from the compositionality properties
+and forward simulations we proved for type preservation.
+Theorem 5.10 (Correctness of Separate Compilation). If   e : A, (and A a base type) and
+  γ then eval(γ  (e)) ≈ eval(γ (e)).
+Proof The following diagram commutes, because ≡ corresponds to ≈ on base types (nat
+or bool), the translation commutes with substitution, and preserves equivalence.
+eval(γ (e))
+
+≡
+
+≡
+
+eval(γ  (e))
+
+γ (e)
+≡
+
+≡
+
+γ  (e)
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+
+
+ANF preserves dependent types up to extensional equality
+
+29
+
+e K = M
+..
+.
+def
+
+if e then e1 else e2  K =
+let f = λ y : B[x := e]. λ p : y ≡ if e then e1 else e2 . K[y]
+in e let x = [·]
+
+in if x then e1  (let x1 = [·] in (f x1 (refl x1 )))
+else e2  (let x2 = [·] in (f x2 (refl x2 )))
+
+where if e then e1 else e2 : B[x := e]
+
+Fig. 14: Join-point optimized ANF translation.
+6 Join-point optimization
+Recall from Figure 8 that the composition of a continuation K with an if configuration, Kif V then M1 else M2 , duplicates K in the branches: if V then KM1  else KM2 .
+Similarly, the ANF translation in Figure 12 performs the same duplication when translating if expressions. This can cause exponential code duplication, which is no problem in
+theory but is a problem in practice.
+CCAe supports implementing the join-point optimization, which avoids this code duplication. We modify the ANF translation from Section 5 to use the definition in Figure 14 and
+prove it is still correct and type preserving. Note that the new translation requires access to
+the type B from the derivation. We can do this either by defining the translation by induction over typing derivations or (preferably) modifying the syntax of if to include B as a
+type annotation, similar to dependent pairs in ECC or dependent case analysis in Coq.
+Lemma 6.1.
+1. If   then  .
+2. If   e : A and  ,    K : (e : A) ⇒ B, then  ,    e K : B.
+Proof By induction.
+Case: [IF] We proceed by induction on the branch sub-expressions and ensure their corresponding continuation is well typed. This means the application of the join point f must
+be on well-typed arguments of (1) x1 : A[x := e] and (2) refl x1 : x1 ≡ if e then e1 else e2 
+(analogously for x2 in the false branch). (1) follows from the equivalence A[x := e] ≡
+A[x := true], which has been shown before in Lemma 5.3. (2) follows if we show
+δ
+(x1 ≡ x1 ) ≡ (x1 ≡ if e then e1 else e2 ) in an environment where x1 = e1  : B [x := true].
+By [≡-CONG-EQUIV], we must show x1 ≡ if e then e1 else e2 , which by definition is
+e1  ≡ if e then e1 else e2 , previously shown in Lemma 5.3.
+
+7 Future and related work
+We first discuss possible extensions to the source language. We sketch adding recursion
+and inductive data types to our source language ECC and conjecture that our proof
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+30
+
+P. Koronkevich et al.
+
+technique can scale to these features. However, extending the source with extensional
+equality seems more difficult. We then discuss ways to efficiently type check CCAe
+terms constructed from the ANF translation. We conclude by discussing related work as
+alternatives to the ANF translation, in particular the CPS translation, Call-by-Push-Value,
+and monadic form. These alternatives either fail to scale to higher universes, or fail to
+compile to a language as “low-level” as CCAe in ANF.
+7.1 Costs of type-preserving compilation
+Compared to other approaches to solving linking errors, such as PCC (Necula, 1997) which
+requires finding and encoding witnesses of safety proofs, type-preserving compilation is a
+lightweight and effective technique (Morrisett et al., 1999; Xi & Harper, 2001; Shao et al.,
+2005).
+Unfortunately, one major disadvantage is the compilation time. TIL (Tarditi et al.,
+1996), a type-preserving compiler for Standard ML, was found to be eight times slower
+than the non-type-preserving compiler SML/NJ. Chen et al. (2008) found that their typepreserving compiler for Microsoft’s Common Intermediate Language (CIL) was 82.8%
+slower than their base compiler, mostly due to type inference and writing type information to object files. We consider long compilation times a relatively small price to pay for
+the safety guarantees provided for the compiled program, particularly given the cost of
+unsafety (Stecklein et al., 2004; Briski et al., 2008).
+It is also unclear that this cost is necessary. Shao et al. (1998) show that careful attention
+to representation of typed intermediate language nearly eliminated compile time overhead introduced in the FLINT compiler compared to the SML/NJ compiler. The focus in
+that work is with respect to large types, which is particularly relevant for dependent-type
+preservation.
+However, annotations overhead with dependent types can be far larger. For example,
+annotation size (including both types and proofs) was 6x time larger than the code size
+in CompCert (Leroy, 2009), and one extension to CompCert doubled that (Stewart et al.,
+2015). If this sort of difference between annotation size and code size is typical, it could be
+a huge problem. It is not clear that is typical; Stewart et al. (2015) note that the doubling
+was in part due to duplication of definitions which should be unnecessary.
+Removing inference from the type system could significantly improve compile
+time (Chen et al., 2008), but could increase code size and require more annotations. This
+time/space tradeoff has been studied in the context of LF (Necula & Rahul, 2001; Sarkar
+et al., 2005). Adapting these techniques to dependently typed languages in the style of Coq
+would likely be necessary for practical implementation of dependent-type preservation, but
+the issues are very similar to that of LF.
+7.2 Recursive functions and match
+Our source language ECC still lacks some key features of a general purpose dependently
+typed language. In particular, our language does not have a fix construct for defining recursive functions and a match construct for eliminating general inductive datatypes. These
+features require a termination condition to ensure termination of programs; thus, building
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+31
+
+a type-preserving compiler for a language with these features would require the compiler
+preserve the termination condition as well. We could preserve a syntactic termination condition, as used by Coq; however, this requires a significantly more complex target guard
+condition. Bowman & Ahmed (2018) provide an example of preserving the guard condition through the closure conversion pass, where the guard condition must essentially
+become a data-flow analysis in order to track the flow of recursive calls through closures.
+This would greatly increase the complexity of the target type system and possibly affect
+type checking performance. This suggests that using a syntactic condition is undesirable
+for a dependently typed intermediate language. An alternative could be compiling this
+syntactic guard condition to sized types, but adding sized types to Coq is still a work in
+progress (Chan & Bowman, 2020).
+However, assuming we have preserved the guard condition through the ANF translation
+with the aforementioned possible complexities, we conjecture that the technique presented
+in this paper scales to these language features. In particular, proving that the ANF translation of match is type preserving would be very similar to the technique used for dependent
+if. Suppose we have added a syntactic form match e as x in (A z) return B with{(Ci yi ) → ei }
+and typing rule:
+  e : A e
+
+, z : A , x : A z  B : U
+
+, yi : Bi  ei : B[z := ei ][x := Ci yi ]
+
+  match e as x in (A z) return B with{(Ci yi ) → ei } : B[z := e ][x := e]
+
+The target language would have a similar syntactic match construct as a configuration
+M. Any proofs of lemmas over configurations M should be updated to include the match
+construct. The ANF translation would first translate the scrutinee e and then push K into
+each branch of the match. In order to prove this translation type preserving, we would
+change the target typing rule for match to include a propositional equality when checking
+each branch. That is, the premises , yi : Bi  ei : B[z := ei ][x := Ci yi ] in the source match
+rule above would change to , yi : Bi , p : e ≡ Ci yi  ei : B[z := ei ][x := Ci yi ]. The target typing rule threads the equality p : e ≡ Ci yi when checking each branch, to record that the
+scrutinee e has reduced to a particular case of the match Ci yi .
+Threading an equality into the branches proves type preservation in the same way as
+with if statements with the equality p : e ≡ true (or p : e ≡ false). The continuation K originally expects something of type B[z := e ][x := e] but then is pushed into the branches
+
+
+and translated with something of type B[z := ei ][x := Ci yi ] . The equality p : e ≡ Ci yi in
+the context introduced by the target typing rule helps resolve the discrepancy between the
+substitution [x := e] and [x := Ci yi ].
+Assuming the termination condition can be preserved through the ANF translation, proving that ANF is type-preserving for fix would be similar to proving type preservation for
+functions. Given the typing rule for fix and the ANF translation:
+, f :  x : A. B, x : A  e : B
+
+guard(f, x, e)
+
+  fix f(x : A). e :  x : A. B
+fix f(x : A). e
+
+def
+
+=
+
+K[fix f(x : A). e]
+
+We could show that the ANF translation is type preserving by Lemma 4.2 and show that
+the target fix expression fix f(x : A). e is well typed. This is easy to show using the target
+[FIX] typing rule, assuming the guard condition is preserved, and by induction on e.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+32
+
+P. Koronkevich et al.
+7.3 Preserving extensional equality
+
+A natural question is whether we can preserve extensional equality through ANF translation. Since the target language already supports this, it seems trivial to preserve,
+no?
+Our study so far suggests that adding new features with the same pattern of dependency
+and judgmental structural does not take much effort. Adding new positive or negative
+types is not significantly more complicated if the translation already supports positive and
+negative types. Adding recursion does not seem difficult since the dependency is not new,
+although it adds a new judgment that must be preserved.
+By contrast, extensional equality is a radical change to the judgmental structure of the
+source language. Currently, in our source language, the typing and equivalence judgments
+are separately defined—typing depends on equivalence, but not vice versa. Adding extensional equality typically makes these two judgment mutually dependent. This completely
+changes the structure of the type preservation proof—as we discussed in Section 5, we
+stage our proof by first showing reduction is preserved, then equivalence, etc, and finally
+that typing is preserved. This structure follows the structure of the source typing derivations. Because adding extensional equality changes the structure of source typing derivations, this entire proof could no longer be staged and would need to be mutually inductive.
+Past authors have not had much success in solving these large mutual inductive proofs
+and instead avoid them. Barthe et al. (1999) discuss this problem as choose to use a Currystyle type system to avoid the problem. Bowman et al. (2018) discuss it also, but choose to
+use untyped equivalence and untyped reduction to avoid it. We follow the latter approach,
+but that is not tenable if we extend the source language with extensional equability.
+We have considered alternative variants of extensional equality. For example, consider
+the following idea for a simplification of the Rule [≡-REFLECT] which avoids mutual
+dependency.
+p : e1 ≡ e2 ∈ 
+  e1 ≡ e2
+
+[≡-REFLECT-IDEA]
+
+In this version of extensional equality, we avoid dependence on the typing judgment
+by restricting extensionality to apply only when we have a proof that we can use in the
+current context. Unfortunately, this breaks subject reduction, and if equivalence is untyped,
+it can lead to unsoundness. Since the only purpose was to break the dependence between
+equivalence and typing, and subject reduction is important for a compiler IL, we end up
+with the standard reflection rule.
+That said, these issues about typed equivalence are only about complicating the proof
+technique, not the translation. Extensional equivalence does not introduce any new dependencies that ANF can disrupt, so it seems likely that ANF would still be type preserving,
+but it will almost certainly be difficult to prove.
+7.4 Recovering decidability
+Our target language CCAe is extensional type theory, which is well known to have undecidable type checking. An IL with undecidable type checking affects our type-check-then-link
+approach, even though linking may not necessarily occur at CCAe . This is because the
+decidability of type checking of earlier ILs may affect the type checking of later ILs
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+33
+
+in the compiler, where linking is to be done. If some information is lost resulting in
+undecidability, then that information is unlikely to be regained later.
+There are then two main approaches to avoid undecidable type checking. One is to find
+ways to recover decidability for the subset of CCAe constructed by the compiler. The other
+is to remove equivalence reflection from CCAe and attempt to recover the proof of type
+preservation, which is much more difficult and not ideal for compilation.
+Recovering Decidability for CCAe . Intuitively, the target terms in CCAe constructed by
+the compiler should be decidable. This is because the terms are constructed from terms in
+a decidable source language. In principle, the translation could make use of this fact and
+insert whatever annotations are necessary into the target term to ensure it can be decidably checked in an extensional type theory. Determining small, suitable annotations for
+compilation is the main subject of future work.
+One approach for annotating the compiled term is a technique from proof-carrying code
+(PCC). In a variant of PCC by Necula & Rahul (2001), the inference rules are represented
+as a higher-order logic program, and the proof checker is a non-deterministic logic interpreter. The proofs are made deterministic by recording non-deterministic choices as a
+bit-string. Our compiler could be modified to produce a similar bit-string encoding the nondeterministic choices. The type checker could then be modified to interpret the encoding
+to ensure type checking is decidable.
+If all else fails, we can recover decidability to translating typing derivations rather
+than syntax. Donning our propositions-as-types hat once again, we can obtain the desired
+typing derivation by using the proof of type preservation. The proof can be viewed as a
+function from source typing derivations to target typing derivations. The target typing
+derivation can then be translated to CIC with additional axioms and be decidably checked
+(Oury, 2005). However, this would require shipping the type preservation proof with the
+compiler, which might be undesirable.
+Using a Target Language Without Equivalence Reflection. We could use the convoy
+pattern (Chlipala, 2013) to compile if expressions, as we did to show consistency of CCAe
+in Section 4.2.1. However, there are two issues with this approach: (1) the convoy pattern
+is not in ANF and (2) the resulting code generated just to show types are preserved (i.e.,
+code not related to execution) is extremely large.
+One could attempt to reduce the code size generated by the convoy pattern by using type
+safe coercions. Consider the addition of the following coercion, subst p e:
+, x : A  B : U
+
+  e1 : A
+
+  e2 : A
+
+  e : B[x := e1 ]
+
+  p : e1 ≡ e2
+
+  subst p e : B[x := e2 ]
+
+[SUBST]
+
+Naive additions of such coercions, however, result in a non-type-preserving translation.
+For example, the coercions could be inserted into the translation for if as follows:
+if e then e1 else e2  K
+
+def
+
+=
+
+e let x = [·] in
+if x then
+(e1  let y = [·] in K[subst refl x y]) else
+(e2  let y = [·] in K[subst refl x y])
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+34
+
+P. Koronkevich et al.
+
+The type preservation proof fails in the branches of the if, despite the coercion. This
+is because our judgmental equivalence cannot determine that the expression expected by
+the continuation, if e then e1 else e2 , is equivalent to the expression subst refl x y. Equality
+reflection was key in proving this equivalence in our proof of type preservation.
+7.5 CPS translation
+ANF is favored as a compiler intermediate representation, although not universally. Cong
+et al. (2019) include a thorough summary of the arguments for and against both CPS and
+ANF as intermediate representations.
+Most recent work on CPS translation of dependently typed languages focuses on expressing control effects (Miquey, 2017; Pédrot, 2017; Cong & Asai, 2018a, 2018b), which we
+discuss further in Section 7.7. When expressing control effects with dependent types, it is
+necessary for consistency to prevent certain dependencies from being expressed (Barthe
+& Uustalu, 2002; Herbelin, 2005), so these translations do not try to recover dependencies
+in the way we discuss in Section 2.
+Two CPS translations exist that do try to recover dependencies in the absence of effects,
+but fail to scale to a predicative universe hierarchy. Bowman et al. (2018) present a typepreserving CPS translation for the Calculus of Constructions. They add a special form
+and typing rule for the application of a computation to a continuation which essentially
+records a machine step and is essentially similar to the let typing rule. They also add a nonstandard equality rule that essentially corresponds to Lemma 4.15 (Naturality). Cong &
+Asai (2018a) extend the translation of Bowman et al. (2018) to dependent pattern matching
+using essentially the same typing rule for if as we do in CCAe .
+Unfortunately, this rule relies on interpreting all functions as parametric and in a single
+computationally relevant impredicative universe. Both of these restrictions are a problem;
+Boulier et al. (2017) give an example of a type theory that is anti-parametric because it
+enables ad hoc polymorphism and type quotation. It is simpler to demonstrate the problems
+that occur when relying on impredicativity.
+Impredicativity is inconsistent with large elimination, that is, eliminating a type to a
+term (Huet, 1986; Chan, 2021)9 This means the CPS translation cannot be used for a consistent type theory with large elimination, while our ANF translation can. For a concrete
+example of what kind of expressiveness is regained, consider the following definition of
+the type of arbitrary arity functions.
+Formally
+Informally
+nargs = λ x : Nat. (indnat Type 0 x
+Nat
+λ x : Nat. λ r : Type 0 . Nat → r)
+
+nargs 0
+nargs succ x
+
+=
+=
+
+Nat
+Nat → (nargs x)
+
+This definition lets us build well-typed multi-arity functions over natural numbers. For
+example, the type of the n-ary summation function is sum :  n : Nat. nargs n. But, this
+requires large elimination and would be inconsistent in an impredicative universe and thus
+cannot be supported by the CPS translation of Bowman et al. (2018). The desire for this
+9
+
+The idea for this proof is due to Huet (1986); however, he seems to have left the proof as an exercise to the
+reader. The idea seems quite well understood in the type theory folklore, but Chan (2021) formalizes the full
+proof in Agda.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+35
+
+sort of definitions makes a predicative universe hierarchy almost, but not quite, universal
+in dependently typed languages. Cedille is a notable exception, instead trying to take full
+advantage of impredicativity (Stump & Jenkins, 2018).
+7.6 Call-by-push-value and monadic form
+Call-by-push-value (CBPV) is similar to our ANF target language and to CPS target
+languages. In essence, CBPV is a λ calculus in monadic form suitable for reasoning
+about call-by-value (CBV) or call-by-name (CBN), due to explicit sequencing of computations (Levy, 2012). It has values, computations, and continuations, as we do, and has
+compositional typing rules (which inspired much of our own presentation). The structure
+of CBPV is of useful for modeling effects; all computations should be considered to carry
+an arbitrary effect, while values do not.
+Work on designing a dependent call-by-push-value (dCBPV) runs into some of the same
+design issues that we see in ANF (Ahman, 2017; Vákár, 2017; Pédrot & Tabareau, 2019),
+but critically avoids the central difficulties introduced in Section 2. The reason is essentially
+that monadic form is more compositional than ANF, so dependency is not disrupted in the
+same way.
+Recall from Section 4 that our definition of composition was entirely motivated by the
+need to compose configurations and continuations. In monadic form generally, there is no
+distinction between computation and configurations, and let is free to compose configurations. This means that configurations can return intermediate computations, instead of
+composing the entire rest of the continuation inside the body of a let. The monadic translation of snd e, which is problematic in ANF, is given below and is easily type preserving.
+snd e : B[y := e] = let x = e in snd x : B[y := e]
+
+Note that since let can bind the “configuration” e, the typing rule [LET] and the
+compositionality lemma suffice to show type preservation, without any reasoning about
+definitions. In fact, we do not even need definitions for monadic form; we only need a
+dependent result type for let. A similar argument applies to the monadic translation of
+dependent if: since we can still nest if on the right-hand side of a let, the difficulties we
+encounter in the ANF translation are avoided.
+The dependent typing rule for let without definitions is essentially the rule given by
+Vákár (2017), called the dependent Kleisli extension, to support the CBV monadic translation of type theory into dCBPV, and the CBN translation with strong dependent pairs.
+Vákár (2017) observes that without the dependent Kleisli extension, CBV translation is illdefined (not type preserving), and CBN only works for dependent elimination of positive
+types. This is the same as the observation made independently by Bowman et al. (2018)
+that type-preserving CBV CPS fails for  types, in addition to the well-known result that
+the CBN translation failed for  types (Barthe & Uustalu, 2002).
+Recently, Pédrot & Tabareau (2019) introduce another variant of dependent call-bypush-value dubbed δCBPV and discuss the thunkability extension in order to develop a
+monadic translation to embed from CCω into δCBPV. Thunkability expresses that a computation behaves like a pure computation, and so it can be depended upon. This justifies
+the addition of an equation to their type theory that is similar to our Lemma 4.15, but
+should hold even when the language is extended with effects. The authors note that the
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+36
+
+P. Koronkevich et al.
+
+thunkability extensions seems to require that the target of the thunkable translation be an
+extensional type theory.
+Monadic form has been studied for compilation (Benton et al., 1998; Benton & Kennedy,
+1999). In these instances, the compiler simplifies from monadic form to ANF as a series
+of intra-language rewrites. Once in ANF, that is, a form that is normal with respect to the
+commuting conversions within monadic form, code generation is greatly simplified since
+all nesting has been eliminated. This more practical implementation technique, not strictly
+adhering to ANF until necessary, is also used in GHC (Maurer et al., 2017) and Chez
+Scheme.10
+These commutative conversions are called commutative cuts in the dependent type theory literature (Herbelin, 2009; Boutillier, 2012). Formally, the problem of commutative
+cuts can be phrased as: Is the following transformation type preserving?
+K[if e then e1 else e2 ]  if e then K[e1 ] else K[e2 ]
+
+ANF necessarily performs this transformation, as we have shown.
+These same commuting conversion do not preserve typing in a standard dependently
+typed language, but do in our target language CCAe . While we study this through the ANF
+translation directly, the more practical application of this work is likely in the design of the
+target language, which is designed to support ANF, rather than in the ANF translation itself.
+In this view, the ANF translation can be seen as a proof technique that all intermediate
+rewrites from monadic form to ANF are support in the target language.
+7.7 CPS for control effects in dependent types
+Most work on CPS for dependent types is primarily concerned with integrating control
+effects and dependent types, not with type-preserving compilation. Therefore, these CPS
+translations necessarily make different design choices than we describe in Section 2. For
+example, we want to avoid any restriction on the source language. However, one must
+necessarily restrict certain dependencies to integrate control effects and dependent types,
+at least for the effectful parts of the language. For our translation, naturality is important,
+but it is non-goal for effectful terms, or is a goal only up to a boundary. We briefly describe
+some of these translations.
+To justify soundness of a dependent sequent calculus, Miquey (2017) present a CPS
+translation based on double negation. Sequent calculi make co-values (essentially, continuation) explicit in the language and thus express control effects. Miquey (2017) develop
+their CPS translation and avoid relying on parametricity and impredicativity. They rely
+on modified source type system to track equalities when checking co-values that depend
+on expression, which is essentially similar to the definitions in our continuation typing. They use delimited continuations to enforce naturality at certain boundaries, to
+constrain the scope of effects. They also rely on the negative-elimination-free (NEF)
+restriction (Herbelin, 2012), which disallows proofs that contain certain kinds of computations, such as arbitrary dependent projection from  types. If we want to compile existing
+languages, such as Coq, which have significant code bases, we cannot admit restrictions
+like the NEF restriction.
+10
+
+https://github.com/cisco/ChezScheme.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+37
+
+7.8 Non-dependently typed ANF translation
+There has not been much work on type preservation for simply typed (or, more specifically,
+non-dependently typed) ANF translation. Most of the type preservation literature focuses
+on CPS translation (Shao, 1997; Morrisett et al., 1999; Thielecke, 2003; Kennedy, 2007;
+Ahmed & Blume, 2011; Perconti & Ahmed, 2014; Patterson et al., 2017).
+This is probably because ANF translation without dependent types is, essentially, not
+interesting. CPS translation transforms every expression, making explicit a representation
+of computation and continuation. This requires a (typed) encoding that captures all the
+properties of interest and changes the types of every term change. This makes type preservation non-trivial and raises interesting questions about exactly type computations and
+continuations should be assigned. This can be particularly interesting when considering a
+compiled component interacting with a hostile context (Ahmed & Blume, 2011).
+By contrast, ANF essentially just reorders existing terms and binds them to names without introducing any new objects into the syntax. No types change at all, so long as types
+do not depend on the syntax of terms.
+A cursory study of non-dependently typed ANF appears in the technical appendix by
+Ahmed & Blume (2011), companion to Ahmed & Blume (2011), which briefly studies
+ANF translation of System F. They show that, in System F, ANF is type preserving and
+fully abstract, since System F in ANF is actually just a subset of System F. The proof is
+not given in detail, however.
+Another tangential study of type-preserving ANF appears in the work of Saffrich &
+Thiemann (2020), which use ANF as part of a proof to show that imperative session types
+are subsumed by a functional session types API. The correctness and type-preservation of
+ANF translation is similarly considered trivial in the text since ANF does not affect typing,
+although they provide a detailed proof of type preservation in the appendix.
+8 Conclusion
+We develop a type-preserving ANF translation for ECC—a significant subset of Coq
+including dependent functions, dependent pairs, dependent elimination of booleans, natural numbers, and the infinite hierarchy of universes—and prove correctness of separate
+compilation with respect to a machine semantics for the target language. The translation,
+these proofs, and our proof technique for ANF are main contributions. This translation
+provides strong evidence that type-preserving compilation can support all of dependent
+type theory. It gives insights into type preservation for dependent types in general and into
+related work on type-preserving control flow transformations.
+
+Acknowledgments
+We gratefully acknowledge Youyou Cong, Max S. New, Hugo Herbelin, Matthias
+Felleisen, Greg Morrisett, Simon Peyton Jones, Paul Downen, Andrew Kennedy, Brian
+LaChance, Danel Ahman, Carlo Angiuli, and the many anonymous reviewers for their time
+in discussing ANF, CPS and related problems during the course of this work. Thank you all.
+We acknowledge the support of the Natural Sciences and Engineering Research Council
+of Canada (NSERC), funding reference number RGPIN-2019-04207. Cette recherche a
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+38
+
+P. Koronkevich et al.
+
+été financée par le Conseil de recherches en sciences naturelles et en génie du Canada
+(CRSNG), numéro de référence RGPIN-2019-04207.
+
+Conflicts of interest
+None.
+
+References
+Ahman, D. (2017) Fibred Computational Effects. Ph.D. thesis. University of Edinburgh. Available
+at: http://arxiv.org/abs/1710.02594.
+Ahmed, A. (2015) Verified Compilers for a Multi-language World. In Summit on Advances in
+Programming Languages (SNAPL). 10.4230/LIPIcs.SNAPL.2015.15.
+Ahmed, A. & Blume, M. (2011) An equivalence-preserving CPS translation via multilanguage semantics. In International Conference on Functional Programming (ICFP).
+10.1145/2034773.2034830.
+Ahmed, A. & Blume, M. (2011) An Equivalence-Preserving CPS Translation via Multi-Language
+Semantics (Technical Appendix). Technical report. Available at: http://www.ccs.neu.edu/
+home/amal/papers/epc-tr.pdf.
+Anand, A., Appel, A. W., Morrisett, G., Paraskevopoulou, Z., Pollack, R., Bélanger, O. S., Sozeau,
+M. & Weaver, M. (2017) CertiCoq: A verified compiler for Coq. In International Workshop on
+Coq for Programming Languages (CoqPL). Available at: http://www.cs.princeton.edu/
+~appel/papers/certicoq-coqpl.pdf.
+Appel, A. W. (2015) Verification of a cryptographic primitive: SHA-256. ACM Trans. Program.
+Lang. Syst. (TOPLAS). 37(2). 10.1145/2701415.
+Barthe, G., Grégoire, B. & Zanella-Béguelin, S. (2009) Formal certification of code-based
+cryptographic proofs. In Symposium on Principles of Programming Languages (POPL).
+10.1145/1480881.1480894.
+Barthe, G., Hatcliff, J. & Sørensen, M. H. B. (1999) CPS translations and applications: The cube and
+beyond. Higher-Order Symb. Comput. 12(2). 10.1023/a:1010000206149.
+Barthe, G. & Uustalu, T. (2002) CPS translating inductive and coinductive types. In Workshop on
+Partial Evaluation and Semantics-based Program Manipulation (PEPM). 10.1145/509799.503043.
+Benton, N. & Kennedy, A. (1999) Monads, effects and transformations. Electron. Notes Theoret.
+Comput. Sci. 26, 3–20. 10.1016/s1571-0661(05)80280-4.
+Benton, N., Kennedy, A. & Russell, G. (1998) Compiling standard ML to Java bytecodes. In
+International Conference on Functional Programming (ICFP). 10.1145/289423.289435.
+Boulier, S., Pédrot, P. & Tabareau, N. (2017) The next 700 syntactical models of type theory. In
+Conference on Certified Programs and Proofs (CPP). 10.1145/3018610.3018620.
+Boutillier, P. (2012) A relaxation of Coq’s guard condition. Journées Francophones des langages
+applicatifs (JFLA). Available at: https://hal.archives-ouvertes.fr/hal-00651780.
+Bowman, W. J. & Ahmed, A. (2018) Parametric Closure Conversion for CIC. Available at:
+https://web.archive.org/web/20210423031005/https://www.williamjbowman.com/
+resources/wjb2018-techreport-parametric-cc-cic.pdf.
+Bowman, W. J., Cong, Y., Rioux, N. & Ahmed, A. (2018) Type-preserving CPS translation of  and
+ types is not not possible. Proc. ACM Program. Lang. (PACMPL). 2(POPL). 10.1145/3158110.
+Briski, K. A., Chitale, P., Hamilton, V., Pratt, A., Starr, B., Veroulis, J. & Villard, B. (2008)
+Minimizing Code Defects to Improve Software Quality and Lower Development Costs.
+Development Solutions. IBM.
+Available at: ftp://ftp.software.ibm.com/software/
+rational/info/do-more/RAW14109USEN.pdf.
+Chan, J. (2021) An Analysis of An Analysis of Girard’s Paradox. Available at: https://web.
+archive.org/web/20220429152422/https://ionathan.ch//2021/11/24/inconsistencies.html.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+39
+
+Chan, J. & Bowman, W. J. (2020) Practical sized typing for coq. Available at: https://arxiv.
+org/abs/1912.05601.
+Chen, J., Hawblitzel, C., Perry, F., Emmi, M., Condit, J., Coetzee, D. & Pratikaki, P. (2008)
+Type-preserving compilation for large-scale optimizing object-oriented compilers. In
+International Conference on Programming Language Design and Implementation (PLDI).
+10.1145/1375581.1375604.
+Chlipala, A. (2007) A certified type-preserving compiler from lambda calculus to assembly language.
+In International Conference on Programming Language Design and Implementation (PLDI).
+10.1145/1250734.1250742.
+Chlipala, A. (2013) Certified Programming with Dependent Types - A Pragmatic Introduction to
+the Coq Proof Assistant. MIT Press. Available at: http://adam.chlipala.net/cpdt/.
+Cong, Y. & Asai, K. (2018a) Handling delimited continuations with dependent types. Proc. ACM
+Program. Lang. (PACMPL). 2(ICFP). 10.1145/3236764.
+Cong, Y. & Asai, K. (2018b) Shifting and resetting in the calculus of constructions. In International
+Symposium on Trends in Functional Programming (TFP). Available at: https://sites.
+google.com/site/youyoucong212/tfp-2018.
+Cong, Y., Osvald, L., Essertel, G. M. & Rompf, T. (2019) Compiling with continuations, or without?
+whatever. PACMPL 3(ICFP), 79:1–79:28. 10.1145/3341643.
+Coquand, T. & Huet, G. (1988) The calculus of constructions. Inf. Comput. 76(2–3).
+10.1016/0890-5401(88)90005-3.
+Flanagan, C., Sabry, A., Duba, B. F. & Felleisen, M. (1993) The essence of compiling with continuations. In International Conference on Programming Language Design and Implementation
+(PLDI). 10.1145/155090.155113.
+Gordon, A. D. (1995) Bisimilarity as a theory of functional programming. In Eleventh Annual
+Conference on Mathematical Foundations of Programming Semantics, MFPS 1995, Tulane
+University, New Orleans, LA, USA, March 29–April 1, 1995. Elsevier, pp. 232–252.
+10.1016/S1571-0661(04)80013-6.
+Gu, R., Koenig, J., Ramananandro, T., Shao, Z., Wu, X. n., Weng, S.-c., Zhang, H. & Guo, Y. (2015)
+Deep specifications and certified abstraction layers. In Symposium on Principles of Programming
+Languages (POPL). 10.1145/2775051.2676975.
+Gu, R., Shao, Z., Chen, H., Wu, X. N., Kim, J., Sjöberg, V. & Costanzo, D. (2016) CertiKOS: An
+extensible architecture for building certified concurrent OS kernels. In Symposium on Operating
+Systems Design and Implementation (OSDI). Available at: https://www.usenix.org/
+conference/osdi16/technical-sessions/presentation/gu.
+Herbelin, H. (2005) On the degeneracy of -types in presence of computational classical logic. In
+International Conference on Typed Lambda Calculi and Applications. 10.1007/11417170_16.
+Herbelin, H. (2009) On a few open problems of the calculus of inductive constructions and on
+their practical consequences. Updated 2010. Available at: https://web.archive.org/web/
+20181125182737/http://pauillac.inria.fr/~herbelin/talks/cic.pdf.
+Herbelin, H. (2012) A constructive proof of dependent choice, compatible with classical logic. In
+Symposium on Logic in Computer Science (LICS). 10.1109/lics.2012.47.
+Huet, G. (1986) Formal Structures for Computation and Deduction. Technical report. Available at:
+http://web.archive.org/web/20220408113829/http://pauillac.inria.fr/~huet/
+PUBLIC/Formal_Structures.ps.gz.
+Kennedy, A. (2007) Compiling with continuations, continued. In International Conference on
+Functional Programming (ICFP). 10.1145/1291220.1291179.
+Lennon-Bertrand, M., Maillard, K., Tabareau, N. & Tanter, E. (2022) Gradualizing the calculus of
+inductive constructions. ACM Trans. Program. Lang. Syst. 10.1145/3495528.
+Leroy, X. (2009) A formally verified compiler back-end. J. Autom. Reas. 43(4).
+10.1007/s10817-009-9155-4.
+Levy, P. B. (2012) Call-By-Push-Value. Available at: https://www.worldcat.org/oclc/
+7330961929.
+Luo, Z. (1990) An Extended Calculus of Constructions. Ph.D. thesis. University of Edinburgh.
+Available at: http://www.lfcs.inf.ed.ac.uk/reports/90/ECS-LFCS-90-118/.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+40
+
+P. Koronkevich et al.
+
+Maurer, L., Downen, P., Ariola, Z. M. & Peyton Jones, S. (2017) Compiling without continuations.
+In International Conference on Programming Language Design and Implementation (PLDI).
+10.1145/3062341.3062380.
+Miquey, É. (2017) A classical sequent calculus with dependent types. In European Symposium on
+Programming (ESOP). 10.1007/978-3-662-54434-1_29.
+Morrisett, G., Walker, D., Crary, K. & Glew, N. (1999) From system F to typed assembly language.
+ACM Trans. Program. Lang. Syst. (TOPLAS). 21(3). 10.1145/319301.319345.
+Necula, G. C. (1997) Proof-carrying code. In Symposium on Principles of Programming Languages
+(POPL). 10.1145/263699.263712.
+Necula, G. C. & Rahul, S. P. (2001) Oracle-based checking of untrusted software. In Conference
+Record of POPL 2001: The 28th ACM SIGPLAN-SIGACT Symposium on Principles
+of Programming Languages, London, UK, January 17–19, 2001. ACM, pp. 142–154.
+10.1145/360204.360216.
+Oury, N. (2005) Extensionality in the calculus of constructions. In Theorem Proving in Higher
+Order Logics, 18th International Conference, TPHOLs 2005, Oxford, UK, August 22–25, 2005,
+Proceedings. Springer, pp. 278–293. 10.1007/11541868_18.
+Patterson, D., Perconti, J., Dimoulas, C. & Ahmed, A. (2017) FunTAL: Reasonably mixing a
+functional language with assembly. In International Conference on Programming Language
+Design and Implementation (PLDI). 10.1145/3062341.3062347.
+Pédrot, P. (2017) A parametric CPS to sprinkle CIC with classical reasoning. In Workshop on
+Syntax and Semantics of Low-Level Languages. Available at: https://web.archive.org/
+web/20220122222238/https://www.cs.bham.ac.uk/~zeilbern/lola2017/abstracts/
+LOLA_2017_paper_5.pdf.
+Pédrot, P.-M. & Tabareau, N. (2019) The fire triangle: How to mix substitution, dependent
+elimination, and effects. In Symposium on Principles of Programming Languages (POPL).
+10.1145/3371126.
+Perconti, J. T. & Ahmed, A. (2014) Verifying an open compiler using multi-language semantics. In
+European Symposium on Programming (ESOP). 10.1007/978-3-642-54833-8_8.
+Peyton Jones, S. L. (1996) Compiling Haskell by program transformation: A report from the
+trenches. In European Symposium on Programming (ESOP). 10.1007/3-540-61055-3_27.
+Pitts, A. M. (1997) Operationally-based theories of program equivalence. In Semantics and Logics
+of Computation, Dybjer, P. & Pitts, A. M. (eds), Publications of the Newton Institute. Cambridge
+University Press, pp. 241–298. 10.1017/CBO9780511526619.007.
+Sabry, A. & Felleisen, M. (1992) Reasoning about programs in continuation-Passing style. In LISP
+and Functional Programming (LFP). 10.1145/141478.141563.
+Sabry, A. & Wadler, P. (1997) A reflection on call-by-value. ACM Trans. Program. Lang. Syst.
+(TOPLAS) 19(6). 10.1145/267959.269968.
+Saffrich, H. & Thiemann, P. (2020) Relating functional and imperative session types. Available at:
+https://arxiv.org/abs/2010.08261.
+Sarkar, S., Pientka, B. & Crary, K. (2005) Small proof witnesses for LF. In International Conference
+Logic Programming (ICLP). 10.1007/11562931_29.
+Severi, P. & Poll, E. (1994) Pure type systems with definitions. In International Symposium Logical
+Foundations of Computer Science (LFCS). 10.1007/3-540-58140-5_30.
+Shao, Z. (1997) An Overview of the FLINT/ML Compiler. Available at: https://web.archive.
+org/web/20161125002746/http://cs.bc.edu/~muller/TIC97//Shao.ps.gz.
+Shao, Z., League, C. & Monnier, S. (1998) Implementing typed intermediate languages. In
+International Conference on Functional Programming (ICFP). 10.1145/289423.289460.
+Shao, Z., Trifonov, V., Saha, B. & Papaspyrou, N. (2005) A type system for certified binaries. ACM
+Trans. Program. Lang. Syst. (TOPLAS) 27(1). 10.1145/1053468.1053469.
+Sozeau, M. (2008) Un environnement pour la programmation avec types dépendants. (An
+Environment for Programming with Dependent Types). Ph.D. thesis. Orsay, France: University
+of Paris-Sud. Available at: https://tel.archives-ouvertes.fr/tel-00640052.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+41
+
+Stecklein, J. M., Dabney, J., Dick, B., Haskins, B., Lovell, R. & Moroney, G. (2004) Error Cost
+Escalation through the Project Life Cycle. Technical report. NASA. Available at: https://
+ntrs.nasa.gov/search.jsp?R=20100036670.
+Stewart, G., Beringer, L., Cuellar, S. & Appel, A. W. (2015) Compositional CompCert. In
+Symposium on Principles of Programming Languages (POPL). 10.1145/2676726.2676985.
+Stump, A. & Jenkins, C. (2018) Syntax and Semantics of Cedille. Available at: http://arxiv.
+org/pdf/1806.04709v3.
+Tarditi, D., Morrisett, G., Cheng, P., Stone, C., Harper, R. & Lee, P. (1996) TIL: A type-directed
+optimizing compiler for ML. In International Conference on Programming Language Design and
+Implementation (PLDI). 10.1145/231379.231414.
+Thielecke, H. (2003) From control effects to typed continuation passing. In Symposium on
+Principles of Programming Languages (POPL). 10.1145/640128.604144.
+Timany, A. & Sozeau, M. (2017) Consistency of the predicative calculus of cumulative inductive
+constructions (pCuIC). arXiv preprint arXiv:1710.03912. Available at: https://arxiv.org/
+abs/1710.03912.
+Vákár, M. (2017) In Search of Effectful Dependent Types. Ph.D. thesis. Oxford University. Available
+at: http://arxiv.org/abs/1706.07997.
+Watkins, K., Cervesato, I., Pfenning, F. & Walker, D. (2003) A concurrent logical framework: The
+propositional fragment. In International Workshop on Types for Proofs and Programs (TYPES).
+10.1007/978-3-540-24849-1_23.
+Xi, H. & Harper, R. (2001) A dependently typed assembly language. In International Conference on
+Functional Programming (ICFP). 10.1145/507635.507657.
+
+1 Appendix: Full proof of type preservation and extended figures
+Lemma 1.1.
+1. If   then  
+2. If   e : A and  ,    K : (e : A) ⇒ B, then  ,    e K : B.
+Proof The proof is by induction on the mutually defined judgments   and
+  e : A. Cases [AX-PROP], [LAM], [APP], [SND], [ELIMNAT], and [IF] are given, as they
+are representative.
+Note that for all sub-expressions e of type A , e  : A  holds by instantiating the induction hypothesis with the empty continuation [·] : (e  : A ) ⇒ A . The general structure of
+each case is similar; we proceed by induction on a sub-expression and prove the new continuation K is well typed by applications of [K-BIND]. Proving the body of K is well typed
+requires using Lemma 4.3. This requires proving that K is composed with a configuration
+M equivalent to e, and showing their types are equivalent. To show M is equivalent to
+e, we use the Lemma 5.4 and Lemma 4.15 to allow for composing configuations and continuations. Additionally, since several typing rules subsitute sub-expressions into the type
+system, we use Lemma 5.5 in these cases to show the types of M and e are equivalent.
+Each non-value proof case focuses on showing these two equivalences.
+Case: [AX-PROP]
+We must show that  ,    K[Prop ] : B. This follows from Lemma 4.2.
+Case: [LAM]
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+42
+
+P. Koronkevich et al.
+
+Must show   K[λ x : A . e ] : B. This follows from Lemma 4.2 if we can
+show  ,    λ x : A . e  :  x : A . B . This follows from [LAM] if we can show
+ ,   , x : A   e  : B . This follows by induction on the judgment , x : A  e : B
+with the empty continuation  ,   , x : A   [·] : (e  : B ) ⇒ B .
+Case: [APP]
+Must show that  ,    e1  (let x1 = [·] in e2  (let x2 = [·] in K[x1 x2 ])) : B.
+Let K1 = (let x1 = [·] in e2  (let x2 = [·] in K[x1 x2 ])). Our conclusion follows by induction
+on   e1 :  x : A . B if we show  ,    K1 : (e1  :  x : A . B ) ⇒ B. By [K-BIND], we
+δ
+must show  ,    e1  :  x : A . B  and  ,   , x1 = e1  :  x : A . B   e2  (let x2 =
+[·] in K[x1 x2 ]) : B.
+The first goal follows from induction on   e1 :  x : A . B with the empty continuation
+ ,    [·] : (e1  :  x : A . B ) ⇒  x : A . B .
+δ
+The second goal also follows by induction on   e2 : A , but we must show  ,   , x1 =
+e1  :  x : A . B   let x2 = [·] in K[x1 x2 ] : (e2  : A ) ⇒ B. By [K-BIND] again, we must
+δ
+show  ,   , x1 = e1  :  x : A . B   e2  : A  (which again follows by induction
+δ
+δ
+with the empty continuation) and  ,   , x1 = e1  :  x : A . B  , x2 = e2  : A  
+K[x1 x2 ] : B.
+δ
+δ
+This follows from Lemma 4.3 if we can show (1)  ,   , x1 = e1  :  x : A . B  , x2 =
+δ
+δ
+e2  : A   x1 x2 : B [x := e2 ] (2)  ,   , x1 = e1  :  x : A . B  , x2 = e2  : A  
+δ
+δ
+e1 e2  : B [x := e2 ]
+and
+(3)
+ ,   , x1 = e1  :  x : A . B  , x2 = e2  : A  
+e1 e2  ≡ x1 x2 .
+δ
+δ
+By δ and [≡-STEP], goal (1) changes to  ,   , x1 = e1  :  x : A . B  , x2 = e2  :
+
+
+
+A   e1  e2  : B [x := e2 ]. We have previously shown that  ,   e1  :  x :
+δ
+A . B  and  ,   , x1 = e1  :  x : A . B   e2  : A . Using these facts with [APP],
+δ
+δ
+we derive  ,   , x1 = e1  :  x : A . B  , x2 = e2  : A   e1  e2  : B [x := e2 ]. We
+have that B [x := e2 ] ≡ B [x := e2 ] by Lemma 5.5 and derive our conclusion by
+[CONV].
+δ
+δ
+By δ and [≡-STEP], goal (3) changes to  ,   , x1 = e1  :  x : A . B  , x2 = e2  :
+
+A   e1 e2  ≡ e1  e2 . We find that the left-hand side of the equivalence can be
+converted as well:
+e1 e2 
+def
+
+= e1  let x1 = [·] in e2  let x2 = [·] in x1 x2
+
+= let x1 = [·] in e2  let x2 = [·] in x1 x2  e1  
+≡ let x1 = e1  in e2  let x2 = [·] in x1 x2
+
+by Lemma 5.4
+by Lemma 4.15
+
+≡ζ e2  let x2 = [·] in e1  x2
+= let x2 = [·] in e1  x2  e2  
+≡ let x2 = e2  in e1  x2
+
+by Lemma 5.4
+by Lemma 4.15
+
+≡ζ e1  e2 
+
+Then goal (2) follows from combining the fact that e1 e2  ≡ e1  e2  and e1  e2  :
+B [x := e2 ].
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+43
+
+Case: [SND]
+Must show  ,    e (let x1 = [·] in K[snd x1 ]) : B. This follows by the induction
+hypothesis for the sub-derivation   e :  x : A . B if we can show
+ ,    let x1 = [·] in K[snd x1 ] : (e :  x : A . B ) ⇒ B.
+δ
+By [K-BIND], it suffices to show (1)  ,    e :  x : A . B  and (2)  ,   , x1 = e :
+ x : A . B   K[snd x1 ] : B.
+Goal (1) follows by the induction hypothesis for   e :  x : A . B with the well-typed
+empty continuation [·] : (e :  x : A . B ) ⇒  x : A . B .
+δ
+Goal (2) follows by Lemma 4.3 if we can show (3)  ,   , x1 = e :  x : A . B  
+δ
+snd x1 : B [x := fst e], (4)  ,   , x1 = e :  x : A . B   snd e ≡ snd x1 , and (5)
+δ
+ ,   , x1 = e :  x : A . B   snd e : B [x := fst e].
+δ
+By δ , we are trying to show  ,   , x1 = e :  x : A . B   snd e : B [x := fst e]. We
+
+have previously shown that  ,   e :  x : A . B . Using this fact with [SND], we
+δ
+derive that  ,   , x1 = e :  x : A . B   snd e : B [x := fst e]. We can derive our
+goal by [CONV] if we can show that B [x := fst e] is equivalent to B [x := fst e]. By
+Lemma 5.5, we have that B [x := fst e] is equivalent to B [x := fst e]. Focusing on
+fst e, we have:
+fst e
+def
+
+= e (let x1 = [·] in fst x1 )
+= let x1 = [·] in fst x1  e 
+≡ let x1 = e in fst x1
+ζ fst e
+
+by Lemma 5.4
+by Lemma 4.15
+
+Finally, B [x := fst e] is equivalent to B [x := fst e] by [≡-SUBST].
+δ
+By δ and [≡-STEP], we are trying to show  ,   , x1 = e :  x : A . B   snd e ≡
+snd e. Focusing on snd e, we have:
+snd e
+def
+
+= e (let x1 = [·] in snd x1 )
+
+= let x1 = [·] in snd x1  e 
+≡ let x1 = e in snd x1
+ζ snd e
+
+by Lemma 5.4
+by Lemma 4.15
+
+Combining goals (3) and (4), we can show goal (5).
+Case: [IF]
+Must show
+ ,    e (let x = [·] in if x then e1  K else e2  K) : B.
+Let K1 = let x = [·] in if x then e1  K else e2  K. Our conclusion follows by induction on
+  e : Bool if we show  ,    K1 : (e : Bool) ⇒ B. By [K-BIND], we must show (1)
+δ
+
+ ,    e : Bool and (2)  ,   , x = e : Bool  if x then e1  K else e2  K : B.
+Goal (1) follows from induction on   e : Bool with the empty continuation [·] : (e :
+Bool) ⇒ Bool.
+δ
+
+By [IF] in goal (2), we focus on showing the new sub-goal  ,   , x = e : Bool , p :
+x ≡ true  e1  K : B as it is the most interesting.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+44
+
+P. Koronkevich et al.
+Universes
+Expressions
+
+Environments
+
+U ::=
+
+Prop | Type i
+
+e, A, B
+
+::=
+|
+|
+|
+|
+
+x | U |  x : A. B | λ x : A. e | e e
+ x : A. B | e1 , e2 as  x : A. B | fst e
+snd e | let x = e in e | Bool
+true | false | if e then e1 else e2
+Nat | zero | succ e | indnat A e e1 e2
+
+
+
+::=
+
+· | , x : A | , x = e : A
+
+δ
+
+Fig. A15: ECC syntax.
+δ
+
+This follows by Lemma 4.3 if we can show (3)  ,   , x = e : Bool , p : x ≡ true 
+δ
+e1  : B [x := e], (4)  ,   , x = e : Bool , p : x ≡ true  e1  ≡ if e then e1 else e2  and
+δ
+(5)  ,   , x = e : Bool , p : x ≡ true  if e then e1 else e2  : B [x := e].
+Goal (3) follows from induction with the empty continuation and [CONV] if we can show
+δ
+that  ,   , x = e : Bool , p : x ≡ true  B [x := e] ≡ B [x := true]. By Lemma 5.5,
+we are trying to show B [x := e] ≡ B [x := true]. By [≡-REFLECT] and [VAR], as
+well as equivalence by δ , we can derive that under the extended environment e ≡ true,
+and we conclude with [≡-SUBST].
+Focusing the right-hand side of goal (4), we have:
+if e then e1 else e2 
+def
+
+= e (let x = [·] in if x then e1  else e2 )
+
+= let x = [·] in if x then e1  else e2   e 
+by Lemma 5.4
+≡ let x = e in if x then e1  else e2 
+by Lemma 4.15
+ζ if e then e1  else e2 
+≡ e1 
+by [≡-IF-β1 ] since e ≡ true by [≡-REFLECT] and [VAR]
+
+Combining goals (3) and (4), we can show goal (5).
+Case: [ELIMNAT]
+Must show
+ ,    e (let y = [·] in e1  (let x1 = [·] in e2  (let x2 = [·] in K[indnat A y x1 x2 ]))) : B.
+This can be proven using the techniques in the [APP] case: induction on subexpressions
+and showing that each continuation is well typed. The body of the final let expression
+must be shown to be of type B, which can be proven by Lemma 4.2 if we show
+δ
+δ
+δ
+ ,   , y = e : Nat , x1 = e1  : A[zero := x] , x2 = e2  :
+ n : Nat.  x : A[x := n]. A[x := succ n]  indnat A e e1 e2  ≡ indnat A y x1 x2
+
+This can be done by focusing on the left-hand side of the equivalence:
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+
+45
+
+indnat A e e1 e2 
+def
+
+= e (let y = [·] in e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A y x1 x2 )))
+
+= let y = [·] in e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A y x1 x2 )) e 
+by Lemma 5.4
+≡ let y = e in e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A y x1 x2 ))
+by Lemma 4.15
+ζ e1  (let x1 = [·] in e2  (let x2 = [·] in indnat A e x1 x2 ))
+= let x1 = [·] in e2  (let x2 = [·] in indnat A e x1 x2 ) e1  
+by Lemma 5.4
+≡ let x1 = e1  in e2  (let x2 = [·] in indnat A e x1 x2 )
+by Lemma 4.15
+ζ e2  (let x2 = [·] in indnat A e e1  x2 )
+= let x2 = [·] in indnat A e e1  x2  e2  
+by Lemma 5.4
+≡ let x2 = e2  in indnat A e e1  x2
+by Lemma 4.15
+ζ indnat A e e1  e2 
+
+
+
+  e  e
+δ
+
+δ
+
+e
+
+(λ x : A. e1 ) e2
+
+β
+
+e1 [x := e2 ]
+
+fst e1 , e2
+
+ σ1
+
+e1
+
+snd e1 , e2
+
+ σ2
+
+e2
+
+let x = e1 in e2
+
+ζ
+
+e2 [x := e1 ]
+
+x
+
+where x = e : A ∈ 
+
+if true then e1 else e2
+
+B1
+
+e1
+
+if false then e1 else e2
+
+B2
+
+e2
+
+indnat A zero e1 e2
+
+ι1
+
+e1
+
+indnat A (succ e) e1 e2
+
+ι2
+
+(e2 e) (indnat A e e1 e2 )
+
+  e ∗ e
+δ
+
+, x = e : A  e1 ∗ e2
+· · ·   let x = e in e1 ∗ let x = e in e2
+  e  e1
+
+[RED-CONG-LET]
+  e1 ∗ e
+
+  e ∗ e
+
+  e ∗ e
+
+[RED-TRANS]
+
+eval(e) = v
+eval(e)
+
+=
+
+v
+
+where e ∗ v and v  v
+
+Fig. A16: ECC dynamic semantics (excerpt).
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+[RED-REFL]
+
+46
+
+P. Koronkevich et al.
+  A ∗ A
+
+, x : A  e ∗ e
+
+  λ x : A. e ∗ λ x : A . e
+  A ∗ A
+
+[RED-CONG-LAM]
+
+, x : A  B ∗ B
+
+   x : A. B ∗  x : A . B
+  A ∗ A
+
+, x : A  B ∗ B
+
+   x : A. B ∗  x : A . B
+  e1 ∗ e1
+
+  e2 ∗ e2
+
+  e1 , e2 as A 
+  e1 ∗ e1
+
+  e2 ∗ e2
+
+  e1 e2 ∗ e1 e2
+
+∗
+
+as A
+
+[RED-CONG-PAIR]
+
+  e ∗ e
+
+[RED-CONG-APP]
+
+  snd e ∗ snd e
+
+[RED-CONG-SIG]
+
+  A ∗ A
+
+e1 , e2
+
+  e ∗ e
+
+[RED-CONG-PI]
+
+  fst e ∗ fst e
+
+[RED-CONG-FST]
+
+[RED-CONG-SND]
+
+δ
+
+, x = e : A  e1 ∗ e2
+  let x = e in e1 ∗ let x = e in e2
+  e ∗ e
+
+  e1 ∗ e1
+
+[RED-CONG-LET]
+
+  e2 ∗ e2
+
+  if e then e1 else e2 ∗ if e then e1 else e2
+  e ∗ e
+  succ e ∗ succ e
+  A ∗ A
+
+  e ∗ e
+
+[RED-CONG-SUCC]
+
+  e1 ∗ e1
+
+  indnat A e e1 e2 
+
+∗
+
+[RED-CONG-IF]
+
+  e2 ∗ e2
+
+indnat A e e1 e2
+
+[RED-CONG-ELIMNAT]
+
+Fig. A17: ECC congruence conversion rules.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+ANF preserves dependent types up to extensional equality
+  e ≡ e
+  e1 ∗ e
+
+  e2 ∗ e
+
+  e1 ≡ e2
+  e1 ∗ λ x : A. e
+
+  e2 ∗ e2
+
+[≡]
+
+, x : A  e ≡ e2 x
+
+  e1 ≡ e2
+  e1 ∗ e1
+
+  e2 ∗ λ x : A. e
+
+, x : A  e1 x ≡ e
+
+  e1 ≡ e2
+A
+
+[≡-η1 ]
+
+[≡-η2 ]
+
+B
+A≡B
+A
+
+  Prop
+
+A
+
+[ -≡]
+
+B
+
+Type 0
+
+[ -PROP]
+
+  A1 ≡ A2
+
+  A1
+
+A2
+
+A
+
+B
+
+B2 [x2 := x1 ]
+
+B2 [x2 := x1 ]
+
+ x2 : A2 . B2
+
+[ -TRANS]
+
+[ -CUM]
+
+[ -PI]
+
+[ -SIG]
+
+Fig. A18: ECC equivalence and subtyping
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+B
+
+Type i+1
+
+ x2 : A2 . B2
+
+, x1 : A2  B1
+
+   x1 : A1 . B1
+
+  A
+
+  Type i
+
+, x1 : A2  B1
+
+   x1 : A1 . B1
+
+A
+
+47
+
+48
+
+P. Koronkevich et al.
+
+e:A
+
+
+[AX-PROP]
+
+  Prop : Type 0
+
+  Type i : Type i+1
+δ
+
+x=e:A∈
+
+
+
+x:A
+
+x:A∈
+
+[AX-TYPE]
+
+, x : A  B : Prop
+
+, x : A  B : Type i
+  e : A
+
+
+
+  e e : B[x := e ]
+  e1 : A
+
+  e2 : B[x := e1 ]
+
+  e :  x : A. B
+
+, x : A  B : U
+
+
+
+[SND]
+
+  Bool : Type 0
+
+  false : Bool
+
+, x : Bool  B : U
+
+  e : Bool
+
+  λ x : A. e :  x : A. B
+, x : A  B : Type i
+
+   x : A. B : Type i
+
+  e1 , e2 as  x : A. B :  x : A. B
+
+  snd e : B[x := fst e]
+
+, x : A  e : B
+
+  A : Type i
+
+[APP]
+
+
+
+[LET]
+
+[PROD-PROP]
+
+[PROD-TYPE]
+
+   x : A. B : Type i
+  e :  x : A . B
+
+δ
+
+  let x = e in e : B[x := e]
+
+   x : A. B : Prop
+  A : Type i
+
+[VAR]
+
+, x = e : A  e : B
+
+e:A
+
+[DEF-VAR]
+
+  A : Type i
+
+
+
+x:A
+
+  e :  x : A. B
+
+[PAIR]
+
+  fst e : A
+
+
+[BOOL]
+
+  true : Bool
+
+[LAM]
+
+[SIG]
+
+[FST]
+
+[TRUE]
+
+[FALSE]
+
+  e1 : B[x := true]
+
+  e2 : B[x := false]
+
+  if e then e1 else e2 : B[x := e]
+e:A
+
+B:U
+
+A
+
+B
+
+e:B
+
+  zero : Nat
+
+
+
+[CONV]
+
+  Nat : Type 0
+  e : Nat
+
+[ZERO]
+
+  succ e : Nat
+
+[IF]
+
+[NAT]
+
+[SUCC]
+
+, x : Nat  A : U
+  e : Nat
+  e2 :  n : Nat.  r : A[x := n]. A[x := succ n]
+  e1 : A[x := zero]
+  indnat A e e1 e2 : A[x := e]
+
+[ELIMNAT]
+
+Fig. A19: ECC typing
+
+
+·
+
+[W-EMPTY]
+
+
+
+A:U
+ , x : A
+
+
+[W-ASSUM]
+
+δ
+
+ , x = e : A
+
+Fig. A20: ECC well-formed environments.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+e:A
+
+[W-DEF]
+
+ANF preserves dependent types up to extensional equality
+Universes
+
+U ::=
+
+Values
+
+V
+
+49
+
+Prop | Type i
+
+::=
+|
+|
+|
+
+x | U | λ x : M. M |  x : M. M
+ x : M. M | V, V | Bool
+true | false | Nat | zero
+e, A, B
+succ V | refl V | V ≡ V
+
+Computations
+
+N
+
+::=
+|
+
+V | V V | fst V | snd V
+indnat M V V V
+
+Configurations
+
+M
+
+::=
+|
+
+N | let x = N in M
+if V then M1 else M2
+
+Continuations
+
+K
+
+::=
+
+[·] | let x = [·] in M
+
+Environments
+
+
+
+::=
+
+· | , x : V | , x = N : N
+
+δ
+
+::=
+|
+|
+|
+|
+|
+|
+|
+|
+|
+
+x | U |  x : A. B
+λ x : A. e | e e
+ x : A. B
+e1 , e2  as  x : A. B
+fst e | snd e
+let x = e in e | Bool
+true | false
+if e then e1 else e2
+Nat | zero | succ e
+indnat A e e1 e2
+
+(b) Typing Syntax
+
+(a) Run-time Syntax
+
+Fig. A21: CCAe syntax.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+50
+
+P. Koronkevich et al.
+
+e≡e
+  e : e1 ≡ e2
+
+  e ≡ e
+
+[≡-REFLECT]
+
+  e1 ≡ e2
+
+  A ≡ B
+
+A≡B
+
+
+
+
+  (A ≡ A ) ≡ (B ≡ B )
+
+  refl e ≡ refl e
+
+  e  e
+
+[≡-CONG-EQUIV]
+  e1 ≡ e2
+
+  e[x := e1 ] ≡ e[x := e2 ]
+  e2 ≡ e
+
+  e1 ≡ λ x : A. e
+
+[≡-CONG-REFL]
+
+[≡-SUBST]
+
+, x : A  e ≡ e x
+
+  e1 ≡ e2
+  e1 ≡ e
+
+, x : A  e ≡ e x
+
+  e2 ≡ λ x : A. e
+  e1 ≡ e2
+
+  e ≡ true
+
+  if e then e else e ≡ e
+
+, x : A  e ≡ e
+
+  λ x : A. e ≡ λ x : A . e
+
+  e1 ≡ e1
+
+  e2 ≡ e2
+
+  A ≡ A
+
+, x : A  B ≡ B
+
+  e1 e2 ≡ e1 e2
+
+  e2 ≡ e2
+
+  snd e ≡ snd e
+
+  fst e ≡ fst e
+  A ≡ A
+
+, x : A  B ≡ B
+
+
+   x : A. B ≡  x : A . B
+  A ≡ A
+
+
+
+  succ e ≡ succ e
+
+  e1 ≡ e1
+
+  e2 ≡ e2
+
+  indnat A e e1 e2 ≡ indnat A e e1 e2
+  e ≡ e
+
+e≡e
+
+[≡-CONG-ELIMNAT]
+
+, V ≡ true  e1 ≡ e1
+
+[≡-CONG-LET]
+
+, V ≡ false  e2 ≡ e2
+
+  if e then e1 else e2 ≡ if e then e1 else e2
+[≡-REFL]
+
+[≡-CONG-SUCC]
+
+δ
+
+, x = e : A  e1 ≡ e1
+
+  let x = e in e1 ≡ let x = e in e1
+  e ≡ e
+
+[≡-CONG-SND]
+
+  e ≡ e
+
+[≡-CONG-SIG]
+
+  e ≡ e
+
+[≡-CONG-PAIR]
+
+  e ≡ e
+
+ [≡-C ONG -F ST ]
+
+[≡-CONG-LAM]
+
+[≡-CONG-PI]
+
+  A ≡ A
+
+  e1 , e2  as A ≡ e1 , e2  as A
+
+  e ≡ e
+
+[≡-IF-β2 ]
+
+[≡-CONG-APP]
+
+   x : A. B ≡  x : A . B
+  e1 ≡ e1
+
+[≡-η2 ]
+
+  if e then e1 else e2 ≡ e2
+  A ≡ A
+
+[≡-IF2]
+
+[≡-η1 ]
+
+  e ≡ false
+
+[≡-IF-β1 ]
+
+  if e then e1 else e2 ≡ e1
+
+[≡-STEP]
+
+  e ≡ e
+
+  e ≡ e
+
+[≡-SYMM]
+  e ≡ e
+
+  e1 ≡ e
+
+Fig. A22: CCAe equivalence
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+[≡-CONG-IF]
+
+  e ≡ e2
+
+  e1 ≡ e2
+
+[≡-TRANS]
+
+ANF preserves dependent types up to extensional equality
+
+51
+
+M  → M
+K[(λ x : A. M) V]
+
+ →β
+
+KM[x := V]
+
+K[fst V1 , V2 ]
+
+ →σ 1
+
+K[V1 ]
+
+K[snd V1 , V2 ]
+
+ →σ 2
+
+K[V2 ]
+
+K[indnat M zero V1 V2 ]
+
+ →ι1
+
+K[V1 ]
+
+K[indnat M (succ V) V1 V2 ]
+
+ →ι2
+
+let x1 = (V2 V) in let x2 = (indnat M V V1 V2 ) in K[x1 x2 ]
+
+let x = V in M
+
+ →ζ
+
+M[x := V]
+
+if true then M1 else M2
+
+ →B 1
+
+M1
+
+if false then M1 else M2
+
+ →B 2
+
+M2
+
+M  →∗ M
+[RED-REFL]
+
+∗
+
+M → M
+
+M1  →∗ M
+
+M  → M1
+∗
+
+M  → M
+
+[RED-TRANS]
+
+eval(M) = V
+eval(M)
+
+=
+
+V
+
+where M  →∗ V and V  → V
+
+Fig. A23: CCAe evaluation.
+
+KM = M
+def
+
+=
+
+K[N]
+
+Klet x = N in M
+
+def
+
+=
+
+let x = N in KM
+
+Kif V then M1 else M2 
+
+def
+
+if V then KM1  else KM2 
+
+KN
+
+=
+
+KK = K
+K[·]
+Klet x = [·] in M
+
+def
+
+=
+
+K
+
+def
+
+let x = [·] in KM
+
+=
+
+Fig. A24: Composition of configurations.
+
+  K : (M : A) ⇒ B
+
+  [·] : (M : A) ⇒ A
+
+[K-EMPTY]
+
+  M : A
+
+δ
+
+, x = M : A  M : B
+
+  let x = [·] in M : (M : A) ⇒ B
+
+Fig. A25: CCAe continuation typing.
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+[K-BIND]
+
+52
+
+P. Koronkevich et al.
+
+e:A
+, x : Bool  B : U
+, p : e ≡ false  e2 : B[x := false]
+, p : e ≡ true  e1 : B[x := true]
+
+  e : Bool
+
+  if e then e1 else e2 : B[x := e]
+e:A
+  refl e : e ≡ e
+
+  Prop : Type 0
+x:A∈
+
+  A ≡ A : Type i
+
+
+[AX-PROP]
+
+  Type i : Type i+1
+x=e:A∈
+
+[VAR]
+
+  let x = e in e : B[x := e]
+
+, x : A  B : Type i
+  e : A
+
+  e e : B[x := e ]
+  e1 : A
+
+  e2 : B[x := e1 ]
+
+  snd e : B[x := fst e]
+
+
+  Bool : Type 0
+
+  false : Bool
+  e : Bool
+
+, x : A  B : Type i
+
+[SIG]
+
+   x : A. B : Type i
+
+
+
+, x : Bool  B : U
+
+[LAM]
+
+  λ x : A. e :  x : A. B
+
+  A : Type i
+
+, x : A  B : U
+
+[SND]
+
+[PROD-PROP]
+
+, x : A  e : B
+
+[PROD-TYPE]
+
+  e1 , e2  as  x : A. B :  x : A. B
+  e :  x : A. B
+
+[DEF-VAR]
+
+   x : A. B : Prop
+
+[APP]
+
+
+
+[AX-TYPE]
+
+, x : A  B : Prop
+
+  A : Type i
+
+[LET]
+
+   x : A. B : Type i
+  e :  x : A . B
+
+
+
+x:A
+
+δ
+
+, x = e : A  e : B
+
+  A : Type i
+
+[EQUIV]
+
+
+
+δ
+
+
+
+x:A
+e:A
+
+  A : Type i
+
+  A : Type i
+
+[REFL]
+
+  e :  x : A. B
+
+[PAIR]
+
+  fst e : A
+
+
+[BOOL]
+
+  true : Bool
+
+[FST]
+
+[TRUE]
+
+[FALSE]
+
+  e1 : B[x := true]
+
+  e2 : B[x := false]
+
+  if e then e1 else e2 : B[x := e]
+e:A
+
+B:U
+
+A
+
+e:B
+
+  zero : Nat
+  e1 : A[x := zero]
+
+B
+
+[IF]
+
+
+
+[CONV]
+
+[ZERO]
+
+  Nat : Type 0
+  e : Nat
+  succ e : Nat
+
+Fig. A26: CCAe typing
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+[NAT]
+
+[SUCC]
+
+, x : Nat  A : U
+  e : Nat
+  e2 :  n : Nat.  r : A[x := n]. A[x := succ n]
+  indnat A e e1 e2 : A[x := e]
+
+[IF]
+
+[ELIMNAT]
+
+ANF preserves dependent types up to extensional equality
+
+53
+
+Lemma 1.2 (Context Replacement (full definition)).
+1. If  , x : A,   and   B A, then  , x : B,   .
+2. If , x : A,    e : C and   B A, then , x : B,    e : C.
+3. If , x : A,    C C and   B A, then , x : B,    C C .
+4. If , x : A,    e ≡ e and   B A, then , x : B,    e ≡ e .
+5. If , x : A,    e ∗ e and   B A, then , x : B,    e ∗ e .
+6. If , x : A,    e  e and   B A, then , x : B,    e  e .
+Lemma 1.3 (Context Definition Replacement (full definition)).
+δ
+
+δ
+
+1. If  , x = e : A,   and   e : A and   e ≡ e , then  , x = e : A,   .
+δ
+δ
+2. If , x = e : A,    e1 : C,   e : A and   e ≡ e , then , x = e : A,    e1 : C.
+δ
+δ
+3. If , x = e : A,    C C and   e : A and   e ≡ e , then , x = e : A,    C C .
+δ
+δ
+4. If , x = e : A,    e1 ≡ e2 and   e : A and   e ≡ e , then , x = e : A,    e1 ≡ e2 .
+δ
+δ
+5. If , x = e : A,    e1 ∗ e2 and   e : A and   e ≡ e , then , x = e : A,    e1 ∗ e2 .
+δ
+δ 
+
+
+
+6. If , x = e : A,   e1  e2 and   e : A and   e ≡ e , then , x = e : A,    e1  e2 .
+Lemma 1.4 (Cut (full definition)).
+1. If  , x : A,   and   e : A, then  ,   [x := e].
+2. If , x : A,    e : C and   e : A, then ,   [x := e]  e [x := e] : C[x := e].
+3. If , x : A,    C C and   e : A, then ,   [x := e]  C[x := e] C [x := e].
+4. If , x : A,    e1 ≡ e2 and   e : A, then ,   [x := e]  e1 [x := e] ≡ e2 [x := e].
+5. If , x : A,    e1 ∗ e2 and   e : A, then ,   [x := e]  e1 [x := e] ∗ e2 [x := e].
+6. If , x : A,    e1  e2 and   e : A, then ,   [x := e]  e1 [x := e]  e2 [x := e].
+Lemma 1.5 (Cut With Definitions (full definition)).
+δ
+
+1. If  , x = e : A,   , then  ,   [x := e].
+δ
+2. If , x = e : A,    e : C, then ,   [x := e]  e [x := e] : C[x := e].
+δ
+3. If , x = e : A,    C C , then ,   [x := e]  C[x := e] C [x := e].
+δ
+4. If , x = e : A,    e1 ≡ e2 , then ,   [x := e]  e1 [x := e] ≡ e2 [x := e].
+δ
+5. If , x = e : A,    e1 ∗ e2 , then ,   [x := e]  e1 [x := e] ∗ e2 [x := e].
+δ
+6. If , x = e : A,    e1  e2 , then ,   [x := e]  e1 [x := e]  e2 [x := e].
+
+https://doi.org/10.1017/S0956796822000090 Published online by Cambridge University Press
+
+

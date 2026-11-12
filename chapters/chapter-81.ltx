@@ -1,0 +1,486 @@
+%%
+%% chapter-81.ltx — Profile-Guided Optimization
+%%
+
+\section{Introduction}\label{sec:pgo-intro}
+
+\emph{Profile-guided optimization} (PGO) uses information about the program's actual runtime behavior to guide compiler optimization decisions. While static analysis can determine what a program \emph{might} do, profiling reveals what it \emph{actually} does---which branches are taken most often, which functions are called most frequently, which values are most common. This information enables the compiler to optimize for the common case, often yielding significant performance improvements.
+
+PGO has become a standard technique in production compilers. GCC, LLVM/Clang, and MSVC all support PGO, and major software projects (Chrome, Firefox, the Linux kernel) use PGO in their build processes. Performance improvements of 10--20\% are typical, with some workloads seeing improvements of 30\% or more.
+
+\section{Profile Collection Methods}\label{sec:profile-collection}
+
+\subsection{Instrumentation-Based Profiling}\label{sec:instrumentation}
+
+\emph{Instrumentation-based profiling} inserts counting code into the program at compile time. When the instrumented program runs, it records execution counts for basic blocks, edges, or function calls.
+
+\begin{definition}[Instrumentation]\label{def:instrumentation}
+\textbf{Instrumentation} adds profiling code to a program:
+\begin{itemize}
+  \item \textbf{Edge profiling}: Insert a counter increment on each CFG edge.
+  \item \textbf{Block profiling}: Insert a counter increment at the entry of each basic block.
+  \item \textbf{Value profiling}: Insert code to record the values of specific expressions.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Instrumentation-Based Profile Collection}
+\label{alg:instrumentation}
+\begin{algorithmic}[1]
+\Require Source program $P$
+\Ensure Profile data file
+\State Compile $P$ with instrumentation (insert counters)
+\State Run instrumented program with representative inputs
+\State Collect profile data (counter values)
+\State Write profile to file
+\State Recompile $P$ with optimization guided by profile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Sampling-Based Profiling}\label{sec:sampling}
+
+\emph{Sampling-based profiling} periodically interrupts the program and records the program counter (PC). This provides an estimate of where time is spent without the overhead of instrumentation.
+
+\begin{definition}[Sampling Profiler]\label{def:sampling-profiler}
+A \textbf{sampling profiler} records the PC at regular intervals (e.g., every 10ms or every $N$ events). The resulting samples approximate the time spent in each function or basic block.
+\end{definition}
+
+Common sampling profilers include \texttt{perf} (Linux), \texttt{Instruments} (macOS), and \texttt{VTune} (Intel).
+
+\subsection{Hardware Performance Counters}\label{sec:hardware-counters}
+
+Modern processors provide \emph{hardware performance counters} that can count events like cache misses, branch mispredictions, and instructions executed. These counters provide detailed information about program behavior with minimal overhead.
+
+\section{Edge and Value Profiling}\label{sec:edge-value-profiling}
+
+\subsection{Edge Profiling}\label{sec:edge-profiling}
+
+\emph{Edge profiling} records the number of times each CFG edge is traversed. This is the most commonly used profile for optimization.
+
+\begin{definition}[Edge Profile]\label{def:edge-profile}
+An \textbf{edge profile} is a mapping from CFG edges to execution counts:
+\[
+\mathit{count} : E \to \mathbb{N}
+\]
+From edge counts, block frequencies and edge probabilities can be derived.
+\end{definition}
+
+\subsection{Value Profiling}\label{sec:value-profiling}
+
+\emph{Value profiling} records the values of specific expressions at specific program points. This information enables optimizations like:
+\begin{itemize}
+  \item \textbf{Speculative optimization}: If a virtual call always targets the same class, specialize for that class.
+  \item \textbf{Switch lowering}: If a switch expression has a few dominant values, use a decision tree for those values.
+  \item \textbf{Division optimization}: If the divisor is often a constant, use multiplication by the reciprocal.
+\end{itemize}
+
+\begin{definition}[Value Profile]\label{def:value-profile}
+A \textbf{value profile} for an expression $e$ at program point $p$ is a histogram of values:
+\[
+\mathit{hist}(e, p) = \{(v_1, c_1), (v_2, c_2), \ldots\}
+\]
+where $v_i$ is a value and $c_i$ is the number of times $e$ had value $v_i$ at point $p$.
+\end{definition}
+
+\subsection{Memory Access Profiling}\label{sec:memory-profiling}
+
+\emph{Memory access profiling} records the addresses accessed by loads and stores. This information enables:
+\begin{itemize}
+  \item \textbf{Alias analysis}: Determine which pointers actually alias at runtime.
+  \item \textbf{Prefetching}: Predict which memory locations will be accessed next.
+  \item \textbf{Data layout optimization}: Arrange data structures to improve cache locality.
+\end{itemize}
+
+\section{Profile Representation}\label{sec:profile-representation}
+
+\subsection{Profile Formats}\label{sec:profile-formats}
+
+Different compilers use different profile formats:
+\begin{itemize}
+  \item \textbf{GCC}: \texttt{.gcda} files containing edge counts and value histograms.
+  \item \textbf{LLVM}: \texttt{.profdata} files (Clang's profile format), supporting both instrumentation and sampling profiles.
+  \item \textbf{AutoFDO}: Uses perf data files directly.
+\end{itemize}
+
+\subsection{Profile Merging}\label{sec:profile-merging}
+
+When a program is run multiple times with different inputs, the profiles from each run must be merged:
+
+\begin{definition}[Profile Merging]\label{def:profile-merge}
+\textbf{Profile merging} combines multiple profile runs into a single profile. For edge counts, merging is typically summation:
+\[
+\mathit{count}_{\mathit{merged}}(e) = \sum_{i=1}^{n} \mathit{count}_i(e)
+\]
+For value profiles, histograms are merged by adding corresponding bins.
+\end{definition}
+
+\section{PGO for Inlining, Layout, and Specialization}\label{sec:pgo-applications}
+
+\subsection{PGO for Inlining}\label{sec:pgo-inlining}
+
+Inlining decisions benefit enormously from profile data:
+\begin{itemize}
+  \item \textbf{Hot call sites}: Calls that execute frequently should be inlined even if they are large.
+  \item \textbf{Cold call sites}: Calls that execute rarely should not be inlined, even if they are small (to save code size).
+  \item \textbf{Recursive calls}: Profile data reveals the recursion depth, enabling bounded inlining.
+\end{itemize}
+
+\begin{definition}[Profile-Guided Inlining]\label{def:pgi}
+\textbf{Profile-guided inlining} uses the call count at each call site to adjust the inlining threshold:
+\[
+\mathit{threshold}(c) = \mathit{base\_threshold} \times f(\mathit{count}(c))
+\]
+where $f$ is an increasing function of the call count.
+\end{definition}
+
+\subsection{PGO for Code Layout}\label{sec:pgo-layout}
+
+(See Chapter~\ref{sec:code-layout-intro}.) Profile data drives the Pettis-Hansen block placement algorithm and hot/cold splitting decisions.
+
+\subsection{PGO for Specialization}\label{sec:pgo-specialization}
+
+Profile data enables \emph{speculative specialization}: optimizing for the common case while retaining a general-case fallback.
+
+\begin{definition}[Speculative Specialization]\label{def:spec-spec}
+\textbf{Speculative specialization} generates two versions of a code region:
+\begin{itemize}
+  \item A \emph{specialized} version optimized for the common case (e.g., a specific type, a specific value).
+  \item A \emph{general} version that handles all cases.
+\end{itemize}
+At runtime, a check selects the specialized version when the common case holds.
+\end{definition}
+
+\begin{example}[Speculative Devirtualization]\label{ex:spec-devirt}
+\begin{verbatim}
+  // Original:
+  obj->method();  // virtual call
+  
+  // Specialized (if profile shows 95% of calls target class Foo):
+  if (obj->vtable == &Foo::vtable) {
+    Foo::method(obj);  // direct call, can be inlined
+  } else {
+    obj->method();  // general case
+  }
+\end{verbatim}
+\end{example}
+
+\section{AutoFDO and Hardware Feedback}\label{sec:autofdo}
+
+\subsection{AutoFDO}\label{sec:autofdo-detail}
+
+\emph{AutoFDO}~\cite{dean2014autofdo} eliminates the need for a separate instrumentation build by using hardware sampling (perf) directly.
+
+\begin{definition}[AutoFDO]\label{def:autofdo}
+\textbf{AutoFDO} uses:
+\begin{enumerate}
+  \item Compile the program with debug information (DWARF).
+  \item Run the program under \texttt{perf record} to collect PC samples.
+  \item Map samples back to source locations using debug info.
+  \item Synthesize edge profiles from the samples.
+  \item Recompile with optimization guided by the synthesized profile.
+\end{enumerate}
+\end{definition}
+
+\subsection{Hardware Feedback Interface}\label{sec:hfi}
+
+Modern processors provide \emph{hardware feedback interfaces} that guide the OS scheduler and compiler:
+\begin{itemize}
+  \item \textbf{Intel Thread Director}: Provides per-thread performance hints to the OS scheduler.
+  \item \textbf{ARM SPE} (Statistical Profiling Extension): Provides detailed information about instruction execution.
+  \item \textbf{LBR} (Last Branch Record): Records the history of taken branches.
+\end{itemize}
+
+\section{Limitations and Pitfalls}\label{sec:pgo-limitations}
+
+\subsection{Profile Representativeness}\label{sec:representativeness}
+
+The most fundamental limitation of PGO is that the profile must be \emph{representative} of actual usage. If the training inputs do not cover the actual workload, the optimizations may be counterproductive.
+
+\begin{definition}[Profile Representativeness]\label{def:representativeness}
+A profile is \textbf{representative} if the execution frequencies it records accurately reflect the frequencies in the target workload. A profile is \textbf{stale} if the program has changed since the profile was collected.
+\end{definition}
+
+\subsection{Profile Staleness}\label{sec:staleness}
+
+If the program changes between profile collection and the optimized build, the profile may be invalid. Compiler changes (different optimization passes, different code generation) can shift basic block addresses, making the profile inapplicable.
+
+\subsection{Phase Behavior}\label{sec:phase-behavior}
+
+Programs often exhibit \emph{phase behavior}: different parts of the execution have different characteristics. A single profile may not capture all phases.
+
+\begin{definition}[Phase Behavior]\label{def:phase-behavior}
+\textbf{Phase behavior} occurs when a program's execution characteristics change over time. For example, a compiler may spend most of its time in parsing, then in optimization, then in code generation---each phase with different hot code.
+\end{definition}
+
+\subsection{Overfitting}\label{sec:overfitting}
+
+PGO can \emph{overfit} to the training workload, optimizing for the specific inputs used during profiling at the expense of other inputs. This is particularly problematic for:
+\begin{itemize}
+  \item Speculative optimizations that assume specific values.
+  \item Layout optimizations that optimize for a specific execution path.
+  \item Inlining decisions that favor specific call patterns.
+\end{itemize}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Method} & \textbf{Overhead} & \textbf{Precision} \\
+\hline
+Instrumentation & 2--10$\times$ slowdown & High (exact counts) \\
+Sampling & $< 5\%$ overhead & Medium (statistical) \\
+AutoFDO & No instrumentation & Medium (synthesized) \\
+Hardware counters & Minimal & High (detailed events) \\
+\hline
+\end{tabular}
+\caption{Comparison of profile collection methods.}
+\label{tab:profile-methods}
+\end{table}
+
+\begin{historical}
+Profile-guided optimization was pioneered by the feedback-directed optimization work at IBM in the 1990s and popularized by GCC's \texttt{-fprofile-generate}/\texttt{-fprofile-use} flags. The AutoFDO technique was developed by Google~\cite{dean2014autofdo} (2014) to eliminate the overhead of instrumentation builds. Modern implementations in LLVM and GCC support sophisticated profile uses including value profiling, context-sensitive profiles, and profile merging. The Bolt tool~\cite{novillo2019bolt} (2019) extends PGO to post-link optimization, achieving additional improvements by optimizing the final binary layout.
+\end{historical}
+
+\section{Summary}\label{sec:pgo-summary}
+
+Profile-guided optimization uses runtime information to guide compiler decisions. Profile collection methods include instrumentation, sampling, and hardware counters. Edge profiles drive inlining, layout, and branch prediction optimizations. Value profiles enable speculative specialization. AutoFDO eliminates the need for instrumentation builds. The key challenge is ensuring profile representativeness: the training workload must match the actual usage. When used correctly, PGO provides 10--20\% performance improvements with minimal effort, making it one of the most cost-effective optimization techniques available.
+
+\section{AutoFDO: Automatic Feedback-Directed Optimization}\label{sec:autofdo-detail}
+
+\emph{AutoFDO} eliminates the need for instrumented builds by synthesizing profile data from hardware sampling.
+
+\begin{definition}[AutoFDO Pipeline]\label{def:autofdo-pipeline}
+The \textbf{AutoFDO} pipeline works as follows:
+\begin{enumerate}
+  \item Compile the program with debug information (no instrumentation).
+  \item Run the program on representative workloads while collecting hardware samples (e.g., using \texttt{perf record} with Last Branch Record).
+  \item Use the \texttt{create\_gcov} tool to map samples back to source locations and synthesize a profile.
+  \item Recompile with the synthesized profile to guide optimizations.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{AutoFDO Profile Synthesis}
+\label{alg:autofdo}
+\begin{algorithmic}[1]
+\Require Hardware samples (address, branch stack), debug info, binary
+\ensure Annotated profile for compiler
+\State Map each sample to a source location using debug info
+\ForAll{basic blocks $B$}
+  \State $count(B) \gets$ number of samples mapping to $B$
+\EndFor
+\ForAll{branch instructions $b$}
+  \State Use LBR (Last Branch Record) data to determine taken/not-taken
+  \State $taken(b) \gets$ count of samples where branch was taken
+  \State $not\_taken(b) \gets$ count of samples where branch was not taken
+  \State $prob(taken) = \frac{taken(b)}{taken(b) + not\_taken(b)}$
+\EndFor
+\State Propagate block counts to edge counts using flow conservation
+\State Output profile in compiler-compatible format
+\end{algorithmic}
+\end{algorithm}
+
+\begin{definition}[Sample Stack Reconstruction]\label{def:sample-stack}
+\textbf{Sample stack reconstruction} uses LBR data to reconstruct the call stack at each sample point. The LBR records the last $k$ branches taken, providing a partial call stack that can be used to attribute samples to the correct calling context.
+\end{definition}
+
+\subsection{AutoFDO vs.\ Instrumentation}\label{sec:autofdo-vs-instr}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Property} & \textbf{Instrumentation} & \textbf{AutoFDO} \\
+\hline
+Build process & Two builds (instrument + optimized) & One build (optimized) \\
+Runtime overhead & 2--10$\times$ slowdown & $< 5\%$ (sampling only) \\
+Profile accuracy & Exact counts & Statistical estimates \\
+Context sensitivity & Possible (with call counting) & Limited (LBR depth) \\
+Edge coverage & Complete & Partial (sampled) \\
+Ease of use & Moderate (recompile, run, recompile) & Easy (compile, sample, recompile) \\
+\hline
+\end{tabular}
+\caption{Comparison of instrumentation-based and AutoFDO profile collection.}
+\label{tab:autofdo-comparison}
+\end{table}
+
+\section{Hardware Feedback Infrastructure}\label{sec:hardware-feedback}
+
+Modern processors provide hardware performance monitoring infrastructure that can be used for profile collection.
+
+\subsection{Intel LBR (Last Branch Record)}\label{sec:intel-lbr}
+
+\begin{definition}[Last Branch Record]\label{def:lbr}
+\textbf{LBR} is an Intel processor feature that records the source and destination of the last $k$ branch executions (typically $k = 16$ or $32$). This provides a partial execution trace that can be used for:
+\begin{itemize}
+  \item Branch prediction profiling (taken/not-taken counts)
+  \item Call stack reconstruction
+  \item Hot path identification
+\end{itemize}
+\end{definition}
+
+\subsection{ARM SPE (Statistical Profiling Extension)}\label{sec:arm-spe}
+
+\begin{definition}[Statistical Profiling Extension]\label{def:spe}
+ARM's \textbf{SPE} provides instruction-level sampling with:
+\begin{itemize}
+  \item Precise PC attribution (exact instruction that caused the event)
+  \item Latency information (cycles between issue and completion)
+  \item Cache miss attribution (which memory access caused the miss)
+  \item Translation latency (TLB miss costs)
+\end{itemize}
+\end{definition}
+
+\subsection{PEBS (Precise Event-Based Sampling)}\label{sec:pebs}
+
+\begin{definition}[PEBS]\label{def:pebs}
+\textbf{PEBS} provides precise event-based sampling on Intel processors. Unlike standard sampling, PEBS records the exact instruction that triggered the event (e.g., a cache miss), eliminating skid.
+\end{definition}
+
+\section{Profile Use for Specific Optimizations}\label{sec:profile-use-opts}
+
+\subsection{Profile-Guided Inlining}\label{sec:pgo-inlining}
+
+\begin{definition}[PGO Inlining Heuristic]\label{def:pgo-inline}
+\textbf{Profile-guided inlining} uses call edge frequencies to decide which call sites to inline:
+\[
+\text{benefit}(s) = freq(s) \times (\text{call\_overhead} + \text{optimization\_gain})
+\]
+Call sites with high benefit are inlined first, up to a total code size budget.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Profile-Guided Inlining}
+\label{alg:pgo-inlining}
+\begin{algorithmic}[1]
+\Require Call graph with edge frequencies, size budget $B$
+\ensure Inlined call graph
+\State Compute benefit for each call site
+\State Sort call sites by benefit (descending)
+\State $used \gets 0$
+\ForAll{call sites $s$ in benefit order}
+  \State $cost \gets$ size increase from inlining $s$
+  \If{$used + cost \leq B$}
+    \State Inline $s$
+    \State $used \gets used + cost$
+    \State Update call graph and recompute benefits
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Profile-Guided Register Allocation}\label{sec:pgo-regalloc}
+
+\begin{definition}[PGO Register Allocation]\label{def:pgo-regalloc}
+\textbf{Profile-guided register allocation} assigns registers to the most frequently used variables, minimizing spill cost:
+\[
+\text{spill\_cost}(v) = \sum_{u \in uses(v)} freq(u) \times (load\_cost + store\_cost)
+\]
+Variables with high spill cost are assigned registers; those with low spill cost are spilled.
+\end{definition}
+
+\subsection{Profile-Guided Instruction Scheduling}\label{sec:pgo-scheduling}
+
+\begin{definition}[PGO Scheduling]\label{def:pgo-scheduling}
+\textbf{Profile-guided scheduling} uses branch probabilities to prioritize instructions on the most likely execution path, placing them earlier in the schedule.
+\end{definition}
+
+\section{Profile Quality and Representativeness}\label{sec:profile-quality}
+
+\begin{definition}[Profile Representativeness]\label{def:profile-rep}
+A profile is \textbf{representative} if the training workload accurately reflects the actual usage patterns. Non-representative profiles can lead to worse performance than no profile at all.
+\end{definition}
+
+\begin{definition}[Profile Merging]\label{def:profile-merge}
+\textbf{Profile merging} combines profiles from multiple training runs to produce a more representative aggregate profile:
+\[
+freq_{merged}(e) = \sum_{i=1}^{n} w_i \cdot freq_i(e)
+\]
+where $w_i$ are weights reflecting the relative importance of each training workload.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Profile Quality} & \textbf{Speedup} & \textbf{Risk} \\
+\hline
+Perfect (matches production) & 15--20\% & None \\
+Good (similar workload mix) & 10--15\% & Low \\
+Fair (different but related) & 5--10\% & Medium \\
+Poor (unrelated workload) & -5--5\% & High (regression possible) \\
+\hline
+\end{tabular}
+\caption{Impact of profile quality on PGO effectiveness.}
+\label{tab:profile-quality}
+\end{table}
+
+\section{Context-Sensitive Profiling}\label{sec:context-sensitive-prof}
+
+\begin{definition}[Context-Sensitive Profile]\label{def:ctx-profile}
+A \textbf{context-sensitive profile} records execution counts per calling context, not just per call site. This enables the compiler to make different optimization decisions for different callers.
+\end{definition}
+
+\begin{example}[Context-Sensitive Profile]\label{ex:ctx-profile}
+\begin{verbatim}
+  // Function isSmall(int x) is called from:
+  //   main(): x is usually small (90% of calls)
+  //   process(): x is usually large (80% of calls)
+  
+  // Context-insensitive profile: x is small 50% of the time
+  // Context-sensitive profile:
+  //   main → isSmall: x small 90%
+  //   process → isSmall: x small 20%
+  
+  // With context-sensitive profile, the compiler can specialize
+  // isSmall differently for each caller.
+\end{verbatim}
+\end{example}
+
+\section{Value Profiling}\label{sec:value-profiling}
+
+\begin{definition}[Value Profiling]\label{def:value-prof}
+\textbf{Value profiling} records the actual runtime values of expressions at specific program points. This enables:
+\begin{itemize}
+  \item \textbf{Speculative optimization}: If a value is almost always a specific constant, the compiler can specialize for that constant.
+  \item \textbf{Virtual call optimization}: If a virtual call target is almost always a specific method, the compiler can emit a direct call with a guard.
+  \item \textbf{Range optimization}: If a value is always in a specific range, the compiler can eliminate range checks.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Value Profiling for Speculative Optimization}
+\label{alg:value-prof}
+\begin{algorithmic}[1]
+\Require Program point $p$, value profile for $p$
+\ensure Speculative optimization if profitable
+\State Compute value distribution at $p$
+\State Find most frequent value $v_{top}$ with frequency $f$
+\If{$f \geq threshold$ (e.g., 90\%)}
+  \State Insert check: \texttt{if (x == v\_top)}
+  \State Generate specialized code for $x = v_{top}$
+  \State Generate fallback code for other values
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\section{Profile Persistence and Management}\label{sec:profile-persistence}
+
+\begin{definition}[Profile Format]\label{def:profile-format}
+Modern compilers support several profile formats:
+\begin{itemize}
+  \item \textbf{GCC}: \texttt{.gcda} files (binary), merged with \texttt{gcov}
+  \item \textbf{LLVM}: \texttt{.profraw} files (Clang format), converted to \texttt{.profdata}
+  \item \textbf{AutoFDO}: \texttt{.afdo} files (text-based)
+  \item \textbf{BOLT}: \texttt{.fdata} files (edge-level profiles)
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Profile Validation]\label{def:profile-valid}
+\textbf{Profile validation} checks that the profile matches the current binary:
+\begin{itemize}
+  \item \textbf{Binary hash check}: Verify the profile was generated for this exact binary.
+  \item \textbf{Function count check}: Verify the number of functions matches.
+  \item \textbf{Staleness detection}: Warn if the profile is from an older version.
+\end{itemize}
+\end{definition}

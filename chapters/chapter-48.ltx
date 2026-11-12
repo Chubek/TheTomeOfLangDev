@@ -1,0 +1,465 @@
+%%
+%% chapter-48.ltx — Linear and Affine Type Systems
+%%
+
+\label{ch:linear-types}
+
+Linear type systems track the usage of values: a linear value must be used exactly once, while an affine value may be used at most once. These disciplines, rooted in linear logic~\cite{girard1987}, provide static guarantees about resource usage---memory, file handles, locks, and other finite resources. This chapter develops the theory of linear and affine types, their connection to linear logic, and their application in modern programming languages, culminating in Rust's ownership system.
+
+%% ============================================================
+%% Section 48.1
+%% ============================================================
+\section{Linear Logic and Linear Types}\label{sec:linear-logic}
+
+Linear logic, introduced by Girard~\cite{girard1987}, is a logic in which every hypothesis must be used exactly once. This stands in contrast to classical and intuitionistic logic, where hypotheses can be used any number of times (contraction) or discarded (weakening).
+
+\subsection{The Resources Interpretation}\label{sec:resources-interpretation}
+
+In linear logic, propositions are interpreted as \emph{resources}: consuming a resource to prove a proposition means that resource is no longer available. The linear implication $A \multimap B$ means ``given one unit of $A$, I can produce one unit of $B$,'' and the premise $A$ is consumed in the process.
+
+\begin{table}[htbp]
+\centering
+\caption{Structural rules and their resource interpretation}\label{tab:structural-rules}
+\begin{tabular}{lp{5cm}p{5cm}}
+\hline
+\textbf{Rule} & \textbf{Logic} & \textbf{Resource Interpretation} \\
+\hline
+Weakening & $\Gamma \vdash A \implies \Gamma, B \vdash A$ & Discarding a resource \\
+Contraction & $\Gamma, A, A \vdash B \implies \Gamma, A \vdash B$ & Duplicating a resource \\
+Exchange & $\Gamma, A, B \vdash C \implies \Gamma, B, A \vdash C$ & Reordering resources \\
+\hline
+\end{tabular}
+\end{table}
+
+Linear logic retains exchange but drops weakening and contraction: resources cannot be discarded or duplicated.
+
+\subsection{Linear Type System}\label{sec:linear-type-system}
+
+\begin{grammar}{Linear Lambda Calculus}
+  \production{\tau}{\alpha \mid \tau_1 \multimap \tau_2 \mid \tau_1 \otimes \tau_2 \mid \mathbf{1} \mid \tau_1 \oplus \tau_2 \mid \mathbf{0}}
+\end{grammar}
+
+The linear function type $\tau_1 \multimap \tau_2$ represents a function that consumes exactly one argument of type $\tau_1$ and produces a result of type $\tau_2$. The tensor product $\tau_1 \otimes \tau_2$ represents a pair where both components must be used. The unit $\mathbf{1}$ is the type with a single value that must be used (trivially).
+
+\begin{typerules}{Linear Lambda Calculus}
+  \typeaxiom{Var}{x : \tau \vdash x : \tau} \\[6pt]
+  \typerule{Abs}{\Gamma, x : \tau_1 \vdash e : \tau_2}
+            {\Gamma \vdash \lambda x.\, e : \tau_1 \multimap \tau_2} \\[6pt]
+  \typerule{App}{\Gamma_1 \vdash e_1 : \tau_1 \multimap \tau_2 \quad \Gamma_2 \vdash e_2 : \tau_1}
+            {\Gamma_1, \Gamma_2 \vdash e_1\; e_2 : \tau_2} \\[6pt]
+  \typerule{Tensor-Intro}{\Gamma_1 \vdash e_1 : \tau_1 \quad \Gamma_2 \vdash e_2 : \tau_2}
+            {\Gamma_1, \Gamma_2 \vdash (e_1, e_2) : \tau_1 \otimes \tau_2} \\[6pt]
+  \typerule{Tensor-Elim}{\Gamma_1 \vdash e : \tau_1 \otimes \tau_2 \quad \Gamma_2, x : \tau_1, y : \tau_2 \vdash e' : \tau}
+            {\Gamma_1, \Gamma_2 \vdash \mathtt{let}\; (x, y) = e\; \mathtt{in}\; e' : \tau}
+\end{typerules}
+
+The key constraint is the \emph{splitting} of the environment: in the App rule, $\Gamma_1$ and $\Gamma_2$ must be a \emph{partition} of the available variables. Each variable is used in exactly one sub-expression.
+
+\subsection{Linearity Enforcement}\label{sec:linearity-enforcement}
+
+\begin{lemma}[Linearity]\label{lem:linearity}
+In a well-typed linear program, every variable bound by a lambda or let is used exactly once in its scope.
+\end{lemma}
+
+\begin{proof}
+By induction on the typing derivation. The App and Tensor-Intro rules split the environment, ensuring each variable appears in exactly one premise. The Abs rule binds a variable that must be used in the body. \qed
+\end{proof}
+
+%% ============================================================
+%% Section 48.2
+%% ============================================================
+\section{Resource Tracking}\label{sec:resource-tracking}
+
+Linear types provide static guarantees about resource usage. The most important application is ensuring that resources are properly acquired and released.
+
+\subsection{File Handles}\label{sec:file-handles}
+
+\begin{example}[Linear file handles]\label{ex:linear-files}
+\begin{verbatim}
+  open  : String -> FileHandle
+  read  : FileHandle -o String * FileHandle
+  close : FileHandle -o Unit
+\end{verbatim}
+The type of $\mathtt{read}$ says: given a file handle, produce a string and the same file handle (which can be used again). The type of $\mathtt{close}$ says: given a file handle, consume it and produce nothing. Since the file handle is linear, it must be closed exactly once---it cannot be discarded (no weakening) or used after closing (no contraction).
+\end{example}
+
+\subsection{Locks and Mutexes}\label{sec:locks}
+
+\begin{example}[Linear locks]\label{ex:linear-locks}
+\begin{verbatim}
+  acquire : Mutex -o Lock
+  release : Lock -o Mutex
+  withLock : Lock -o (Lock * a) -o a  (* must return the lock *)
+\end{verbatim}
+A lock must be released after use. The type of $\mathtt{withLock}$ ensures that the lock is returned, so it can be released.
+\end{example}
+
+\subsection{Uniqueness Types}\label{sec:uniqueness-types}
+
+Clean~\cite{clean1990} uses \emph{uniqueness types} to track unique references to mutable data. A unique reference guarantees exclusive access: no other reference to the same data exists.
+
+\begin{verbatim}
+  updateArray : *Array a -> Int -> a -> *Array a
+\end{verbatim}
+
+The asterisk denotes a unique reference. The function can mutate the array in place because it has exclusive access, and it returns a new unique reference to the (mutated) array.
+
+%% ============================================================
+%% Section 48.3
+%% ============================================================
+\section{Affine Types and Disposal}\label{sec:affine-types}
+
+Affine types relax linearity by allowing values to be used \emph{at most once} rather than \emph{exactly once}. This corresponds to linear logic with weakening but without contraction.
+
+\subsection{Affine Lambda Calculus}\label{sec:affine-calculus}
+
+The affine lambda calculus is identical to the linear lambda calculus, except that the environment splitting rule is relaxed:
+
+\[
+  \typerule{Affine-App}{\Gamma_1 \vdash e_1 : \tau_1 \multimap \tau_2 \quad \Gamma_2 \vdash e_2 : \tau_1}
+            {\Gamma_1 \uplus \Gamma_2 \vdash e_1\; e_2 : \tau_2}
+\]
+
+where $\uplus$ allows $\Gamma_1$ and $\Gamma_2$ to be \emph{disjoint subsets} of the available variables (some variables may be unused).
+
+\subsection{Disposal}\label{sec:disposal}
+
+Affine types require a mechanism for \emph{disposal}: if a value is not used, it must be explicitly or implicitly discarded. For types that can be safely discarded (e.g., integers, booleans), the compiler inserts an implicit drop. For types that require cleanup (e.g., file handles), the programmer must explicitly dispose of them.
+
+\begin{definition}[Disposable Types]\label{def:disposable}
+A type $\tau$ is \emph{disposable} (or \emph{droppable}) if there exists a function $\mathtt{drop} : \tau \multimap \mathbf{1}$. Base types like $\mathrm{int}$ and $\mathrm{bool}$ are disposable; resource types like $\mathrm{FileHandle}$ are not.
+\end{definition}
+
+\subsection{Affine Types in Practice}\label{sec:affine-practice}
+
+Rust's ownership system is essentially an affine type system:
+\begin{itemize}
+  \item Values are \emph{moved} (used at most once) by default.
+  \item Types that implement \texttt{Copy} can be implicitly duplicated (restoring contraction for those types).
+  \item Types that implement \texttt{Drop} have a destructor called when they go out of scope (implicit disposal).
+\end{itemize}
+
+%% ============================================================
+%% Section 48.4
+%% ============================================================
+\section{Bounded Types and Capabilities}\label{sec:bounded-types}
+
+Bounded linear types allow a resource to be used a bounded number of times, generalizing both linear (exactly once) and affine (at most once) types.
+
+\subsection{Usage Annotations}\label{sec:usage-annotations}
+
+\begin{definition}[Usage Annotation]\label{def:usage}
+A \emph{usage annotation} is an element of a lattice of usages. The simplest lattice is:
+\[
+  0 \leq 1 \leq \omega
+\]
+where $0$ means ``unused,'' $1$ means ``used once,'' and $\omega$ means ``used any number of times.''
+\end{definition}
+
+Types can be annotated with usage information: $\tau^{\pi}$ means ``a value of type $\tau$ with usage $\pi$.'' The function type becomes:
+\[
+  \tau_1^{\pi_1} \to^{\pi} \tau_2^{\pi_2}
+\]
+meaning ``a function that uses its argument with usage $\pi_1$ and produces a result with usage $\pi_2$, and the function itself has usage $\pi$.''
+
+\subsection{Capabilities}\label{sec:capabilities}
+
+The \emph{capability calculus} extends linear types with a notion of \emph{capabilities}: permissions to perform certain operations.
+
+\begin{example}[Capabilities for memory]\label{ex:capabilities}
+\begin{verbatim}
+  ReadCap   : permission to read from a memory location
+  WriteCap  : permission to write to a memory location
+  AllocCap  : permission to allocate new memory
+  FreeCap   : permission to free allocated memory
+\end{verbatim}
+A pointer with $\mathrm{ReadCap}$ can be read but not written. A pointer with both $\mathrm{ReadCap}$ and $\mathrm{WriteCap}$ is a mutable reference. Capabilities are linear: they must be passed explicitly and cannot be forged.
+\end{example}
+
+%% ============================================================
+%% Section 48.5
+%% ============================================================
+\section{Applications: File Handles, Unique Pointers}\label{sec:applications}
+
+\subsection{File Handles Revisited}\label{sec:files-revisited}
+
+A complete linear type system for file handles ensures:
+\begin{enumerate}
+  \item Every opened file is eventually closed.
+  \item No file is used after being closed.
+  \item No file is closed more than once.
+\end{enumerate}
+
+\begin{verbatim}
+  processFile : String -> (FileHandle -o a * FileHandle) -o a
+  processFile path f =
+    let fh = open path
+    let (result, fh') = f fh
+    close fh'
+    result
+\end{verbatim}
+
+The function $\mathtt{processFile}$ opens a file, passes the handle to the user function $f$, and ensures the handle is closed afterward. The linear type of $f$ guarantees that the handle is returned (not discarded).
+
+\subsection{Unique Pointers}\label{sec:unique-pointers}
+
+A unique pointer is a pointer that is the sole reference to a block of memory. It can be used for:
+\begin{itemize}
+  \item \textbf{In-place mutation.} Since the pointer is unique, the memory can be mutated without affecting other references.
+  \item \textbf{Deterministic deallocation.} When the unique pointer goes out of scope, the memory is freed.
+  \item \textbf{Transfer of ownership.} Moving a unique pointer transfers ownership of the memory.
+\end{itemize}
+
+\begin{example}[Unique pointers in Clean]\label{ex:clean-unique}
+\begin{verbatim}
+  sortArray : *Array Int -> *Array Int
+  sortArray arr = sortInPlace arr  -- mutates in place, safe because unique
+\end{verbatim}
+The unique pointer guarantees that no other code holds a reference to the array, so in-place sorting is safe.
+\end{example}
+
+%% ============================================================
+%% Section 48.6
+%% ============================================================
+\section{Connection to Rust's Ownership System}\label{sec:rust-ownership}
+
+Rust's ownership system is the most successful application of linear/affine types in a mainstream programming language. It provides memory safety without garbage collection by tracking ownership and borrowing at compile time.
+
+\subsection{Ownership and Moves}\label{sec:ownership-moves}
+
+In Rust, every value has a single \emph{owner}. When a value is assigned to another variable or passed to a function, ownership is \emph{moved}:
+
+\begin{verbatim}
+  let s1 = String::from("hello");
+  let s2 = s1;  // s1 is moved to s2; s1 is no longer valid
+  // println!("{}", s1);  // ERROR: s1 has been moved
+\end{verbatim}
+
+This is the affine discipline: each value is used at most once (by move). Types that implement \texttt{Copy} (like integers) are implicitly cloned instead of moved, restoring the ability to use them multiple times.
+
+\subsection{Borrowing}\label{sec:rust-borrowing}
+
+Rust allows \emph{borrowing}: creating a reference to a value without transferring ownership. The borrow checker enforces:
+\begin{itemize}
+  \item \textbf{Shared borrows} (\texttt{\&T}): multiple readers, no writers.
+  \item \textbf{Exclusive borrows} (\texttt{\&mut T}): one writer, no readers.
+  \item \textbf{Lifetimes}: borrows cannot outlive the owner.
+\end{itemize}
+
+\begin{verbatim}
+  let mut v = vec![1, 2, 3];
+  let r1 = &v;       // shared borrow
+  let r2 = &v;       // another shared borrow (OK)
+  // let r3 = &mut v; // ERROR: cannot borrow as mutable while shared borrows exist
+  println!("{} {}", r1[0], r2[0]);
+\end{verbatim}
+
+\subsection{The Type-Theoretic View}\label{sec:rust-type-theory}
+
+Rust's type system can be understood as a combination of:
+\begin{itemize}
+  \item \textbf{Affine types.} Values are moved (used at most once) by default.
+  \item \textbf{Borrow types.} References are linear (must be used) and carry lifetime annotations.
+  \item \textbf{Substructural regions.} Lifetimes define regions of memory, and references are indexed by regions.
+\end{itemize}
+
+\begin{insight}
+Rust's ownership system demonstrates that linear/affine types can be made practical for everyday programming. The key insight is that most programs are ``mostly affine'': values are used once (moved) or many times (copied), and the interesting cases involve borrowing. The borrow checker enforces a discipline that is essentially a form of linear typing for references, ensuring that mutable and immutable accesses are properly separated.
+\end{insight}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (linear) {Linear Logic};
+  \node[block, below left=1.5cm and 0.5cm of linear] (linear-types) {Linear Types};
+  \node[block, below right=1.5cm and 0.5cm of linear] (affine) {Affine Types};
+  \node[block, below=1.2cm of linear-types] (clean) {Clean (Uniqueness)};
+  \node[block, below=1.2cm of affine] (rust) {Rust (Ownership)};
+
+  \draw[arrow] (linear) -- (linear-types);
+  \draw[arrow] (linear) -- (affine);
+  \draw[arrow] (linear-types) -- (clean);
+  \draw[arrow] (affine) -- (rust);
+\end{tikzpicture}
+\caption{From linear logic to Rust: linear types enforce exact usage; affine types allow disposal. Clean uses uniqueness types (a form of linear types); Rust uses affine types with borrowing.}\label{fig:linear-to-rust}
+\end{figure}
+
+\begin{historical}
+Linear logic was introduced by Girard~\cite{girard1987} as a refinement of classical and intuitionistic logic that tracks resource usage. The application to programming languages was pioneered by Wadler~\cite{wadler1990} and Abramsky~\cite{abramsky1993}, who showed that linear types can enforce protocols and prevent resource leaks. The Clean language~\cite{clean1990} was the first to use uniqueness types for efficient I/O in a pure functional language. Rust's ownership system, developed by Graydon Hoare and the Rust team, brought linear/affine types to a systems programming audience, demonstrating that these ideas can scale to large, performance-critical codebases.
+\end{historical}
+
+%% ============================================================
+%% Section 48.7
+%% ============================================================
+\section{Advanced Resource Tracking and Rust Connections}\label{sec:resource-advanced}
+
+\subsection{Usage Protocols}\label{sec:usage-protocols}
+
+Linear types can be extended to track \emph{usage protocols}: sequences of operations that must be performed on a resource.
+
+\begin{definition}[Usage Protocol]\label{def:usage-protocol}
+A \emph{usage protocol} is a regular language over operations that describes the valid sequences of operations on a resource. For example, the protocol for a file handle is:
+\[
+  \mathrm{open} \cdot (\mathrm{read} + \mathrm{write})^* \cdot \mathrm{close}
+\]
+\end{definition}
+
+\begin{example}[Protocol for database connections]\label{ex:db-protocol}
+\begin{verbatim}
+  -- Protocol: connect -> (query -> result)* -> disconnect
+  type DbConn = {
+    connect   : () -o QueryPhase
+    query     : QueryPhase -o Result * QueryPhase
+    disconnect : QueryPhase -o ()
+  }
+\end{verbatim}
+The linear type ensures that a database connection is properly opened, used for zero or more queries, and then closed.
+\end{example}
+
+\subsection{Session Types as Linear Types}\label{sec:session-as-linear}
+
+Session types (see \cref{ch:session-types}) are a special case of linear types applied to communication channels. The linearity of channels ensures that each message is sent and received exactly once.
+
+\begin{verbatim}
+  -- Session type as linear type:
+  send : !String.end -o String -o end
+  recv : ?String.S -o (String -o S)
+  -- The channel is consumed by each operation
+\end{verbatim}
+
+\subsection{Rust's Borrow Checker in Detail}\label{sec:rust-borrow-detail}
+
+Rust's borrow checker implements a form of linear/affine typing with additional features for shared and exclusive access.
+
+\begin{verbatim}
+  // Rust's type system as affine types:
+  // - Values are moved (affine: used at most once)
+  // - &T is a shared borrow (can be duplicated: contraction allowed)
+  // - &mut T is an exclusive borrow (linear: used exactly once)
+  // - Lifetimes ensure borrows don't outlive the owner
+
+  fn process(data: &mut Vec<i32>) {
+      data.push(42);  // exclusive access: no other references
+  }
+
+  fn read_all(data: &Vec<i32>) -> i32 {
+      data.iter().sum()  // shared access: multiple readers allowed
+  }
+\end{verbatim}
+
+\begin{table}[htbp]
+\centering
+\caption{Mapping between linear type concepts and Rust features}\label{tab:rust-linear}
+\begin{tabular}{p{4cm}p{4cm}p{4cm}}
+\hline
+\textbf{Linear Type Concept} & \textbf{Rust Feature} & \textbf{Enforcement} \\
+\hline
+Linear usage & Move semantics & Compile-time check \\
+Affine (at most once) & Drop on scope exit & Implicit destructor \\
+Contraction forbidden & No implicit copy & Move on assignment \\
+Weakening allowed & Drop trait & Implicit drop \\
+Tensor product & Tuple of owned values & Both must be used \\
+Linear implication & Function with owned args & Args consumed \\
+Unique reference & \texttt{\&mut T} & Exclusive access \\
+Shared reference & \texttt{\&T} & Multiple readers \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Lifetime Annotations as Region Types}\label{sec:lifetime-regions}
+
+Rust's lifetime annotations can be understood as \emph{region types} in the sense of linear type theory:
+
+\begin{verbatim}
+  // Rust with explicit lifetimes:
+  fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+      if x.len() > y.len() { x } else { y }
+  }
+
+  // As region types:
+  longest : forall 'a. (String @ 'a, String @ 'a) -> String @ 'a
+  -- The result lives in the intersection of the input lifetimes
+\end{verbatim}
+
+\begin{definition}[Region Type]\label{def:region-type}
+A \emph{region type} $\tau @ \rho$ pairs a value type $\tau$ with a region $\rho$ that describes where the value is valid. The region $\rho$ is a lifetime annotation that constrains how long the value can be borrowed.
+\end{definition}
+
+\subsection{NLL: Non-Lexical Lifetimes}\label{sec:nll}
+
+Rust's original borrow checker used \emph{lexical lifetimes}: a borrow was valid until the end of its enclosing scope. The \emph{Non-Lexical Lifetimes} (NLL) system refines this by computing the precise region where a borrow is actually used.
+
+\begin{verbatim}
+  // Before NLL (lexical):
+  let mut data = vec![1, 2, 3];
+  let r = &data[0];   // borrow starts
+  println!("{}", r);   // last use of r
+  data.push(4);        // ERROR: cannot borrow as mutable while r is alive
+  // (r's lexical scope extends to end of block)
+
+  // After NLL:
+  let mut data = vec![1, 2, 3];
+  let r = &data[0];   // borrow starts
+  println!("{}", r);   // last use of r -> borrow ends here
+  data.push(4);        // OK: borrow has ended
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.6cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (linear-logic) {Linear Logic};
+  \node[block, below left=1.2cm and 0.3cm of linear-logic] (linear-types) {Linear Types};
+  \node[block, below right=1.2cm and 0.3cm of linear-logic] (affine-types) {Affine Types};
+  \node[block, below=1cm of linear-types] (session) {Session Types};
+  \node[block, below=1cm of affine-types] (rust) {Rust Ownership};
+  \node[block, below=1cm of session] (protocols) {Usage Protocols};
+  \node[block, below=1cm of rust] (nll) {NLL Borrowing};
+
+  \draw[arrow] (linear-logic) -- (linear-types);
+  \draw[arrow] (linear-logic) -- (affine-types);
+  \draw[arrow] (linear-types) -- (session);
+  \draw[arrow] (affine-types) -- (rust);
+  \draw[arrow] (session) -- (protocols);
+  \draw[arrow] (rust) -- (nll);
+\end{tikzpicture}
+\caption{From linear logic to modern resource management. Linear types enforce exact usage; affine types allow disposal. Session types apply linearity to communication; Rust applies affinity to memory with borrowing.}\label{fig:linear-resource-hierarchy}
+\end{figure}
+
+\subsection{Linear Haskell}\label{sec:linear-haskell}
+
+Linear Haskell extends Haskell with linear types, enabling resource-aware programming in a lazy functional language:
+
+\begin{verbatim}
+  -- Linear Haskell:
+  consume :: a %1 -> ()     -- linear function: must use its argument
+  duplicate :: a -> (a, a)  -- not linear: duplicates its argument
+
+  -- Linear IO:
+  readFile :: FilePath %1 -> IO (String, Handle)
+  -- The file handle is returned and must be used linearly
+
+  -- Linear arrays:
+  writeArray :: MArray a %1 -> Int -> a -> MArray a
+  -- The mutable array is consumed and returned (linear usage)
+\end{verbatim}
+
+Linear Haskell enables efficient in-place mutation of arrays and other data structures while maintaining referential transparency. The linearity ensures that the mutable array is used in a single-threaded manner.
+
+%% ============================================================
+%% Section 48.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-48}
+
+Linear and affine type systems provide static guarantees about resource usage by tracking how values are consumed. Linear types require exact usage (once); affine types allow at-most-once usage with disposal. These disciplines, rooted in linear logic, find applications in file handle management, unique pointers, concurrent programming, and memory safety.
+
+Rust's ownership system is the most prominent real-world application, demonstrating that affine types with borrowing can provide memory safety without garbage collection. The ongoing challenge is to make these systems more accessible to programmers while retaining their expressive power.
+
+For further reading, we recommend Wadler's tutorial on linear types~\cite{wadler1990}, the Linear Haskell proposal~\cite{bernardy2017}, and the Rustonomicon's treatment of ownership and lifetimes.

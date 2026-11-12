@@ -1,0 +1,455 @@
+%%
+%% chapter-99.ltx — Learned Cost Models
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:learned-cost}
+
+\section{Introduction}\label{sec:learned-cost-intro}
+
+Compiler optimization requires predicting the cost of different code alternatives: which instruction sequence is fastest, which register allocation minimizes spills, which loop transformation improves cache behavior. These predictions are made by \emph{cost models}: mathematical functions that estimate the execution time, code size, or energy consumption of a piece of code. Traditional cost models are hand-tuned by compiler engineers, but they are often inaccurate because they cannot capture the complex interactions between code, hardware, and runtime behavior.
+
+\emph{Learned cost models} use machine learning to predict costs from features extracted from the IR. By training on real execution data, these models can capture patterns that hand-tuned models miss, leading to better optimization decisions.
+
+This chapter covers the theory and practice of learned cost models, from feature extraction and training data generation to neural cost models and their integration into optimization pipelines.
+
+\section{Traditional Hand-Tuned Cost Models}\label{sec:traditional-cost}
+
+\subsection{How Traditional Cost Models Work}\label{sec:traditional-how}
+
+Traditional cost models assign a cost to each instruction, basic block, or loop based on:
+
+\begin{itemize}
+  \item \textbf{Instruction latency}: the number of cycles each instruction takes.
+  \item \textbf{Resource usage}: which functional units are used, and for how long.
+  \item \textbf{Pipeline effects}: stalls due to data dependencies, structural hazards, and control hazards.
+  \item \textbf{Memory access patterns}: cache hit/miss rates, TLB behavior.
+  \item \textbf{Heuristics}: rules of thumb for complex interactions (e.g., ``inlining is good if the function body is small'').
+\end{itemize}
+
+\subsection{Limitations}\label{sec:traditional-limits}
+
+Hand-tuned cost models have several limitations:
+\begin{itemize}
+  \item \textbf{Inaccuracy}: they cannot capture all the factors that affect performance.
+  \item \textbf{Maintenance}: they must be updated for each new processor.
+  \item \textbf{Complexity}: the interactions between factors are too complex to model by hand.
+  \item \textbf{Portability}: a cost model tuned for one processor may not work for another.
+\end{itemize}
+
+\subsection{Example: LLVM's TargetTransformInfo}\label{sec:tti}
+
+LLVM's \texttt{TargetTransformInfo} (TTI) interface provides cost estimates for operations:
+
+\begin{verbatim}
+  unsigned getInstructionCost(Instruction *I,
+                              TargetTransformInfo::TargetCostKind CostKind);
+  unsigned getMemoryOpCost(unsigned Opcode, Type *Src,
+                           unsigned Alignment, unsigned AddressSpace);
+  unsigned getShuffleCost(ShuffleKind Kind, Type *Tp, int Index);
+\end{verbatim}
+
+These functions return integer costs that are used by the optimizer to make decisions. The implementations are target-specific and hand-tuned.
+
+\section{Machine Learning for Cost Prediction}\label{sec:ml-cost}
+
+\subsection{The Learning Problem}\label{sec:learning-problem}
+
+\begin{definition}[Cost Prediction as ML]\label{def:cost-ml}
+Cost prediction can be formulated as a supervised learning problem:
+\begin{itemize}
+  \item \textbf{Input}: features extracted from the IR (and possibly the target).
+  \item \textbf{Output}: the cost (execution time, code size, energy) of the code.
+  \item \textbf{Training data}: pairs of (features, measured cost) collected from real executions.
+\end{itemize}
+\end{definition}
+
+\subsection{Learning Algorithms}\label{sec:learning-algorithms}
+
+Various ML algorithms have been applied to cost prediction:
+
+\begin{itemize}
+  \item \textbf{Decision trees and random forests}: interpretable, handle mixed features, robust to noise.
+  \item \textbf{Gradient-boosted trees (XGBoost, LightGBM)}: high accuracy, widely used.
+  \item \textbf{Neural networks}: can capture complex patterns, but require more data and are less interpretable.
+  \item \textbf{Graph neural networks}: operate directly on the IR graph, avoiding manual feature extraction.
+\end{itemize}
+
+\section{Feature Extraction from IR}\label{sec:feature-extraction}
+
+\subsection{Static Features}\label{sec:static-features}
+
+Features extracted from the IR without execution:
+
+\begin{table}[htbp]
+\centering
+\caption{Common IR features for cost prediction}
+\label{tab:ir-features}
+\begin{tabular}{ll}
+\hline
+\textbf{Feature Category} & \textbf{Examples} \\
+\hline
+Instruction mix & Count of adds, muls, loads, stores, branches \\
+Data dependencies & Depth of dependency chain, number of dependences \\
+Control flow & Number of branches, loop depth, loop trip count estimate \\
+Memory access & Stride, access pattern, array dimensions \\
+Type information & Integer vs.\ float, vector width, pointer depth \\
+Function structure & Number of basic blocks, instructions, parameters \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Dynamic Features}\label{sec:dynamic-features}
+
+Features that require execution or profiling:
+\begin{itemize}
+  \item \textbf{Branch outcomes}: actual branch taken frequencies.
+  \item \textbf{Cache behavior}: hit/miss rates for different access patterns.
+  \item \textbf{Value distributions}: the distribution of values at key points.
+  \item \textbf{Runtime types}: the actual types of dynamically-typed values.
+\end{itemize}
+
+\subsection{Graph-Based Features}\label{sec:graph-features}
+
+Instead of extracting hand-crafted features, graph neural networks (GNNs) can learn features directly from the IR graph:
+
+\begin{definition}[Graph Neural Network for IR]\label{def:gnn-ir}
+A \emph{graph neural network} (GNN) takes the IR graph as input and learns a representation by propagating information along the graph edges. The final node or graph embedding is used for cost prediction.
+\end{definition}
+
+\section{Training Data Generation}\label{sec:training-data}
+
+\subsection{Collecting Execution Data}\label{sec:collecting-data}
+
+Training data is collected by:
+\begin{enumerate}
+  \item Generating a diverse set of programs (or program fragments).
+  \item Compiling each program with different optimization settings.
+  \item Measuring the actual cost (execution time, code size, energy) of each compiled version.
+  \item Extracting features from the IR for each program.
+  \item Creating (features, cost) pairs for training.
+\end{enumerate}
+
+\subsection{Benchmark Suites}\label{sec:benchmark-suites}
+
+Standard benchmark suites are used for training and evaluation:
+\begin{itemize}
+  \item \textbf{SPEC CPU}: standard benchmark suite for integer and floating-point performance.
+  \item \textbf{LLVM Test Suite}: a collection of C/C++ programs used for compiler testing.
+  \item \textbf{PolyBench}: benchmarks for loop transformations and polyhedral optimization.
+  \item \textbf{Custom benchmarks}: domain-specific programs for specialized compilers.
+\end{itemize}
+
+\subsection{Synthetic Training Data}\label{sec:synthetic-data}
+
+When real execution data is expensive to collect, synthetic data can be generated:
+\begin{itemize}
+  \item \textbf{Random program generation}: generate random programs with known properties.
+  \item \textbf{Mutation}: mutate existing programs to create variants.
+  \item \textbf{Simulation}: use cycle-accurate simulators instead of real hardware.
+\end{itemize}
+
+\section{Neural Cost Models}\label{sec:neural-cost}
+
+\subsection{Architecture}\label{sec:neural-arch}
+
+Neural cost models typically consist of:
+\begin{enumerate}
+  \item \textbf{Feature extraction}: convert the IR to a feature vector or graph.
+  \item \textbf{Encoder}: a neural network that maps features to a latent representation.
+  \item \textbf{Predictor}: a final layer that maps the latent representation to a cost estimate.
+\end{enumerate}
+
+\subsection{Learning to Optimize}\label{sec:learning-to-optimize}
+
+Beyond cost prediction, ML can be used to directly predict optimization decisions:
+
+\begin{definition}[Learning to Optimize]\label{def:l2o}
+\emph{Learning to optimize} (L2O) is the use of machine learning to directly predict compiler optimization decisions (e.g., which functions to inline, which loops to unroll, which instructions to select) rather than predicting costs and using a traditional decision procedure.
+\end{definition}
+
+\begin{itemize}
+  \item \textbf{Inline decision}: predict whether inlining a function will improve performance.
+  \item \textbf{Phase ordering}: predict the best order of optimization passes.
+  \item \textbf{Register allocation}: predict good register assignments.
+  \item \textbf{Instruction selection}: predict the best instruction sequence.
+\end{itemize}
+
+\subsection{Reinforcement Learning for Optimization}\label{sec:rl-optimization}
+
+\begin{definition}[RL for Compiler Optimization]\label{def:rl-compiler}
+\emph{Reinforcement learning} (RL) can be used to learn optimization policies: the compiler is the agent, optimization decisions are actions, and the reward is the resulting program performance.
+\end{definition}
+
+The RL approach:
+\begin{enumerate}
+  \item The agent observes the current IR state.
+  \item It selects an optimization action (e.g., inline function $f$, unroll loop $L$).
+  \item The environment applies the action and returns the new IR state.
+  \item The reward is the change in program performance.
+  \item The agent learns a policy that maximizes cumulative reward.
+\end{enumerate}
+
+\section{Integration with Optimization Pipelines}\label{sec:integration}
+
+\subsection{Replacing Cost Models}\label{sec:replacing}
+
+A learned cost model can replace a traditional cost model in the optimization pipeline:
+
+\begin{itemize}
+  \item The optimizer calls the cost model as before.
+  \item Instead of a hand-tuned function, the call goes to the learned model.
+  \item The model returns a cost estimate that drives the optimization decision.
+\end{itemize}
+
+\subsection{Hybrid Approaches}\label{sec:hybrid-approaches}
+
+In practice, learned and traditional cost models are combined:
+\begin{itemize}
+  \item Use the traditional model as a baseline.
+  \item Use the learned model to correct or refine the traditional model's predictions.
+  \item Fall back to the traditional model when the learned model's confidence is low.
+\end{itemize}
+
+\subsection{Online Learning}\label{sec:online-learning}
+
+The cost model can be updated during compilation:
+\begin{itemize}
+  \item After each optimization, measure the actual effect.
+  \item Use the measurement to update the model (online learning).
+  \item The model improves over time as it sees more programs.
+\end{itemize}
+
+\section{Advanced Feature Extraction}\label{sec:advanced-features}
+
+\subsection{Structural IR Features}\label{sec:structural-features}
+
+Beyond basic instruction counts, structural features capture the shape and complexity of the IR:
+
+\begin{table}[htbp]
+\centering
+\caption{Structural features for cost prediction}
+\label{tab:structural-features}
+\begin{tabular}{ll}
+\hline
+\textbf{Feature} & \textbf{Description} \\
+\hline
+CFG depth & Longest path from entry to exit in the CFG \\
+CFG width & Maximum number of basic blocks at any level \\
+Loop nesting depth & Maximum depth of nested loops \\
+Dependency chain length & Longest chain of data-dependent instructions \\
+Register pressure & Number of live variables at the point of maximum pressure \\
+Memory access density & Ratio of memory operations to total operations \\
+Branch density & Ratio of branch instructions to total instructions \\
+Call density & Ratio of call instructions to total instructions \\
+PHI node count & Number of phi nodes (indicates CFG complexity) \\
+Exception handlers & Number of exception handling regions \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Hardware-Aware Features}\label{sec:hardware-features}
+
+Features that capture the interaction between the code and the target hardware:
+
+\begin{itemize}
+  \item \textbf{Cache footprint}: estimated working set size (sum of accessed memory regions).
+  \item \textbf{TLB pressure}: number of distinct pages accessed.
+  \item \textbf{Pipeline utilization}: estimated occupancy of functional units based on instruction mix and dependencies.
+  \item \textbf{Vector utilization}: ratio of vector operations to scalar operations.
+  \item \textbf{Memory bandwidth}: estimated bytes transferred per instruction.
+  \item \textbf{Branch predictability}: estimated branch misprediction rate based on pattern analysis.
+\end{itemize}
+
+\subsection{Feature Normalization and Selection}\label{sec:feature-normalization}
+
+Raw features must be normalized and selected before training:
+
+\begin{algorithm}[htbp]
+\caption{Feature Preprocessing Pipeline}
+\label{alg:feature-preprocessing}
+\begin{algorithmic}[1]
+\Procedure{PreprocessFeatures}{$\text{raw\_features}$}
+  \State \Comment{Step 1: Remove constant features}
+  \Let{features}{\textsc{RemoveConstant}(raw\_features)}
+  \State \Comment{Step 2: Remove highly correlated features}
+  \Let{features}{\textsc{RemoveCorrelated}(features, threshold=0.95)}
+  \State \Comment{Step 3: Normalize to zero mean, unit variance}
+  \Let{features}{\textsc{Standardize}(features)}
+  \State \Comment{Step 4: Apply PCA for dimensionality reduction}
+  \Let{features}{\textsc{PCA}(features, n\_components=50)}
+  \State \Return features
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\section{Neural Cost Model Architectures}\label{sec:neural-architectures}
+
+\subsection{Graph Neural Networks for IR}\label{sec:gnn-detail}
+
+Graph neural networks (GNNs) operate directly on the IR graph, learning representations by propagating information along edges:
+
+\begin{definition}[IR Graph Neural Network]\label{def:ir-gnn}
+An \emph{IR GNN} takes the program's data-flow graph as input. Each node (instruction) has an initial feature vector (opcode embedding, type information, etc.). The GNN performs $k$ rounds of message passing, where each node aggregates messages from its neighbors and updates its representation.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Message Passing in an IR GNN}
+\label{alg:gnn-message-passing}
+\begin{algorithmic}[1]
+\Procedure{MessagePassing}{$G$, $k$}
+  \For{each node $v$ in $G$}
+    \State $h_v^{(0)} \gets \textsc{Encode}(v.\text{features})$
+  \EndFor
+  \For{round $t = 1$ to $k$}
+    \For{each node $v$ in $G$}
+      \Let{m_v^{(t)}}{\sum_{u \in N(v)} W^{(t)} \cdot h_u^{(t-1)}}
+      \State $h_v^{(t)} \gets \textsc{ReLU}(W_{\text{self}} \cdot h_v^{(t-1)} + m_v^{(t)})$
+    \EndFor
+  \EndFor
+  \State \Return $\{h_v^{(k)} \mid v \in G\}$
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+The final node embeddings can be:
+\begin{itemize}
+  \item \textbf{Pooled} (sum, mean, max) to produce a graph-level embedding for whole-function cost prediction.
+  \item \textbf{Used directly} for per-instruction cost prediction.
+  \item \textbf{Attended} using attention mechanisms to weight important nodes.
+\end{itemize}
+
+\subsection{Autoregressive Cost Models}\label{sec:autoregressive-cost}
+
+Some cost models predict the execution time of a program by modeling it as a sequence of basic block costs:
+
+\begin{definition}[Autoregressive Cost Model]\label{def:autoregressive-cost}
+An \emph{autoregressive cost model} predicts the cost of each basic block conditioned on the costs of previous blocks, capturing sequential dependencies in execution.
+\end{definition}
+
+\begin{verbatim}
+  ; Autoregressive cost prediction:
+  cost(bb_1) = f(features(bb_1))
+  cost(bb_2) = f(features(bb_2), cost(bb_1))
+  cost(bb_3) = f(features(bb_3), cost(bb_1), cost(bb_2))
+  ...
+  total_cost = sum(cost(bb_i))
+\end{verbatim}
+
+\subsection{Transfer Learning Across Targets}\label{sec:transfer-learning}
+
+A cost model trained on one hardware target can be fine-tuned for a new target with limited data:
+
+\begin{itemize}
+  \item \textbf{Pre-training}: train the model on a large dataset from target $A$.
+  \item \textbf{Fine-tuning}: retrain the final layers on a small dataset from target $B$.
+  \item \textbf{Multi-task learning}: train a shared model on multiple targets simultaneously, with target-specific heads.
+\end{itemize}
+
+This approach dramatically reduces the data collection burden for new hardware targets.
+
+\section{Reinforcement Learning for Phase Ordering}\label{sec:rl-phase-ordering}
+
+\subsection{The Phase Ordering Problem}\label{sec:phase-ordering-problem}
+
+The phase ordering problem---determining the optimal sequence of optimization passes---is one of the most challenging problems in compiler optimization:
+
+\begin{definition}[Phase Ordering Problem]\label{def:phase-ordering}
+The \emph{phase ordering problem} is the problem of finding the sequence of optimization passes that produces the best code. Because optimizations interact in complex ways (one pass may enable or disable another), the optimal ordering depends on the program.
+\end{definition}
+
+\subsection{RL Formulation}\label{sec:rl-formulation}
+
+\begin{verbatim}
+  ; State: current IR (encoded as a feature vector or graph embedding)
+  ; Action: select next optimization pass to apply
+  ; Reward: change in program cost (negative execution time or code size)
+  ; Episode: sequence of passes until a termination condition
+  
+  ; Training:
+  ;   for episode in training_programs:
+  ;     state = encode(initial_ir)
+  ;     for step in max_steps:
+  ;       action = policy(state)
+  ;       new_ir = apply(ir, action)
+  ;       reward = cost(ir) - cost(new_ir)
+  ;       state = encode(new_ir)
+  ;       update_policy(state, action, reward)
+\end{verbatim}
+
+\subsection{Reward Shaping for Compiler RL}\label{sec:reward-shaping}
+
+Designing the reward function is critical for RL success:
+
+\begin{itemize}
+  \item \textbf{Sparse reward}: reward only at the end of the episode (final program performance). Simple but hard to learn.
+  \item \textbf{Dense reward}: reward after each pass (improvement in intermediate cost). Easier to learn but may encourage short-sighted decisions.
+  \item \textbf{Curriculum learning}: start with simple programs and easy optimization decisions, gradually increasing difficulty.
+  \item \textbf{Multi-objective reward}: combine execution time, code size, and compilation time with weighted sum.
+\end{itemize}
+
+\section{Evaluation and Benchmarking}\label{sec:evaluation}
+
+\subsection{Evaluation Methodology}\label{sec:eval-methodology}
+
+Evaluating learned cost models requires careful methodology:
+
+\begin{itemize}
+  \item \textbf{Train/validation/test split}: use separate programs for training, hyperparameter tuning, and final evaluation.
+  \item \textbf{Cross-validation}: use $k$-fold cross-validation to reduce variance in evaluation metrics.
+  \item \textbf{Hardware diversity}: evaluate on multiple hardware targets to test portability.
+  \item \textbf{Statistical significance}: use paired tests to determine whether improvements are statistically significant.
+\end{itemize}
+
+\subsection{Evaluation Metrics}\label{sec:eval-metrics}
+
+\begin{table}[htbp]
+\centering
+\caption{Evaluation metrics for learned cost models}
+\label{tab:eval-metrics}
+\begin{tabular}{lll}
+\hline
+\textbf{Metric} & \textbf{Definition} & \textbf{Goal} \\
+\hline
+MAE & Mean absolute error of cost predictions & Minimize \\
+MAPE & Mean absolute percentage error & Minimize \\
+Pearson $r$ & Correlation between predicted and actual costs & Maximize \\
+Top-1 accuracy & Fraction of times the best decision is selected & Maximize \\
+Geomean speedup & Geometric mean of speedup over baseline & Maximize \\
+Compilation overhead & Additional time for model inference & Minimize \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Comparison with Hand-Tuned Heuristics}\label{sec:comparison-heuristics}
+
+Learned cost models are typically compared against:
+\begin{itemize}
+  \item \textbf{Default heuristics}: the compiler's built-in cost model (e.g., LLVM's TTI).
+  \item \textbf{Expert-tuned heuristics}: manually improved cost models by compiler engineers.
+  \item \textbf{Oracle}: the best possible decision (computed by trying all options and selecting the best).
+\end{itemize}
+
+The goal is to approach oracle performance while maintaining reasonable compilation time.
+
+\subsection{Ablation Studies}\label{sec:ablation}
+
+Ablation studies determine which components of a learned cost model contribute most to its accuracy:
+
+\begin{itemize}
+  \item \textbf{Feature ablation}: remove features one at a time and measure the impact on accuracy.
+  \item \textbf{Architecture ablation}: compare different neural network architectures (MLP, GNN, Transformer).
+  \item \textbf{Training data ablation}: vary the amount and diversity of training data.
+  \item \textbf{Target ablation}: evaluate on different hardware targets to test portability.
+\end{itemize}
+
+These studies help identify the most important features and guide the design of future cost models.
+
+\section{Summary}\label{sec:learned-cost-summary}
+
+Learned cost models offer a promising approach to improving compiler optimization decisions. By training on real execution data, they can capture complex patterns that hand-tuned models miss. The key challenges are feature extraction, training data generation, model accuracy, and integration with existing optimization pipelines. As machine learning techniques continue to advance, learned cost models are likely to become an increasingly important component of compiler infrastructure.
+
+\begin{historical}
+The application of machine learning to compiler optimization dates back to the 1990s, with early work on using neural networks for instruction selection and register allocation. The modern era began around 2014--2015, with work on using ML for phase ordering, inlining decisions, and autotuning. Google's Autophase (2019) used reinforcement learning to learn optimization pass ordering. The ML for Systems (ML4Systems) workshop at NeurIPS (since 2018) has become a venue for research on learned compiler optimizations. The trend is toward end-to-end learning, where the entire optimization pipeline is learned from data, rather than hand-crafted. However, the need for correctness guarantees and interpretability means that hybrid approaches---combining learned and traditional techniques---are likely to dominate in practice.
+\end{historical}

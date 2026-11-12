@@ -1,0 +1,451 @@
+%%
+%% chapter-56.ltx — Static Single Assignment Form
+%%
+
+\label{ch:ssa}
+
+Static Single Assignment (SSA) form is the dominant intermediate representation in modern compilers. In SSA form, every variable is assigned exactly once, and phi functions merge values at control-flow join points. This simple constraint makes data dependencies explicit, enabling a wide range of optimizations to be expressed as local transformations. This chapter develops the theory and practice of SSA, from construction algorithms to out-of-SSA translation.
+
+%% ============================================================
+%% Section 56.1
+%% ============================================================
+\section{SSA: Definition and Properties}\label{sec:ssa-definition}
+
+\begin{definition}[SSA Form]\label{def:ssa}
+A program is in \emph{Static Single Assignment} form if every variable is defined exactly once. That is, for every variable $v$, there is exactly one assignment $v = \ldots$ in the program.
+\end{definition}
+
+At control-flow join points where different definitions of a variable may reach, \emph{phi functions} select the appropriate definition:
+
+\begin{verbatim}
+  B1: x1 = 1
+      if (cond) goto B2 else goto B3
+  B2: x2 = 2
+      goto B4
+  B3: x3 = 3
+      goto B4
+  B4: x4 = phi(x2, x3)  // x4 = x2 if from B2, x3 if from B3
+      y = x4 + 1
+\end{verbatim}
+
+\subsection{Properties of SSA}\label{sec:ssa-properties}
+
+\begin{itemize}
+  \item \textbf{Single definition.} Each variable has exactly one defining assignment.
+  \item \textbf{Explicit data flow.} The use of a variable directly references its definition.
+  \item \textbf{Def-use chains.} The def-use chains are explicit in the IR (no dataflow analysis needed).
+  \item \textbf{Dominance.} A variable's definition dominates all its uses.
+\end{itemize}
+
+\begin{theorem}[Dominance Property]\label{thm:ssa-dominance}
+In SSA form, the definition of every variable $v$ dominates all uses of $v$.
+\end{theorem}
+
+\begin{proof}
+Since $v$ is defined exactly once, and the definition must be reached before any use, the definition dominates all uses. \qed
+\end{proof}
+
+%% ============================================================
+%% Section 56.2
+%% ============================================================
+\section{Construction Algorithms}\label{sec:ssa-construction}
+
+Converting a program to SSA form involves two steps: inserting phi functions and renaming variables.
+
+\subsection{Cytron et al. Algorithm}\label{sec:cytron-algorithm}
+
+The classic algorithm by Cytron et al.~\cite{cytron1991} uses dominance frontiers to place phi functions.
+
+\subsubsection{Step 1: Phi Function Placement}
+
+For each variable $v$ defined in block $B$, insert phi functions at all blocks in the \emph{iterated dominance frontier} of $B$.
+
+\begin{definition}[Iterated Dominance Frontier]\label{def:idf}
+The \emph{iterated dominance frontier} of a set of blocks $S$, written $\mathrm{IDF}(S)$, is the least fixed point of:
+\[
+  \mathrm{IDF}(S) = \mathrm{DF}(S) \cup \mathrm{DF}(\mathrm{IDF}(S))
+\]
+where $\mathrm{DF}(S) = \bigcup_{D \in S} \mathrm{DF}(D)$.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Phi Function Placement (Cytron et al.)}\label{alg:phi-placement}
+\begin{algorithmic}[1]
+\Function{PlacePhiFunctions}{$\mathrm{CFG}$}
+  \For{each variable $v$}
+    \Let{\mathrm{defs}(v)}{\text{set of blocks where } v \text{ is defined}}
+    \Let{\mathrm{phi\_blocks}}{\mathrm{IDF}(\mathrm{defs}(v))}
+    \For{each block $B \in \mathrm{phi\_blocks}$}
+      \State Insert $v \gets \phi(v, v, \ldots)$ at the beginning of $B$
+    \EndFor
+  \EndFor
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Step 2: Variable Renaming}
+
+After phi function placement, rename variables so that each definition is unique:
+
+\begin{algorithm}[H]
+\caption{SSA Renaming (Cytron et al.)}\label{alg:ssa-rename}
+\begin{algorithmic}[1]
+\Function{Rename}{$B, \mathrm{stack}$}
+  \For{each instruction $v = \ldots$ in $B$}
+    \State $i \gets \mathrm{stack}[v].\mathrm{push\_new}()$
+    \State Rename $v$ to $v_i$
+  \EndFor
+  \For{each use of $v$ in $B$}
+    \State Replace with $\mathrm{stack}[v].\mathrm{top}()$
+  \EndFor
+  \For{each successor $S$ of $B$}
+    \For{each phi function $v_j \gets \phi(\ldots)$ in $S$}
+      \State Set the argument corresponding to $B$ to $\mathrm{stack}[v].\mathrm{top}()$
+    \EndFor
+  \EndFor
+  \For{each child $C$ of $B$ in the dominator tree}
+    \State $\mathrm{Rename}(C, \mathrm{stack})$
+  \EndFor
+  \For{each definition $v_i$ in $B$}
+    \State $\mathrm{stack}[v].\mathrm{pop}()$
+  \EndFor
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Brauner et al. Algorithm}\label{sec:brauner-algorithm}
+
+The algorithm by Brauner et al.~\cite{brauner2013} simplifies SSA construction by using a different strategy for phi function placement. Instead of computing dominance frontiers, it traverses the dominator tree and inserts phi functions based on the live range of each variable.
+
+\subsection{Minimal SSA}\label{sec:minimal-ssa}
+
+The Cytron algorithm produces \emph{minimal} SSA form: it inserts the minimum number of phi functions needed to ensure the single-assignment property. Some phi functions may be \emph{redundant} (all arguments are the same variable); these can be removed in a cleanup pass.
+
+%% ============================================================
+%% Section 56.3
+%% ============================================================
+\section{Phi Functions and Their Semantics}\label{sec:phi-semantics}
+
+Phi functions are not real operations; they are a notational device for merging values at control-flow join points.
+
+\subsection{Semantics}\label{sec:phi-sem}
+
+The semantics of a phi function $v \gets \phi(v_1, v_2, \ldots, v_n)$ is:
+\[
+  v = \begin{cases}
+    v_1 & \text{if control came from predecessor 1} \\
+    v_2 & \text{if control came from predecessor 2} \\
+    \vdots \\
+    v_n & \text{if control came from predecessor } n
+  \end{cases}
+\]
+
+Phi functions execute \emph{in parallel}: all phi functions in a block read their arguments before any of them write their results.
+
+\subsection{Phi Functions as Parallel Assignment}\label{sec:phi-parallel}
+
+\begin{verbatim}
+  // Before (non-SSA):
+  B1: x = 1; goto B3
+  B2: x = 2; goto B3
+  B3: y = x + 1
+
+  // After (SSA):
+  B1: x1 = 1; goto B3
+  B2: x2 = 2; goto B3
+  B3: x3 = phi(x1, x2); y = x3 + 1
+\end{verbatim}
+
+\subsection{Phi Function Optimization}\label{sec:phi-optimization}
+
+Several optimizations can simplify phi functions:
+\begin{itemize}
+  \item \textbf{Phi elimination.} If all arguments are the same variable, the phi function is redundant: $v \gets \phi(x, x) \implies v = x$.
+  \item \textbf{Copy propagation.} If $v \gets \phi(x, y)$ and $x = y$ at the join point, the phi function is redundant.
+  \item \textbf{Phi forwarding.} If a phi function's result is used only in one successor, it can be replaced by a simple copy.
+\end{itemize}
+
+%% ============================================================
+%% Section 56.4
+%% ============================================================
+\section{Dominance Frontiers}\label{sec:dominance-frontiers-ssa}
+
+Dominance frontiers are the key concept linking dominance to SSA construction.
+
+\subsection{Intuition}\label{sec:df-intuition}
+
+The dominance frontier of a block $D$ is the set of blocks where $D$'s dominance ``ends.'' If a variable is defined in $D$, its value may be ``overwritten'' at blocks in $\mathrm{DF}(D)$ by a different definition reaching from another path.
+
+\subsection{Computing Dominance Frontiers}\label{sec:df-computation}
+
+\begin{algorithm}[H]
+\caption{Dominance Frontier Computation}\label{alg:df-computation}
+\begin{algorithmic}[1]
+\Function{ComputeDF}{$\mathrm{CFG}$}
+  \For{each block $B$ with $\geq 2$ predecessors}
+    \For{each predecessor $P$ of $B$}
+      \State $\mathrm{runner} \gets P$
+      \While{$\mathrm{runner} \neq \mathrm{idom}(B)$}
+        \State $\mathrm{DF}(\mathrm{runner}) \gets \mathrm{DF}(\mathrm{runner}) \cup \{B\}$
+        \State $\mathrm{runner} \gets \mathrm{idom}(\mathrm{runner})$
+      \EndWhile
+    \EndFor
+  \EndFor
+  \State \Return $\mathrm{DF}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+%% ============================================================
+%% Section 56.5
+%% ============================================================
+\section{SSA for Memory (Memory SSA)}\label{sec:memory-ssa}
+
+Standard SSA applies to scalar variables. Extending it to memory (arrays, objects, pointers) requires additional machinery.
+
+\subsection{The Problem}\label{sec:memory-ssa-problem}
+
+Memory operations (loads and stores) can alias: a store through one pointer may affect a load through another pointer. This creates implicit data dependencies that are not captured by standard SSA.
+
+\subsection{Memory SSA}\label{sec:memory-ssa-form}
+
+Memory SSA extends SSA by treating the \emph{memory state} as a virtual variable:
+
+\begin{verbatim}
+  // Before:
+  *p = 1;
+  x = *q;  // may or may not read the value written through p
+
+  // After (Memory SSA):
+  mem1 = store(mem0, p, 1);
+  x = load(mem1, q);  // explicit memory dependency
+\end{verbatim}
+
+Each memory operation takes the current memory state as input and produces a new memory state. Phi functions merge memory states at join points.
+
+\subsection{Alias Analysis for Memory SSA}\label{sec:alias-memory-ssa}
+
+The effectiveness of Memory SSA depends on alias analysis: if the compiler can prove that two pointers do not alias, it can avoid creating unnecessary memory phi functions.
+
+\subsection{Limitations}\label{sec:memory-ssa-limits}
+
+Memory SSA can be imprecise when alias information is incomplete. Conservative alias analysis may create phi functions for memory states that are not actually needed, leading to pessimistic optimization.
+
+%% ============================================================
+%% Section 56.6
+%% ============================================================
+\section{Out-of-SSA Translation}\label{sec:out-of-ssa}
+
+Before code generation, SSA form must be converted back to a non-SSA form (since real machines do not have phi functions).
+
+\subsection{The Problem}\label{sec:out-of-ssa-problem}
+
+Phi functions must be replaced by copy instructions that move the appropriate value into the phi function's result variable:
+
+\begin{verbatim}
+  // SSA:
+  B1: x1 = 1; goto B3
+  B2: x2 = 2; goto B3
+  B3: x3 = phi(x1, x2)
+
+  // Out of SSA:
+  B1: x = 1; goto B3
+  B2: x = 2; goto B3
+  B3: // x already has the right value (no copy needed!)
+\end{verbatim}
+
+\subsection{Coalescing}\label{sec:coalescing}
+
+The key optimization in out-of-SSA translation is \emph{coalescing}: assigning the phi function's result and its arguments to the same register, eliminating the need for copy instructions.
+
+\begin{algorithm}[H]
+\caption{SSA Coalescing}\label{alg:coalescing}
+\begin{algorithmic}[1]
+\Function{Coalesce}{$\mathrm{SSA}$}
+  \For{each phi function $v \gets \phi(v_1, \ldots, v_n)$}
+    \For{each argument $v_i$ from predecessor $B_i$}
+      \If{$v$ and $v_i$ do not interfere}
+        \State Assign $v$ and $v_i$ to the same register
+      \Else
+        \State Insert copy: $v \gets v_i$ at the end of $B_i$
+      \EndIf
+    \EndFor
+  \EndFor
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Briggs et al. Algorithm}\label{sec:briggs-algorithm}
+
+The algorithm by Briggs et al.~\cite{briggs1998} integrates coalescing with register allocation, producing efficient code without excessive copy instructions.
+
+\begin{historical}
+SSA form was introduced by Rosen et al.~\cite{rosen1988} and popularized by Cytron et al.~\cite{cytron1991}, who gave the first efficient construction algorithm. The connection between SSA and dominance frontiers was a key insight of the Cytron paper. The out-of-SSA translation problem was studied by Briggs et al.~\cite{briggs1998}, who showed that coalescing can eliminate most copy instructions. Memory SSA, developed by several researchers in the 2000s, extends SSA to handle the complexities of memory aliasing. Today, SSA form is the standard IR in virtually all production compilers: LLVM, GCC, HotSpot, V8, and Rust's MIR all use SSA.
+\end{historical}
+
+%% ============================================================
+%% Section 56.7
+%% ============================================================
+\section{Advanced SSA Construction and Memory SSA}\label{sec:ssa-advanced}
+
+\subsection{Simpler SSA Construction Algorithms}\label{sec:simpler-ssa}
+
+The Cytron et al.\ algorithm requires computing dominance frontiers, which can be complex. Simpler algorithms have been developed.
+
+\begin{algorithm}[H]
+\caption{Simple SSA Construction (Brauner et al.)}\label{alg:simple-ssa}
+\begin{algorithmic}[1]
+\Function{SimpleSSA}{$\mathrm{CFG}$}
+  \State \Comment{Step 1: Insert trivial phi functions at every join point}
+  \For{each block $B$ with $\geq 2$ predecessors}
+    \For{each variable $v$ live at the entry of $B$}
+      \State Insert $v \gets \phi(v, v, \ldots)$ at the beginning of $B$
+    \EndFor
+  \EndFor
+  \State \Comment{Step 2: Rename variables (same as Cytron)}
+  \State $\mathrm{Rename}(\mathrm{entry}, \mathrm{stacks})$
+  \State \Comment{Step 3: Remove redundant phi functions}
+  \State $\mathrm{RemoveRedundantPhi}()$
+  \State \Return $\mathrm{SSA}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+This algorithm is simpler because it does not require computing dominance frontiers. The cost is that it inserts more phi functions initially, which are then removed in the cleanup pass.
+
+\subsection{Iterative SSA Construction}\label{sec:iterative-ssa}
+
+For incremental compilation, it is useful to update SSA form incrementally rather than recomputing from scratch.
+
+\begin{verbatim}
+  // Incremental SSA update:
+  // When a new definition of variable x is added in block B:
+  // 1. Rename x to x_new in B and its dominated blocks
+  // 2. Update phi functions in the dominance frontier of B
+  // 3. Propagate changes to affected phi functions
+  // Cost: O(changed region) instead of O(entire program)
+\end{verbatim}
+
+\subsection{Memory SSA: Detailed Construction}\label{sec:memory-ssa-detail}
+
+Memory SSA extends standard SSA to handle memory operations (loads and stores) by treating the memory state as a virtual variable.
+
+\begin{algorithm}[H]
+\caption{Memory SSA Construction}\label{alg:memory-ssa}
+\begin{algorithmic}[1]
+\Function{BuildMemorySSA}{$\mathrm{CFG}$}
+  \State \Comment{Treat memory as a single virtual variable 'mem'}
+  \State $\mathrm{defs}(\mathrm{mem}) \gets \text{blocks containing stores}$
+  \State \Comment{Place phi functions for mem using standard algorithm}
+  \State $\mathrm{phi\_blocks} \gets \mathrm{IDF}(\mathrm{defs}(\mathrm{mem}))$
+  \For{each block $B \in \mathrm{phi\_blocks}$}
+    \State Insert $\mathrm{mem}_j \gets \phi(\mathrm{mem}_{i_1}, \ldots, \mathrm{mem}_{i_n})$ at beginning of $B$
+  \EndFor
+  \State \Comment{Rename memory states}
+  \State $\mathrm{Rename}(\mathrm{entry}, \mathrm{mem\_stack})$
+  \State \Comment{Annotate loads and stores with memory state}
+  \For{each store $*p = v$ in block $B$}
+    \State Annotate: $\mathrm{mem}_{new} = \mathrm{store}(\mathrm{mem}_{old}, p, v)$
+  \EndFor
+  \For{each load $x = *q$ in block $B$}
+    \State Annotate: $x = \mathrm{load}(\mathrm{mem}_{current}, q)$
+  \EndFor
+  \State \Return annotated $\mathrm{CFG}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{verbatim}
+  // Memory SSA example:
+  // Before:
+  // B1: *p = 1; x = *q;
+  // B2: *q = 2; y = *p;
+
+  // After Memory SSA:
+  // B1: mem1 = store(mem0, p, 1)
+  //     x = load(mem1, q)       // depends on mem1
+  // B2: mem2 = store(mem1, q, 2)
+  //     y = load(mem2, p)       // depends on mem2
+\end{verbatim}
+
+\subsection{Memory SSA with Alias Analysis}\label{sec:memory-ssa-alias}
+
+The effectiveness of Memory SSA depends on alias analysis. If the compiler can prove that two pointers do not alias, it can avoid creating unnecessary memory dependencies.
+
+\begin{verbatim}
+  // Without alias info (conservative):
+  // mem1 = store(mem0, p, 1)
+  // x = load(mem1, q)    // must depend on mem1 (p and q may alias)
+
+  // With alias info (p and q do not alias):
+  // mem1 = store(mem0, p, 1)
+  // x = load(mem0, q)    // can use mem0 (p and q don't alias)
+  // -> No unnecessary dependency created
+\end{verbatim}
+
+\subsection{SSA for Other Resources}\label{sec:ssa-resources}
+
+The SSA concept can be extended beyond scalars and memory to other resources:
+
+\begin{itemize}
+  \item \textbf{Value SSA.} Standard SSA for scalar variables.
+  \item \textbf{Memory SSA.} SSA for the memory state (loads/stores).
+  \item \textbf{Lock SSA.} SSA for lock acquisition and release.
+  \item \textbf{File SSA.} SSA for file open/read/write/close operations.
+  \item \textbf{Network SSA.} SSA for socket send/receive operations.
+\end{itemize}
+
+\begin{table}[htbp]
+\centering
+\caption{SSA construction algorithms compared}\label{tab:ssa-algorithms}
+\begin{tabular}{p{3cm}p{3cm}p{3cm}p{3cm}}
+\hline
+\textbf{Algorithm} & \textbf{Complexity} & \textbf{Prerequisites} & \textbf{Quality} \\
+\hline
+Cytron et al. & $O(E)$ & Dominance frontiers & Minimal SSA \\
+Brauner et al. & $O(V^2)$ & Dominator tree & Minimal (after cleanup) \\
+Simple (all phi) & $O(V \cdot E)$ & None & Non-minimal \\
+Incremental & $O(\Delta)$ & Existing SSA & Minimal (local) \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (source) {Source Program};
+  \node[block, below=of source] (cfg) {CFG};
+  \node[block, below left=1.5cm and 0.5cm of cfg] (scalar) {Scalar SSA};
+  \node[block, below right=1.5cm and 0.5cm of cfg] (memory) {Memory SSA};
+  \node[block, below=1cm of scalar] (opts) {Scalar Opts\\(CSE, DCE)};
+  \node[block, below=1cm of memory] (alias) {Alias Analysis};
+  \node[block, below=1.5cm of opts] (codegen) {Code Generation};
+  \node[block, below=1.5cm of alias] (codegen2) {Code Generation};
+
+  \draw[arrow] (source) -- (cfg);
+  \draw[arrow] (cfg) -- (scalar);
+  \draw[arrow] (cfg) -- (memory);
+  \draw[arrow] (scalar) -- (opts);
+  \draw[arrow] (memory) -- (alias);
+  \draw[arrow] (opts) -- (codegen);
+  \draw[arrow] (alias) -- (codegen2);
+\end{tikzpicture}
+\caption{Two SSA variants: scalar SSA for register variables and memory SSA for memory operations. Both feed into optimization passes before code generation.}\label{fig:ssa-variants}
+\end{figure}
+
+\begin{insight}
+The key insight of SSA form is that making data dependencies explicit transforms global analyses into local pattern matching. In non-SSA form, determining which definition reaches a use requires a global dataflow analysis. In SSA form, the reaching definition is simply the variable being used---it is right there in the instruction. This locality is what makes SSA-based optimizations so effective and so easy to implement. Memory SSA extends this insight to the memory domain, treating the entire memory state as a single variable that flows through the program.
+\end{insight}
+
+%% ============================================================
+%% Section 56.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-56}
+
+SSA form is the cornerstone of modern compiler optimization. By ensuring that every variable is assigned exactly once, it makes data dependencies explicit and enables local optimization techniques. The construction algorithm, based on dominance frontiers, is efficient and well-understood. The out-of-SSA translation, with coalescing, produces efficient machine code.
+
+For further reading, we recommend the original Cytron et al. paper~\cite{cytron1991}, the comprehensive survey by Braun~\cite{braun2013}, and the LLVM documentation on SSA.

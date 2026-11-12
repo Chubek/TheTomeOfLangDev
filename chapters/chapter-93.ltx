@@ -1,0 +1,485 @@
+%%
+%% chapter-93.ltx — Speculative and Versioned IR
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:speculative-ir}
+
+\section{Introduction}\label{sec:spec-ir-intro}
+
+Traditional compiler IR represents the program conservatively: every operation must handle all possible types, all possible control flow paths, and all possible alias relationships. This conservatism is necessary for correctness but leaves significant optimization opportunities on the table. \emph{Speculative IR} extends the traditional IR with operations that are correct only under certain assumptions---assumptions that are checked at runtime and that, if violated, trigger a fallback to the conservative version.
+
+This chapter explores the design of speculative and versioned intermediate representations, where the IR can express optimistic assumptions about types, control flow, and data values, guarded by runtime checks that ensure correctness.
+
+\section{Speculative Assumptions in IR}\label{sec:spec-assumptions}
+
+\subsection{The Motivation}\label{sec:spec-motivation}
+
+Consider a dynamically-typed language where the expression \texttt{a + b} could involve integers, floats, strings, or objects with overloaded addition. A conservative compilation must handle all cases:
+
+\begin{verbatim}
+  ; Conservative: check all types
+  if (isInt(a) && isInt(b)) return a + b;
+  if (isFloat(a) && isFloat(b)) return a + b;
+  if (isString(a) && isString(b)) return concat(a, b);
+  ...
+\end{verbatim}
+
+If profiling reveals that \texttt{a} and \texttt{b} are always integers at this point, the compiler can speculate:
+
+\begin{verbatim}
+  ; Speculative: assume integers
+  guard(isInt(a) && isInt(b)) -> DEOPT
+  return a + b  ; direct integer addition
+\end{verbatim}
+
+The speculative version is faster (no type dispatch) but requires a guard to ensure correctness.
+
+\subsection{Types of Speculative Assumptions}\label{sec:spec-types}
+
+\begin{definition}[Speculative Assumption Categories]\label{def:spec-categories}
+Common speculative assumptions include:
+\begin{itemize}
+  \item \textbf{Type assumptions}: ``this value has type $T$.''
+  \item \textbf{Class assumptions}: ``this object's class is exactly $C$.''
+  \item \textbf{Null assumptions}: ``this reference is not null.''
+  \item \textbf{Range assumptions}: ``this integer is in $[lo, hi]$.''
+  \item \textbf{Shape assumptions}: ``this array has length $n$'' or ``this object has field $f$.''
+  \item \textbf{Alias assumptions}: ``these two pointers do not alias.''
+  \item \textbf{Control flow assumptions}: ``this branch is always taken'' or ``this loop iterates $n$ times.''
+\end{itemize}
+\end{definition}
+
+\subsection{Representing Assumptions in IR}\label{sec:spec-representation}
+
+Speculative assumptions are represented in the IR as special operations:
+
+\begin{definition}[Guard Operation]\label{def:guard-op}
+A \emph{guard} is an IR operation that checks a condition and, if the condition fails, transfers control to a deoptimization path:
+\[
+  \texttt{guard}(cond, deopt\_target)
+\]
+The guard is semantically equivalent to:
+\[
+  \texttt{if} (\neg cond) \texttt{ goto deopt\_target}
+\]
+but the deoptimization target is not a normal code location---it is a description of how to reconstruct the interpreter state.
+\end{definition}
+
+\section{Type Speculation and Guards}\label{sec:type-speculation}
+
+\subsection{Type Guards}\label{sec:type-guards}
+
+Type guards are the most common form of speculative assumption:
+
+\begin{example}[Type Guard in IR]\label{ex:type-guard-ir}
+\begin{verbatim}
+  ; Original (conservative)
+  %result = dynamic_add %a, %b
+
+  ; Speculative (optimized)
+  guard_type %a, Int -> deopt_1
+  guard_type %b, Int -> deopt_2
+  %result = int_add %a, %b
+\end{verbatim}
+The \texttt{guard\_type} operations check that \texttt{\%a} and \texttt{\%b} are integers. If they are, the fast \texttt{int\_add} is used. If not, execution deoptimizes.
+\end{example}
+
+\subsection{Type Hierarchies and Class Checks}\label{sec:type-hierarchies}
+
+For object-oriented languages, type guards may involve class hierarchy checks:
+
+\begin{itemize}
+  \item \textbf{Exact class check}: \texttt{obj.class == C}. Fast (single comparison).
+  \item \textbf{Subtype check}: \texttt{obj.class <: C}. Requires traversal of the class hierarchy or a precomputed layout (e.g., Cohen's display, Cohen's encoding, or a type check bitmap).
+  \item \textbf{Interface check}: \texttt{obj implements I}. Requires scanning the interface table.
+\end{itemize}
+
+The compiler chooses the cheapest check that is sufficient for the speculation.
+
+\subsection{Guard Coalescing}\label{sec:guard-coalescing}
+
+Multiple guards can often be combined into a single check:
+
+\begin{itemize}
+  \item If two values are always the same type, a single guard can check both.
+  \item If a type check implies another (e.g., \texttt{String} implies \texttt{Object}), redundant guards can be eliminated.
+  \item If a guard has already been checked on a dominating path, it need not be repeated.
+\end{itemize}
+
+\section{Versioned Code for Different Assumptions}\label{sec:versioned-code}
+
+\subsection{Multi-Versioning}\label{sec:multi-versioning}
+
+A single source operation may have multiple compiled versions, each specialized for different assumptions:
+
+\begin{definition}[Code Versioning]\label{def:code-versioning}
+\emph{Code versioning} is the technique of generating multiple versions of a code region, each specialized for a different set of assumptions. At runtime, the appropriate version is selected based on the actual conditions.
+\end{definition}
+
+\begin{example}[Versioned Loop]\label{ex:versioned-loop}
+A loop that adds array elements might have three versions:
+\begin{verbatim}
+  ; Version 1: all integers, no bounds checks needed
+  guard(all_ints(arr)) -> version_2
+  guard(no_alias(arr, result)) -> version_2
+  for i in 0..n:
+    result[i] = arr[i] + 1
+
+  ; Version 2: all integers, but bounds checks needed
+  guard(all_ints(arr)) -> version_3
+  for i in 0..n:
+    guard(i < len(arr)) -> version_3
+    result[i] = arr[i] + 1
+
+  ; Version 3: generic (handles all types)
+  for i in 0..n:
+    result[i] = dynamic_add(arr[i], 1)
+\end{verbatim}
+\end{example}
+
+\subsection{Version Selection}\label{sec:version-selection}
+
+Version selection can be:
+\begin{itemize}
+  \item \textbf{Eager}: check all assumptions at entry and jump to the appropriate version.
+  \item \textbf{Lazy}: start with the most optimistic version; if a guard fails, fall through to the next version.
+  \item \textbf{Adaptive}: start with the generic version; after observing stable behavior, recompile a specialized version.
+\end{itemize}
+
+\subsection{Cloning and Specialization}\label{sec:cloning}
+
+The compiler implements versioning by \emph{cloning} the original code and specializing each clone:
+
+\begin{enumerate}
+  \item Clone the original code region.
+  \item Insert guards at the entry of each clone.
+  \item Propagate the assumed types/values through the clone, replacing dynamic operations with static ones.
+  \item Eliminate dead code (branches that are now unreachable).
+  \item Connect the deoptimization targets to the next less-specialized version.
+\end{enumerate}
+
+\section{Guard Failure and Recovery}\label{sec:guard-failure}
+
+\subsection{Guard Failure Semantics}\label{sec:guard-failure-semantics}
+
+When a guard fails, the program must continue as if the speculative optimization had never occurred. This requires:
+
+\begin{enumerate}
+  \item \textbf{State reconstruction}: rebuild the interpreter's view of the program state (local variables, operand stack, etc.).
+  \item \textbf{Control transfer}: transfer control to the appropriate point in the unoptimized code.
+  \item \textbf{Side effect preservation}: any side effects performed before the guard failure must be preserved.
+\end{enumerate}
+
+\subsection{Side Effects and Guard Placement}\label{sec:guard-placement}
+
+Guards must be placed carefully to avoid losing side effects:
+
+\begin{definition}[Guard Placement Rule]\label{def:guard-placement}
+A guard must not be placed before a side-effecting operation that the deoptimized code expects to have occurred. If a side effect has occurred, the guard's deoptimization must account for it.
+\end{definition}
+
+This leads to the concept of \emph{effect ordering}: the compiler must track which side effects have been performed and ensure that deoptimization correctly reflects them.
+
+\subsection{Uncommon Traps}\label{sec:uncommon-traps}
+
+\begin{definition}[Uncommon Trap]\label{def:uncommon-trap}
+An \emph{uncommon trap} is a guard whose failure is expected to be rare. The deoptimization path is the ``uncommon'' path, and it may be optimized for code size rather than speed.
+\end{definition}
+
+Uncommon traps include:
+\begin{itemize}
+  \item Type check failures (the object is not the expected type).
+  \item Null check failures (a reference that was assumed non-null is null).
+  \item Bounds check failures (an index that was assumed in-bounds is out-of-bounds).
+  \item Overflow (an arithmetic operation that was assumed not to overflow does overflow).
+\end{itemize}
+
+\section{Profile-Driven Speculation}\label{sec:profile-speculation}
+
+\subsection{Collecting Profiles}\label{sec:collecting-profiles}
+
+The compiler uses profiling information to decide which assumptions to make:
+
+\begin{itemize}
+  \item \textbf{Type profiles}: collected at each operation, recording the types of operands observed.
+  \item \textbf{Branch profiles}: collected at each conditional branch, recording the frequency of each direction.
+  \item \textbf{Value profiles}: collected at selected operations, recording the actual values observed.
+  \item \textbf{Call profiles}: collected at each call site, recording the target methods observed.
+\end{itemize}
+
+\subsection{Deciding What to Speculate}\label{sec:speculation-decisions}
+
+The compiler uses profiles to decide which speculations are worthwhile:
+
+\begin{definition}[Speculation Heuristic]\label{def:spec-heuristic}
+A speculation is worthwhile if:
+\begin{enumerate}
+  \item The profile indicates that the assumption holds with high probability (e.g., $> 95\%$).
+  \item The optimization enabled by the speculation is significant (e.g., eliminates a type dispatch, enables inlining).
+  \item The cost of the guard is small relative to the benefit.
+  \item The deoptimization cost is acceptable (the assumption is unlikely to be violated frequently).
+\end{enumerate}
+\end{definition}
+
+\subsection{Speculation Under Uncertainty}\label{sec:speculation-uncertainty}
+
+When profiles are incomplete (e.g., the code has not been executed many times), the compiler must decide whether to speculate with limited information:
+
+\begin{itemize}
+  \item \textbf{Conservative}: do not speculate until profiles are reliable. Safer but slower to optimize.
+  \item \textbf{Aggressive}: speculate based on limited data. Faster to optimize but risk more deoptimizations.
+  \item \textbf{Adaptive}: start conservative, become more aggressive as profiles stabilize.
+\end{itemize}
+
+\section{Implementation Patterns}\label{sec:impl-patterns}
+
+\subsection{Sea of Nodes with Guards}\label{sec:sea-of-nodes-guards}
+
+In a sea-of-nodes IR (as used by Graal/Truffle and HotSpot C2), guards are represented as nodes with both data and control dependencies:
+
+\begin{itemize}
+  \item A guard node takes a condition (data input) and has a control dependency on the preceding control flow.
+  \item If the condition is false, control flows to the deoptimization target.
+  \item The guard also acts as a type assertion: downstream nodes can assume the guarded type.
+\end{itemize}
+
+\subsection{Phi-Based Type Specialization}\label{sec:phi-specialization}
+
+After a guard, the type of a value changes. This is represented by inserting a \emph{phi node} at the merge point:
+
+\begin{verbatim}
+  ; Before guard: %x has type Dynamic
+  guard_type %x, Int -> deopt
+  ; After guard: %x has type Int
+  ; At merge point:
+  %x_merged = phi(%x_int, %x_dynamic)  ; type: Dynamic
+\end{verbatim}
+
+\subsection{Assumption Dependencies}\label{sec:assumption-deps}
+
+Some speculations depend on global state (e.g., ``no new subclass of \texttt{String} has been defined''). The runtime maintains \emph{assumption dependencies}:
+
+\begin{itemize}
+  \item Compiled code registers a dependency on an assumption.
+  \item When the assumption is invalidated (e.g., a new subclass is defined), all dependent compiled code is deoptimized.
+  \item Assumptions are implemented as objects with a list of dependent code blobs.
+\end{itemize}
+
+\section{Advanced Type Speculation}\label{sec:advanced-type-spec}
+
+\subsection{Shape Speculation}\label{sec:shape-spec}
+
+Beyond simple type checks, modern JITs speculate on the \emph{shape} of objects---their memory layout, field offsets, and map structure.
+
+\begin{definition}[Object Shape]\label{def:object-shape}
+An object's \emph{shape} (also called its \emph{hidden class} or \emph{map}) describes the set of fields it contains, their types, and their offsets in memory. Objects created with the same sequence of field additions share the same shape.
+\end{definition}
+
+Shape speculation enables:
+\begin{itemize}
+  \item \textbf{Direct field access}: instead of a hash lookup, the field is accessed at a known offset.
+  \item \textbf{Inline caching}: the shape ID is cached at the call site, and a single comparison selects the fast path.
+  \item \textbf{Object representation optimization}: objects with the same shape can use a compact representation.
+\end{itemize}
+
+\begin{example}[Shape Guard]\label{ex:shape-guard}
+\begin{verbatim}
+  ; Speculate that obj has shape S (fields: x: Int at +8, y: Int at +16)
+  guard_shape obj, S -> deopt
+  %x = load [obj + 8]     ; direct field access
+  %y = load [obj + 16]    ; direct field access
+  %result = int_add %x, %y
+\end{verbatim}
+If the object's shape changes (e.g., a new field is added), the guard fails and execution deoptimizes.
+\end{example}
+
+\subsection{Transitioning Type Speculation}\label{sec:transitioning-types}
+
+In dynamic languages, objects can change type over time (e.g., by adding new properties). The JIT must handle these transitions:
+
+\begin{itemize}
+  \item \textbf{Shape transitions}: when a field is added, the object transitions to a new shape. The JIT guards on the current shape.
+  \item \textbf{Type transitions}: when a field's type changes (e.g., from integer to float), the object's representation may change. The JIT guards on the field type.
+  \item \textbf{Dictionary mode}: when an object has too many shapes or fields, it transitions to a dictionary representation. The JIT must handle this fallback.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw, fill=TomeBg, minimum width=2cm, minimum height=0.6cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[node, fill=TomeExBg] (s0) at (0, 0) {Shape $\emptyset$};
+  \node[node, fill=TomeExBg] (s1) at (3, 0) {Shape \{x\}};
+  \node[node, fill=TomeDefBg] (s2) at (6, 0) {Shape \{x, y\}};
+  \node[node, fill=TomeWarnBg] (s3) at (9, 0) {Dictionary};
+
+  \draw[arr] (s0) -- node[above, font=\footnotesize] {add x} (s1);
+  \draw[arr] (s1) -- node[above, font=\footnotesize] {add y} (s2);
+  \draw[arr] (s2) -- node[above, font=\footnotesize] {too many} (s3);
+\end{tikzpicture}
+\caption{Shape transition chain for a dynamic object}
+\label{fig:shape-transitions}
+\end{figure}
+
+\section{Versioned Code Generation Strategies}\label{sec:versioned-strategies}
+
+\subsection{Polymorphic Inline Caching}\label{sec:polymorphic-ic}
+
+Versioned code can be generated for different receiver types at a call site:
+
+\begin{definition}[Polymorphic Inline Cache]\label{def:polymorphic-ic}
+A \emph{polymorphic inline cache} (PIC) is a call site that has been specialized for multiple receiver types. Each type has a dedicated code path with the target method inlined.
+\end{definition}
+
+\begin{verbatim}
+  ; PIC with 3 versions
+  cmp [obj.type], STRING_TYPE
+  je string_version       ; inlined String.length()
+  cmp [obj.type], ARRAY_TYPE
+  je array_version        ; inlined Array.length()
+  cmp [obj.type], BUFFER_TYPE
+  je buffer_version       ; inlined Buffer.length()
+  jmp generic_dispatch    ; full dynamic dispatch
+\end{verbatim}
+
+The number of versions in a PIC is typically limited (e.g., 4--8). Beyond this limit, the call site becomes megamorphic and falls back to generic dispatch.
+
+\subsection{Loop Versioning}\label{sec:loop-versioning}
+
+Loops are particularly amenable to versioning because they execute many times, amortizing the cost of version selection:
+
+\begin{example}[Versioned Loop for Array Operations]\label{ex:versioned-array}
+\begin{verbatim}
+  ; Version 1: float64 array, aligned, no overlap with output
+  guard(isFloat64Array(arr)) -> version_2
+  guard(isAligned(arr.data, 16)) -> version_2
+  guard(noOverlap(arr.data, out.data)) -> version_2
+  vectorized_loop:
+    %v = load_aligned [arr.data + i]  ; SIMD load
+    %r = fmul %v, 2.0                ; SIMD multiply
+    store_aligned [out.data + i], %r  ; SIMD store
+    i += 4
+    if i < n goto vectorized_loop
+
+  ; Version 2: float64 array, unaligned
+  guard(isFloat64Array(arr)) -> version_3
+  scalar_loop:
+    out[i] = arr[i] * 2.0
+    i++
+    if i < n goto scalar_loop
+
+  ; Version 3: generic (handles all element types)
+  generic_loop:
+    out[i] = dynamic_mul(arr[i], 2.0)
+    i++
+    if i < n goto generic_loop
+\end{verbatim}
+\end{example}
+
+\subsection{Speculation Failure Counters}\label{sec:spec-counters}
+
+When a speculation fails, the system must decide whether to:
+\begin{itemize}
+  \item Recompile with a different speculation.
+  \item Fall back to a less-specialized version.
+  \item Give up on speculation for this code region.
+\end{itemize}
+
+This decision is guided by \emph{speculation failure counters}:
+
+\begin{algorithm}[htbp]
+\caption{Speculation Failure Handling}
+\label{alg:spec-failure}
+\begin{algorithmic}[1]
+\Procedure{HandleSpecFailure}{$\text{code\_region}, \text{assumption}$}
+  \State $\text{assumption.fail\_count} \gets \text{assumption.fail\_count} + 1$
+  \If{$\text{assumption.fail\_count} < \text{threshold\_retry}$}
+    \State \textsc{Recompile}(code\_region, \text{new\_assumptions})
+  \ElsIf{$\text{assumption.fail\_count} < \text{threshold\_fallback}$}
+    \State \textsc{InstallFallbackVersion}(code\_region)
+  \Else
+    \State \textsc{InstallGenericVersion}(code\_region)
+    \State \textsc{Blacklist}(code\_region, \text{assumption})
+  \EndIf
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\section{Speculative IR for Static Languages}\label{sec:spec-static}
+
+\subsection{Speculation in Statically-Typed Languages}\label{sec:spec-static-typed}
+
+Even statically-typed languages benefit from speculative IR. Consider Java:
+\begin{itemize}
+  \item \textbf{Final field speculation}: a \texttt{final} field is assumed to be initialized and never changed. If reflection modifies it, deoptimization occurs.
+  \item \textbf{Sealed class speculation}: a sealed class hierarchy is assumed to have no new subtypes. If a new subtype is loaded, deoptimization occurs.
+  \item \textbf{Non-null speculation}: a parameter annotated \texttt{@NonNull} is assumed to never be null.
+\end{itemize}
+
+\subsection{Class Hierarchy Analysis and Speculation}\label{sec:cha-spec}
+
+Class hierarchy analysis (CHA) provides static information that can be used for speculation:
+
+\begin{definition}[CHA-Based Speculation]\label{def:cha-spec}
+If class hierarchy analysis shows that a method $m$ has exactly one implementation (or zero, making it abstract), the JIT can speculatively inline that implementation, guarded by an assumption that no new subclass overriding $m$ is loaded.
+\end{definition}
+
+The assumption is registered with the class loader: when a new class is loaded that overrides $m$, all code depending on the assumption is deoptimized.
+
+\section{Guard Optimization}\label{sec:guard-optimization}
+
+\subsection{Guard Hoisting}\label{sec:guard-hoisting}
+
+Guards can be moved (hoisted) to earlier points in the program to reduce the number of times they are executed:
+
+\begin{definition}[Guard Hoisting]\label{def:guard-hoisting}
+\emph{Guard hoisting} is the optimization of moving a guard to an earlier program point where it dominates more uses of the guarded assumption, reducing the total number of guard executions.
+\end{definition}
+
+\begin{verbatim}
+  ; Before hoisting:
+  loop:
+    guard_type %x, Int -> deopt    ; executed every iteration
+    %r = int_add %x, 1
+    ...
+    goto loop
+
+  ; After hoisting:
+  guard_type %x, Int -> deopt      ; executed once before loop
+  loop:
+    %r = int_add %x, 1
+    ...
+    goto loop
+\end{verbatim}
+
+Guard hoisting is safe as long as:
+\begin{itemize}
+  \item The guard dominates all uses of the guarded assumption.
+  \item The guard is not moved past a side effect that could change the guarded property.
+  \item The deoptimization at the hoisted point correctly reconstructs the program state.
+\end{itemize}
+
+\subsection{Guard Combining}\label{sec:guard-combining}
+
+Multiple guards can be combined into a single check using bitwise operations or branch-free code:
+
+\begin{verbatim}
+  ; Before: two separate guards
+  guard_type %a, Int -> deopt_1
+  guard_type %b, Int -> deopt_2
+
+  ; After: combined guard (if type tags can be checked together)
+  %combined = or %a.type_tag, %b.type_tag
+  guard_eq %combined, INT_TAG_COMBINED -> deopt_combined
+\end{verbatim}
+
+\section{Summary}\label{sec:spec-ir-summary}
+
+Speculative and versioned IR extends the traditional compiler IR with the ability to express optimistic assumptions, guarded by runtime checks. This enables aggressive optimization of dynamically-typed and polymorphic code while maintaining correctness through deoptimization. The key design challenges are representing guards and assumptions in the IR, managing multiple code versions, handling guard failures correctly, and deciding which speculations are worthwhile based on profiling data.
+
+\begin{historical}
+Speculative optimization has its roots in the Self VM (1990s), which pioneered type feedback and inline caching. The concept of ``uncommon traps'' was formalized in the Java HotSpot compiler. The Graal compiler (2008--) and Truffle framework (2012--) pushed speculative optimization to its current state of the art, using a sea-of-nodes IR with rich guard and deoptimization support. The concept of versioned code for different assumptions has been explored in many systems, from the DylaDyn dynamic compilation framework to modern JavaScript JITs. The trend is toward more expressive speculative IRs that can capture a wider range of assumptions and more sophisticated profile-driven speculation strategies.
+\end{historical}

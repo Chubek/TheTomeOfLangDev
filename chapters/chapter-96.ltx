@@ -1,0 +1,459 @@
+%%
+%% chapter-96.ltx — Demand-Driven Compilation
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:demand-driven}
+
+\section{Introduction}\label{sec:demand-intro}
+
+Traditional compilers compile everything: every function, every module, every type is processed regardless of whether it will actually be used at runtime. \emph{Demand-driven compilation} inverts this approach: code is compiled only when it is needed, and only to the extent required by the context in which it is used. This lazy approach to compilation can dramatically reduce compilation time, enable new optimization opportunities, and provide a natural foundation for multi-stage programming.
+
+This chapter explores the theory and practice of demand-driven compilation, from basic lazy compilation strategies to partial evaluation, binding-time analysis, and the foundations of multi-stage programming.
+
+\section{Compile Only What Is Needed}\label{sec:compile-needed}
+
+\subsection{The Case for Lazy Compilation}\label{sec:lazy-case}
+
+Many programs contain code that is rarely or never executed:
+\begin{itemize}
+  \item Error handling paths that are triggered only on failure.
+  \item Debug and diagnostic code that is enabled only during development.
+  \item Platform-specific code for configurations that are not used.
+  \item Optional features that the user has not enabled.
+\end{itemize}
+
+Compiling this code wastes time and may produce code that is never executed, increasing binary size and potentially interfering with optimization of the hot path.
+
+\subsection{Dead Code and the Compiler}\label{sec:dead-code}
+
+\begin{definition}[Dead Code Elimination]\label{def:dce}
+\emph{Dead code elimination} (DCE) removes code that cannot affect the program's observable behavior. This includes unreachable code, unused functions, and computations whose results are never used.
+\end{definition}
+
+DCE is a standard optimization, but it operates \emph{after} all code has been compiled. Demand-driven compilation avoids compiling dead code in the first place.
+
+\subsection{Lazy Compilation in JITs}\label{sec:lazy-jit}
+
+JIT compilers are naturally demand-driven: a method is compiled only when it is first called. This means:
+\begin{itemize}
+  \item Methods that are never called are never compiled.
+  \item Startup time is reduced because only the initialization code is compiled.
+  \item Memory is saved because unused methods have no compiled code.
+\end{itemize}
+
+\section{Lazy Compilation Strategies}\label{sec:lazy-strategies}
+
+\subsection{Compile on First Call}\label{sec:first-call}
+
+The simplest lazy strategy: compile a function the first time it is called.
+
+\begin{algorithm}[htbp]
+\caption{Compile-on-First-Call}
+\label{alg:first-call}
+\begin{algorithmic}[1]
+\Procedure{CallFunction}{$f$, args}
+  \If{$f$.\text{compiled\_code} is null}
+    \State $f$.\text{compiled\_code} $\gets$ \textsc{Compile}($f$)
+  \EndIf
+  \State \Return \textsc{Execute}($f$.\text{compiled\_code}, args)
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Compile on First Hot Call}\label{sec:first-hot}
+
+A refinement: compile only when the function is called frequently enough to justify the compilation cost.
+
+\begin{itemize}
+  \item Maintain an invocation count for each function.
+  \item When the count exceeds a threshold, compile the function.
+  \item Below the threshold, interpret.
+\end{itemize}
+
+This is the strategy used by tiered JIT compilers (\cref{ch:jit}).
+
+\subsection{Selective Compilation}\label{sec:selective}
+
+More sophisticated strategies compile different parts of a function at different optimization levels:
+\begin{itemize}
+  \item \textbf{Hot paths}: fully optimized.
+  \item \textbf{Cold paths}: minimally compiled or interpreted.
+  \item \textbf{Unlikely paths}: not compiled at all (deoptimize if reached).
+\end{itemize}
+
+\section{Partial Evaluation}\label{sec:partial-eval}
+
+\subsection{The Concept}\label{sec:pe-concept}
+
+\begin{definition}[Partial Evaluation]\label{def:partial-eval}
+\emph{Partial evaluation} is a program transformation that takes a program $P$ and some of its inputs (the \emph{static} inputs) and produces a \emph{residual program} $P'$ that is specialized to those static inputs:
+\[
+  P'(\text{dynamic\_input}) = P(\text{static\_input}, \text{dynamic\_input})
+\]
+\end{definition}
+
+\subsection{Partial Evaluation of Compilers}\label{sec:pe-compilers}
+
+When the program $P$ is an interpreter and the static input is a source program, partial evaluation produces a compiled version of that program. This is the \emph{first Futamura projection} (\cref{sec:futamura-1}).
+
+\subsection{The Partial Evaluator}\label{sec:pe-evaluator}
+
+A partial evaluator must:
+\begin{enumerate}
+  \item Determine which expressions are static (can be evaluated at PE time) and which are dynamic (must be deferred).
+  \item Evaluate static expressions and simplify the program.
+  \item Generate residual code for dynamic expressions.
+  \item Handle control flow: if a branch condition is static, only the taken branch generates residual code.
+\end{enumerate}
+
+\begin{example}[Partial Evaluation of an Interpreter]\label{ex:pe-interp}
+Consider a simple interpreter for arithmetic expressions:
+\begin{verbatim}
+  eval(Add(Const(3), Var("x"))) =
+    eval(Const(3)) + eval(Var("x")) =
+    3 + x
+\end{verbatim}
+Partial evaluation with respect to the expression \texttt{Add(Const(3), Var("x"))} produces:
+\begin{verbatim}
+  residual(x) = 3 + x
+\end{verbatim}
+The constant folding (\texttt{eval(Const(3)) = 3}) has been performed at PE time.
+\end{example}
+
+\subsection{Binding-Time Improvement}\label{sec:bti}
+
+\begin{definition}[Binding-Time Improvement]\label{def:bti}
+\emph{Binding-time improvement} is the process of restructuring a program so that more computations can be performed at partial evaluation time. This includes:
+\begin{itemize}
+  \item Exposing static information that was hidden behind dynamic abstractions.
+  \item Restructuring data structures to separate static and dynamic components.
+  \item Annotating the program with binding-time information.
+\end{itemize}
+\end{definition}
+
+\section{Binding-Time Analysis}\label{sec:bta}
+
+\subsection{The Analysis}\label{sec:bta-analysis}
+
+\begin{definition}[Binding-Time Analysis]\label{def:bta}
+A \emph{binding-time analysis} (BTA) classifies each expression in the program as:
+\begin{itemize}
+  \item \textbf{Static}: can be computed at partial evaluation time.
+  \item \textbf{Dynamic}: must be computed at runtime.
+  \item \textbf{Mixed}: contains both static and dynamic components.
+\end{itemize}
+\end{definition}
+
+The BTA is a form of abstract interpretation where the abstract domain is $\{\text{static}, \text{dynamic}\}$ with the ordering $\text{static} \sqsubseteq \text{dynamic}$.
+
+\subsection{BTA as a Dataflow Analysis}\label{sec:bta-dataflow}
+
+The BTA can be formulated as a dataflow analysis:
+\begin{itemize}
+  \item \textbf{Lattice}: $\{\text{S}, \text{D}\}$ with $\text{S} \sqsubseteq \text{D}$.
+  \item \textbf{Transfer functions}: for each operation, the result is static only if all operands are static.
+  \item \textbf{Join}: $\text{S} \sqcup \text{D} = \text{D}$ (conservative: if either branch is dynamic, the result is dynamic).
+\end{itemize}
+
+\subsection{Polyvariant BTA}\label{sec:polyvariant-bta}
+
+A \emph{polyvariant} BTA allows a function to be specialized differently for different call sites. This is essential for effective partial evaluation of interpreters, where the same interpreter function may be called with different static inputs.
+
+\section{Multi-Stage Programming Foundations}\label{sec:msp}
+
+\subsection{The Idea}\label{sec:msp-idea}
+
+\begin{definition}[Multi-Stage Programming]\label{def:msp}
+\emph{Multi-stage programming} (MSP) is a programming language feature that allows the programmer to explicitly control the staging of computations: which computations happen at compile time (stage 1) and which happen at runtime (stage 0).
+\end{definition}
+
+\subsection{Stage Annotations}\label{sec:stage-annotations}
+
+MSP languages provide two key operations:
+\begin{itemize}
+  \item \textbf{Brackets} $\langle e \rangle$: delay the computation of $e$ to the next stage (generate code).
+  \item \textbf{Escape} $\sim e$: evaluate $e$ at the current stage and splice the result into the generated code.
+  \item \textbf{Run} $\text{run}(e)$: execute the generated code.
+\end{itemize}
+
+\begin{example}[MetaOCaml Staging]\label{ex:metaocaml}
+\begin{verbatim}
+  (* Power function: stage 1 = compile time, stage 0 = runtime *)
+  let rec power n =
+    if n = 0 then .<1>.
+    else if n mod 2 = 0 then
+      let h = power (n / 2) in
+      .<let x = .~h in x * x>.
+    else .<.~(power (n - 1)) * x>.
+
+  (* power 4 generates: let x = let x = 1 in x * x in x * x *)
+  (* power 4 is a closed code value that can be run: *)
+  let p4 = .!<fun x -> .~(power 4)>.
+  (* p4 is a function that computes x^4 without any loop *)
+\end{verbatim}
+\end{example}
+
+\subsection{The Type System for Staging}\label{sec:staging-types}
+
+MSP languages use a modal type system to ensure that generated code is well-typed:
+
+\begin{typerules}{Staging}
+  \typerule{Code-Intro}{\Gamma \vdash e : \tau}{\Gamma \vdash \langle e \rangle : \text{code}(\tau)} \\[6pt]
+  \typerule{Code-Elim}{\Gamma \vdash e : \text{code}(\tau)}{\Gamma \vdash \sim e : \tau} \\[6pt]
+  \typerule{Run}{\Gamma \vdash e : \text{code}(\tau)}{\Gamma \vdash \text{run}(e) : \tau}
+\end{typerules}
+
+\subsection{Cross-Stage Persistence}\label{sec:cross-stage}
+
+Values computed at an earlier stage can be used in later stages:
+
+\begin{definition}[Cross-Stage Persistence]\label{def:cross-stage}
+A value computed at stage $n$ can be referenced at stage $n+1$ (and later) through a \emph{cross-stage persistent} (CSP) variable. The value is ``lifted'' into the generated code as a constant.
+\end{definition}
+
+\section{Applications to Dynamic Languages}\label{sec:dynamic-apps}
+
+\subsection{Specializing Interpreters}\label{sec:specializing-interps}
+
+Partial evaluation and MSP can be used to specialize interpreters for dynamic languages:
+\begin{itemize}
+  \item The interpreter is written with staging annotations.
+  \item When a program is loaded, the interpreter is partially evaluated with respect to the program.
+  \item The result is specialized code that runs faster than interpretation.
+\end{itemize}
+
+This is essentially what Truffle does automatically (\cref{ch:self-optimizing}), but MSP gives the programmer explicit control over the staging.
+
+\subsection{Generating Efficient Code for DSLs}\label{sec:dsl-codegen}
+
+MSP is particularly useful for domain-specific languages (DSLs):
+\begin{itemize}
+  \item The DSL is embedded in a host language with staging support.
+  \item DSL constructs are annotated with staging information.
+  \item When a DSL program is executed, the staging annotations cause efficient code to be generated.
+\end{itemize}
+
+\subsection{Lightweight Modular Staging}\label{sec:lms}
+
+\begin{definition}[Lightweight Modular Staging]\label{def:lms}
+\emph{Lightweight modular staging} (LMS) is a Scala library that implements multi-stage programming using types rather than syntax. Types annotated as ``deferred'' are staged; normal types are evaluated immediately.
+\end{definition}
+
+LMS has been used to implement high-performance DSLs for linear algebra, database queries, and machine learning, generating code that rivals hand-written C.
+
+\section{Advanced Partial Evaluation}\label{sec:advanced-pe}
+
+\subsection{The First Futamura Projection in Detail}\label{sec:futamura-detail}
+
+The first Futamura projection states that partial evaluation of an interpreter yields a compiler:
+
+\begin{theorem}[First Futamura Projection]\label{thm:futamura-1-detail}
+Given an interpreter $\text{interp}$ and a source program $src$:
+\[
+  \text{PE}(\text{interp}, src) = \text{compiled\_program}
+\]
+where $\text{compiled\_program}(input) = \text{interp}(src, input)$.
+\end{theorem}
+
+The partial evaluator specializes the interpreter with respect to the source program. The result is a program that takes the same inputs as the interpreter but no longer needs to parse or dispatch on the source program's structure---that work has been done at PE time.
+
+\begin{example}[PE of a Simple Interpreter]\label{ex:pe-simple-interp}
+Consider an interpreter for a simple expression language:
+\begin{verbatim}
+  interp(expr, env) =
+    match expr with
+    | Const(n) => n
+    | Var(x) => lookup(x, env)
+    | Add(e1, e2) => interp(e1, env) + interp(e2, env)
+    | If(c, t, e) => if interp(c, env) != 0 then interp(t, env) else interp(e, env)
+\end{verbatim}
+Partial evaluation with respect to \texttt{Add(Const(3), Var("x"))}:
+\begin{verbatim}
+  residual(env) =
+    3 + lookup("x", env)
+\end{verbatim}
+The match on \texttt{Const(3)} and \texttt{Var("x")} has been resolved at PE time.
+\end{example}
+
+\subsection{Self-Applicable Partial Evaluators}\label{sec:self-applicable-pe}
+
+The second and third Futamura projections involve self-application of the partial evaluator:
+
+\begin{theorem}[Second Futamura Projection]\label{thm:futamura-2}
+Partial evaluation of a partial evaluator with respect to an interpreter yields a compiler:
+\[
+  \text{PE}(\text{PE}, \text{interp}) = \text{compiler}
+\]
+\end{theorem}
+
+\begin{theorem}[Third Futamura Projection]\label{thm:futamura-3}
+Partial evaluation of a partial evaluator with respect to itself yields a compiler generator:
+\[
+  \text{PE}(\text{PE}, \text{PE}) = \text{compiler\_generator}
+\]
+\end{theorem}
+
+These projections are theoretically profound but practically challenging: the partial evaluator must be efficient enough to specialize itself without diverging.
+
+\subsection{Offline vs.\ Online Partial Evaluation}\label{sec:offline-online-pe}
+
+\begin{definition}[Offline vs.\ Online PE]\label{def:offline-online-pe}
+\begin{itemize}
+  \item \textbf{Offline PE}: a binding-time analysis (BTA) is performed before specialization, classifying each expression as static or dynamic. The specializer then uses these annotations.
+  \item \textbf{Online PE}: the specializer makes binding-time decisions on the fly during specialization, without a prior BTA.
+\end{itemize}
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Offline vs.\ online partial evaluation}
+\label{tab:offline-online-pe}
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Offline PE} & \textbf{Online PE} \\
+\hline
+BTA & Required & Not required \\
+Termination & Guaranteed (with well-mixing) & May diverge \\
+Specialization quality & Good (with good BTA) & Potentially better \\
+Implementation complexity & Higher (two phases) & Lower (one phase) \\
+Examples & Mix, Schism & Similix, Jones \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Binding-Time Analysis: Advanced Topics}\label{sec:advanced-bta}
+
+\subsection{Well-Mixing and Termination}\label{sec:well-mixing}
+
+A critical requirement for partial evaluation termination is \emph{well-mixing}: the binding times of expressions must not depend on dynamic values in a way that causes unbounded specialization.
+
+\begin{definition}[Well-Mixing]\label{def:well-mixing}
+A program is \emph{well-mixing} if the control flow during partial evaluation does not depend on dynamic values in a way that causes the specializer to generate an unbounded number of residual instructions.
+\end{definition}
+
+\begin{example}[Non-Well-Mixing Program]\label{ex:non-well-mixing}
+\begin{verbatim}
+  ; This program is NOT well-mixing:
+  fun loop(n) =
+    if n > 0 then loop(n - 1) else 0
+  ; If n is dynamic, the PE tries to unroll the loop
+  ; at specialization time, potentially forever.
+\end{verbatim}
+The BTA must mark the recursive call as dynamic to prevent unbounded specialization.
+\end{example}
+
+\subsection{Binding-Time Constraints}\label{sec:bta-constraints}
+
+The BTA generates and solves a set of constraints:
+
+\begin{itemize}
+  \item \textbf{User annotations}: the programmer specifies which inputs are static.
+  \item \textbf{Operation constraints}: an operation is static only if all its operands are static.
+  \item \textbf{Control flow constraints}: if a branch condition is dynamic, both branches must be residualized.
+  \item \textbf{Function call constraints}: a function call is static only if the function and all arguments are static.
+  \item \textbf{Well-mixing constraints}: loops and recursion with dynamic conditions must be residualized.
+\end{itemize}
+
+The BTA solves these constraints to find the most static (most specialized) binding-time assignment that satisfies all constraints.
+
+\subsection{Polyvariant Specialization}\label{sec:polyvariant-specialization}
+
+A \emph{monovariant} specializer creates at most one specialized version of each function. A \emph{polyvariant} specializer can create multiple versions, each specialized for different binding-time patterns:
+
+\begin{verbatim}
+  ; Original:
+  fun add(x, y) = x + y
+  
+  ; Monovariant PE with x static, y dynamic:
+  fun add_3(y) = 3 + y
+  
+  ; Polyvariant PE can also create:
+  fun add_5(y) = 5 + y
+  ; (if add is called with different static first arguments)
+\end{verbatim}
+
+Polyvariant specialization produces better residual code but may increase code size. The specializer must decide when to create a new specialization versus generalizing an existing one.
+
+\section{Demand-Driven Compilation for Lazy Languages}\label{sec:lazy-lang-compilation}
+
+\subsection{Compiling Lazy Evaluation}\label{sec:compiling-lazy}
+
+Lazy languages (Haskell, Miranda) evaluate expressions only when their values are needed. The compiler must support this demand-driven evaluation:
+
+\begin{itemize}
+  \item \textbf{Thunks}: unevaluated expressions are represented as thunks (closures). When the value is needed, the thunk is evaluated and updated with the result.
+  \item \textbf{Strictness analysis}: determines which function arguments are always evaluated, allowing the compiler to avoid creating thunks for them.
+  \item \textbf{Demand analysis}: determines the demand pattern of a function (which components of its arguments are needed).
+\end{itemize}
+
+\subsection{Compiling Demand-Driven Optimizations}\label{sec:demand-opts}
+
+The compiler itself can be demand-driven:
+\begin{itemize}
+  \item \textbf{Lazy optimization passes}: optimization passes are run only when their results are needed.
+  \item \textbf{On-demand analysis}: analyses are performed only for the parts of the program that are being compiled.
+  \item \textbf{Speculative compilation}: compile code that is likely to be needed, based on profiling data.
+\end{itemize}
+
+\section{Demand-Driven Compilation in Practice}\label{sec:demand-practice}
+
+\subsection{Lazy Compilation in GHC}\label{sec:ghc-lazy}
+
+The Glasgow Haskell Compiler (GHC) uses demand-driven compilation extensively:
+
+\begin{itemize}
+  \item \textbf{Core simplifier}: applies rewrite rules on demand, only when the result is needed.
+  \item \textbf{Worker/wrapper transformation}: splits a function into a strict worker and a lazy wrapper, based on strictness analysis.
+  \item \textbf{SpecConvol}: specializes functions for known call patterns, generating specialized versions on demand.
+\end{itemize}
+
+\subsection{Demand-Driven Optimization in Truffle}\label{sec:truffle-demand}
+
+The Truffle framework uses demand-driven compilation through self-optimizing interpreters:
+
+\begin{enumerate}
+  \item The interpreter starts with a generic version of each AST node.
+  \item When a node is executed frequently, it specializes itself based on observed types.
+  \item Specialization is demand-driven: only nodes that are executed frequently are specialized.
+  \item The partial evaluator (via Graal) compiles the specialized interpreter into machine code on demand.
+\end{enumerate}
+
+This approach means that cold code paths are never compiled, and hot code paths are compiled with maximum specialization.
+
+\subsection{Termination and Productivity}\label{sec:termination-productivity}
+
+A fundamental challenge in demand-driven compilation is ensuring termination:
+
+\begin{definition}[PE Termination]\label{def:pe-termination}
+A partial evaluator \emph{terminates} if, for any terminating program $P$ and static input $s$, the residual program $\text{PE}(P, s)$ is finite.
+\end{definition}
+
+Termination is guaranteed when:
+\begin{itemize}
+  \item The binding-time annotation ensures that loop conditions depending on dynamic values cause the loop to be residualized (not unrolled at PE time).
+  \item The specializer uses a \emph{well-founded ordering} to ensure that recursive specialization terminates.
+  \item A \emph{chicken} operator forces certain expressions to be dynamic, preventing unbounded specialization.
+\end{itemize}
+
+\begin{definition}[Chicken Operator]\label{def:chicken}
+The \emph{chicken} operator $\text{chicken}(e)$ forces the expression $e$ to be treated as dynamic during partial evaluation, even if all its operands are static. This is used to ensure termination when specializing recursive functions.
+\end{definition}
+
+\subsection{Online vs.\ Offline Staging}\label{sec:online-offline-staging}
+
+Staging can be performed at different times:
+\begin{itemize}
+  \item \textbf{Offline staging}: code generation happens at compile time, before the program runs. The generated code is included in the binary.
+  \item \textbf{Online staging}: code generation happens at runtime, during program execution. The generated code is compiled and executed dynamically (as in JIT compilation).
+  \item \textbf{Mixed staging}: some staging happens at compile time and some at runtime, depending on what information is available.
+\end{itemize}
+
+\section{Summary}\label{sec:demand-summary}
+
+Demand-driven compilation shifts the compilation process from a batch operation to a lazy, on-demand service. By compiling only what is needed, when it is needed, and specializing based on the context of use, demand-driven compilers can reduce compilation time, improve code quality, and enable new programming paradigms like multi-stage programming. The theoretical foundations---partial evaluation, binding-time analysis, and staging type systems---provide a rigorous basis for these techniques.
+
+\begin{historical}
+Partial evaluation was studied extensively in the 1970s and 1980s, with landmark work by Futamura (1971), Jones, Gomard, and Sestoft (1993). Multi-stage programming was developed by Taha and Sheard (2000) in the MetaML language, and later refined in MetaOCaml. Lightweight modular staging (Rompf and Odersky, 2010) brought MSP to a wider audience by embedding it in Scala. The connection between partial evaluation and JIT compilation was realized by the Truffle framework, which uses partial evaluation to automatically transform interpreters into compilers. The trend is toward making staging more accessible, either through automatic partial evaluation (Truffle) or lightweight embedding (LMS), so that programmers can benefit from multi-stage computation without the complexity of explicit staging annotations.
+\end{historical}

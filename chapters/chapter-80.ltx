@@ -1,0 +1,475 @@
+%%
+%% chapter-80.ltx — Code Layout Optimization
+%%
+
+\section{Introduction}\label{sec:code-layout-intro}
+
+\emph{Code layout optimization} determines the placement of basic blocks and functions in the final executable. While seemingly a low-level concern, code layout has a profound impact on performance: it affects instruction cache utilization, branch prediction accuracy, and instruction fetch bandwidth. A well-laid-out program can be 10--20\% faster than the same program with a poor layout, even when the instruction sequences are identical.
+
+This chapter covers the major code layout techniques: basic block placement, trace formation, cache-aware layout, branch prediction optimization, hot/cold splitting, and profile-guided layout using the Pettis-Hansen algorithm.
+
+\section{Basic Block Placement}\label{sec:basic-block-placement}
+
+\subsection{The Problem}\label{sec:bbp-problem}
+
+\begin{definition}[Basic Block Placement Problem]\label{def:bbp}
+Given a CFG with basic blocks and edge probabilities (from profiling or heuristics), find a linear ordering of the blocks that minimizes the expected number of taken branches (or maximizes instruction cache utilization).
+\end{definition}
+
+The basic block placement problem is NP-hard in general (it generalizes the traveling salesman problem), but effective heuristics exist.
+
+\subsection{The Pettis-Hansen Algorithm}\label{sec:pettis-hansen}
+
+The \emph{Pettis-Hansen algorithm}~\cite{pettis1990profile} (1990) is the most widely used block placement heuristic. It constructs \emph{traces}---linear sequences of blocks that are likely to execute consecutively---and places them contiguously in memory.
+
+\begin{algorithm}[H]
+\caption{Pettis-Hansen Block Placement}
+\label{alg:pettis-hansen}
+\begin{algorithmic}[1]
+\Require CFG with edge probabilities
+\Ensure Linear ordering of basic blocks
+\State Sort all edges by probability (highest first)
+\State $\mathit{traces} \gets \emptyset$
+\ForAll{edges $e = (u, v)$ in decreasing probability order}
+  \If{$u$ is not the end of a trace and $v$ is not the start of a trace}
+    \State Merge the traces containing $u$ and $v$
+  \ElsIf{$u$ is the end of a trace and $v$ is not in any trace}
+    \State Append $v$ to $u$'s trace
+  \ElsIf{$v$ is the start of a trace and $u$ is not in any trace}
+    \State Prepend $u$ to $v$'s trace
+  \EndIf
+\EndFor
+\State Order traces by their entry block's execution frequency
+\State Place traces contiguously in memory
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties}\label{sec:pettis-properties}
+
+\begin{itemize}
+  \item \textbf{Fall-through optimization}: On architectures where branches are more expensive than fall-through (e.g., x86), placing the likely successor immediately after the block eliminates a branch.
+  \item \textbf{Cache locality}: Blocks in the same trace are placed contiguously, improving instruction cache locality for the hot path.
+  \item \textbf{Branch prediction}: The processor's branch predictor learns the fall-through pattern, improving prediction accuracy.
+\end{itemize}
+
+\section{Trace Formation}\label{sec:trace-formation}
+
+\subsection{What is a Trace?}\label{sec:trace-def}
+
+\begin{definition}[Trace]\label{def:trace}
+A \textbf{trace} is a linear sequence of basic blocks $B_1, B_2, \ldots, B_k$ such that the most likely execution path passes through these blocks in order. Traces represent the ``hot path'' through the program.
+\end{definition}
+
+\subsection{Trace Selection Algorithms}\label{sec:trace-selection}
+
+\begin{definition}[Trace Selection]\label{def:trace-selection}
+\textbf{Trace selection} identifies the most important traces in a program. Methods include:
+\begin{itemize}
+  \item \textbf{Frequency-based}: Start from the most frequently executed block and follow the most likely successors.
+  \item \textbf{Loop-based}: Each loop body is a trace, with the loop header as the entry.
+  \item \textbf{Path-based}: Use profiling to identify the most common execution paths.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Trace Formation}
+\label{alg:trace-formation}
+\begin{algorithmic}[1]
+\Require CFG with edge probabilities
+\Ensure Set of traces covering all blocks
+\State $\mathit{unplaced} \gets$ all blocks
+\While{$\mathit{unplaced} \neq \emptyset$}
+  \State $B \gets$ block in $\mathit{unplaced}$ with highest execution frequency
+  \State $\mathit{trace} \gets [B]$
+  \State Remove $B$ from $\mathit{unplaced}$
+  \State $\mathit{current} \gets B$
+  \While{true}
+    \State $s \gets$ most likely successor of $\mathit{current}$ that is in $\mathit{unplaced}$
+    \If{$s$ exists and $P(\mathit{current} \to s) > \mathit{threshold}$}
+      \State Append $s$ to $\mathit{trace}$
+      \State Remove $s$ from $\mathit{unplaced}$
+      \State $\mathit{current} \gets s$
+    \Else
+      \State Break
+    \EndIf
+  \EndWhile
+  \State Add $\mathit{trace}$ to $\mathit{traces}$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\section{Cache-Aware Code Layout}\label{sec:cache-aware}
+
+\subsection{Instruction Cache Effects}\label{sec:icache-effects}
+
+The instruction cache (I-cache) stores recently fetched instructions. When the processor needs an instruction not in the cache, it incurs a \emph{cache miss} penalty (typically 10--100 cycles). Code layout affects I-cache performance in two ways:
+
+\begin{itemize}
+  \item \textbf{Spatial locality}: Blocks placed close together in memory are likely to be in the same cache line.
+  \item \textbf{Temporal locality}: Frequently executed blocks stay in the cache.
+\end{itemize}
+
+\subsection{Cache-Aware Placement}\label{sec:cache-aware-placement}
+
+\begin{definition}[Cache-Aware Placement]\label{def:cache-aware}
+\textbf{Cache-aware placement} considers the cache geometry (line size, associativity, total size) when laying out code. The goal is to minimize cache misses by:
+\begin{itemize}
+  \item Keeping hot code within the cache.
+  \item Avoiding \emph{cache thrashing}: multiple hot blocks mapping to the same cache set.
+  \item Aligning hot blocks to cache line boundaries.
+\end{itemize}
+\end{definition}
+
+\subsection{Cache Simulation}\label{sec:cache-simulation}
+
+Cache-aware layout tools often include a \emph{cache simulator} that estimates the I-cache miss rate for a given layout. The layout optimizer iterates, trying different placements and selecting the one with the lowest estimated miss rate.
+
+\section{Branch Prediction Optimization}\label{sec:branch-prediction}
+
+\subsection{Static Branch Prediction}\label{sec:static-prediction}
+
+\begin{definition}[Static Branch Prediction]\label{def:static-pred}
+\textbf{Static branch prediction} uses compile-time information to predict branch outcomes. Common heuristics:
+\begin{itemize}
+  \item Backward branches (loops) are predicted taken.
+  \item Forward branches are predicted not taken.
+  \item Branches to frequently executed targets are predicted taken.
+\end{itemize}
+\end{definition}
+
+\subsection{Branch Layout Optimization}\label{sec:branch-layout}
+
+The layout of branches affects prediction accuracy:
+\begin{itemize}
+  \item \textbf{Branch shortening}: Replace long branches with short branches when the target is nearby.
+  \item \textbf{Branch inversion}: Invert the branch condition so the likely path falls through.
+  \item \textbf{Branch elimination}: Remove branches that are always taken or never taken (from profiling).
+\end{itemize}
+
+\section{Hot/Cold Splitting}\label{sec:hot-cold-splitting}
+
+\subsection{Overview}\label{sec:hot-cold-overview}
+
+\emph{Hot/cold splitting} separates frequently executed code (``hot'') from rarely executed code (``cold'') and places them in different sections of the executable.
+
+\begin{definition}[Hot/Cold Splitting]\label{def:hot-cold}
+\textbf{Hot/cold splitting} divides the program into:
+\begin{itemize}
+  \item \textbf{Hot section}: Contains frequently executed code. Placed to maximize cache utilization and minimize branch penalties.
+  \item \textbf{Cold section}: Contains rarely executed code (error handlers, unusual paths). Placed at the end of the executable.
+\end{itemize}
+\end{definition}
+
+\subsection{Benefits}\label{sec:hot-cold-benefits}
+
+\begin{itemize}
+  \item \textbf{Cache efficiency}: The hot section fits in the I-cache; cold code does not displace hot code.
+  \item \textbf{Page faults}: Cold code can be placed on pages that are not loaded until needed.
+  \item \textbf{Code size}: The hot section is smaller, improving fetch bandwidth.
+\end{itemize}
+
+\subsection{Implementation}\label{sec:hot-cold-impl}
+
+\begin{algorithm}[H]
+\caption{Hot/Cold Splitting}
+\label{alg:hot-cold}
+\begin{algorithmic}[1]
+\Require Program with profile data
+\Ensure Split hot and cold code
+\State Compute execution frequency for each basic block
+\State $\mathit{hot\_threshold} \gets$ frequency cutoff (e.g., top 90\% of execution)
+\ForAll{basic blocks $B$}
+  \If{$\mathit{freq}(B) \geq \mathit{hot\_threshold}$}
+    \State Mark $B$ as hot
+  \Else
+    \State Mark $B$ as cold
+  \EndIf
+\EndFor
+\State Place hot blocks first (using Pettis-Hansen)
+\State Place cold blocks after hot blocks
+\State Insert jumps from hot to cold blocks where needed
+\end{algorithmic}
+\end{algorithm}
+
+\section{Profile-Guided Layout (Pettis-Hansen)}\label{sec:pgl}
+
+\subsection{Profile Collection}\label{sec:profile-collection}
+
+Profile-guided layout requires execution counts for basic blocks or edges. These are collected by:
+\begin{itemize}
+  \item \textbf{Instrumentation}: Compile with profiling code that counts block executions.
+  \item \textbf{Hardware profiling}: Use processor performance counters (e.g., Intel LBR, ARM SPE).
+  \item \textbf{Sampling}: Periodically sample the program counter.
+\end{itemize}
+
+\subsection{The Pettis-Hansen Algorithm (Detailed)}\label{sec:pettis-detailed}
+
+The Pettis-Hansen algorithm (Algorithm~\ref{alg:pettis-hansen}) works as follows:
+
+\begin{enumerate}
+  \item \textbf{Sort edges}: All CFG edges are sorted by their execution probability (or count), in decreasing order.
+  \item \textbf{Build traces}: Process edges in order. For each edge $(u, v)$:
+    \begin{itemize}
+      \item If $u$ and $v$ are in different traces, merge them.
+      \item If $u$ is at the end of a trace and $v$ is unplaced, extend the trace.
+      \item If $v$ is at the start of a trace and $u$ is unplaced, prepend to the trace.
+    \end{itemize}
+  \item \textbf{Order traces}: Sort traces by the execution frequency of their entry block.
+  \item \textbf{Place blocks}: Place traces contiguously in memory, most frequent first.
+\end{enumerate}
+
+\begin{example}[Pettis-Hansen Example]\label{ex:pettis}
+Consider a program with the following edge frequencies:
+\begin{verbatim}
+  A → B: 1000   B → C: 900   C → D: 800
+  A → E: 100    E → F: 100   D → A: 700 (back edge)
+\end{verbatim}
+Sorted edges: A→B (1000), B→C (900), C→D (800), D→A (700), A→E (100), E→F (100).
+Trace formation: A-B-C-D (following the hot path). Then E-F as a separate trace.
+Layout: [A, B, C, D] [E, F]
+\end{example}
+
+\begin{historical}
+The Pettis-Hansen algorithm was published in 1990~\cite{pettis1990profile} and remains the standard block placement algorithm used in production compilers. Hot/cold splitting was introduced by Calder et al.~\cite{calder1997online} (1997) and is now a standard feature in GCC and LLVM. Cache-aware layout was developed by Johnson et al.~\cite{johnson1993branch} (1993) and others. Modern work on code layout includes the Bolt tool from Facebook~\cite{novillo2019bolt} (2019), which performs post-link optimization of code layout using profile data.
+\end{historical}
+
+\section{Summary}\label{sec:code-layout-summary}
+
+Code layout optimization determines the physical placement of code in the executable. The Pettis-Hansen algorithm uses profile data to place hot code contiguously, improving cache utilization and branch prediction. Trace formation identifies the most likely execution paths. Cache-aware layout considers the I-cache geometry. Hot/cold splitting separates frequently and rarely executed code. These optimizations are particularly important for large programs where instruction cache pressure is significant. Profile-guided optimization (Chapter~\ref{sec:pgo}) provides the execution data needed for effective layout decisions.
+
+\section{Trace Formation Algorithms}\label{sec:trace-formation}
+
+\emph{Trace formation} identifies the most frequently executed paths through the program and lays them out contiguously in memory.
+
+\begin{definition}[Trace]\label{def:trace}
+A \textbf{trace} is a sequence of basic blocks that forms a likely execution path. Formally, a trace is a maximal single-entry, single-exit (SESE) region where the entry edge has the highest probability among all incoming edges.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Trace Formation Algorithm}
+\label{alg:trace-formation}
+\begin{algorithmic}[1]
+\Require CFG with edge probabilities, unplaced blocks $U$
+\ensure Set of traces covering all blocks
+\State $traces \gets \emptyset$
+\While{$U \neq \emptyset$}
+  \State Select unplaced block $b$ with highest execution frequency
+  \State $T \gets [b]$ \Comment{Start new trace}
+  \State $current \gets b$
+  \While{true}
+    \State Find most likely successor $s$ of $current$
+    \If{$s$ is unplaced and $s$ has no other placed predecessor}
+      \State Append $s$ to $T$
+      \State Remove $s$ from $U$
+      \State $current \gets s$
+    \Else
+      \State \textbf{break}
+    \EndIf
+  \EndWhile
+  \State Add $T$ to $traces$
+  \State Remove blocks of $T$ from $U$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Extended Traces}\label{sec:extended-traces}
+
+\begin{definition}[Extended Trace]\label{def:extended-trace}
+An \textbf{extended trace} allows loops to be included in the trace by following back edges. This captures the common case of loop bodies being executed many times.
+\end{definition}
+
+\begin{definition}[Non-Sequential Trace]\label{def:non-seq-trace}
+A \textbf{non-sequential trace} allows the trace to include blocks that are not immediate successors, connected by low-probability edges. This captures paths that skip over unlikely branches.
+\end{definition}
+
+\section{Cache-Aware Code Layout}\label{sec:cache-aware-layout}
+
+\emph{Cache-aware} code layout considers the geometry of the instruction cache when placing code.
+
+\begin{definition}[I-Cache Conflict Miss]\label{def:icache-conflict}
+An \textbf{I-cache conflict miss} occurs when two frequently executed code blocks map to the same cache set, causing one to evict the other. This is common when code blocks are separated by a distance that is a multiple of the cache set size.
+\end{definition}
+
+\begin{definition}[Cache-Aware Placement]\label{def:cache-aware-placement}
+\textbf{Cache-aware placement} assigns each basic block to a physical address such that:
+\begin{enumerate}
+  \item Hot blocks are placed contiguously (spatial locality).
+  \item Blocks that execute together do not map to the same cache set (avoiding conflict misses).
+  \item The total working set of hot code fits in the I-cache.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Cache-Aware Block Placement}
+\label{alg:cache-aware}
+\begin{algorithmic}[1]
+\Require Traces $T_1, \ldots, T_k$ with execution frequencies, cache geometry
+\ensure Physical addresses for all blocks
+\State $addr \gets 0$
+\ForAll{traces $T_i$ in frequency order (hottest first)}
+  \ForAll{blocks $b \in T_i$}
+    \State $set(b) \gets addr \mod C_{set\_count}$
+    \If{$set(b)$ conflicts with a hot block already placed}
+      \State Insert NOP padding to shift $set(b)$
+    \EndIf
+    \State $address(b) \gets addr$
+    \State $addr \gets addr + size(b)$
+    \State Align $addr$ to instruction boundary
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Cache Conflict Resolution]\label{ex:cache-conflict}
+\begin{verbatim}
+  // I-cache: 32KB, 8-way set associative, 64-byte lines
+  // Number of sets: 32KB / (8 × 64) = 64 sets
+  
+  // Problem: hot_loop_A at address 0x1000 and hot_loop_B at 0x1040
+  // Both map to set 0 (0x1000 / 64 = 64, 64 mod 64 = 0)
+  // They conflict! Each evicts the other.
+  
+  // Solution: insert NOP padding between them
+  // hot_loop_B moved to 0x1080 → set 1 (no conflict)
+\end{verbatim}
+\end{example}
+
+\section{Hot/Cold Splitting}\label{sec:hot-cold-splitting}
+
+\begin{definition}[Hot/Cold Splitting]\label{def:hot-cold-split}
+\textbf{Hot/cold splitting} separates a function's code into:
+\begin{itemize}
+  \item \textbf{Hot section}: Frequently executed code (main path, loop bodies).
+  \item \textbf{Cold section}: Rarely executed code (error handlers, unlikely branches).
+\end{itemize}
+The cold section is placed far from the hot section, reducing I-cache pressure.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Hot/Cold Splitting}
+\label{alg:hot-cold-split}
+\begin{algorithmic}[1]
+\Require Function $f$ with profile data, threshold $\tau$
+\ensure Split function with hot and cold sections
+\State Identify hot blocks: $H = \{b \mid freq(b) \geq \tau \cdot freq(entry)\}$
+\State Identify cold blocks: $C = \{b \mid b \notin H\}$
+\State Place $H$ contiguously in the hot text section
+\State Place $C$ in the cold text section (separate ELF section)
+\ForAll{edges from $H$ to $C$}
+  \State Insert long branch to cold section
+\EndFor
+\ForAll{edges from $C$ to $H$}
+  \State Insert long branch back to hot section
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Technique} & \textbf{Speedup} & \textbf{Code Size Impact} \\
+\hline
+Pettis-Hansen layout & 5--15\% & Neutral \\
+Hot/cold splitting & 3--10\% & +1--3\% (branch overhead) \\
+Cache-aware placement & 2--8\% & +1--5\% (NOP padding) \\
+Combined (BOLT) & 10--20\% & +2--5\% \\
+\hline
+\end{tabular}
+\caption{Performance impact of code layout optimizations.}
+\label{tab:layout-speedup}
+\end{table}
+
+\section{Binary Layout Optimization (BOLT)}\label{sec:bolt}
+
+\emph{BOLT} (Binary Optimization and Layout Tool) performs post-link optimization of code layout:
+
+\begin{definition}[BOLT Optimization]\label{def:bolt}
+\textbf{BOLT} disassembles a binary, analyzes its control flow using profile data, and re-layouts the code for better performance. Key optimizations:
+\begin{itemize}
+  \item Basic block reordering (Pettis-Hansen)
+  \item Hot/cold splitting
+  \item Inline small functions at call sites
+  \item Jump table optimization
+  \item Branch relaxation and shortening
+\end{itemize}
+\end{definition}
+
+\begin{tikzpicture}[
+  node distance=1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.8cm, fill=blue!10},
+  arr/.style={->, thick}
+]
+  \node[block] (binary) {Original Binary};
+  \node[block, right=2.5cm of binary] (disasm) {Disassemble};
+  \node[block, right=2.5cm of disasm] (profile) {Profile Analysis};
+  \node[block, right=2.5cm of profile] (layout) {Layout Optimization};
+  \node[block, right=2.5cm of layout] (output) {Optimized Binary};
+  
+  \draw[arr] (binary) -- (disasm);
+  \draw[arr] (disasm) -- (profile);
+  \draw[arr] (profile) -- (layout);
+  \draw[arr] (layout) -- (output);
+  
+  \node[below=0.5cm of profile, font=\small, color=blue] {LBR/PEBS data};
+  \node[below=0.5cm of layout, font=\small, color=blue] {Reorder, split, inline};
+\end{tikzpicture}
+
+\section{Branch Prediction and Code Layout}\label{sec:branch-pred-layout}
+
+\begin{definition}[Branch Prediction and Layout]\label{def:branch-pred-layout}
+Modern processors predict branch directions based on history. Code layout affects prediction accuracy:
+\begin{itemize}
+  \item \textbf{Fall-through prediction}: Most processors predict conditional branches as \emph{not taken} (fall through). Placing the likely target as the fall-through improves prediction.
+  \item \textbf{Branch target buffer} (BTB): The BTB stores the targets of recently taken branches. Placing targets at predictable addresses improves BTB hit rates.
+  \item \textbf{Return address stack}: Function returns are predicted using a stack. Proper call/return structure ensures accurate prediction.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Forward vs.\ Backward Branch Heuristic]\label{def:forward-backward}
+The \textbf{forward/backward branch heuristic} predicts:
+\begin{itemize}
+  \item \textbf{Backward branches} (loop back-edges): Taken
+  \item \textbf{Forward branches}: Not taken
+\end{itemize}
+Code layout should align with this heuristic: loop back-edges should be backward in the layout, and unlikely exits should branch forward.
+\end{definition}
+
+\section{Function Ordering}\label{sec:function-ordering}
+
+\begin{definition}[Function Layout Optimization]\label{def:func-layout}
+\textbf{Function layout optimization} determines the order of functions in the executable. Functions that call each other frequently should be placed close together to improve I-cache locality and reduce branch target distances.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Function Ordering by Call Graph Clustering}
+\label{alg:func-ordering}
+\begin{algorithmic}[1]
+\Require Call graph $G$ with edge weights (call frequencies)
+\ensure Ordered function list
+\State Compute connected components of $G$ weighted by call frequency
+\State Order components by total execution frequency (hottest first)
+\ForAll{components $C$}
+  \State Order functions within $C$ by call frequency (caller before callee)
+\EndFor
+\State Place functions in computed order
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Layout Technique} & \textbf{Benefit} & \textbf{Requires Profile?} \\
+\hline
+Pettis-Hansen block placement & 5--15\% & Yes \\
+Hot/cold splitting & 3--10\% & Yes \\
+Cache-aware placement & 2--8\% & No (geometry only) \\
+Function reordering & 2--5\% & Yes \\
+Branch target alignment & 1--3\% & No \\
+NOP insertion for alignment & 1--2\% & No \\
+\hline
+\end{tabular}
+\caption{Summary of code layout techniques and their benefits.}
+\label{tab:layout-techniques}
+\end{table}

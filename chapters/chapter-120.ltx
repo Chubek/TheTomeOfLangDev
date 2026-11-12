@@ -1,0 +1,511 @@
+%% chapter-120.ltx — Compile-Time / Run-Time Staging
+
+\section{Introduction}\label{sec:staging-intro}
+
+The boundary between compile time and run time has always been somewhat artificial. A compiler runs at compile time, but it may embed information in the generated code that is only used at run time. A JIT compiler runs at run time, but it performs many of the same tasks as a static compiler. Macro systems blur the boundary further: code written by the programmer is transformed before it is compiled, effectively extending compile time.
+
+\emph{Staging} is the deliberate, principled management of this boundary. A staging controller determines which computations happen at compile time and which at run time. The goal is to maximize the work done at compile time (specialization, optimization, verification) while preserving the flexibility of run-time computation.
+
+This chapter examines the many ways in which modern programming languages and systems blur the compile-time / run-time boundary: from runtime code generation and JIT compilation, through template metaprogramming and constexpr, to macros and multi-stage programming. We develop a unified framework for understanding staging and show how it applies across a wide range of systems.
+
+\section{Blurring the Compile-Time / Run-Time Boundary}\label{sec:blurring-boundary}
+
+\subsection{The Traditional Model}
+
+In the traditional compilation model, the boundary between compile time and run time is sharp:
+
+\begin{enumerate}
+  \item \textbf{Compile time}: The compiler reads source code, performs analysis and optimization, and produces target code. All type checking, constant folding, and dead code elimination happens here.
+  \item \textbf{Run time}: The target code is loaded and executed. The compiled program operates on run-time data, with no access to the compiler's internal state.
+\end{enumerate}
+
+This model is clean but wasteful. Many computations that could be performed at compile time (because their inputs are known) are deferred to run time, where they incur overhead on every execution.
+
+\subsection{The Staged Model}
+
+In the staged model, the boundary is permeable:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=stealth,
+  node distance=2cm,
+]
+  % Compile time
+  \node[draw, rounded corners, fill=TomeBg, minimum width=12cm, minimum height=3cm, align=center] (ct) at (0, 0) {};
+  \node[above=0.1cm of ct.north west, anchor=south west, font=\bfseries\small\color{TomeInk}] {Compile Time};
+  \node[font=\small] at (-4.5, 0.5) {Source Code};
+  \node[font=\small] at (-1.5, 0.5) {Analysis \& Optimization};
+  \node[font=\small] at (1.5, 0.5) {Partial Eval};
+  \node[font=\small] at (4.5, 0.5) {Code Gen};
+
+  \node[draw, minimum width=1.5cm, minimum height=0.6cm, fill=white, font=\small] (src) at (-4.5, -0.5) {Source};
+  \node[draw, minimum width=2cm, minimum height=0.6cm, fill=white, font=\small] (anal) at (-1.5, -0.5) {Analyze};
+  \node[draw, minimum width=2cm, minimum height=0.6cm, fill=white, font=\small] (pe) at (1.5, -0.5) {Specialize};
+  \node[draw, minimum width=2cm, minimum height=0.6cm, fill=white, font=\small] (cg) at (4.5, -0.5) {Generate};
+
+  \draw[->] (src) -- (anal);
+  \draw[->] (anal) -- (pe);
+  \draw[->] (pe) -- (cg);
+
+  % Boundary
+  \draw[thick, dashed, TomeGold] (-6.5, -1.8) -- (6.5, -1.8);
+  \node[font=\small\itshape\color{TomeGold}, right=0.1cm] at (-6.5, -1.8) {compile-time / run-time boundary};
+
+  % Run time
+  \node[draw, rounded corners, fill=TomeExBg, minimum width=12cm, minimum height=2cm, align=center] (rt) at (0, -3.2) {};
+  \node[above=0.1cm of rt.north west, anchor=south west, font=\bfseries\small\color{TomeInk}] {Run Time};
+  \node[draw, minimum width=2cm, minimum height=0.6cm, fill=white, font=\small] (exec) at (-3, -3.2) {Execute};
+  \node[draw, minimum width=2.5cm, minimum height=0.6cm, fill=white, font=\small] (jit) at (1, -3.2) {JIT Compile};
+  \node[draw, minimum width=2cm, minimum height=0.6cm, fill=white, font=\small] (opt) at (4.5, -3.2) {Optimize};
+
+  \draw[->] (exec) -- (jit);
+  \draw[->] (jit) -- (opt);
+  \draw[->, dashed, TomeGold] (jit.north) -- node[right, font=\small\color{TomeGold}] {feedback} (pe.south);
+\end{tikzpicture}
+\caption{The staged compilation model with feedback from run time to compile time}
+\label{fig:staged-model}
+\end{figure}
+
+\begin{definition}[Staging Controller]\label{def:staging-controller}
+A \emph{staging controller} is a mechanism that determines which computations are performed at compile time and which at run time. It may be:
+\begin{itemize}
+  \item \emph{Static}: determined by the language design (e.g., macros, template metaprogramming).
+  \item \emph{Dynamic}: determined by run-time information (e.g., JIT compilation, runtime code generation).
+  \item \emph{Hybrid}: a combination of static and dynamic decisions (e.g., partial evaluation with profiling feedback).
+\end{itemize}
+\end{definition}
+
+\section{Staging Controllers}\label{sec:staging-controllers}
+
+\subsection{Static Staging Controllers}
+
+Static staging controllers make all staging decisions at compile time, based on information available in the source program:
+
+\begin{enumerate}
+  \item \textbf{Macros}: Transform source code before compilation. The macro expansion happens at compile time; the expanded code is compiled normally.
+  \item \textbf{Template metaprogramming}: Computation at the type level happens at compile time; the resulting types and values are embedded in the compiled code.
+  \item \textbf{Constexpr}: Functions marked as \texttt{constexpr} are evaluated at compile time when their arguments are known.
+  \item \textbf{Compile-time function execution}: Languages like D, Zig, and Odin allow arbitrary functions to be called at compile time.
+\end{enumerate}
+
+\subsection{Dynamic Staging Controllers}
+
+Dynamic staging controllers make staging decisions at run time, based on information gathered during execution:
+
+\begin{enumerate}
+  \item \textbf{JIT compilation}: The JIT compiler decides which methods to compile based on profiling data (call frequency, type feedback).
+  \item \textbf{Runtime code generation}: Programs generate and execute code at run time, using libraries like \texttt{libjit}, LLVM's ORC, or architecture-specific assemblers.
+  \item \textbf{Runtime specialization}: The runtime system specializes code based on observed types, inlining monomorphic call sites and deoptimizing when assumptions are violated.
+\end{enumerate}
+
+\subsection{Hybrid Staging Controllers}
+
+The most sophisticated systems combine static and dynamic staging:
+
+\begin{enumerate}
+  \item \textbf{Tiered compilation}: Code is first interpreted, then compiled with minimal optimization (tier 1), then recompiled with aggressive optimization (tier 2) based on profiling data.
+  \item \textbf{Multi-stage programming}: The programmer explicitly annotates staging decisions, and the system enforces them at compile time while allowing dynamic code generation at run time.
+  \item \textbf{Partial evaluation with profiling}: The partial evaluator uses profiling data to guide specialization decisions, combining static analysis with dynamic information.
+\end{enumerate}
+
+\section{Runtime Code Generation}\label{sec:runtime-codegen}
+
+\subsection{The Mechanism}
+
+Runtime code generation (RCG) is the process of creating executable machine code during program execution. The basic mechanism involves:
+
+\begin{enumerate}
+  \item \textbf{Code construction}: Building a sequence of machine instructions (or an IR that is translated to machine instructions).
+  \item \textbf{Memory allocation}: Allocating executable memory (using \texttt{mmap} with \texttt{PROT\_EXEC} on Unix, or \texttt{VirtualAlloc} with \texttt{PAGE\_EXECUTE} on Windows).
+  \item \textbf{Code emission}: Writing the machine instructions to the executable memory.
+  \item \textbf{Execution}: Calling the generated code as a function.
+\end{enumerate}
+
+\subsection{Libraries and Frameworks}
+
+Several libraries support runtime code generation:
+
+\begin{itemize}
+  \item \textbf{libjit}: A portable library for building and executing JIT-compiled code. Supports multiple architectures.
+  \item \textbf{LLVM ORC}: LLVM's On-Request Compilation framework, which provides lazy JIT compilation with symbol resolution.
+  \item \textbf{GNU Lightning}: A small, fast library for generating assembly code at run time. Designed for emulators and language implementations.
+  \item \textbf{asmjit}: A lightweight, cross-platform JIT assembly compiler for x86/x64 and ARM.
+  \item \textbf{dynasm}: A dynamic assembler that allows writing assembly code inline in C programs using a preprocessor.
+\end{itemize}
+
+\subsection{Safety Considerations}
+
+Runtime code generation raises significant safety concerns:
+
+\begin{enumerate}
+  \item \textbf{Memory safety}: Executable memory must be properly managed to prevent code injection attacks.
+  \item \textbf{Type safety}: Generated code must be type-correct. Without type checking, generated code can cause undefined behavior.
+  \item \textbf{Resource management}: Executable memory is a limited resource; leaked code can exhaust available memory.
+  \item \textbf{Portability}: Machine-specific code must be generated for each target architecture.
+\end{enumerate}
+
+\section{JIT as Staging}\label{sec:jit-as-staging}
+
+\subsection{The JIT Compiler as a Staging Controller}
+
+A JIT compiler is, in essence, a staging controller that operates at run time. It observes the program's behavior and decides which parts to compile, when to compile them, and what optimizations to apply.
+
+\begin{definition}[JIT as Staging]\label{def:jit-staging}
+A JIT compiler performs the following staging decisions:
+\begin{enumerate}
+  \item \textbf{What to compile}: Which methods or traces to compile based on profiling data.
+  \item \item \textbf{When to compile}: The threshold of invocations or iterations before compilation is triggered.
+  \item \textbf{How to compile}: The level of optimization, based on the expected benefit and compilation cost.
+  \item \textbf{When to recompile}: When profiling data changes (phase behavior), the compiled code is replaced with a new version.
+\end{enumerate}
+\end{definition}
+
+\subsection{Profiling as Compile-Time Information}
+
+In the JIT context, profiling data serves the same role as static analysis in a traditional compiler: it provides information about the program's behavior that guides optimization.
+
+\begin{example}[Type Specialization via JIT]\label{ex:jit-type-spec}
+Consider a dynamically-typed language where a method is called with different argument types:
+\begin{verbatim}
+  def add(a, b) = a + b
+\end{verbatim}
+The JIT compiler observes that \texttt{add} is called 1000 times with integer arguments and 5 times with string arguments. It generates specialized code for the integer case (using machine integer addition) and falls back to the generic implementation for strings. This is \emph{type specialization}: a compile-time optimization driven by run-time profiling data.
+\end{example}
+
+\subsection{Tiered Compilation as Multi-Stage Staging}
+
+Modern JIT compilers use \emph{tiered compilation}, which is a form of multi-stage staging:
+
+\begin{enumerate}
+  \item \textbf{Tier 0 (interpretation)}: Code is interpreted. Profiling data is collected.
+  \item \textbf{Tier 1 (baseline compilation)}: Frequently executed code is compiled with minimal optimization. Fast compilation, moderate performance.
+  \item \textbf{Tier 2 (optimizing compilation)}: Hot code is recompiled with aggressive optimization, using profiling data. Slow compilation, high performance.
+  \item \textbf{Tier 3 (speculative optimization)}: The most critical code is compiled with speculative assumptions (e.g., ``this method always returns an integer''). If assumptions are violated, the code is deoptimized and recompiled at a lower tier.
+\end{enumerate}
+
+Each tier represents a different staging decision: more work is invested in compilation for code that is expected to benefit most from optimization.
+
+\section{Template Metaprogramming (C++)}\label{sec:template-metaprogramming}
+
+\subsection{Templates as a Compile-Time Language}
+
+C++ templates constitute an accidentally Turing-complete programming language that runs at compile time. Template metaprogramming (TMP) exploits this to perform computations during compilation.
+
+\begin{example}[Compile-Time Factorial in C++]\label{ex:cpp-tmp-factorial}
+\begin{verbatim}
+  template<int N>
+  struct Factorial {
+      static const int value = N * Factorial<N-1>::value;
+  };
+
+  template<>
+  struct Factorial<0> {
+      static const int value = 1;
+  };
+
+  // Usage: Factorial<5>::value is 120, computed at compile time
+\end{verbatim}
+\end{example}
+
+\subsection{The Staging Interpretation}
+
+Template metaprogramming can be understood as a staging mechanism:
+
+\begin{itemize}
+  \item \textbf{Compile-time stage}: Template instantiation, type computation, and constexpr evaluation happen at compile time.
+  \item \textbf{Run-time stage}: The instantiated templates produce types and constants that are embedded in the compiled code.
+  \item \textbf{Staging annotations}: The \texttt{template} keyword marks code that runs at compile time; the absence of \texttt{template} marks run-time code.
+\end{itemize}
+
+\subsection{Limitations of C++ TMP}
+
+C++ template metaprogramming has significant limitations as a staging mechanism:
+
+\begin{enumerate}
+  \item \textbf{Poor error messages}: Template errors are notoriously difficult to understand.
+  \item \textbf{Limited expressiveness}: The template language lacks many features of a general-purpose language (prior to C++20 \texttt{consteval}).
+  \item \textbf{Compilation time}: Complex template metaprograms can dramatically increase compilation time.
+  \item \textbf{No run-time interaction}: Template computations cannot depend on run-time values.
+\end{enumerate}
+
+\section{Constexpr and Compile-Time Evaluation}\label{sec:constexpr}
+
+\subsection{The Constexpr Model}
+
+Modern C++ (C++11 through C++20) provides \texttt{constexpr} as a principled staging mechanism:
+
+\begin{itemize}
+  \item \texttt{constexpr} functions can be evaluated at compile time when their arguments are constant expressions.
+  \item \texttt{consteval} functions (C++20) \emph{must} be evaluated at compile time.
+  \item \texttt{constinit} variables (C++20) are initialized at compile time but can be modified at run time.
+  \item \texttt{if constexpr} performs compile-time branching, eliminating dead branches from the compiled code.
+\end{itemize}
+
+\begin{example}[Constexpr Compile-Time Computation]\label{ex:constexpr}
+\begin{verbatim}
+  constexpr int fibonacci(int n) {
+      if (n <= 1) return n;
+      return fibonacci(n-1) + fibonacci(n-2);
+  }
+
+  // Evaluated at compile time:
+  constexpr int fib10 = fibonacci(10);  // 55
+
+  // Can also be called at run time:
+  int fib_n = fibonacci(user_input);
+\end{verbatim}
+\end{example}
+
+\subsection{Constexpr as a Staging Controller}
+
+The \texttt{constexpr} model is a \emph{dual-use} staging controller: a function can be called at either compile time or run time, depending on the context. This is more flexible than the strict staging of multi-stage programming but less predictable.
+
+\begin{definition}[Dual-Use Staging]\label{def:dual-use-staging}
+A \emph{dual-use staging controller} allows a computation to be performed at either compile time or run time, depending on whether its inputs are known at compile time. This is in contrast to \emph{strict staging}, where the staging is determined by explicit annotations.
+\end{definition}
+
+\subsection{Compile-Time Evaluation in Other Languages}
+
+Several other languages support compile-time evaluation:
+
+\begin{itemize}
+  \item \textbf{D}: Supports compile-time function execution (CTFE) with the \texttt{enum} and \texttt{static} keywords.
+  \item \textbf{Zig}: Allows arbitrary comptime evaluation using the \texttt{comptime} keyword.
+  \item \textbf{Nim}: Supports compile-time execution via the \texttt{static} keyword and \texttt{const} expressions.
+  \item \textbf{Rust}: Supports const evaluation via \texttt{const fn} and \texttt{const} contexts, with increasing capabilities in each release.
+  \item \textbf{Julia}: The \texttt{@generated} macro allows functions to generate specialized code based on the types of their arguments.
+\end{itemize}
+
+\section{Macros as Staging}\label{sec:macros-staging}
+
+\subsection{Macro Expansion as Compile-Time Computation}
+
+Macro systems are among the oldest staging mechanisms. A macro transforms source code at compile time, before the main compilation proceeds. This is a form of staging: the macro runs at compile time, and its output is compiled as part of the main program.
+
+\begin{definition}[Macro as Staging]\label{def:macro-staging}
+A \emph{macro} is a compile-time function that takes source code (or AST fragments) as input and produces source code (or AST fragments) as output. The macro runs at compile time; its output is compiled and executed at run time.
+\end{definition}
+
+\subsection{Hygienic vs.\ Unhygienic Macros}
+
+The distinction between hygienic and unhygienic macros is crucial for staging:
+
+\begin{itemize}
+  \item \textbf{Unhygienic macros} (C preprocessor, early Lisp): The macro's output is spliced into the surrounding code without regard for variable binding. This can cause variable capture, where a macro's local variable accidentally binds a variable in the calling context.
+  \item \textbf{Hygienic macros} (Scheme, Racket, Rust): The macro system ensures that variables introduced by the macro do not accidentally capture or shadow variables in the calling context. This is achieved by tracking the \emph{origin} of each identifier.
+\end{itemize}
+
+\subsection{Macros in Modern Languages}
+
+\begin{description}
+  \item[Rust] Rust's \texttt{macro\_rules!} provides hygienic pattern-matching macros. Procedural macros allow arbitrary compile-time computation on token streams.
+  \item[Racket] Racket's macro system is based on \emph{syntax transformers}: compile-time functions that operate on syntax objects. The system supports full hygiene, module-level macros, and multi-stage macros.
+  \item[Scheme] Scheme's \texttt{syntax-rules} provides pattern-based hygienic macros. \texttt{syntax-case} adds the ability to inspect and decompose syntax objects.
+  \item[Terra] Terra is a low-level systems language that is embedded in Lua. Lua code runs at compile time and generates Terra code, providing a powerful staging mechanism for systems programming.
+\end{description}
+
+\subsection{Macros and the Futamura Connection}
+
+Macros are related to the Futamura projections in a subtle way. A macro system can be viewed as a partial evaluator that specializes the language to the macro-expanded form:
+
+\begin{equation}
+\mathit{macro\_expand}(m, p) = p'
+\end{equation}
+
+where $m$ is the macro definition, $p$ is the program using the macro, and $p'$ is the expanded program. This is analogous to the first Futamura projection: specializing the ``interpreter'' (the macro system) to the ``source program'' (the macro definition) produces a ``compiled program'' (the expanded code).
+
+\section{Unified Framework for Staging}\label{sec:unified-staging}
+
+\subsection{A Taxonomy of Staging Mechanisms}
+
+We can classify staging mechanisms along several dimensions:
+
+\begin{table}[htbp]
+\centering
+\caption{Taxonomy of staging mechanisms}
+\label{tab:staging-taxonomy}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Mechanism} & \textbf{When} & \textbf{Type-safe} & \textbf{Composable} & \textbf{Dynamic} \\
+\hline
+C preprocessor & Compile time & No & No & No \\
+C++ templates & Compile time & Yes & Limited & No \\
+C++ constexpr & Both & Yes & Yes & No \\
+Lisp macros & Compile time & No & Yes & No \\
+Racket macros & Compile time & Yes & Yes & No \\
+MetaOCaml & Both & Yes & Yes & No \\
+LMS & Both & Yes & Yes & No \\
+JIT compilation & Run time & Varies & No & Yes \\
+Runtime code gen & Run time & No & No & Yes \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{The Staging Spectrum}
+
+Staging mechanisms exist on a spectrum from fully static to fully dynamic:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+  \draw[thick, ->] (-6, 0) -- (6, 0);
+  \node[below] at (-6, 0) {Fully Static};
+  \node[below] at (6, 0) {Fully Dynamic};
+
+  \filldraw[TomeInk] (-5, 0) circle (2pt) node[above=4pt, font=\tiny] {consteval};
+  \filldraw[TomeInk] (-3.5, 0) circle (2pt) node[above=4pt, font=\tiny] {constexpr};
+  \filldraw[TomeInk] (-2, 0) circle (2pt) node[above=4pt, font=\tiny] {templates};
+  \filldraw[TomeInk] (-0.5, 0) circle (2pt) node[above=4pt, font=\tiny] {macros};
+  \filldraw[TomeInk] (1, 0) circle (2pt) node[above=4pt, font=\tiny] {MSP};
+  \filldraw[TomeInk] (2.5, 0) circle (2pt) node[above=4pt, font=\tiny] {JIT};
+  \filldraw[TomeInk] (4, 0) circle (2pt) node[above=4pt, font=\tiny] {RCG};
+\end{tikzpicture}
+\caption{The staging spectrum from static to dynamic}
+\label{fig:staging-spectrum}
+\end{figure}
+
+\subsection{Design Principles for Staging}
+
+Based on the survey of staging mechanisms, we can extract several design principles:
+
+\begin{enumerate}
+  \item \textbf{Type safety}: Staging should be type-safe. Generated code should be checked before execution.
+  \item \textbf{Composability}: Staging constructs should be composable. Staged functions should be callable from other staged functions.
+  \item \textbf{Predictability}: The staging decisions should be predictable. The programmer should be able to reason about what happens at compile time and what at run time.
+  \item \textbf{Transparency}: The staging mechanism should be transparent to the run-time semantics. The staged program should produce the same results as the unstaged version.
+  \item \textbf{Ergonomics}: The staging annotations should be lightweight and intuitive. Heavy annotation burdens discourage use.
+\end{enumerate}
+
+\section{Summary and Outlook}\label{sec:staging-summary}
+
+The boundary between compile time and run time is increasingly porous. Modern programming languages and systems offer a rich variety of staging mechanisms, from compile-time evaluation (constexpr, template metaprogramming) through macro systems to runtime code generation and JIT compilation.
+
+The key insights of this chapter are:
+
+\begin{enumerate}
+  \item Staging is a fundamental aspect of compiler design: every compiler makes staging decisions, whether explicitly or implicitly.
+  \item The quality of staging decisions directly affects program performance: more work at compile time means less at run time.
+  \item Type safety and composability are essential for practical staging: unsafe staging leads to bugs; non-composable staging leads to duplication.
+  \item The trend is toward more sophisticated staging: JIT compilers, multi-stage programming, and compile-time evaluation are becoming standard features.
+\end{enumerate}
+
+The future of staging lies in the convergence of these mechanisms: compilers that combine static analysis, partial evaluation, and dynamic profiling to make optimal staging decisions automatically, while giving programmers the tools to override those decisions when necessary.
+
+\section{Advanced Staging Techniques}\label{sec:advanced-staging}
+
+\subsection{Multi-Stage Staging Controllers}
+
+Some systems support \emph{multiple} staging controllers that interact:
+
+\begin{example}[Layered Staging in a Web Framework]\label{ex:layered-staging}
+A web framework might have three stages:
+\begin{enumerate}
+  \item \textbf{Design time}: Templates are checked for type correctness, routes are validated, and database schemas are verified.
+  \item \textbf{Deploy time}: Configuration is resolved, database connections are established, and optimized code is generated for the target environment.
+  \item \textbf{Run time}: Requests are processed, database queries are executed, and responses are generated.
+\end{enumerate}
+Each stage has its own staging controller, and information flows from earlier stages to later ones.
+\end{example}
+
+\subsection{Staging and Incremental Computation}
+
+Staging is closely related to \emph{incremental computation}: the idea that when inputs change, only the affected outputs should be recomputed. In the staging context:
+
+\begin{itemize}
+  \item \textbf{Compile-time caching}: Results of compile-time computations are cached and reused across compilations.
+  \item \textbf{Incremental compilation}: When source code changes, only the affected parts are recompiled.
+  \item \textbf{Incremental JIT}: When profiling data changes, only the affected compiled code is recompiled.
+\end{itemize}
+
+\subsection{Staging for Domain-Specific Optimization}
+
+Staging is particularly powerful for domain-specific optimization:
+
+\begin{example}[Staging for Linear Algebra]\label{ex:staging-linalg}
+A linear algebra DSL might use staging to:
+\begin{enumerate}
+  \item At compile time: determine the sizes of matrices, the sparsity patterns, and the target hardware.
+  \item Generate specialized code: for known matrix sizes, generate unrolled loops; for sparse matrices, generate code that skips zeros; for GPU targets, generate CUDA kernels.
+  \item At run time: the generated code operates on the actual data with no interpretation overhead.
+\end{enumerate}
+This is the approach taken by LMS-based systems like OptiML and Delite.
+\end{example}
+
+\subsection{The Cost Model for Staging Decisions}
+
+A fundamental question is: \emph{how much work should be done at compile time?} The answer depends on a cost model:
+
+\begin{definition}[Staging Cost Model]\label{def:staging-cost}
+Let $C_c$ be the cost of compile-time computation and $C_r$ be the cost of run-time computation. A staging decision is \emph{optimal} if it minimizes:
+\[
+\alpha \cdot C_c + \beta \cdot C_r
+\]
+where $\alpha$ is the weight for compilation cost (important for fast build times) and $\beta$ is the weight for execution cost (important for performance-critical applications).
+
+For code that is executed $N$ times, the break-even point is when $C_c = N \cdot (C_r^{\mathit{unstaged}} - C_r^{\mathit{staged}})$.
+\end{definition}
+
+This cost model explains why JIT compilers use thresholds: they wait until a method has been called enough times to justify the cost of compilation.
+
+\section{Staging in Modern Language Implementations}\label{sec:staging-modern}
+
+\subsection{Julia's Generated Functions}
+
+Julia's \texttt{@generated} macro provides a powerful staging mechanism:
+
+\begin{verbatim}
+  @generated function process(x::T) where T
+      if T <: Integer
+          return :(x + 1)
+      elseif T <: AbstractFloat
+          return :(x * 2.0)
+      else
+          return :(error("unsupported type"))
+      end
+  end
+\end{verbatim}
+
+The body of the \texttt{@generated} function runs at compile time, with access to the types of the arguments. It returns an expression that is then compiled and executed at run time. This is a form of type-driven staging.
+
+\subsection{Zig's Comptime}
+
+Zig provides \texttt{comptime} as a first-class staging mechanism:
+
+\begin{verbatim}
+  fn fibonacci(comptime n: u32) u32 {
+      if (n <= 1) return n;
+      return fibonacci(n - 1) + fibonacci(n - 2);
+  }
+
+  const fib10 = comptime fibonacci(10);  // computed at compile time
+\end{verbatim}
+
+In Zig, \texttt{comptime} is not a special annotation but a fundamental part of the language: any function can be called at compile time, and the compiler evaluates it using the same interpreter that runs at run time. This eliminates the distinction between compile-time and run-time computation.
+
+\subsection{Rust's Const Generics and Const Evaluation}
+
+Rust is progressively expanding its compile-time evaluation capabilities:
+
+\begin{itemize}
+  \item \textbf{const fn}: Functions that can be evaluated at compile time.
+  \item \textbf{const generics}: Type-level values that are known at compile time.
+  \item \textbf{const evaluation}: The compiler's constant evaluator, which is a MIR interpreter.
+  \item \textbf{proc macros}: Procedural macros that run at compile time and generate code.
+\end{itemize}
+
+The combination of these features makes Rust a powerful staging platform: generic code is specialized at compile time, const evaluation performs compile-time computation, and proc macros enable arbitrary code generation.
+
+\section{Summary of Staging Principles}\label{sec:staging-principles-summary}
+
+The study of staging mechanisms across languages and systems reveals several unifying principles:
+
+\begin{enumerate}
+  \item \textbf{Staging is universal}: Every compiler makes staging decisions, whether explicitly or implicitly. The question is not \emph{whether} to stage, but \emph{how} and \emph{when}.
+  \item \textbf{Type safety matters}: Staging mechanisms that are type-safe (MSP, constexpr) are more reliable than those that are not (C preprocessor, runtime code generation).
+  \item \textbf{Composability enables reuse}: Staging constructs that can be composed (macros, staged functions) are more powerful than those that cannot.
+  \item \textbf{Profiling guides staging}: JIT compilers demonstrate that run-time profiling data can guide staging decisions more effectively than static analysis alone.
+  \item \textbf{The boundary is blurring}: The trend is toward systems that seamlessly combine compile-time and run-time computation, rather than maintaining a sharp boundary.
+\end{enumerate}
+
+These principles will guide the design of future staging mechanisms, as languages continue to evolve toward more sophisticated, more efficient, and more flexible compilation strategies.

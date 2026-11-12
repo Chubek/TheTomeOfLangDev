@@ -1,0 +1,477 @@
+%%
+%% chapter-53.ltx — IR Design Principles
+%%
+
+\label{ch:ir-design}
+
+The intermediate representation (IR) is the heart of a compiler. It is the language in which programs are analyzed, transformed, and optimized before being lowered to machine code. The design of an IR determines the expressiveness of the optimizer, the ease of implementing analyses, and the quality of the generated code. This chapter explores the fundamental design principles that guide the construction of intermediate representations.
+
+%% ============================================================
+%% Section 53.1
+%% ============================================================
+\section{What Makes a Good IR?}\label{sec:good-ir}
+
+An IR must balance competing requirements: it must be close enough to the source to preserve semantic information, yet close enough to the target to enable efficient code generation.
+
+\subsection{Design Criteria}\label{sec:design-criteria}
+
+\begin{itemize}
+  \item \textbf{Expressiveness.} The IR must be able to represent all programs in the source language without loss of information relevant to optimization.
+  \item \textbf{Analyzability.} The IR should make program properties (data flow, control flow, dependencies) explicit and easy to analyze.
+  \item \textbf{Transformability.} Optimizations should be expressible as local, composable transformations on the IR.
+  \item \textbf{Verifiability.} It should be possible to verify that transformations preserve semantics.
+  \item \textbf{Efficiency.} The IR should be compact and fast to traverse, enabling rapid compilation.
+  \item \textbf{Portability.} The IR should be target-independent, allowing the same optimizer to serve multiple backends.
+\end{itemize}
+
+\subsection{The IR Spectrum}\label{sec:ir-spectrum}
+
+Compilers typically use multiple IRs, progressing from high-level (close to source) to low-level (close to target):
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (ast) {AST};
+  \node[block, right=of ast] (hir) {High-level IR};
+  \node[block, right=of hir] (mir) {Mid-level IR};
+  \node[block, right=of mir] (lir) {Low-level IR};
+  \node[block, right=of lir] (mach) {Machine Code};
+
+  \draw[arrow] (ast) -- (hir);
+  \draw[arrow] (hir) -- (mir);
+  \draw[arrow] (mir) -- (lir);
+  \draw[arrow] (lir) -- (mach);
+
+  \node[font=\small, below=0.5cm of ast, align=center] {Source-like};
+  \node[font=\small, below=0.5cm of mir, align=center] {Target-independent};
+  \node[font=\small, below=0.5cm of lir, align=center] {Target-specific};
+\end{tikzpicture}
+\caption{The IR spectrum: from source-like ASTs to target-specific machine representations. Each level preserves different kinds of information.}\label{fig:ir-spectrum}
+\end{figure}
+
+\subsection{High-Level vs. Low-Level IR}\label{sec:high-vs-low}
+
+\begin{table}[htbp]
+\centering
+\caption{Properties of high-level and low-level IRs}\label{tab:ir-levels}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Property} & \textbf{High-Level IR} & \textbf{Low-Level IR} \\
+\hline
+Control flow & Structured (loops, if/else) & Unstructured (branches, labels) \\
+Data types & Rich (generics, ADTs) & Primitive (int, float, pointer) \\
+Memory model & Abstract (objects, references) & Concrete (addresses, offsets) \\
+Optimizations & Inlining, fusion, specialization & Register allocation, scheduling \\
+Target dependence & None & Architecture-specific \\
+\hline
+\end{tabular}
+\end{table}
+
+%% ============================================================
+%% Section 53.2
+%% ============================================================
+\section{SSA vs. Non-SSA}\label{sec:ssa-vs-non-ssa}
+
+The choice between SSA and non-SSA form is one of the most consequential IR design decisions.
+
+\subsection{Non-SSA Form}\label{sec:non-ssa}
+
+In non-SSA form, variables can be assigned multiple times:
+
+\begin{verbatim}
+  x = 1
+  if (cond) {
+    x = 2
+  }
+  y = x + 1
+\end{verbatim}
+
+The value of $x$ at the use site depends on the control flow path. Analyzing such code requires dataflow analysis to determine which definitions reach which uses.
+
+\subsection{SSA Form}\label{sec:ssa-form}
+
+In SSA form, every variable is assigned exactly once. Phi functions merge values at control flow join points:
+
+\begin{verbatim}
+  x1 = 1
+  if (cond) {
+    x2 = 2
+  }
+  x3 = phi(x1, x2)  // x3 = x1 if we came from above, x2 if from the then-branch
+  y = x3 + 1
+\end{verbatim}
+
+SSA form makes def-use chains explicit, enabling many optimizations to be expressed as simple local transformations.
+
+\subsection{Comparison}\label{sec:ssa-comparison}
+
+\begin{table}[htbp]
+\centering
+\caption{SSA vs. non-SSA}\label{tab:ssa-comparison}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Property} & \textbf{Non-SSA} & \textbf{SSA} \\
+\hline
+Definitions & Multiple assignments & Single assignment \\
+Def-use chains & Implicit (dataflow) & Explicit \\
+Phi functions & None & At join points \\
+Optimization style & Dataflow-based & Local rewriting \\
+Construction & Direct translation & Requires algorithm \\
+Code size & Smaller & Larger (phi functions) \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}
+SSA form is now the dominant IR representation in production compilers (LLVM, GCC, HotSpot, V8). Its key advantage is that it makes data dependencies explicit, transforming global dataflow analyses into local pattern matching. The cost---phi functions and the construction algorithm---is modest and well-understood.
+\end{insight}
+
+%% ============================================================
+%% Section 53.3
+%% ============================================================
+\section{Graph vs. Tree vs. Linear Representations}\label{sec:graph-tree-linear}
+
+IRs can be organized as trees, graphs, or linear sequences, each with different trade-offs.
+
+\subsection{Tree Representation}\label{sec:tree-rep}
+
+A tree representation uses a hierarchical structure where each node has a single parent:
+
+\begin{verbatim}
+  BinOp(+)
+  ├── BinOp(*)
+  │   ├── Var(x)
+  │   └── Const(2)
+  └── Const(3)
+\end{verbatim}
+
+\textbf{Advantages:} Simple, easy to traverse, natural for expression trees.\\
+\textbf{Disadvantages:} Cannot represent shared subexpressions or cyclic data flow.
+
+\subsection{Graph Representation}\label{sec:graph-rep}
+
+A graph representation allows nodes to have multiple parents, enabling sharing and cycles:
+
+\begin{itemize}
+  \item \textbf{Data-flow graph (DFG).} Nodes are operations; edges are data dependencies.
+  \item \textbf{Control-flow graph (CFG).} Nodes are basic blocks; edges are control flow.
+  \item \textbf{Program dependence graph (PDG).} Combines data and control dependencies.
+\end{itemize}
+
+\textbf{Advantages:} Can represent sharing (common subexpressions), cycles (loops), and complex dependencies.\\
+\textbf{Disadvantages:} More complex to traverse and transform; requires care to maintain invariants.
+
+\subsection{Linear Representation}\label{sec:linear-rep}
+
+A linear representation is a sequence of instructions:
+
+\begin{verbatim}
+  t1 = x * 2
+  t2 = t1 + 3
+  store t2, [ptr]
+\end{verbatim}
+
+\textbf{Advantages:} Simple, compact, easy to serialize.\\
+\textbf{Disadvantages:} Ordering constraints can obscure optimization opportunities; must be augmented with CFG information for control flow.
+
+%% ============================================================
+%% Section 53.4
+%% ============================================================
+\section{Multi-Level IR}\label{sec:multi-level-ir}
+
+Modern compilers use multiple IR levels, each suited to different kinds of optimization.
+
+\subsection{The LLVM Approach}\label{sec:llvm-approach}
+
+LLVM uses three IR levels:
+\begin{enumerate}
+  \item \textbf{High-level (pre-SSA).} Used for source-level optimizations (inlining, constant folding).
+  \item \textbf{Mid-level (LLVM IR).} SSA-based, target-independent. Used for most optimizations.
+  \item \textbf{Low-level (SelectionDAG / MachineInstr).} Target-specific. Used for instruction selection, register allocation, and scheduling.
+\end{enumerate}
+
+\subsection{The MLIR Approach}\label{sec:mlir-approach}
+
+MLIR (Multi-Level Intermediate Representation) takes the multi-level approach to its logical conclusion: it provides a framework for defining custom IR \emph{dialects}, each suited to a particular domain (tensors, quantum circuits, graph neural networks). Dialects can be lowered incrementally, preserving structure at each level.
+
+\subsection{The Graal Approach}\label{sec:graal-approach}
+
+GraalVM uses a sea-of-nodes IR (see \cref{ch:graph-ir}) that combines data and control flow in a single graph. The IR is used for both high-level optimizations (inlining, partial escape analysis) and low-level optimizations (register allocation, code generation).
+
+%% ============================================================
+%% Section 53.5
+%% ============================================================
+\section{IR for Different Purposes}\label{sec:ir-purposes}
+
+Different compilation tasks require different IR properties.
+
+\subsection{IR for Optimization}\label{sec:ir-optimization}
+
+An optimization-friendly IR should:
+\begin{itemize}
+  \item Make dependencies explicit (SSA form).
+  \item Support local transformations (pattern matching, rewriting).
+  \item Enable global analyses (dataflow, alias analysis).
+  \item Preserve enough information for verification.
+\end{itemize}
+
+\subsection{IR for Verification}\label{sec:ir-verification}
+
+A verification-friendly IR should:
+\begin{itemize}
+  \item Have a formal semantics (operational or denotational).
+  \item Support proof-carrying code or certified transformations.
+  \item Make invariants explicit (types, effects, memory safety).
+\end{itemize}
+
+\subsection{IR for Code Generation}\label{sec:ir-codegen}
+
+A code-generation-friendly IR should:
+\begin{itemize}
+  \item Be close to the target architecture (instruction set, registers, memory model).
+  \item Support instruction selection (tree or DAG matching).
+  \item Encode scheduling constraints (latencies, resources).
+\end{itemize}
+
+%% ============================================================
+%% Section 53.6
+%% ============================================================
+\section{Case Studies}\label{sec:ir-case-studies}
+
+\subsection{LLVM IR}\label{sec:llvm-ir}
+
+LLVM IR is a typed, SSA-based, RISC-like instruction set. Key features:
+\begin{itemize}
+  \item \textbf{Typed.} Every value has a type (integers, floats, pointers, vectors, structs).
+  \item \textbf{SSA.} Every virtual register is assigned exactly once.
+  \item \textbf{Infinite virtual registers.} Register allocation is deferred to the backend.
+  \item \textbf{Target-independent.} The same IR serves x86, ARM, RISC-V, and other targets.
+\end{itemize}
+
+\begin{verbatim}
+  define i32 @add(i32 %a, i32 %b) {
+  entry:
+    %sum = add i32 %a, %b
+    ret i32 %sum
+  }
+\end{verbatim}
+
+\subsection{MLIR}\label{sec:mlir-case}
+
+MLIR extends the LLVM approach with a framework for defining custom dialects. Each dialect defines its own operations, types, and attributes. Dialects can be lowered to other dialects, enabling multi-level optimization.
+
+\begin{verbatim}
+  // Affine dialect: loop nests with affine bounds
+  affine.for %i = 0 to %N {
+    affine.load %A[%i] : memref<100xf32>
+  }
+
+  // Lowered to standard dialect:
+  scf.for %i = %c0 to %N step %c1 {
+    %v = memref.load %A[%i] : memref<100xf32>
+  }
+\end{verbatim}
+
+\subsection{Graal IR}\label{sec:graal-ir}
+
+Graal uses a sea-of-nodes IR where all operations (including control flow) are nodes in a graph. The graph is unordered until scheduling, allowing optimizations to reorder operations freely.
+
+\subsection{V8 Ignition/TurboFan}\label{sec:v8-ir}
+
+V8 uses multiple IRs:
+\begin{itemize}
+  \item \textbf{Bytecode (Ignition).} A compact, stack-based bytecode for the interpreter.
+  \item \item \textbf{TurboFan IR.} A sea-of-nodes graph for the optimizing compiler.
+\end{itemize}
+
+The TurboFan IR represents both JavaScript semantics and machine-level operations in a single graph, enabling aggressive optimizations like speculative inlining and hidden class optimization.
+
+\begin{historical}
+The evolution of IR design reflects the growing complexity of both source languages and target architectures. Early compilers used a single IR (often a simple three-address code). The development of SSA form in the 1980s~\cite{cytron1991} revolutionized optimization by making data dependencies explicit. The rise of multi-core processors and specialized hardware (GPUs, TPUs) has driven the development of multi-level IRs like MLIR~\cite{lattner2021}, which can represent domain-specific abstractions while still lowering to machine code. The tension between expressiveness (for high-level optimization) and concreteness (for code generation) continues to drive innovation in IR design.
+\end{historical}
+
+%% ============================================================
+%% Section 53.7
+%% ============================================================
+\section{Advanced Multi-Level IR and Case Studies}\label{sec:multi-level-advanced}
+
+\subsection{Multi-Level IR Design Patterns}\label{sec:multi-level-patterns}
+
+Modern compilers use multiple IR levels, each designed for specific optimization tasks. The design of each level reflects its position in the compilation pipeline.
+
+\begin{definition}[IR Level Properties]\label{def:ir-level}
+Each IR level is characterized by:
+\begin{itemize}
+  \item \textbf{Abstraction level.} How close to the source or target.
+  \item \textbf{Type system.} The types available at this level.
+  \item \textbf{Control flow.} Structured (loops) vs. unstructured (branches).
+  \item \textbf{Memory model.} Abstract (objects) vs. concrete (addresses).
+  \item \textbf{Optimization focus.} What optimizations are most effective at this level.
+\end{itemize}
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Multi-level IR design: typical levels and their properties}\label{tab:multi-level-design}
+\begin{tabular}{p{2cm}p{2.5cm}p{2.5cm}p{2.5cm}p{2.5cm}}
+\hline
+\textbf{Level} & \textbf{Types} & \textbf{Control Flow} & \textbf{Memory} & \textbf{Key Opts} \\
+\hline
+Source & Generics, ADTs & Structured & Objects & Inlining \\
+High IR & Monomorphized & Structured & Objects & Specialization \\
+Mid IR & Primitives & SSA & Abstract & CSE, DCE \\
+Low IR & Machine types & CFG + SSA & Addresses & Regalloc \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{The LLVM Multi-Level Approach}\label{sec:llvm-multi}
+
+LLVM uses three main IR levels:
+
+\begin{verbatim}
+  // Level 1: Clang AST (source-like)
+  // - Preserves C/C++ semantics
+  // - Supports source-level warnings and errors
+  // - Used for template instantiation and macro expansion
+
+  // Level 2: LLVM IR (mid-level)
+  // - SSA form, typed, target-independent
+  // - Infinite virtual registers
+  // - Used for most optimizations
+
+  // Level 3: MachineInstr (low-level)
+  // - Target-specific instructions
+  // - Physical register names
+  // - Used for register allocation and code generation
+\end{verbatim}
+
+\subsection{The Swift IR Approach}\label{sec:swift-ir}
+
+Swift uses a multi-level IR with SIL (Swift Intermediate Language) as its primary IR:
+
+\begin{itemize}
+  \item \textbf{SIL (high).} Preserves Swift-specific features: generics, value types, optionals, ARC.
+  \item \textbf{SIL (low).} After generic specialization, ARC optimization, and devirtualization.
+  \item \textbf{LLVM IR.} Final lowering to target-independent LLVM IR.
+\end{itemize}
+
+The key insight of SIL is that Swift-specific optimizations (ARC optimization, generic specialization, existential opening) must happen before lowering to LLVM IR, because LLVM IR cannot represent Swift's type system features.
+
+\subsection{The Graal/Truffle Approach}\label{sec:graal-truffle}
+
+GraalVM uses a \emph{sea-of-nodes} IR where all operations (including control flow) are nodes in a single graph:
+
+\begin{verbatim}
+  // Sea-of-nodes representation:
+  // Nodes: Phi, Add, Load, Store, If, Return, ...
+  // Edges: data flow (solid) and control flow (dashed)
+
+  // Example: x = a > 0 ? a + 1 : a - 1
+  //   cond = CmpGT(a, 0)
+  //   if (cond) {
+  //     true_val = Add(a, 1)
+  //   } else {
+  //     false_val = Sub(a, 1)
+  //   }
+  //   x = Phi(true_val, false_val)
+
+  // The sea-of-nodes allows reordering:
+  // - Add and Sub can be moved before the If (speculative)
+  // - If the branch is predictable, only one path executes
+\end{verbatim}
+
+\subsection{Case Study: JavaScript Compilation in V8}\label{sec:v8-case-study}
+
+V8 compiles JavaScript through multiple IR levels:
+
+\begin{enumerate}
+  \item \textbf{Parsing.} Source code $\to$ AST (with scope information).
+  \item \textbf{Ignition.} AST $\to$ bytecode (stack-based, for the interpreter).
+  \item \textbf{TurboFan.} Bytecode $\to$ sea-of-nodes graph (for the optimizing compiler).
+  \item \textbf{Maglev.} An additional mid-tier compiler for faster optimization.
+  \item \textbf{Code generation.} Graph $\to$ machine code.
+\end{enumerate}
+
+\begin{table}[htbp]
+\centering
+\caption{V8's compilation tiers}\label{tab:v8-tiers}
+\begin{tabular}{p{2cm}p{2.5cm}p{2.5cm}p{2.5cm}p{2.5cm}}
+\hline
+\textbf{Tier} & \textbf{IR} & \textbf{Speed} & \textbf{Quality} & \textbf{Use} \\
+\hline
+Ignition & Bytecode & Fastest & Lowest & Initial execution \\
+Maglev & Mid-level & Fast & Medium & Warm-up \\
+TurboFan & Sea-of-nodes & Slow & Highest & Hot code \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Case Study: Rust's MIR}\label{sec:rust-mir-case}
+
+Rust uses MIR (Mid-level Intermediate Representation) as its primary IR:
+
+\begin{itemize}
+  \item \textbf{HIR (High-level IR).} Close to the AST, preserves generics and trait bounds.
+  \item \textbf{MIR.} CFG-based, with explicit borrows and drops. Used for borrow checking and most optimizations.
+  \item \textbf{LLVM IR.} Final lowering for code generation.
+\end{itemize}
+
+\begin{verbatim}
+  // Rust MIR example:
+  fn add(x: i32, y: i32) -> i32 {
+    bb0: {
+      _0 = Add(_1, _2);   // _0 = return, _1 = x, _2 = y
+      return;
+    }
+  }
+
+  // MIR preserves borrow information:
+  fn borrow_example(x: &mut i32) {
+    bb0: {
+      _2 = &_mut(*_1);    // reborrow
+      _3 = *_2;            // read through borrow
+      StorageDead(_2);     // borrow ends here
+    }
+  }
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (llvm) {LLVM};
+  \node[block, below left=1.5cm and 0.5cm of llvm] (swift) {Swift (SIL)};
+  \node[block, below right=1.5cm and 0.5cm of llvm] (rust) {Rust (MIR)};
+  \node[block, below=1.2cm of llvm] (graal) {Graal (Sea-of-Nodes)};
+  \node[block, below=1.2cm of swift] (swift-opts) {ARC, Generics};
+  \node[block, below=1.2cm of rust] (rust-opts) {Borrow check, Drops};
+  \node[block, below=1.2cm of graal] (graal-opts) {Speculative opts};
+
+  \draw[arrow] (llvm) -- (swift);
+  \draw[arrow] (llvm) -- (rust);
+  \draw[arrow] (llvm) -- (graal);
+  \draw[arrow] (swift) -- (swift-opts);
+  \draw[arrow] (rust) -- (rust-opts);
+  \draw[arrow] (graal) -- (graal-opts);
+\end{tikzpicture}
+\caption{Multi-level IR case studies: LLVM serves as the backend for multiple front-ends, each with its own mid-level IR that preserves language-specific features for optimization.}\label{fig:multi-level-case-studies}
+\end{figure}
+
+%% ============================================================
+%% Section 53.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-53}
+
+The design of an intermediate representation is one of the most consequential decisions in compiler construction. The IR must balance expressiveness, analyzability, transformability, and efficiency. The choice between SSA and non-SSA, graph and linear, high-level and low-level, determines the kinds of optimizations that can be performed and the quality of the generated code.
+
+Modern compilers use multiple IRs, each suited to a different phase of compilation. The trend toward multi-level IRs (MLIR) reflects the growing diversity of both source languages and target hardware.
+
+For further reading, we recommend Muchnick's comprehensive treatment~\cite{muchnick1997}, the LLVM language reference~\cite{llvm2024}, and the MLIR overview by Lattner et al.~\cite{lattner2021}.

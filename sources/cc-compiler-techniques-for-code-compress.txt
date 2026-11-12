@@ -1,0 +1,903 @@
+Compiler Techniques for Code Compression 
+Saumya Debray
+William Evans
+Robert Muth
+Department of Computer Science
+University of Arizona
+Tucson, AZ 85721, U.S.A.
+fdebray, will, muthg@cs.arizona.edu
+
+Technical Summary
+
+Abstract
+
+In recent years there has been an increasing trend towards the incorporation of computers into
+a variety of devices where the amount of available memory is limited. This makes it desirable to
+try and reduce the size of applications where possible. This paper explores the use of compiler
+techniques to accomplish code compression to yield smaller executables. The main contribution
+of this paper is that, by showing how \equivalent" code fragments can be detected and factored
+out without having to resort to purely linear treatments of code sequences as in sux-tree-based
+approaches, it sets up a framework for code compression that can be more exible in its treatment
+of what code fragments are considered \equivalent." Our ideas have been implemented in the form
+of a binary-rewriting tool that is able to achieve signi cantly better compression than previous
+approaches.
+
+1 Motivation
+
+In recent years there has been an increasing trend towards the incorporation of computers into a
+wide variety of devices, such as palm-tops, telephones, embedded controllers, etc. In many of these
+devices, the amount of memory available is limited, e.g., due to considerations such as space, weight,
+power consumption, or price. At the same time, there is an increasing desire to use more and more
+sophisticated software in such devices, such as encryption software in telephones, or speech or image
+processing software in laptops and palm-tops. Unfortunately, an application that requires more memory
+than is available on a particular device will not be able to run on that device. This makes it desirable
+to try and reduce the size of applications where possible. This paper explores the use of compiler
+techniques to accomplish this code compression.
+Previous work in program compression has explored the compressiblity of a wide range of program
+representations: source languages, intermediate representations, machine codes, etc. [15]. The resulting
+compressed form either must be decompressed (and perhaps compiled) before execution [5, 6, 7] or it
+can be executed (or interpreted [9, 14]) without decompression [4, 8]. The rst method results in a
+smaller compressed representation than the second, but requires the overhead of decompression before
+execution. This overhead may be negligible and, in fact, may be compensated for by the savings
+in transmission or retrieval cost [7]. A more severe problem is that it requires space to place the
+decompressed code. This also has been somewhat mitigated by techniques of partial decompression
+or decompression-on-the- y [3, 5] but these techniques require altering the run-time operation or the
+hardware of the computer. In this paper, we explore compression to an executable form. The resulting
+form is larger than the smallest compressed representation of the program, but we do not pay any
+decompression overhead or require more space in order to execute.
+ This work was supported in part by the National Science Foundation under grant CCR-9711166.
+
+1
+
+Much of the earlier work on code compression to yield smaller executables has treated an executable
+program as a simple linear sequence of instructions. Early work by Fraser et al. used a sux tree
+construction to identify repeated instruction sequences within such a linear sequence [8]. Such repeated
+sequences were then abstracted out into functions. Applied to a range of Unix utilities on a Vax
+processor, this technique managed to reduce code size by a factor of about 7% on the average. A
+shortcoming of this approach is that since it relies on a purely textual interpretation of a program, it is
+sensitive to super cial di erences between code fragments, e.g., due to the use of di erent registers, that
+may not actually have any e ect on the behavior of the code. This shortcoming has been addressed by
+Baker, who proposed parameterized sux trees [1]; by Cooper and McIntosh, who use register renaming
+to get around this problem [4] (a similar approach is discussed by Baker and Manber [2]); and by Zastre,
+who uses parameterized procedural abstractions [16]. The main idea here is to rewrite instructions so
+that instead of using hard-coded register names, the (register) operands of an instruction are expressed,
+if possible, in terms of a previous reference (within the same basic block) to that register. Further,
+branch instructions are rewritten, where possible, to PC-relative form. These transformations allow
+the sux tree construction to detect the repetition of similar but not lexically identical instruction
+sequences. Cooper and McIntosh have obtained a code size reduction of about 5% on the average using
+these techniques on classically optimized code (in their implementation, the classical optimizations
+achieve a code size reduction of about 18% compared to unoptimized code).
+However, any approach that treats a program as a simple linear sequence of instructions, e.g., in
+using sux trees to identify repeating instruction sequences, will su er from the disadvantage of having
+to work with a particular ordering of instructions. There may be many reasons why two \equivalent"
+computations may map to di erent instruction sequences in two di erent parts of a program. The rst,
+and most obvious, is that there may be di erences in register usage and branch labels. Di erences in
+the actual sequence of instructions produced may also arise due to instruction scheduling, or because
+of pro le-directed code layout to improve instruction cache utilization [13].
+This paper describes a somewhat di erent approach to code compression. Instead of treating a
+program as a simple linear sequence of instructions, we work with its (interprocedural) control ow
+graph. Instead of using a sux tree construction to identify repeated instruction sequences, we use
+a ngerprinting scheme to identify \similar" basic blocks. If two blocks that are similar are found to
+not be identical, we try to rename registers|using a technique somewhat di erent from that of Cooper
+and McIntosh|in an attempt to make them identical. We use the notions of dominators and postdominators to detect identical subgraphs of the control ow graph, larger than a single basic block, and
+that can be abstracted out into a procedure. Finally, we identify architecture-speci c idioms, e.g., for
+saving and restoring speci c sets of registers at the entry to and return from functions.
+The main contribution of this paper is that, by showing how \equivalent" code fragments can
+be detected and factored out without having to resort to purely linear treatments of code sequences
+as in sux-tree-based approaches, it sets up a framework for code compression that can be more
+exible in its treatment of what code fragments are considered \equivalent." For example, while our
+current implementation searches for sets of basic blocks that contain identical instruction sequences,
+it is straightforward to generalize this component of the system to consider use-de nition chains, and
+thereby handle di erences in the sequence of instructions arising out of instruction scheduling decisions.
+Similarly, the treatment of single-entry single-exit regions in Section 2.4 focuses on structural properties
+of control ow graphs rather than any particular linearization: this allows it to handle di erences in
+code sequences arising out of pro le-directed code layout. We believe that the added exibility gained
+from our approach can be useful in improving the results of code compression.
+Our ideas have been implemented in the form of a binary-rewriting tool based on alto, a post-linktime code optimizer [12]. The resulting system, which we call squeeze, is able to achieve signi cantly
+better compression than previous approaches. In our system, reductions in code size come from two
+sources: aggressive (inter-procedural) application of what are essentially classical compiler analyses and
+optimizations; and code factoring, which we use to refer to a variety of techniques to identify and \factor
+2
+
+A’
+
+A
+
+cmp r2,r1,r0
+add r5,r6,r8
+beq r0
+
+cmp r2,r1,r0
+beq r0
+B
+
+C
+
+stq r7,4(r30)
+add r5,r6,r8
+sub r5,r6,r9
+stq r9,8(r30)
+ldq r9,12(r22)
+xor r5,r6,r0
+stq r9,16(r23)
+xor r19,r19,r19
+
+add r5,r6,r8
+sub r5,r6,r19
+stq r19,8(r30)
+ldq r19,22(r22)
+xor r5,r6,r0
+stq r9,16(r23)
+
+B’
+
+C’
+
+stq r7,4(r30)
+D
+
+sub r5,r6,r9
+stq r9,8(r30)
+ldq r9,12(r30)
+xor r5,r6,r0
+
+ldq r19,22(r22)
+stq r9,16(23)
+
+sub r5,r6,r19
+stq r19,8(r30)
+ldq r19,22(r30)
+xor r5,r6,r0
+
+D’
+
+ldq r19,22(r22)
+
+xor r19,r19,r19
+E’
+
+E
+
+stq r9,16(r23)
+
+Figure 1: Local Code Factoring
+out" repeated instruction sequences. Classical compiler optimizations have been discussed in detail by
+many authors (e.g., see [11]), and so are not discussed further here. The next section describes the code
+factoring techniques used within squeeze.
+
+2 Code Factoring
+
+2.1 Local Factoring Transformations
+
+Inspired by an idea of Knoop et al. [10] we try to merge identical code fragments by moving them to
+a point that pre- or post-dominates all the occurrences of the fragments. We have implemented a local
+variant of this scheme which we describe using the example depicted in Figure 1. The left hand side
+of the gure shows an assembly code owchart with a conditional branch (beq r0) in block A. Blocks
+B and C contain the same instruction add r5,r6,r8: since these instructions do not have backward
+dependencies with any any other instruction in B or C, we can safely move them into block A just
+before the beq instruction, as shown in the right hand side of Figure 1. Similarly, blocks B, C, and D
+share the same store instruction (stq r9,r16(r23)), and since these instructions do not have forward
+dependencies with any other instruction in B, C,and D, it can be safely moved into block E. In this case
+it is not possible to move the store instruction from B and C into A because, due to the lack of aliasing
+information, there are backward dependencies to the load instructions (ldq) in B and C. In general,
+however, it might be possible to move an instruction either up or down. In this case we prefer to move it
+down since moving it up will eliminate excactly one copy while moving it down might eliminate several
+copies.
+Our scheme uses register reallocation to make this transformation more e ective. For example, the
+sub instructions in B and C write to di erent registers (r9 and r19). We can, however, rename the
+r9 to r19 in B, thereby making the instructions identical. Another opportunity rests with the xor
+instructions in B and C. Even though they are identical we can not move them into A because they
+write register r0 which is used by the conditional branch. Reallocating r0 in A to another register
+which is dead at the end of A will make the transformation possible.
+
+2.2 Procedural Abstraction
+Given a single-entry single-exit code fragment , procedural abstraction of involves ( ) creating a
+procedure C whose body is a copy of ; and ( ) replacing the appropriate occurrences of in the
+program text by a function call to C . While the rst step is not very dicult, at the level of assembly
+or machine code the second step involves a little work. In order to create a function call using some
+C
+
+f
+
+C
+
+C
+
+ii
+
+i
+
+C
+
+f
+
+3
+
+form of \jump-and-link" instruction that transfers control to the callee and at the same time puts the
+return address into a register, it is necessary to nd a free register for that purpose. If there are many
+di erent occurrences of the code fragment in the program, for each register that can be used as
+a return register we compute a gure of merit for , which is essentially a measure of the number of
+instructions saved by using as the return register. In the simplest case, this might simply count the
+number of occurrences of for which register is not live at the entry point. In some situations, e.g.,
+when abstracting out register save instructions from function prologs (see Section 2.5.1), the gure of
+merit may be computed slightly di erently. Once a gure of merit has been computed for each register,
+a register with the highest gure of merit (which must exceed 0) is chosen as the return register. If
+a single instance of C , using a particular return register, is not enough to abstract out all of the
+occurrences of in the program, under some circumstances we may create multiple instances of C
+that use di erent return registers.
+C
+
+r
+
+r
+
+r
+
+C
+
+r
+
+f
+
+C
+
+f
+
+2.3 Procedural Abstraction for Individual Basic Blocks
+
+Central to our approach is the ability to apply procedural abstraction to individual basic blocks. In
+this section we discuss how candidate basic blocks for procedural abstraction are identi ed. The actual
+code transformation then proceeds as described in Section 2.2.
+
+2.3.1 Fingerprinting
+To reduce the cost of comparing basic blocks to determine whether they are identical (or similar),
+we compute a \ ngerprint" for each basic block, such that two blocks with di erent ngerprints are
+guaranteed to be di erent. In our current implementation, a ngerprint is a 64-bit value formed by
+concatenating 4-bit encodings of the op-codes of the rst 16 instructions in the block. Since most systems
+applications tend to have short basic blocks, characterizing the rst 16 instructions seems enough for
+most basic blocks. With 4 bits per instruction, we encode 15 di erent op-codes: we decide which 15
+will be explicitly represented by considering a static instruction count of the program, such that the
+15 most frequently occurring op-codes are given distinct 4-bit patterns. The remaining pattern, 0000,
+represents other op-codes, i.e., op-codes that are not in the top 15 in frequency.
+To reduce the number of pairwise comparisons of ngerprints that must be carried out, we use
+a hashing scheme such that basic blocks in di erent hash buckets are guaranteed to have di erent
+ngerprints, and so need not be compared.
+
+2.3.2 Renaming Basic Blocks
+When we nd two basic blocks that are \similar," i.e., have the same ngerprint and the same number
+of instructions, but which are not identical, we attempt to rename the registers in one of them so as
+to make the two identical. The basic idea is very simple: registers are renamed \locally," i.e., within
+the basic block; and if necessary, register-to-register moves are inserted, in new basic blocks inserted
+immediately before and after the block being renamed, so as to preserve program behavior.
+For soundness, it is necessary to ensure that the renaming does not alter any use-de nition relationships: we do this by keeping track of the set of registers that are live at each point in the basic block,
+as well as the set of registers that have already been subjected to renaming. These sets are then used
+to detect and disallow renamings that could alter the program's behavior. We omit details due to space
+constraints.
+The renaming algorithm keeps track of the number of explicit register-to-register moves that have to
+be inserted before and after a basic block that is being renamed. If, at the end of the renaming process,
+the savings from the renaming, i.e., the number of instructions in the block, does not exceed the cost
+of renaming, i.e., the number of register moves required together with a function call instruction, the
+renaming is undone.
+4
+
+2.3.3 Control Flow Separation
+The approach described above will typically not be able to abstract two basic blocks that are identical
+except for an explicit control transfer instruction at the end. The reason for this is that if the control
+transfers are to di erent targets, the blocks will be considered to be di erent and so will not be abstracted. Moreover, if the control transfer instruction is a conditional branch, procedural abstraction
+becomes complicated by the fact that two possible return addresses have to be communicated.
+To avoid such problems, basic blocks that end in an explicit control transfer instruction are split
+into two blocks: one block containing all the instructions in the block except for the control transfer,
+and another block that contains only the control transfer instruction. The rst of this pair of blocks
+can then be subjected to renaming and/or procedural abstraction in the usual way.
+The next section describes how code fragments larger than a single basic block can be subjected to
+procedural abstraction.
+
+2.4 Single-Entry/Single-Exit Regions
+The discussion thus far has focused on the procedural abstraction of individual basic blocks. In general,
+however, we may be able to nd multiple occurrences of a code fragment consisting of more than one
+basic block. In order to apply procedural abstraction to such a code fragment , at every occurrence
+of in the program we must be able to identify a single program point from which control enters ,
+and a single program point to which control returns after leaving . It isn't hard to see that any set
+of basic blocks with a single entry point and a single exit point corresponds to a pair of points ( )
+such that dominates every block in and post-dominates every block in ; conversely, a pair of
+program points ( ), where dominates and post-dominates , uniquely identi es a set of basic
+blocks with a single entry point and single exit point. Two such regions are considered to be identical
+if it is possible to set up a 1-1 correspondence ' between their members such that if 1 ' 2 , then ( )
+0
+0
+1 is identical to 2 ; and ( ) if 1 is a (immediate) successor of 1 under some condition , and 2 is
+0
+0
+a (immediate) successor of 2 under the same condition , then 1 ' 2 . The algorithm to determine
+whether two regions are identical works by recursively traversing the two regions, starting at the entry
+node, and verifying that corresponding blocks are identical.
+In squeeze, after procedural abstraction has been applied to individual basic blocks, we identify
+pairs of basic blocks ( ) such that dominates and post-dominates . Each such pair de nes a
+single-entry single-exit set of basic blocks. These sets of basic blocks are then partitioned into groups
+of identical regions, which then become candidates for further procedural abstraction.
+As in the case of basic blocks, we compute a ngerprint for each region so that regions with di erent
+ngerprints will necessarily be di erent. These ngerprints are, again, 64-bit values: there are 8 bits
+for the number of basic blocks in the region and 8 bits for the total number of instructions, with the bit
+pattern 11...1 being used to represent values larger than 256; and the remaining 48 bits are used to
+encode the rst (according to a particular preorder traversal of the region) 8 basic blocks in the region,
+with each block encoded using 6 bits: two bits give the type of the block, and four bits for the number
+of instructions in the block. Again as in the case of basic blocks, the number of pairwise comparisons
+of ngerprints is reduced by distributing the regions over a hash table.
+It turns out that applying procedural abstraction to a set of basic blocks is not as straightforward
+as for a single basic block, especially in a binary rewriting implementation such as ours. The reason is
+that in general, when the procedure corresponding to such a single-entry single-exit region is called, the
+return address will be put into a register whose value cannot be guaranteed to be preserved through that
+entire procedure, e.g., because the region contains function calls. This means that the return address
+register has to be saved somewhere, e.g., on the stack. However, allocating an extra word on the stack,
+to hold the saved return address, can cause problems unless we are careful: allocating this space at the
+top of the stack frame can cause changes in the displacements of other variables in the stack frame,
+C
+
+C
+
+C
+
+C
+
+C
+
+d; p
+
+d
+
+C
+
+d; p
+
+d
+
+p
+
+p
+
+C
+
+p
+
+d
+
+B
+
+B
+
+B
+
+ii
+
+B
+
+B
+
+B
+
+d; p
+
+C
+
+d
+
+p
+
+5
+
+p
+
+B
+
+B
+
+C
+
+B
+
+d
+
+i
+
+B
+
+relative to the top-of-stack pointer; while allocating it at the bottom of the stack frame can change the
+displacements of any arguments that have been passed on the stack. If there is any address arithmetic
+involving the stack pointer, e.g., for address computations for local arrays, such computations may be
+a ected by changes in displacements within the stack frame. These problems are somewhat easier to
+handle if the procedural abstraction is being carried out before code generation, e.g., at the level of
+abstract syntax trees [6]. At the level of assembly code (as in the work of Cooper and McIntosh [4] and
+Fraser et al. [8]) or machine code (as in our work), it becomes considerably more complicated. There
+are, however, some simple cases where it is possible to avoid the complications associated with having
+to save and restore the return address when introducing procedural abstractions. Here, we identify two
+such situations.
+In the rst case, suppose that we are given two identical regions ( 0 0) and ( 1 1), where 0 and
+1 are return blocks, i.e., control returns from the blocks i to the caller. If, as is usually the case, we
+can assume that the return address of a function is always stored at a xed location within the stack
+frame relative to the stack pointer, there is no need to use procedural abstraction to create a separate
+function for these two regions: instead, we can use a transformation known as cross-jumping [11], where
+the code in the region ( 1 1) is simply replaced by a branch to 0.
+In the second case, given two identical regions ( 0 0) and ( 1 1) that we would like to abstract
+into a procedure, suppose that it is possible to nd a callee-saved register that is ( ) already saved and
+restored by the functions in which the regions under consideration occur; and ( ) is not live at entry
+to 0 and 1, and is not de ned within either region. In this case, when abstracting these regions into
+a procedure , it is not necessary to add any code to explicitly save and restore the return address for
+: the instruction to call can simply put the return address in , and the return instruction(s) within
+can simply jump indirectly through to return to the caller.
+d ;p
+
+p
+
+d ;p
+
+p
+
+p
+
+d ;p
+
+d
+
+d ;p
+
+d ;p
+
+r
+
+i
+
+ii
+
+d
+
+d
+
+r
+
+r
+
+p
+
+p
+
+p
+
+r
+
+p
+
+r
+
+2.5 Architecture-Speci c Idioms
+
+Apart from the general-purpose techniques described earlier for detecting and abstracting out repeated
+code fragments, there are machine-speci c idioms that can be pro tably exploited. In particular, the
+instructions to save and restore registers (the return address and callee-saved registers) in the prolog
+and epilog of each function generally have a predictable structure and are saved at predictable locations
+within the stack frame. For example, the standard calling convention for the DEC Alpha processor
+under Digital Unix treats register $26 as the return address register ($ra) and registers $9 through
+$15 as callee-saved registers; these are saved at locations 0x0($sp), 0x8($sp), 0x10($sp), and so on.
+Abstracting out such instructions can yield considerable savings in code size.
+
+2.5.1 Abstracting Register Saves
+In order to abstract out the register save instructions in the prolog of a function into a separate
+function , it is necessary to identify a register that can be used to hold the return address for the call
+from to . For each register , we rst compute the savings that would be obtained if were to be
+used for the return address for such calls. This is done by totaling up, for each function where
+is free at entry to , the number of registers saved in 's prolog. A register
+with maximal savings
+(which must exceed 0) is then chosen, and a family of functions Save r15
+Save r9 Save rra generated
+to save the callee-saved registers and the return address register, then return via register : the idea
+is that function Save ri saves register $ and then falls through into the code for function Save ri?1 . A
+function that has register free at its entry, and saves only registers $9, .. ., $ in its prolog, then has
+these register save instructions replaced by an instruction to call the function Save rk using register to
+hold the return address: As an example, suppose we have two functions f0() and f1(), such that f0()
+saves registers $9, . .., $14, and f1() saves only register $9. Assume that register $0 is free at entry to
+both these functions, and is chosen to be the return address register for the functions abstracting their
+register save actions. The code resulting from the transformation described above is shown in Figure 2.
+f
+
+g
+
+f
+
+g
+
+r
+
+r
+
+f
+
+f
+
+f
+
+r
+
+r
+
+; : : :;
+
+;
+
+r
+
+i
+
+r
+
+k
+
+r
+
+6
+
+f0:
+
+Save0
+15
+
+$sp := $sp - 32
+bsr $0,Save0
+14
+
+f1:
+$sp := $sp - 40
+bsr $0, Save0
+
+stq $15, 0x38($sp)
+
+9
+
+Save0
+14
+
+stq $14, 0x30($sp)
+...
+
+Save09
+
+stq $9, 0x8($sp)
+
+Save0ra
+stq $ra, 0x0($sp)
+ret ($0)
+
+Figure 2: Example code from abstraction of register save actions from function prologs
+It may turn out that the set of functions subjected to this transformation do not use all of the calleesaved registers: e.g., in Figure 2, suppose that none of the functions using return address register $0 save
+register $15. In this case, the code for the function Save 015 becomes unreachable and is subsequently
+eliminated.
+A particular choice of return address register, as described above, may not account for all of the
+functions in a program. The process is therefore repeated, using other choices of return address registers,
+until either no further bene t can be obtained, or all functions are accounted for.
+
+2.5.2 Abstracting Register Restores
+The code for abstracting out register restore sequences in function epilogs is conceptually analogous to
+that described above, but with a few di erences. If we were to simply do the opposite of what was
+done for register saves in function prologs, the code resulting from procedural abstraction at each return
+block for a function might have the following structure, with three instructions to manage the control
+transfers and stack pointer update:
+...
+bsr $1, ...
+$sp := $sp - k
+ret ($ra)
+
+/* call function that restores registers */
+/* deallocate stack frame */
+/* return */
+
+If we could somehow move the instruction for deallocating the stack frame into the function that restores
+saved registers, there would be no need to return to the function whose epilog we are abstracting:
+control could return directly to 's caller (in e ect realizing tail call optimization). The problem is
+that the code to restore saved registers is used by many di erent functions, which in general have stack
+frames of di erent sizes, and hence need to adjust the stack pointer by di erent amounts. The solution
+to this problem is to pass, as an argument to the function that restores registers, the amount by which
+the stack pointer must be adjusted. Since the return address register $ra is guaranteed to be free at this
+point|it is about to be overwritten with 's return address prior to returning control to 's caller|it
+can be used to pass this argument.1 Since there is now no need for control to return to after the
+registers have been restored|it can return directly to 's caller|we can simply jump from function
+to the function that restores registers, instead of using a function call. The resulting code requires two
+instructions instead of three in each function return block:
+f
+
+f
+
+f
+
+f
+
+f
+
+f
+
+f
+
+1 In practice not all functions can be guaranteed to follow the calling conventions, so it is necessary to verify that
+register $ra is, in fact, being used as the return address register by f .
+
+7
+
+Program Size (No. of instructions)
+unoptimized optimized squeezed
+(Nunopt )
+(Nopt )
+(Nsqz )
+compress
+21956
+21065
+16914
+gcc
+528353
+341988
+258666
+go
+134353
+80658
+66380
+ijpeg
+80760
+56514
+45659
+li
+44346
+38885
+29250
+m88ksim
+72563
+53062
+41343
+perl
+138394
+102756
+77303
+vortex
+205670
+150547
+112970
+adpcm
+18664
+18344
+14570
+gsm
+36245
+30391
+24534
+mpeg2dec
+35371
+28132
+22024
+mpeg2enc
+52551
+41792
+33447
+rasta
+97326
+90570
+66855
+Geometric Mean
+Program
+
+Nopt =Nunopt
+
+Nsqz =Nopt
+
+0.959
+0.647
+0.600
+0.700
+0.877
+0.731
+0.742
+0.732
+0.983
+0.835
+0.795
+0.795
+0.931
+0.782
+
+0.803
+0.756
+0.823
+0.808
+0.752
+0.779
+0.752
+0.750
+0.794
+0.807
+0.783
+0.800
+0.738
+0.780
+
+Table 1: Code size reduction
+...
+$ra := k
+br ...
+
+/* $sp needs to be adjusted by k */
+/* jump to function that restores registers */
+
+The code in the function that restores registers is pretty much what one would expect. Unlike the
+situation for register save sequences discussed in Section 2.5.1, we need only one function for restoring
+registers. The reason for this is that there is no need to call this function: control can jump into it
+directly, as discussed above. This means that we don't have to generate di erent versions of the function
+with di erent return address registers. The overall structure of the code is analogous to that for saving
+registers: there is a chain of basic blocks, each of which restores a callee-saved register, with control
+falling through into the next block, which saves the next (lower-numbered) callee-saved register, and
+so on. The last member of this chain adjusts the stack pointer appropriately, loads the return address
+into a register, and returns. There is, however, one minor twist at the end. The amount by which the
+stack pointer must be adjusted is passed in register $ra, so this register cannot be overwritten until
+after it has been used to adjust the stack pointer. On the other hand, since the memory location from
+which 's memory address is to be restored is in 's stack frame, we can't adjust the stack pointer until
+after the return address has been loaded into $ra. We get around this problem using the following
+instruction sequence:
+f
+
+...
+add $sp, $ra, $sp
+sub $sp, $ra, $ra
+ldq $ra, 0x0($ra)
+ret ($ra)
+
+f
+
+
+
+
+/* $sp := $sp + $ra
+new $sp */
+/* $ra := $sp - $ra
+old $sp */
+/* $ra := return address */
+
+3 Experimental Results
+
+To evaluate our ideas, we used the eight SPEC-95 integer benchmarks, as well as ve embedded applications, adpcm, gsm, mpeg2dec, mpeg2enc and rasta, obtained from the MediaBench benchmark suite
+from UCLA (http://www.cs.ucla.edu/~leec/mediabench). The programs were compiled using gcc
+8
+
+Improvement (%)
+
+100.0
+
+Classical Optimizations
+Code Factoring
+
+80.0
+60.0
+40.0
+20.0
+0.0
+rasta
+
+mpeg2enc
+
+mpeg2dec
+
+gsm
+
+adpcm
+
+vortex
+
+perl
+
+m88ksim
+
+li
+
+ijpeg
+
+go
+
+gcc
+
+compress
+
+Figure 3: Origins of code size improvements
+version 2.7.2.2, at optimization level -O2, with additional ags instructing the linker to retain relocation information and produce statically linked executables.2 At the -O2 level of optimization used,
+the compiler carries out most supported optimizations that do not involve a space-speed tradeo ; in
+particular, loop unrolling and function inlining are not carried out. We expect the resulting code to be
+comparable in size and quality to the optimized code of Cooper and McIntosh [4]. To obtain instruction
+counts, we rst disassemble the executable les and discard unreachable code and no-op instructions.
+This eliminates library routines that are linked in but are not actually called, as well as any no-op
+instructions that may have been inserted by the compiler for instruction scheduling or alignment purposes. To identify unreachable code, our implementation constructs a control ow graph for the entire
+program and then carries out a reachability analysis. In the course of constructing the control ow
+graph, unconditional branches are discarded: these are subsequently reinserted as necessary, after all
+the code transformations have been carried out, during code layout just before the transformed code is
+written out. To get accurate counts, therefore, we generate the nal code layout in each case (i.e., with
+and without compression) and count the total number of instructions.
+The overall code size reductions achieved using our techniques are shown in Table 1. The second
+column, labelled \unoptimized," gives the code size obtained using gcc -O0, i.e., with no optimization;
+the third column, labelled \optimized," gives the size of the programs using gcc -O2; and the fourth
+column, labelled \compressed," gives the code size obtained using squeeze on the optimized input programs. The fth column shows the code size reduction obtained using classical optimizations within gcc;
+the last column shows the additional reduction in code size obtained using squeeze. It can be seen from
+this table that gcc, using classical compiler optimizations, is able to achieve signi cant improvements
+in code size compared to the unoptimized code, with an average reduction of about 22%, which is more
+or less comparable to the corresponding numbers for Cooper and McIntosh. More importantly, the
+last column of this table illustrates that, even when given the already optimized executables as input,
+squeeze is able to achieve signi cant further reductions in size: for many of the benchmarks, it is able to
+achieve compression ratios of 20% or more, with an average size reduction of 22%. The source of these
+improvements in code size is shown in Figure 3. In general, roughly 60% of the code size reduction can
+be attributed to classical code optimizations such as dead and unreachable code elimination, and about
+40% attributable to the various code factoring techniques discussed.
+Our results indicate that, even though we start with programs that have been subjected to extensive
+optimization, we are still able to obtain signi cant reductions in code size. Roughly 40% of our code
+size reductions come from the code factoring techniques described, while about 60% come from the
+2 The requirement for statically linked executables is a result of the fact that squeeze relies on the presence of relocation
+information for its control ow analysis. The Digital Unix linker ld refuses to retain relocation information for nonstatically-linked executables.
+
+9
+
+application of compiler optimizations. It should be noted, however, that within squeeze, the improvements due to classical compiler optimizations are fundamentally inter-procedural in their origins, and
+are made possible by aggressive inter-procedural analysis and optimization that is possible at link time
+because the entire program is available for inspection (for the same reasons, our link-time optimizer
+alto is able to obtain signi cant improvements in execution speed, even for programs that have already
+been subjected to extensive compile-time optimization [12]).
+
+4 Conclusions
+
+This paper focuses on the problem of code compression to yield smaller executables. It describes an
+approach to this problem that departs from classical sux-tree-based approaches. Because it does not
+treat the program as a simple linear sequence of instructions, it can be more exible in its treatment of
+what code fragments may be considered \equivalent." This exibility, combined with aggressive interprocedural program analysis and optimization, allow us to obtain considerably greater compression,
+even on optimized code, than previous approaches.
+
+Acknowledgements
+
+We are grateful to Nathaniel McIntosh for helpful discussions, and for pointing us to the UCLA Mediabench benchmark programs.
+
+References
+
+[1] B. S. Baker, \A Theory of Parameterized Pattern Matching: Algorithms and Applications (Extended Abstract)", Proc. ACM Symposium on Theory of Computing, 1993, pp. 71{80.
+[2] B. S. Baker and U. Manber, \Deducing Similarities in Java Sources from Bytecodes", Proc.
+USENIX Annual Technical Conference, June 1998, pp. 179{190.
+[3] Martin Benes, Steven M. Nowick, and Andrew Wolfe. A fast asynchronous hu man decoder for
+compressed-code embedded processors. In Proc. International Symposium on Advanced Research
+in Asynchronous Circuits and Systems, September 1998.
+[4] K. D. Cooper and N. McIntosh, \Enhanced Code Compression for Embedded RISC Processors".
+Proc. SIGPLAN '99 Conference on Programming Language Design and Implementation, May 1999
+(to appear).
+[5] J. Ernst, W. Evans, C. Fraser, S. Lucco, and T. Proebsting. Code compression. In SIGPLAN '97
+Conference on Programming Language Design and Implementation, 1997.
+[6] M. Franz. Adaptive compression of syntax trees and iterative dynamic code optimization: Two
+basic technologies for mobile-object systems. Technical Report 97-04, Department of Information
+and Computer Science, University of California, Irvine, February 1997.
+[7] M. Franz and T. Kistler. Slim binaries. Technical Report 96-24, Department of Information and
+Computer Science, University of California, Irvine, June 1996.
+[8] C. W. Fraser, E. W. Myers, and A. L. Wendt, \Analyzing and Compressing Assembly Code", Proc.
+SIGPLAN '84 Symposium on Compiler Construction, June 1984, pp. 117{121.
+[9] C.W. Fraser and T.A. Proebsting. Custom instruction sets for code compression. Unpublished
+manuscript. http://research.microsoft.com/ toddpro/papers/pldi2.ps, October 1995.
+[10] J. Knoop, O. Ruthing, and B. Ste en, \Optimal Code Motion: Theory and Practice", ACM
+Transactions on Programming Languages and Systems vol. 16 no. 4, July 1994, pp. 1117{1155.
+10
+
+[11] S. S. Muchnick, Advanced Compiler Design and Implementation, Morgan Kaufman, 1997.
+[12] R. Muth, S. K. Debray, S. Watterson, and K. De Bosschere, \alto : A Link-Time Optimizer for
+the DEC Alpha", Technical Report 98-14, Dept. of Computer Science, The University of Arizona,
+December 1998.
+[13] K. Pettis and R. C. Hansen, \Pro le-Guided Code Positioning", Proc. SIGPLAN '90 Conference
+on Programming Language Design and Implementation, June 1990, pp. 16{27.
+[14] T.A. Proebsting. Optimizing an ANSI C interpreter with superoperators. In Proc. Symp. on
+Principles of Programming Languages, pages 322{332, January 1995.
+[15] R.
+van
+de
+Wiel.
+The
+`Code
+Compaction'
+Bibliography.
+URL:
+http://www.win.tue.nl/cs/pa/rikvdw/bibl.html.
+[16] M. J. Zastre, Compacting Object Code via Parameterized Procedural Abstraction, Masters Thesis,
+Dept. of Computing Science, University of Victoria, Canada, 1993.
+
+11
+
+

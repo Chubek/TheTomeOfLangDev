@@ -1,0 +1,403 @@
+%%
+%% chapter-109.ltx — Energy-Aware Compilation
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:energy-intro}
+
+For most of the history of computing, the primary goal of compilation was to
+produce code that runs as \emph{fast} as possible.  Speed was the universal
+currency: faster code meant more throughput, lower latency, and better user
+experience.  But in the modern era---characterized by mobile devices, data
+centers, and the Internet of Things---\emph{energy} has become an equally
+important compilation target.
+
+Energy consumption affects every level of computing:
+\begin{itemize}
+\item \textbf{Mobile devices:} Battery life is the primary user-facing metric.
+\item \textbf{Data centers:} Energy costs account for 40\% of the total cost of
+      ownership of a data center~\cite{barroso2013datacenter}.
+\item \textbf{Embedded systems:} Many devices must operate for years on a
+      single battery or energy-harvesting source.
+\item \textbf{Environmental impact:} Computing accounts for an estimated 2--4\%
+      of global carbon emissions~\cite{strubell2020energy}.
+\end{itemize}
+
+\emph{Energy-aware compilation} is the practice of optimizing compiled code for
+energy efficiency, either as a primary objective or in trade-off with
+performance.  This chapter explores the theory and practice of energy-aware
+compilation, from energy modeling (\cref{sec:energy-models}) to optimization
+techniques (\cref{sec:energy-optimization}) and thermal-aware scheduling
+(\cref{sec:energy-thermal}).
+
+% ============================================================
+% Energy as a Compilation Target
+% ============================================================
+\section{Energy as a Compilation Target}\label{sec:energy-target}
+
+\subsection{The Multi-Objective Optimization Problem}\label{sec:energy-multi}
+
+Energy-aware compilation is fundamentally a \emph{multi-objective optimization}
+problem: the compiler must balance energy consumption against performance, code
+size, and other objectives.
+
+\begin{definition}[Energy-Aware Compilation]\label{def:energy-compile}
+Given a program $P$, a target architecture $A$, and an objective function
+$f : \mathcal{C} \to \mathbb{R}^k$ mapping compiled code to a vector of metrics
+(e.g., $(\mathit{time}, \mathit{energy}, \mathit{size})$), energy-aware
+compilation finds $c \in \mathcal{C}$ that minimizes $f(c)$ according to some
+preference ordering on $\mathbb{R}^k$.
+\end{definition}
+
+\subsection{Pareto Optimality}\label{sec:energy-pareto}
+
+When optimizing for multiple objectives, there is typically no single optimal
+solution.  Instead, there is a set of \emph{Pareto-optimal} solutions:
+
+\begin{definition}[Pareto Optimality]\label{def:pareto}
+A solution $c_1$ \emph{dominates} $c_2$ (written $c_1 \prec c_2$) if $c_1$ is
+at least as good as $c_2$ in all objectives and strictly better in at least one.
+A solution is \emph{Pareto-optimal} if no other solution dominates it.
+\end{definition}
+
+The set of Pareto-optimal solutions forms the \emph{Pareto front}: a curve in
+the objective space representing the best achievable trade-offs.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+  \begin{axis}[
+    xlabel={Execution Time (ms)},
+    ylabel={Energy (mJ)},
+    xmin=0, xmax=100,
+    ymin=0, ymax=100,
+    width=10cm, height=7cm,
+    grid=both,
+    grid style={line width=.1pt, draw=gray!10},
+    major grid style={line width=.2pt,draw=gray!50},
+  ]
+    % Pareto front
+    \addplot[thick, TomeInk, mark=*, mark size=2] coordinates {
+      (10, 90) (20, 70) (30, 55) (45, 40) (60, 30) (80, 20)
+    };
+    \addlegendentry{Pareto front}
+    % Dominated solutions
+    \addplot[only marks, mark=x, gray, mark size=2] coordinates {
+      (25, 80) (35, 65) (50, 50) (70, 45) (40, 80) (55, 60)
+    };
+    \addlegendentry{Dominated solutions}
+  \end{axis}
+\end{tikzpicture}
+\caption{Pareto front for time--energy trade-offs}\label{fig:pareto-front}
+\end{figure}
+
+% ============================================================
+% Measuring Energy Consumption
+% ============================================================
+\section{Measuring Energy Consumption}\label{sec:energy-measuring}
+
+\subsection{Hardware Power Measurement}\label{sec:energy-hardware}
+
+Energy consumption can be measured at several levels:
+
+\begin{itemize}
+\item \textbf{Chip-level:} Intel RAPL (Running Average Power Limit) provides
+      energy counters for the package, cores, and memory controller.
+\item \textbf{Board-level:} External power meters (e.g., Watts Up? Pro) measure
+      the total power draw of the system.
+\item \textbf{Component-level:} Specialized hardware (e.g., National Instruments
+      data acquisition) can measure individual components.
+\end{itemize}
+
+\subsection{Software Energy Estimation}\label{sec:energy-software}
+
+When hardware measurement is not available, energy can be estimated using
+\emph{software energy models} that map program behavior to energy consumption.
+
+\begin{definition}[Software Energy Model]\label{def:energy-model}
+A \emph{software energy model} is a function $E : \mathcal{P} \to \mathbb{R}$
+that estimates the energy consumed by executing a program $P$.  The model is
+typically parameterized by features of the program's execution (instruction mix,
+cache miss rate, branch prediction accuracy, etc.).
+\end{definition}
+
+\subsection{Instruction-Level Energy Models}\label{sec:energy-instruction}
+
+The simplest energy models assign an energy cost to each instruction:
+\[
+E(P) = \sum_{i \in \mathit{instrs}(P)} e(i)
+\]
+where $e(i)$ is the energy cost of instruction $i$.  More sophisticated models
+account for:
+\begin{itemize}
+\item \textbf{Instruction interactions:} The energy of executing two instructions
+      in sequence may differ from the sum of their individual energies.
+\item \textbf{Pipeline effects:} Instructions that stall the pipeline consume
+      more energy.
+\item \textbf{Memory hierarchy:} Cache misses are significantly more expensive
+      than cache hits.
+\end{itemize}
+
+% ============================================================
+% Energy Models for Instructions
+% ============================================================
+\section{Energy Models for Instructions}\label{sec:energy-models}
+
+\subsection{Base Energy Model}\label{sec:energy-base}
+
+A basic instruction-level energy model decomposes energy into components:
+
+\begin{definition}[Instruction Energy Decomposition]\label{def:energy-decomp}
+The energy of executing instruction $i$ is:
+\[
+e(i) = e_{\mathit{base}}(i) + e_{\mathit{src}}(i) + e_{\mathit{dest}}(i) + e_{\mathit{overhead}}
+\]
+where:
+\begin{itemize}
+\item $e_{\mathit{base}}(i)$ is the base energy of the instruction type.
+\item $e_{\mathit{src}}(i)$ accounts for the operand values (bit transitions).
+\item $e_{\mathit{dest}}(i)$ accounts for the destination register writes.
+\item $e_{\mathit{overhead}}$ accounts for pipeline and control logic.
+\end{itemize}
+\end{definition}
+
+\subsection{Cache-Aware Energy Models}\label{sec:energy-cache}
+
+Memory accesses dominate energy consumption in many programs.  A cache-aware
+energy model accounts for the energy cost of different levels of the memory
+hierarchy:
+
+\begin{table}[htbp]
+\caption{Typical Energy Costs per Access}\label{tab:energy-costs}
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Memory Level} & \textbf{Energy (nJ)} & \textbf{Latency (cycles)} \\
+\hline
+Register file & 0.1--1 & 0 \\
+L1 cache & 1--5 & 3--4 \\
+L2 cache & 5--20 & 10--12 \\
+L3 cache & 20--50 & 30--40 \\
+Main memory & 100--500 & 200--300 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Calibration}\label{sec:energy-calibration}
+
+Energy models must be \emph{calibrated} by measuring the actual energy
+consumption of known programs and fitting the model parameters.  This is
+typically done using hardware power measurement tools (e.g., Intel RAPL) and
+carefully designed calibration benchmarks.
+
+% ============================================================
+% Energy-Aware Optimization
+% ============================================================
+\section{Energy-Aware Optimization}\label{sec:energy-optimization}
+
+\subsection{Energy-Aware Instruction Selection}\label{sec:energy-isel}
+
+Instruction selection can be guided by energy costs rather than (or in addition
+to) execution time.  For example, on ARM processors, the \texttt{MUL} instruction
+may consume less energy than a sequence of \texttt{ADD} instructions for certain
+multiplications, even if the \texttt{ADD} sequence is faster.
+
+\begin{example}[Energy-Aware Instruction Selection]\label{ex:energy-isel}
+Consider computing $x \times 3$.  Two implementations:
+\begin{enumerate}
+\item \texttt{ADD r0, r0, r0, LSL \#1} (1 instruction)
+\item \texttt{MOV r1, \#3; MUL r0, r0, r1} (2 instructions)
+\end{enumerate}
+The \texttt{ADD} version is faster (1 cycle vs.\ 3 cycles) but may consume more
+energy due to the barrel shifter activity.  An energy-aware instruction selector
+would choose based on the optimization objective.
+\end{example}
+
+\subsection{Energy-Aware Register Allocation}\label{sec:energy-regalloc}
+
+Register allocation affects energy consumption in several ways:
+\begin{itemize}
+\item \textbf{Spill code:} Spilling registers to memory incurs the high energy
+      cost of memory accesses.
+\item \textbf{Register transitions:} Frequent writes to the same register cause
+      bit transitions that consume energy.
+\item \textbf{Register file banking:} Some architectures have register banks
+      with different energy costs.
+\end{itemize}
+
+An energy-aware register allocator minimizes spills (to avoid memory accesses)
+and minimizes register transitions (by preferring assignments that cause fewer
+bit changes).
+
+\subsection{Energy-Aware Loop Transformations}\label{sec:energy-loop}
+
+Loop transformations can significantly affect energy consumption by changing the
+access patterns of the loop:
+
+\begin{itemize}
+\item \textbf{Loop fusion:} Combining two loops reduces loop overhead and may
+      improve data locality.
+\item \textbf{Loop fission:} Splitting a loop may reduce register pressure and
+      improve cache behavior.
+\item \textbf{Loop interchange:} Changing the nesting order of loops can
+      transform column-major access into row-major access, dramatically
+      improving cache behavior and reducing memory energy.
+\item \textbf{Loop tiling:} Partitioning loops into tiles that fit in cache
+      reduces the number of cache misses.
+\end{itemize}
+
+\subsection{Voltage and Frequency Scaling}\label{sec:energy-dvfs}
+
+\emph{Dynamic voltage and frequency scaling} (DVFS) adjusts the processor's
+voltage and clock frequency at run time.  Since energy is proportional to
+$V^2 \times f$ and performance is proportional to $f$, there is a cubic
+relationship between energy and performance:
+\[
+E \propto V^2 \times f \propto f^3
+\]
+Running at lower frequency saves energy cubically but increases execution time
+linearly.
+
+An energy-aware compiler can insert DVFS hints---instructions that request
+frequency changes---at appropriate points in the program.  For example, before a
+memory-intensive section (where the CPU is stalled waiting for data), the
+compiler can request a lower frequency.
+
+% ============================================================
+% Thermal-Aware Scheduling
+% ============================================================
+\section{Thermal-Aware Scheduling}\label{sec:energy-thermal}
+
+\subsection{The Thermal Problem}\label{sec:thermal-problem}
+
+High energy consumption leads to high temperatures, which in turn cause:
+\begin{itemize}
+\item \textbf{Thermal throttling:} The processor reduces frequency to prevent
+      overheating, degrading performance.
+\item \textbf{Increased leakage:} Higher temperatures increase leakage current,
+      which increases energy consumption (a positive feedback loop).
+\item \textbf{Reduced reliability:} High temperatures accelerate hardware
+      degradation (electromigration, time-dependent dielectric breakdown).
+\end{itemize}
+
+\subsection{Thermal-Aware Instruction Scheduling}\label{sec:thermal-sched}
+
+Thermal-aware instruction scheduling arranges instructions to minimize peak
+temperature while maintaining performance.  The key insight is that different
+functional units generate different amounts of heat; by distributing work across
+functional units, the scheduler can avoid hot spots.
+
+\begin{definition}[Thermal-Aware Scheduling]\label{def:thermal-sched}
+Given a set of instructions $I$ with dependencies $D$ and thermal profiles
+$T : I \to \mathbb{R}$ (heat generated by each instruction), thermal-aware
+scheduling finds an ordering $\sigma$ of $I$ that:
+\begin{enumerate}
+\item Respects the dependencies $D$.
+\item Minimizes the peak temperature $\max_t \mathit{temp}(t)$.
+\item Does not increase the total execution time beyond a given bound.
+\end{enumerate}
+\end{definition}
+
+\subsection{Thermal Simulation}\label{sec:thermal-sim}
+
+Thermal simulation models the temperature of the processor as a function of
+time, given a sequence of instructions.  The standard model uses an RC
+(resistor-capacitor) equivalent circuit:
+\[
+C \frac{dT}{dt} = P(t) - \frac{T - T_{\mathit{ambient}}}{R}
+\]
+where $C$ is the thermal capacitance, $R$ is the thermal resistance, $P(t)$ is
+the power at time $t$, and $T$ is the temperature.
+
+% ============================================================
+% Trade-offs: Performance vs.\ Energy
+% ============================================================
+\section{Trade-offs: Performance vs.\ Energy}\label{sec:energy-tradeoffs}
+
+\subsection{The Performance--Energy Frontier}\label{sec:energy-frontier}
+
+The relationship between performance and energy is not monotonic.  Some
+optimizations improve both performance and energy (e.g., reducing cache misses);
+others improve one at the expense of the other (e.g., loop unrolling may improve
+speed but increase instruction fetch energy).
+
+\begin{definition}[Energy-Delay Product]\label{def:edp}
+The \emph{energy-delay product} (EDP) is a combined metric:
+\[
+\mathit{EDP} = E \times D
+\]
+where $E$ is energy and $D$ is delay (execution time).  Minimizing EDP balances
+energy and performance.  The \emph{energy-delay$^2$ product} ($\mathit{ED}^2\mathit{P}$)
+gives more weight to performance.
+\end{definition}
+
+\subsection{Dark Silicon and the Power Wall}\label{sec:energy-dark-silicon}
+
+The end of Dennard scaling~\cite{esmaeilzadeh2011dark} means that not all
+transistors on a chip can be active simultaneously without exceeding the thermal
+design power.  This \emph{dark silicon} phenomenon means that energy efficiency
+is no longer optional---it is a fundamental constraint on processor design and,
+by extension, on compilation.
+
+\begin{insight}
+The shift from performance-only optimization to energy-aware optimization
+represents a fundamental change in the compiler's objective function.  Where
+once the compiler's goal was to minimize execution time, it must now navigate a
+multi-dimensional space of trade-offs between time, energy, temperature, and
+other metrics.  This shift mirrors the broader transition in computer
+architecture from the single-core frequency-scaling era to the multi-core,
+heterogeneous, power-constrained era.
+\end{insight}
+
+\subsection{Compiler Strategies for Energy Efficiency}\label{sec:energy-strategies}
+
+\begin{itemize}
+\item \textbf{Code compaction:} Smaller code means fewer instruction fetches,
+      reducing energy.
+\item \textbf{Data locality optimization:} Better cache behavior reduces
+      expensive memory accesses.
+\item \textbf{Algorithmic optimization:} Choosing algorithms with fewer
+      operations reduces total energy.
+\item \textbf{Approximate computing:} Trading accuracy for energy in
+      error-tolerant applications.
+\item \textbf{Hardware--software co-design:} Exposing hardware energy features
+      (power gates, clock gates) to the compiler.
+\end{itemize}
+
+\begin{historical}
+Energy-aware compilation emerged in the late 1990s and early 2000s, driven by
+the rise of mobile computing.  Early work by Tiwari et
+al.~\cite{tiwari1994energy} developed instruction-level energy models for
+embedded processors.  The work of Sinha and
+Chandrakasan~\cite{sinha2001jouletrack} introduced JouleTrack, a tool for
+tracking energy consumption at the source level.  As mobile devices and data
+centers have grown in importance, energy-aware compilation has become an
+increasingly active area of research, with modern compilers incorporating
+energy-aware optimizations alongside traditional performance optimizations.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:energy-summary}
+
+Energy-aware compilation extends the compiler's optimization objectives beyond
+pure performance to include energy consumption, thermal behavior, and their
+trade-offs.  As computing devices become increasingly constrained by power and
+thermal limits, energy-aware compilation will become an essential capability of
+production compilers.
+
+Key open challenges include:
+\begin{itemize}
+\item \textbf{Accurate energy modeling:} Building energy models that are both
+      accurate and fast enough for use in the compiler.
+\item \textbf{Multi-objective optimization:} Efficiently exploring the
+      Pareto front of time--energy trade-offs.
+\item \textbf{Hardware--software co-optimization:} Exposing more hardware
+      energy features to the compiler.
+\item \textbf{Approximate computing:} Integrating quality-energy trade-offs
+      into the compilation process.
+\end{itemize}

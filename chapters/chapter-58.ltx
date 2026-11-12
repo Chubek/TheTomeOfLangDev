@@ -1,0 +1,458 @@
+%%
+%% chapter-58.ltx — Semantic IR
+%%
+
+\label{ch:semantic-ir}
+
+Traditional intermediate representations are \emph{operational}: they describe programs in terms of the operations that a machine performs. A \emph{semantic IR}, by contrast, describes programs in terms of their \emph{meaning}, independent of any particular execution model. This chapter explores the design and applications of semantic IRs, which express high-level operations (tensor computations, parser combinators, database queries) in a form that can be lowered to multiple backends while preserving optimization opportunities.
+
+%% ============================================================
+%% Section 58.1
+%% ============================================================
+\section{Expressing Meaning Independently of Execution}\label{sec:semantic-meaning}
+
+A semantic IR captures the \emph{intent} of a computation rather than its \emph{mechanism}. Instead of specifying how to compute a result (loop over elements, accumulate in a register), it specifies what to compute (sum of elements, product of matrices).
+
+\subsection{Operational vs. Semantic}\label{sec:operational-vs-semantic}
+
+\begin{example}[Matrix multiplication]\label{ex:matrix-mul}
+\textbf{Operational IR:}
+\begin{verbatim}
+  for i = 0 to N:
+    for j = 0 to M:
+      for k = 0 to K:
+        C[i,j] += A[i,k] * B[k,j]
+\end{verbatim}
+
+\textbf{Semantic IR:}
+\begin{verbatim}
+  C = matmul(A, B)
+\end{verbatim}
+
+The semantic IR expresses the intent (matrix multiplication) without specifying the algorithm (triple loop). This allows the compiler to choose the best implementation for the target (BLAS, GPU kernel, specialized loop nest).
+\end{example}
+
+\subsection{Benefits of Semantic IR}\label{sec:semantic-benefits}
+
+\begin{itemize}
+  \item \textbf{Backend flexibility.} The same semantic IR can be lowered to different backends (CPU, GPU, TPU, FPGA).
+  \item \textbf{High-level optimization.} Optimizations can operate on the semantic level (fusion, tiling, parallelization) before lowering.
+  \item \textbf{Portability.} The semantic IR is independent of the target architecture.
+  \item \textbf{Composability.} Semantic operations compose naturally, enabling modular compilation.
+\end{itemize}
+
+%% ============================================================
+%% Section 58.2
+%% ============================================================
+\section{Semantic Operators and Their Contracts}\label{sec:semantic-operators}
+
+A semantic IR defines a set of \emph{semantic operators}, each with a precise mathematical contract.
+
+\subsection{Operator Contracts}\label{sec:operator-contracts}
+
+\begin{definition}[Semantic Operator]\label{def:semantic-op}
+A \emph{semantic operator} is an operation with a well-defined mathematical semantics. Its contract specifies:
+\begin{itemize}
+  \item \textbf{Input/output types.} The types of the inputs and outputs.
+  \item \textbf{Semantics.} The mathematical function computed.
+  \item \textbf{Side effects.} Any effects (I/O, mutation) performed.
+  \item \textbf{Equivalences.} Algebraic laws (commutativity, associativity) that enable optimization.
+\end{itemize}
+\end{definition}
+
+\begin{example}[Tensor operators]\label{ex:tensor-ops}
+\begin{verbatim}
+  matmul : Tensor[m,k] -> Tensor[k,n] -> Tensor[m,n]
+    -- Semantics: C[i,j] = sum_k A[i,k] * B[k,j]
+    -- Equivalences: matmul(A, matmul(B, C)) = matmul(matmul(A, B), C)
+
+  transpose : Tensor[m,n] -> Tensor[n,m]
+    -- Semantics: B[j,i] = A[i,j]
+    -- Equivalences: transpose(transpose(A)) = A
+
+  reduce_sum : Tensor[n] -> Scalar
+    -- Semantics: sum of all elements
+    -- Equivalences: reduce_sum(concat(A, B)) = reduce_sum(A) + reduce_sum(B)
+\end{verbatim}
+\end{example}
+
+\subsection{Equational Reasoning}\label{sec:equational-reasoning}
+
+Semantic operators support equational reasoning: the compiler can rewrite expressions using the operators' algebraic laws.
+
+\begin{example}[Fusion via equational reasoning]\label{ex:fusion}
+\begin{verbatim}
+  -- Source:
+  result = reduce_sum(matmul(transpose(A), B))
+
+  -- Rewrite using transpose(matmul(A,B)) = matmul(transpose(B), transpose(A)):
+  result = reduce_sum(matmul(transpose(A), B))
+  -- No simplification possible here, but:
+
+  -- If we know A is symmetric (A = transpose(A)):
+  result = reduce_sum(matmul(A, B))
+  -- This enables a more efficient implementation
+\end{verbatim}
+\end{example}
+
+%% ============================================================
+%% Section 58.3
+%% ============================================================
+\section{Multi-Backend Lowering}\label{sec:multi-backend}
+
+A key advantage of semantic IRs is the ability to lower the same program to multiple backends.
+
+\subsection{Lowering Strategies}\label{sec:lowering-strategies}
+
+\begin{itemize}
+  \item \textbf{Direct lowering.} Each semantic operator is translated directly to a backend-specific operation.
+  \item \textbf{Library lowering.} Semantic operators are translated to library calls (e.g., BLAS for matrix operations).
+  \item \textbf{Code generation.} Semantic operators are compiled to custom code (e.g., generating a GPU kernel for matrix multiplication).
+  \item \textbf{Hybrid.} Some operators use libraries, others use generated code.
+\end{itemize}
+
+\subsection{Example: Tensor Compilation}\label{sec:tensor-compilation}
+
+\begin{verbatim}
+  -- Semantic IR:
+  result = matmul(A, B) + C
+
+  -- Backend 1: CPU (BLAS)
+  call dgemm(A, B, temp)
+  call daxpy(temp, C, result)
+
+  -- Backend 2: GPU (CUDA kernel)
+  kernel matmul_add(A, B, C, result) {
+    // custom GPU kernel that fuses matmul and add
+  }
+
+  -- Backend 3: TPU (XLA HLO)
+  %temp = hlo.dot(A, B)
+  %result = hlo.add(%temp, C)
+\end{verbatim}
+
+\subsection{Backend Selection}\label{sec:backend-selection}
+
+The compiler selects the best backend based on:
+\begin{itemize}
+  \item \textbf{Target hardware.} CPU, GPU, TPU, FPGA.
+  \item \textbf{Problem size.} Small problems may use CPU; large problems benefit from GPU/TPU.
+  \item \textbf{Data layout.} The memory layout of tensors affects the choice of algorithm.
+  \item \textbf{Performance model.} A cost model estimates the performance of each backend.
+\end{itemize}
+
+%% ============================================================
+%% Section 58.4
+%% ============================================================
+\section{Precision and Effect Annotations}\label{sec:precision-effects}
+
+Semantic IRs can carry annotations about precision and effects, enabling the compiler to make informed decisions.
+
+\subsection{Precision Annotations}\label{sec:precision-annotations}
+
+\begin{verbatim}
+  -- Semantic IR with precision:
+  result : fp32 = matmul : fp16(A, B)  -- compute in fp16, result in fp32
+
+  -- The compiler can choose to:
+  -- 1. Use fp16 hardware (GPU tensor cores)
+  -- 2. Accumulate in fp32 for accuracy
+  -- 3. Use mixed precision for speed/accuracy tradeoff
+\end{verbatim}
+
+\subsection{Effect Annotations}\label{sec:effect-annotations}
+
+\begin{verbatim}
+  -- Semantic IR with effects:
+  result = read_file("data.csv") : {io}
+  parsed = parse_csv(result) : {}  -- pure
+  model = train(parsed) : {alloc, compute}  -- allocates memory, computes
+\end{verbatim}
+
+Effect annotations enable the compiler to:
+\begin{itemize}
+  \item Schedule I/O operations (overlap with computation).
+  \item Allocate memory efficiently (pre-allocate for known sizes).
+  \item Parallelize pure computations.
+\end{itemize}
+
+%% ============================================================
+%% Section 58.5
+%% ============================================================
+\section{Examples: Tensor Operations, Parser Combinators}\label{sec:semantic-examples}
+
+\subsection{Tensor Operations (MLIR/Torch)}\label{sec:tensor-mlir}
+
+MLIR's \texttt{torch} dialect defines semantic operators for tensor operations:
+
+\begin{verbatim}
+  %result = torch.aten.matmul %A, %B : !torch.tensor, !torch.tensor -> !torch.tensor
+  %sum = torch.aten.sum %result : !torch.tensor -> !torch.tensor
+\end{verbatim}
+
+These operators are lowered through a series of dialects:
+\begin{enumerate}
+  \item \texttt{torch} dialect (high-level tensor operations).
+  \item \texttt{linalg} dialect (linear algebra operations).
+  \item \texttt{scf} dialect (structured control flow: loops).
+  \item \texttt{llvm} dialect (LLVM IR).
+\end{enumerate}
+
+\subsection{Parser Combinators}\label{sec:parser-combinators}
+
+Parser combinators can be represented as a semantic IR:
+
+\begin{verbatim}
+  -- Semantic IR for parsers:
+  expr = seq(lit("("), expr, lit(")")) | ident
+  -- This is a semantic description of the grammar, not an implementation.
+
+  -- Lowering 1: recursive descent parser
+  fn parse_expr(input) {
+    if (input.peek() == "(") { ... }
+    else { parse_ident(input) }
+  }
+
+  -- Lowering 2: table-driven parser (LALR)
+  // Generated parse table from the grammar
+\end{verbatim}
+
+\subsection{Database Queries}\label{sec:database-queries}
+
+Database queries are naturally expressed as semantic IRs:
+
+\begin{verbatim}
+  -- Semantic IR (relational algebra):
+  result = project(name, age, filter(age > 18, users))
+
+  -- Lowering 1: SQL
+  SELECT name, age FROM users WHERE age > 18
+
+  -- Lowering 2: query plan
+  Scan(users) -> Filter(age > 18) -> Project(name, age)
+
+  -- Lowering 3: execution engine
+  for row in users:
+    if row.age > 18:
+      emit(row.name, row.age)
+\end{verbatim}
+
+%% ============================================================
+%% Section 58.6
+%% ============================================================
+\section{Comparison with Low-Level IR}\label{sec:semantic-vs-low}
+
+\begin{table}[htbp]
+\centering
+\caption{Semantic IR vs. low-level IR}\label{tab:semantic-vs-low}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Aspect} & \textbf{Semantic IR} & \textbf{Low-Level IR} \\
+\hline
+Operations & matmul, reduce, parse & add, load, branch \\
+Types & Tensor, Parser, Query & i32, f64, ptr \\
+Optimization & Fusion, tiling, parallelism & CSE, DCE, loop unrolling \\
+Backend & CPU, GPU, TPU, custom & x86, ARM, RISC-V \\
+Abstraction & High (domain-specific) & Low (machine-like) \\
+\hline
+\end{tabular}
+\end{table}
+
+Semantic IRs and low-level IRs are complementary. A complete compiler uses both: the semantic IR captures high-level structure, and the low-level IR enables machine-specific optimization.
+
+\begin{insight}
+The key insight of semantic IRs is that the compiler should preserve high-level structure as long as possible. Lowering too early destroys optimization opportunities: a matrix multiplication lowered to a triple loop cannot be recognized as a matrix multiplication and optimized with BLAS or a GPU kernel. By maintaining semantic operators through multiple lowering stages, the compiler can apply domain-specific optimizations at each level.
+\end{insight}
+
+\begin{historical}
+The idea of semantic IRs has roots in the database community, where query plans represent the semantics of a query independently of its execution. The tensor compilation community (XLA, TVM, Halide) has developed sophisticated semantic IRs for machine learning workloads. MLIR~\cite{lattner2021} provides a general framework for defining semantic IRs (dialects) and lowering them incrementally. The trend toward domain-specific compilers (for tensors, graphs, quantum circuits) has increased the importance of semantic IRs as a way to bridge the gap between high-level abstractions and hardware.
+\end{historical}
+
+%% ============================================================
+%% Section 58.7
+%% ============================================================
+\section{Advanced Semantic Operators and Multi-Backend Lowering}\label{sec:semantic-advanced}
+
+\subsection{Semantic Operator Contracts in Detail}\label{sec:operator-contracts-detail}
+
+A well-designed semantic operator has a precise contract that enables the compiler to reason about its properties.
+
+\begin{definition}[Operator Contract]\label{def:operator-contract}
+An operator contract specifies:
+\begin{enumerate}
+  \item \textbf{Preconditions.} What must be true before the operation (e.g., matrix dimensions are compatible).
+  \item \textbf{Postconditions.} What is guaranteed after the operation (e.g., the result has a specific shape).
+  \item \textbf{Algebraic laws.} Equivalences that enable rewriting (e.g., associativity, commutativity).
+  \item \textbf{Side effects.} What observable effects the operation has (e.g., memory allocation, I/O).
+\end{enumerate}
+\end{definition}
+
+\begin{example}[Contract for matrix multiplication]\label{ex:matmul-contract}
+\begin{verbatim}
+  matmul : Tensor[m,k] -> Tensor[k,n] -> Tensor[m,n]
+  -- Preconditions: A.shape = (m, k), B.shape = (k, n)
+  -- Postconditions: C.shape = (m, n)
+  -- Semantics: C[i,j] = sum(A[i,:] * B[:,j])
+  -- Laws:
+  --   matmul(A, matmul(B, C)) = matmul(matmul(A, B), C)  (associativity)
+  --   matmul(A, B + C) = matmul(A, B) + matmul(A, C)     (distributivity)
+  --   transpose(matmul(A, B)) = matmul(transpose(B), transpose(A))
+  -- Side effects: allocates result tensor
+\end{verbatim}
+\end{example}
+
+\subsection{Fusion Rules for Semantic Operators}\label{sec:fusion-rules}
+
+Fusion combines multiple operations into a single operation, reducing memory traffic and improving performance.
+
+\begin{verbatim}
+  // Fusion rule: map-map fusion
+  map(f, map(g, xs)) = map(x -> f(g(x)), xs)
+  // Two passes over the data become one pass
+
+  // Fusion rule: map-reduce fusion
+  reduce(op, map(f, xs)) = reduce(op, xs, f)
+  // Map and reduce in a single pass
+
+  // Fusion rule: matmul-add fusion (GEMM + AXPY)
+  matmul(A, B) + C = gemm_add(A, B, C)
+  // Matrix multiply and add in a single kernel
+\end{verbatim}
+
+\begin{table}[htbp]
+\centering
+\caption{Common fusion patterns for semantic operators}\label{tab:fusion-patterns}
+\begin{tabular}{p{3cm}p{4cm}p{4.5cm}}
+\hline
+\textbf{Pattern} & \textbf{Before} & \textbf{After} \\
+\hline
+Map-map & $\mathrm{map}(f, \mathrm{map}(g, xs))$ & $\mathrm{map}(f \circ g, xs)$ \\
+Map-reduce & $\mathrm{reduce}(\mathrm{map}(f, xs))$ & $\mathrm{reduce\_with}(f, xs)$ \\
+Filter-map & $\mathrm{map}(f, \mathrm{filter}(p, xs))$ & $\mathrm{filter\_map}(p, f, xs)$ \\
+Matmul-add & $\mathrm{matmul}(A, B) + C$ & $\mathrm{gemm\_add}(A, B, C)$ \\
+Conv-bias & $\mathrm{bias}(\mathrm{conv}(x, w))$ & $\mathrm{conv\_bias}(x, w, b)$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Multi-Backend Lowering Strategies}\label{sec:multi-backend-detail}
+
+The same semantic IR can be lowered to different backends, each with its own strategy.
+
+\begin{verbatim}
+  -- Semantic IR:
+  result = matmul(A, B)
+
+  -- Backend 1: CPU with BLAS
+  -- Strategy: call optimized BLAS library
+  call dgemm('N', 'N', m, n, k, 1.0, A, lda, B, ldb, 0.0, C, ldc)
+
+  -- Backend 2: GPU with CUDA
+  -- Strategy: generate custom GPU kernel
+  __global__ void matmul_kernel(float* A, float* B, float* C, int m, int n, int k) {
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    // tiled matrix multiplication
+  }
+
+  -- Backend 3: TPU with XLA
+  -- Strategy: lower to XLA HLO
+  %result = "mhlo.dot"(%A, %B) : (tensor<mxkxf32>, tensor<kxnxsf32>) -> tensor<mxnxsf32>
+
+  -- Backend 4: FPGA
+  -- Strategy: generate hardware pipeline
+  // Systolic array with pipelined multiply-accumulate units
+\end{verbatim}
+
+\subsection{Backend Selection via Cost Models}\label{sec:cost-models}
+
+The compiler uses cost models to select the best backend for each operation:
+
+\begin{algorithm}[H]
+\caption{Backend Selection}\label{alg:backend-selection}
+\begin{algorithmic}[1]
+\Function{SelectBackend}{$\mathrm{op}, \mathrm{available\_backends}$}
+  \State $\mathrm{best\_cost} \gets \infty$
+  \State $\mathrm{best\_backend} \gets \mathrm{null}$
+  \For{each backend $b$ in $\mathrm{available\_backends}$}
+    \State $\mathrm{cost} \gets \mathrm{estimate\_cost}(b, \mathrm{op})$
+    \If{$\mathrm{cost} < \mathrm{best\_cost}$}
+      \State $\mathrm{best\_cost} \gets \mathrm{cost}$
+      \State $\mathrm{best\_backend} \gets b$
+    \EndIf
+  \EndFor
+  \State \Return $\mathrm{best\_backend}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[htbp]
+\centering
+\caption{Cost model factors for backend selection}\label{tab:cost-factors}
+\begin{tabular}{p{3cm}p{3.5cm}p{5cm}}
+\hline
+\textbf{Factor} & \textbf{CPU} & \textbf{GPU} \\
+\hline
+Problem size & Small: prefer CPU & Large: prefer GPU \\
+Data transfer & No overhead & PCI-e transfer cost \\
+Parallelism & Limited cores & Thousands of threads \\
+Memory & Large, slow & Small, fast (HBM) \\
+Precision & Full precision & Mixed precision (tensor cores) \\
+Latency & Low & High (kernel launch) \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Semantic IR for Graph Neural Networks}\label{sec:semantic-gnn}
+
+Graph neural networks (GNNs) require semantic operators that capture graph structure:
+
+\begin{verbatim}
+  -- Semantic IR for GNNs:
+  -- Graph convolution:
+  node_features = gnn.conv(graph, features, weights)
+  -- Semantics: for each node v, aggregate neighbor features and apply weights
+  -- Laws: gnn.conv is equivariant under graph isomorphism
+
+  -- Graph attention:
+  node_features = gnn.attention(graph, features, query, key, value)
+  -- Semantics: weighted aggregation with learned attention weights
+
+  -- Lowering to sparse matrix operations:
+  -- gnn.conv(graph, features, weights) = sparse_matmul(adjacency, features) * weights
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (semantic) {Semantic IR\\(matmul, conv, gnn)};
+  \node[block, below left=1.5cm and 0.5cm of semantic] (fusion) {Fusion Pass\\(combine ops)};
+  \node[block, below right=1.5cm and 0.5cm of semantic] (schedule) {Scheduling\\(tiling, parallelism)};
+  \node[block, below=1cm of fusion] (cpu) {CPU Backend\\(BLAS, MKL)};
+  \node[block, below=1cm of schedule] (gpu) {GPU Backend\\(CUDA, ROCm)};
+  \node[block, below left=1cm and 0.3cm of cpu] (tpu) {TPU};
+  \node[block, below right=1cm and 0.3cm of gpu] (fpga) {FPGA};
+
+  \draw[arrow] (semantic) -- (fusion);
+  \draw[arrow] (semantic) -- (schedule);
+  \draw[arrow] (fusion) -- (cpu);
+  \draw[arrow] (fusion) -- (gpu);
+  \draw[arrow] (schedule) -- (gpu);
+  \draw[arrow] (cpu) -- (tpu);
+  \draw[arrow] (gpu) -- (fpga);
+\end{tikzpicture}
+\caption{Multi-backend lowering from semantic IR. Fusion and scheduling passes prepare the program for backend-specific code generation. Different backends produce optimized code for CPU, GPU, TPU, or FPGA.}\label{fig:semantic-multi-backend}
+\end{figure}
+
+%% ============================================================
+%% Section 58.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-58}
+
+Semantic IRs represent programs in terms of their meaning rather than their execution. They enable multi-backend compilation, high-level optimization, and domain-specific transformations. The key challenge is designing semantic operators with precise contracts that enable equational reasoning while remaining expressive enough to capture the full range of computations in the domain.
+
+For further reading, we recommend the MLIR documentation~\cite{lattner2021}, the Halide language paper~\cite{rala2013}, and the TVM compiler paper~\cite{chen2018}.

@@ -1,0 +1,463 @@
+%%
+%% chapter-77.ltx — Instruction Selection
+%%
+
+\section{Introduction}\label{sec:instruction-selection-intro}
+
+\emph{Instruction selection} is the phase of code generation that maps the intermediate representation (IR) of a program to a sequence of target machine instructions. Given an IR tree or DAG representing a computation, instruction selection chooses the best sequence of machine instructions to implement it, respecting the target architecture's instruction set, addressing modes, and register constraints.
+
+The instruction selection problem is fundamentally a \emph{pattern matching} problem: each machine instruction implements a specific pattern of operations, and the goal is to cover the IR with a minimum-cost set of instruction patterns. This chapter develops the theory and practice of instruction selection, from tree parsing with tree automata to the BURS (Bottom-Up Rewrite System) algorithm and modern table-driven approaches.
+
+\section{Pattern Matching on Trees and DAGs}\label{sec:pattern-matching}
+
+\subsection{The IR as Trees and DAGs}\label{sec:ir-trees}
+
+The intermediate representation is typically organized as a collection of \emph{expression trees} (for expressions without shared subexpressions) or \emph{expression DAGs} (for expressions with shared subexpressions).
+
+\begin{definition}[Expression Tree]\label{def:expr-tree}
+An \textbf{expression tree} is a tree where:
+\begin{itemize}
+  \item Leaf nodes represent constants or memory loads.
+  \item Internal nodes represent operations (add, multiply, etc.).
+  \item Each node is labeled with an operator from a ranked alphabet.
+\end{itemize}
+\end{definition}
+
+\begin{example}[Expression Tree]\label{ex:expr-tree}
+The expression \texttt{a[i] = x * 4 + 1} is represented as:
+\begin{verbatim}
+        STORE
+       /     \
+    ADDR     ADD
+   /    \   /   \
+  a     MUL  CONST(1)
+       /   \
+     ADD   CONST(4)
+    /   \
+   x     i
+\end{verbatim}
+\end{example}
+
+\subsection{Machine Description as Patterns}\label{sec:machine-patterns}
+
+Each target machine instruction is described as a \emph{tree pattern} with an associated \emph{cost}.
+
+\begin{definition}[Machine Instruction Pattern]\label{def:machine-pattern}
+A \textbf{machine instruction pattern} is a tree pattern with:
+\begin{itemize}
+  \item A \emph{root label} matching the IR operator.
+  \item \emph{Child patterns} matching the operands.
+  \item A \emph{cost} (typically the instruction latency or code size).
+  \item A \emph{side effect} (the assembly instruction emitted).
+\end{itemize}
+\end{definition}
+
+\begin{example}[x86 Instruction Patterns]\label{ex:x86-patterns}
+\begin{verbatim}
+  reg -> CONST(c)         { cost 1; emit "mov reg, c" }
+  reg -> ADD(reg, reg)    { cost 1; emit "add reg, reg" }
+  reg -> ADD(reg, CONST)  { cost 2; emit "add reg, imm" }
+  reg -> MUL(reg, reg)    { cost 3; emit "imul reg, reg" }
+  reg -> LOAD(ADDR)       { cost 2; emit "mov reg, [addr]" }
+  reg -> MEM(reg)         { cost 1; emit "mov reg, [reg]" }
+\end{verbatim}
+\end{example}
+
+\section{Tree Parsing with Tree Automata}\label{sec:tree-automata}
+
+\subsection{Bottom-Up Tree Parsing}\label{sec:bottom-up-parsing}
+
+Instruction selection can be formulated as \emph{bottom-up tree parsing}: starting from the leaves, each subtree is matched against machine patterns, and the best (minimum-cost) match is selected.
+
+\begin{definition}[Bottom-Up Tree Parsing]\label{def:bottom-up-parse}
+\textbf{Bottom-up tree parsing} assigns to each node $n$ in the IR tree a set of \emph{nonterminals} that $n$ can produce. For a leaf node, the nonterminals are determined by the leaf patterns. For an internal node, the nonterminals are determined by patterns whose children match the nonterminals of the child nodes.
+\end{definition}
+
+\subsection{Tree Automata}\label{sec:tree-automata-theory}
+
+\begin{definition}[Top-Down Tree Automaton]\label{def:top-down-ta}
+A \textbf{top-down tree automaton} is a tuple $(Q, \Sigma, \Delta, q_0)$ where:
+\begin{itemize}
+  \item $Q$ is a finite set of states (nonterminals).
+  \item $\Sigma$ is a ranked alphabet (IR operators).
+  \item $\Delta$ is a set of transitions: $q \to f(q_1, \ldots, q_k)$ for each $f \in \Sigma$ of arity $k$.
+  \item $q_0$ is the initial state (the goal: produce a \texttt{reg}).
+\end{itemize}
+\end{definition}
+
+\section{BURS (Bottom-Up Rewrite System)}\label{sec:burs}
+
+\emph{BURS} is a system for generating optimal instruction selectors from a machine description. It was developed by Peleg, Ipsen, and Patil~\cite{peleg1993burg} and is based on tree grammar reduction.
+
+\subsection{Tree Grammar Formulation}\label{sec:burs-grammar}
+
+\begin{definition}[BURS Tree Grammar]\label{def:burs-grammar}
+A \textbf{BURS tree grammar} is a set of productions of the form:
+\[
+\mathit{nt} \to \mathit{pattern} \quad \text{cost } c
+\]
+where $\mathit{nt}$ is a nonterminal, $\mathit{pattern}$ is a tree over terminals (IR operators) and nonterminals, and $c$ is the cost.
+\end{definition}
+
+\begin{example}[BURS Grammar for x86]\label{ex:burs-x86}
+\begin{verbatim}
+  reg -> CONST(c)           cost 1
+  reg -> ADD(reg, reg)      cost 1
+  reg -> ADD(reg, CONST(c)) cost 2
+  reg -> MUL(reg, reg)      cost 3
+  reg -> MEM(reg)           cost 1
+  reg -> LOAD(reg)          cost 2
+  reg -> reg                 cost 0    (identity: copy)
+\end{verbatim}
+\end{example}
+
+\subsection{Optimal Parsing}\label{sec:burs-optimal}
+
+\begin{definition}[Optimal BURS Parsing]\label{def:burs-optimal}
+The \textbf{optimal BURS parsing} of a tree $T$ is the derivation of minimum total cost that produces the start symbol from $T$. This is computed by dynamic programming bottom-up.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{BURS Optimal Parsing}
+\label{alg:burs}
+\begin{algorithmic}[1]
+\Require IR tree $T$, BURS grammar $G$
+\Ensure Minimum-cost instruction sequence
+\ForAll{leaves $l$ of $T$ (bottom-up order)}
+  \ForAll{rules $r$ matching $l$}
+    \State $\mathit{cost}[l][\mathit{nt}(r)] = \min(\mathit{cost}[l][\mathit{nt}(r)], \mathit{cost}(r))$
+  \EndFor
+\EndFor
+\ForAll{internal nodes $n$ of $T$ (bottom-up)}
+  \ForAll{rules $r$ matching $n$}
+    \State $c = \mathit{cost}(r) + \sum_{i} \mathit{cost}[\mathit{child}_i(n)][\mathit{nt}_i(r)]$
+    \State $\mathit{cost}[n][\mathit{nt}(r)] = \min(\mathit{cost}[n][\mathit{nt}(r)], c)$
+  \EndFor
+\EndFor
+\State Reconstruct optimal derivation from root
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[BURS Optimality]\label{thm:burs-optimal}
+The BURS algorithm computes the minimum-cost instruction sequence for any IR tree, provided the grammar is non-ambiguous (or the minimum over all derivations is taken).
+\end{theorem}
+
+\section{DAG Covering for Instruction Selection}\label{sec:dag-covering}
+
+When the IR is a DAG (with shared subexpressions), the problem becomes \emph{DAG covering}: find a minimum-cost cover of the DAG using instruction patterns.
+
+\begin{definition}[DAG Covering]\label{def:dag-cover}
+A \textbf{DAG cover} is a mapping from each node in the DAG to a set of nonterminals it can produce, such that the total cost is minimized. Unlike tree covering, a node in a DAG may have multiple parents, and its value may be computed once and used multiple times.
+\end{definition}
+
+DAG covering is NP-hard in general, but practical algorithms use heuristics or restrict the problem to make it tractable.
+
+\section{Dynamic Programming Approaches}\label{sec:dp-approaches}
+
+\subsection{The IBURG Algorithm}\label{sec:iburg}
+
+\emph{IBURG} is an improvement over BURS that handles the case where patterns have multiple possible costs depending on the context.
+
+\begin{definition}[IBURG]\label{def:iburg}
+\textbf{IBURG} extends BURS by allowing \emph{parameterized costs}: the cost of a rule can depend on the nonterminals chosen for its children. This enables more accurate cost modeling.
+\end{definition}
+
+\subsection{The TWIG System}\label{sec:twig}
+
+\emph{TWIG}~\cite{chase1986improving} uses dynamic programming on trees with \emph{regular tree grammar} techniques. It handles the case where the grammar is not strictly bottom-up by using a two-pass approach.
+
+\section{Modern Approaches: TableGen, ISel Frameworks}\label{sec:modern-isel}
+
+\subsection{LLVM's TableGen}\label{sec:tablegen}
+
+LLVM uses a \emph{TableGen}-based approach to instruction selection. Machine descriptions are written in a declarative format (.td files), and TableGen generates C++ code for the instruction selector.
+
+\begin{definition}[LLVM SelectionDAG]\label{def:selectiondag}
+LLVM's instruction selector operates on a \textbf{SelectionDAG}: a DAG representation of a basic block where:
+\begin{itemize}
+  \item Nodes represent operations and values.
+  \item Edges represent data and control dependencies.
+  \item Legalization transforms the DAG to use only legal types and operations.
+  \item Instruction selection maps DAG nodes to machine instructions.
+\end{itemize}
+\end{definition}
+
+\subsection{ISel Pattern Matching}\label{sec:isel-pattern}
+
+Modern instruction selectors use \emph{predicate-based pattern matching}:
+\begin{enumerate}
+  \item The DAG is traversed bottom-up.
+  \item At each node, a set of patterns is tested in priority order.
+  \item The first matching pattern determines the instruction emitted.
+  \item Patterns include predicates on node types, operand types, and constant values.
+\end{enumerate}
+
+\subsection{Global Instruction Selection}\label{sec:global-isel}
+
+\emph{Global instruction selection} (GlobalISel) in LLVM extends the SelectionDAG approach to handle instructions that span multiple basic blocks, such as tail calls and exception handling.
+
+\begin{historical}
+Instruction selection has evolved from hand-coded peephole optimizers to sophisticated automated systems. The BURS approach of Peleg et al.~\cite{peleg1993burg} (1993) was a major advance, providing optimal instruction selection for tree-structured IR. The TWIG system of Chase~\cite{chase1986improving} (1986) extended this to handle more complex grammars. Modern compilers like LLVM and GCC use table-driven approaches that generate instruction selectors from machine descriptions. The trend is toward more declarative, maintainable instruction selection specifications that can be automatically optimized.
+\end{historical}
+
+\section{Instruction Selection with Addressing Modes}\label{sec:addressing-modes}
+
+Real instruction selection must handle complex addressing modes, where a single instruction can perform address computation and memory access simultaneously.
+
+\begin{definition}[Addressing Mode Pattern]\label{def:addr-mode}
+An \textbf{addressing mode pattern} describes how a memory access can be folded into an instruction. For example, x86's \texttt{mov eax, [ebx + ecx*4 + 8]} performs the computation $ebx + ecx \times 4 + 8$ and loads from the resulting address in a single instruction.
+\end{definition}
+
+\begin{example}[Addressing Mode Matching]\label{ex:addr-mode}
+The expression \texttt{load(a + i * 4 + 8)} can be matched by:
+\begin{verbatim}
+  reg -> LOAD(ADD(ADD(base, MUL(idx, CONST(4))), CONST(8)))
+    cost 1; emit "mov reg, [base + idx*4 + 8]"
+\end{verbatim}
+This avoids separate instructions for the address computation and the load.
+\end{example}
+
+\section{Legalization}\label{sec:legalization}
+
+\emph{Legalization} transforms the IR to use only operations and types that are supported by the target machine.
+
+\begin{definition}[Legalization]\label{def:legalization}
+\textbf{Legalization} transforms the IR to:
+\begin{itemize}
+  \item Replace unsupported types with supported types (e.g., \texttt{i64} on a 32-bit machine becomes two \texttt{i32} operations).
+  \item Replace unsupported operations with sequences of supported operations.
+  \item Expand complex operations into simpler ones (e.g., \texttt{div} becomes a call to a library function).
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Type Legalization}
+\label{alg:legalization}
+\begin{algorithmic}[1]
+\Require IR with arbitrary types, target type set $T$
+\Ensure IR using only types in $T$
+\ForAll{values $v$ with type $\tau \notin T$}
+  \State Find smallest type $\tau' \in T$ such that $\tau' \geq \tau$
+  \If{$\tau'$ is a vector type}
+    \State Split $v$ into vector elements
+  \ElsIf{$\tau'$ is wider than $\tau$}
+    \State Promote $v$ to $\tau'$ (zero-extend or sign-extend)
+  \Else
+    \State Expand $v$ into multiple values of smaller types
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Summary}\label{sec:instruction-selection-summary}
+
+Instruction selection maps the IR to target machine instructions. It is fundamentally a pattern matching problem: covering an IR tree or DAG with minimum-cost machine instruction patterns. Tree automata and BURS provide optimal solutions for tree-structured IR. DAG covering handles shared subexpressions but is NP-hard in general. Addressing modes allow folding address computation into load/store instructions. Legalization ensures the IR uses only types and operations supported by the target. Modern compilers use table-driven approaches (LLVM TableGen) that generate instruction selectors from declarative machine descriptions. The quality of instruction selection directly affects the performance of generated code.
+
+\section{BURS: Bottom-Up Rewrite Systems}\label{sec:burs-detail}
+
+\emph{BURS} (Bottom-Up Rewrite System) is a systematic technique for optimal instruction selection on tree-structured IR.
+
+\begin{definition}[BURS]\label{def:burs}
+A \textbf{BURS} is a tree grammar $G = (N, \Sigma, P, S)$ where:
+\begin{itemize}
+  \item $N$ is a set of nonterminals (representing machine resources: registers, conditions)
+  \item $\Sigma$ is the set of IR operators
+  \item $P$ is a set of productions (tree patterns with costs)
+  \item $S$ is the start nonterminal
+\end{itemize}
+Each production $A \to pattern$ has an associated cost (e.g., execution time or code size).
+\end{definition}
+
+\begin{example}[BURS Grammar for x86]\label{ex:burs-grammar}
+\begin{verbatim}
+  // Nonterminals: reg (register), mem (memory operand)
+  // Terminals: CONST, ADD, MUL, LOAD, STORE, reg
+  
+  // Productions:
+  reg → CONST(c)              cost: 1  (mov reg, imm)
+  reg → ADD(reg, reg)         cost: 1  (add reg, reg)
+  reg → ADD(reg, CONST(c))    cost: 1  (add reg, imm)
+  reg → MUL(reg, reg)         cost: 3  (imul reg, reg)
+  reg → MUL(reg, CONST(c))    cost: 3  (imul reg, imm)
+  reg → LOAD(mem)             cost: 2  (mov reg, [mem])
+  mem → reg                   cost: 0  (register addressing)
+  mem → ADD(reg, CONST(c))    cost: 0  (base+disp addressing)
+  mem → ADD(reg, reg)         cost: 0  (base+index addressing)
+  reg → LOAD(ADD(reg, reg))   cost: 2  (mov reg, [base+index])
+\end{verbatim}
+\end{example}
+
+\subsection{BURS Labeling Algorithm}\label{sec:burs-labeling}
+
+\begin{algorithm}[H]
+\caption{BURS Tree Labeling (Dynamic Programming)}
+\label{alg:burs-labeling}
+\begin{algorithmic}[1]
+\Require IR tree $T$, BURS grammar $G$
+\ensure Minimum-cost labeling of $T$
+\State Process $T$ bottom-up (leaves to root)
+\ForAll{nodes $n$ in bottom-up order}
+  \ForAll{productions $p: A \to pattern$ matching at $n$}
+    \State Compute cost: $c(p) = \text{production cost} + \sum_{\text{children } c} \text{best\_cost}(c, \text{NT}_p(c))$
+    \State Record: $\text{cost}(n, A) = \min(\text{cost}(n, A), c(p))$
+    \State Record: $\text{rule}(n, A) = p$ \Comment{Best rule for nonterminal $A$ at $n$}
+  \EndFor
+\EndFor
+\State \Return $\text{cost}(\text{root}, S)$ and trace back rules
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[BURS Optimality]\label{thm:burs-optimal}
+BURS finds the minimum-cost instruction selection for tree-structured IR in $O(|T| \cdot |P|)$ time, where $|T|$ is the tree size and $|P|$ is the number of productions. The result is provably optimal among all instruction selections that can be expressed by the grammar.
+\end{theorem}
+
+\section{Dynamic Programming for DAG Covering}\label{sec:dp-dag-covering}
+
+When the IR is a DAG (with shared subexpressions), the problem becomes harder because sharing introduces interactions between pattern choices.
+
+\begin{definition}[DAG Covering Problem]\label{def:dag-covering}
+The \textbf{DAG covering problem} is: given a DAG $D$ and a set of tree patterns with costs, find a minimum-cost cover of $D$ using the patterns. A cover assigns each node to at least one pattern, and shared nodes must be consistently covered.
+\end{definition}
+
+\begin{theorem}[DAG Covering Complexity]\label{thm:dag-covering-complexity}
+The DAG covering problem is NP-hard in general. However, for trees (DAGs without sharing), it is solvable in polynomial time by BURS.
+\end{theorem}
+
+\subsection{Heuristic DAG Covering}\label{sec:heuristic-dag}
+
+\begin{definition}[Maximal Munch]\label{def:maximal-munch}
+\textbf{Maximal munch} is a greedy heuristic for DAG covering: at each node, select the largest (most specific) pattern that matches, regardless of whether a smaller pattern might lead to a better global solution.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Maximal Munch Instruction Selection}
+\label{alg:maximal-munch}
+\begin{algorithmic}[1]
+\Require IR DAG $D$, pattern set $P$
+\ensure Instruction sequence covering $D$
+\State Start at root of $D$
+\While{uncovered nodes remain}
+  \State Find the largest pattern $p \in P$ that matches at current node
+  \State Emit instruction for $p$
+  \State Mark nodes covered by $p$
+  \State Move to next uncovered node (deepest first)
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Maximal Munch vs.\ Optimal]\label{ex:munch-vs-optimal}
+\begin{verbatim}
+  // IR tree: ADD(MUL(x, 3), y)
+  
+  // Maximal munch: matches ADD(MUL(x, 3), y)
+  // → lea rax, [rdi + rdi*2]  ; x * 3
+  // → add rax, rsi             ; + y
+  // Cost: 2 instructions
+  
+  // But optimal might be:
+  // → mov rax, rdi
+  // → lea rax, [rax + rax*2 + rsi]  ; x*3 + y in one LEA
+  // Cost: 2 instructions (same), but LEA has higher latency
+  
+  // Maximal munch may miss opportunities where a smaller
+  // local match enables a better global solution.
+\end{verbatim}
+\end{example}
+
+\section{Table-Driven Instruction Selection}\label{sec:table-driven-isel}
+
+\subsection{LLVM TableGen}\label{sec:tablegen-detail}
+
+LLVM uses \emph{TableGen} to generate instruction selectors from declarative machine descriptions:
+
+\begin{definition}[TableGen Instruction Description]\label{def:tablegen-desc}
+A \textbf{TableGen instruction description} specifies:
+\begin{itemize}
+  \item Instruction format (encoding, operands)
+  \item Pattern (SDNode DAG that this instruction implements)
+  \item Predicates (when this instruction is available)
+  \item Scheduling information (latency, resource usage)
+\end{itemize}
+\end{definition}
+
+\begin{verbatim}
+  // Example TableGen instruction definition:
+  def ADD32rr : Instruction<
+    (outs GR32:$dst),
+    (ins GR32:$src1, GR32:$src2),
+    "add\t{$dst, $src1, $src2}",
+    [(set GR32:$dst, (add GR32:$src1, GR32:$src2))]
+  > {
+    let Constraints = "$src1 = $dst";
+    let AsmString = "add\t{$dst, $src2}";
+  }
+\end{verbatim}
+
+\subsection{SelectionDAG ISel}\label{sec:selectiondag-isel}
+
+LLVM's \emph{SelectionDAG} instruction selector converts the SelectionDAG to machine instructions using a combination of BURS (for simple patterns) and custom C++ code (for complex patterns):
+
+\begin{algorithm}[H]
+\caption{SelectionDAG Instruction Selection}
+\label{alg:selectiondag}
+\begin{algorithmic}[1]
+\Require SelectionDAG $G$, machine description $M$
+\ensure Machine instruction DAG
+\ForAll{nodes $n$ in $G$ in topological order}
+  \State Try to match $n$ against TableGen patterns
+  \If{pattern matched}
+    \State Emit machine instruction for matched pattern
+  \Else
+    \State Call custom selector (C++ code) for $n$
+  \EndIf
+\EndFor
+\State Perform post-selection legalization
+\end{algorithmic}
+\end{algorithm}
+
+\section{Instruction Selection for Complex Addressing Modes}\label{sec:complex-addressing}
+
+\begin{definition}[Address Mode Selection]\label{def:addr-mode-selection}
+\textbf{Address mode selection} chooses the most efficient addressing mode for each memory access. Modern x86-64 supports:
+\begin{itemize}
+  \item \texttt{[base]}: base register only
+  \item \texttt{[base + disp]}: base + displacement
+  \item \texttt{[base + index*scale]}: base + scaled index
+  \item \texttt{[base + index*scale + disp]}: full SIB addressing
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Address Mode Selection}
+\label{alg:addr-mode}
+\begin{algorithmic}[1]
+\Require Address computation DAG for a load/store
+\ensure Optimal addressing mode
+\State Analyze address computation tree
+\If{tree matches \texttt{base + index*scale + disp}}
+  \State Use full SIB addressing mode (cost: 0 extra instructions)
+\ElsIf{tree matches \texttt{base + disp}}
+  \State Use base+disp addressing mode
+\ElsIf{tree is a single register}
+  \State Use register-indirect addressing
+\Else
+  \State Compute address into a register using LEA
+  \State Use register-indirect addressing (cost: 1 LEA instruction)
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\section{Instruction Selection Quality Metrics}\label{sec:isel-quality}
+
+\begin{definition}[Instruction Selection Quality]\label{def:isel-quality}
+The quality of instruction selection is measured by:
+\begin{itemize}
+  \item \textbf{Code size}: Total bytes of generated code.
+  \item \textbf{Execution time}: Estimated cycle count based on instruction latencies.
+  \item \textbf{Register pressure}: Number of registers required by the selected instructions.
+\end{itemize}
+\end{definition}
+
+\begin{theorem}[BURS vs.\ Heuristic Quality]\label{thm:burs-quality}
+BURS produces optimal instruction selection for tree-structured IR. For DAG-structured IR, the gap between maximal munch and optimal is typically 1--5\% in code quality, but maximal munch is $O(n)$ vs.\ $O(n^2)$ or worse for optimal DAG covering.
+\end{theorem}

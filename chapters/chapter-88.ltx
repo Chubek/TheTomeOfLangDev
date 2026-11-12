@@ -1,0 +1,423 @@
+%%
+%% chapter-88.ltx — Garbage Collection
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:garbage-collection}
+
+\section{Introduction}\label{sec:gc-intro}
+
+Garbage collection (GC) is the automatic reclamation of memory that is no longer accessible to the program. Instead of requiring the programmer to explicitly free memory, the garbage collector periodically identifies and reclaims \emph{garbage}---objects that can no longer affect the future computation. This abstraction eliminates entire classes of bugs (dangling pointers, double-free, memory leaks) at the cost of runtime overhead and reduced control over when memory is reclaimed.
+
+Garbage collection is one of the most studied topics in computer science, with a literature spanning six decades. This chapter covers the fundamental algorithms, from the classic mark-and-sweep and copying collectors to modern generational, concurrent, and incremental approaches.
+
+\section{Reachability and Roots}\label{sec:reachability}
+
+\subsection{Defining Garbage}\label{sec:defining-garbage}
+
+The theoretical foundation of garbage collection is the concept of \emph{reachability}.
+
+\begin{definition}[Reachability]\label{def:reachability}
+An object $o$ is \emph{reachable} if there exists a path from a \emph{root} to $o$ through a chain of references. The \emph{roots} are:
+\begin{itemize}
+  \item References in CPU registers.
+  \item References on the call stack (local variables, parameters).
+  \item References in global/static variables.
+  \item References in handles managed by the runtime (e.g., JNI global references).
+\end{itemize}
+An object that is not reachable is \emph{garbage} and may be reclaimed.
+\end{definition}
+
+\begin{definition}[Reachable Set]\label{def:reachable-set}
+The \emph{reachable set} $\mathcal{R}$ is defined inductively:
+\begin{enumerate}
+  \item All root objects are in $\mathcal{R}$.
+  \item If $o \in \mathcal{R}$ and $o$ contains a reference to $o'$, then $o' \in \mathcal{R}$.
+\end{enumerate}
+The garbage set is $\mathcal{G} = \mathcal{H} \setminus \mathcal{R}$, where $\mathcal{H}$ is the set of all allocated objects.
+\end{definition}
+
+\subsection{Conservative vs.\ Precise Collection}\label{sec:conservative-precise}
+
+\begin{definition}[Conservative GC]\label{def:conservative-gc}
+A \emph{conservative} garbage collector treats any value that \emph{looks like} a pointer as a pointer. This is necessary when the language does not distinguish pointers from integers (as in C/C++) or when stack scanning cannot precisely identify pointer locations.
+\end{definition}
+
+\begin{definition}[Precise GC]\label{def:precise-gc}
+A \emph{precise} (or \emph{exact}) garbage collector knows exactly which values are pointers and which are not, using type information or stack maps.
+\end{definition}
+
+Precise collectors can move objects (updating all references), while conservative collectors cannot (because they might miss interior pointers or misidentify integers as pointers).
+
+\section{Mark-and-Sweep}\label{sec:mark-sweep}
+
+\subsection{The Algorithm}\label{sec:ms-algorithm}
+
+Mark-and-sweep is the classic garbage collection algorithm, first described by McCarthy in 1960.
+
+\begin{algorithm}[htbp]
+\caption{Mark-and-Sweep Garbage Collection}
+\label{alg:mark-sweep}
+\begin{algorithmic}[1]
+\State \textbf{Mark Phase:}
+\For{each root $r$}
+  \State \textsc{Mark}($r$)
+\EndFor
+\State \textbf{Sweep Phase:}
+\For{each object $o$ in the heap}
+  \If{$o$ is marked}
+    \State Clear $o$'s mark bit
+  \Else
+    \State \textsc{Free}($o$) \Comment{Add to free list}
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[htbp]
+\caption{Recursive Mark}
+\label{alg:mark}
+\begin{algorithmic}[1]
+\Procedure{Mark}{$o$}
+  \If{$o$ is null or $o$ is marked}
+    \State \Return
+  \EndIf
+  \State Set $o$'s mark bit
+  \For{each reference $r$ in $o$}
+    \State \textsc{Mark}($r$)
+  \EndFor
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties}\label{sec:ms-properties}
+
+\begin{itemize}
+  \item \textbf{Time complexity}: $O(|\mathcal{R}| + |\mathcal{H}|)$---proportional to the number of reachable objects plus the total heap size.
+  \item \textbf{Space overhead}: one mark bit per object, plus free list overhead.
+  \item \textbf{Fragmentation}: the sweep phase creates a free list of non-contiguous blocks, leading to external fragmentation.
+  \item \textbf{Stop-the-world}: the entire mutator (user program) must be paused during collection.
+\end{itemize}
+
+\subsection{Marking Strategies}\label{sec:marking-strategies}
+
+The mark phase can be implemented in several ways:
+\begin{itemize}
+  \item \textbf{Recursive (depth-first)}: simple but risks stack overflow for deep object graphs.
+  \item \textbf{Iterative (work list)}: use an explicit work list (stack or queue) to avoid deep recursion.
+  \item \textbf{Cookie-based}: use the mark bits themselves to track progress, enabling incremental marking.
+\end{itemize}
+
+\subsection{Sweep and Compaction}\label{sec:sweep-compaction}
+
+The sweep phase can be augmented with \emph{compaction} to eliminate fragmentation:
+
+\begin{definition}[Compacting Collection]\label{def:compacting}
+A \emph{compacting} (or \emph{copying/compacting}) collector moves live objects to eliminate gaps between them. This requires updating all references to moved objects.
+\end{definition}
+
+Compaction strategies include:
+\begin{itemize}
+  \item \textbf{Linearizing}: move all live objects to one end of the heap.
+  \item \textbf{Sliding}: slide live objects toward one end, closing gaps.
+  \item \textbf{One-pass (Lisp 2)}: compute forwarding addresses in one pass, update references in a second pass, copy objects in a third pass.
+\end{itemize}
+
+\section{Copying Collectors (Cheney's Algorithm)}\label{sec:copying}
+
+\subsection{Semi-Space Copying}\label{sec:semi-space}
+
+A \emph{copying collector} divides the heap into two semi-spaces: \emph{from-space} (where allocation currently occurs) and \emph{to-space} (where live objects are copied during collection).
+
+\begin{algorithm}[htbp]
+\caption{Cheney's Copying Collector}
+\label{alg:cheney}
+\begin{algorithmic}[1]
+\State \textbf{Allocation:} bump pointer in from-space
+\State \textbf{Collection trigger:} from-space is full
+\State \textbf{Collection:}
+\Let{scan}{\text{start of to-space}}
+\Let{free}{\text{start of to-space}}
+\For{each root $r$}
+  \State $r \gets \textsc{Copy}(\text{deref}(r))$
+\EndFor
+\While{$\text{scan} < \text{free}$}
+  \For{each reference field $f$ in $\text{scan}$}
+    \State $\text{deref}(f) \gets \textsc{Copy}(\text{deref}(f))$
+  \EndFor
+  \State $\text{scan} \gets \text{scan} + \text{size}(\text{scan})$
+\EndWhile
+\State Swap from-space and to-space
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[htbp]
+\caption{Copy Operation}
+\label{alg:copy}
+\begin{algorithmic}[1]
+\Procedure{Copy}{$obj$}
+  \If{$obj$ has forwarding pointer}
+    \State \Return forwarding pointer
+  \EndIf
+  \Let{new}{\text{copy } obj \text{ to free}}
+  \State Install forwarding pointer in $obj$
+  \Let{free}{\text{free} + \text{size}(obj)}
+  \State \Return new
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties of Copying Collection}\label{sec:copying-properties}
+
+\begin{itemize}
+  \item \textbf{Time complexity}: $O(|\mathcal{R}|)$---proportional only to the number of live objects (not the total heap size).
+  \item \textbf{No fragmentation}: objects are packed contiguously in to-space.
+  \item \textbf{Fast allocation}: bump pointer allocation is as fast as a stack allocation.
+  \item \textbf{Space overhead}: requires $2\times$ the live data size (half the heap is always unused).
+  \item \textbf{Cache performance}: copied objects are allocated contiguously, improving locality.
+\end{itemize}
+
+\subsection{Baker's Technique}\label{sec:baker}
+
+Baker's technique improves Cheney's algorithm by performing the copying incrementally during mutation, using \emph{read barriers} to intercept accesses to unforwarded objects. This eliminates the stop-the-world pause at the cost of overhead on every pointer read.
+
+\section{Generational Collection}\label{sec:generational}
+
+\subsection{The Generational Hypothesis}\label{sec:generational-hypothesis}
+
+\begin{definition}[Generational Hypothesis]\label{def:generational-hyp}
+The \emph{generational hypothesis} states that most objects die young: the vast majority of allocated objects become unreachable shortly after allocation.
+\end{definition}
+
+This observation, verified empirically in countless programs, motivates \emph{generational garbage collection}: divide the heap into generations and collect young generations frequently.
+
+\subsection{Nursery Collection}\label{sec:nursery}
+
+\begin{definition}[Nursery]\label{def:nursery}
+The \emph{nursery} is the youngest generation, where all new objects are allocated. It is collected frequently (often when it is half-full).
+\end{definition}
+
+During a nursery collection:
+\begin{enumerate}
+  \item Trace from roots and from \emph{remembered sets} (see below).
+  \item Copy surviving objects to the next older generation (the \emph{tenured} space or the next \emph{survivor space}).
+  \item Objects that survive several collections are \emph{promoted} to older generations.
+\end{enumerate}
+
+\subsection{Remembered Sets and Write Barriers}\label{sec:remembered-sets}
+
+The key challenge in generational collection is finding references from old objects to young objects without scanning the entire old generation.
+
+\begin{definition}[Remembered Set]\label{def:remembered-set}
+A \emph{remembered set} is a data structure that records inter-generational pointers---specifically, pointers from older objects to younger objects.
+\end{definition}
+
+Remembered sets are maintained by \emph{write barriers}:
+
+\begin{definition}[Write Barrier]\label{def:write-barrier}
+A \emph{write barrier} is code inserted by the compiler (or runtime) at every pointer write to maintain the remembered set or other GC invariants.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Remembered Set Write Barrier}
+\label{alg:write-barrier}
+\begin{algorithmic}[1]
+\Procedure{WriteBarrier}{$obj$, $field$, $value$}
+  \State $\text{deref}(obj).\text{field} \gets value$
+  \If{$\text{generation}(obj) > \text{generation}(value)$}
+    \State Add $obj$ to remembered set
+  \EndIf
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+Write barrier implementations include:
+\begin{itemize}
+  \item \textbf{Yuasa-style}: check on every write (simple but overhead on every store).
+  \item \textbf{Dijkstra-style}: record the old value before overwriting (for concurrent marking).
+  \item \textbf{Card table}: divide old generation into fixed-size cards; mark a card as dirty when any pointer in it is modified. Scanning a card is cheap.
+  \item \textbf{SATB (Snapshot-At-The-Beginning)}: record all objects that had references to newly-created objects at the start of the marking cycle.
+\end{itemize}
+
+\subsection{Copying Generational Collectors}\label{sec:gen-copying}
+
+The most common generational design uses copying for young generations:
+
+\begin{itemize}
+  \item \textbf{Eden}: the allocation area in the nursery.
+  \item \textbf{Survivor spaces} ($S_0$, $S_1$): two areas for objects that survive nursery collection. Cheney's algorithm alternates between them.
+  \item \textbf{Tenured generation}: older objects, collected less frequently (often with a mark-compact algorithm).
+\end{itemize}
+
+\section{Concurrent and Incremental GC}\label{sec:concurrent-gc}
+
+\subsection{The Pause Time Problem}\label{sec:pause-problem}
+
+Stop-the-world collectors pause the entire program during collection. For interactive applications, long pauses are unacceptable. \emph{Concurrent} collectors run concurrently with the mutator, reducing pause times.
+
+\subsection{Concurrent Marking}\label{sec:concurrent-marking}
+
+\begin{definition}[Concurrent Marking]\label{def:concurrent-marking}
+\emph{Concurrent marking} performs the mark phase concurrently with the mutator. The mutator is only paused briefly for root scanning and the final remark.
+\end{definition}
+
+The challenge of concurrent marking is that the mutator may modify the object graph while marking is in progress. This can cause:
+\begin{itemize}
+  \item \textbf{Floating garbage}: objects that become unreachable during marking but are still marked as live.
+  \item \textbf{Missed objects}: objects that become reachable during marking but are not reached by the marker.
+\end{itemize}
+
+Write barriers solve the missed-objects problem:
+
+\begin{itemize}
+  \item \textbf{Dijkstra (insertion) barrier}: when the mutator creates a new reference from a black (already-marked) object to a white (unmarked) object, the white object is immediately marked black.
+  \item \textbf{Yuasa (deletion) barrier}: when the mutator deletes a reference from a black object, the referenced object is marked black (preventing it from being collected even if it becomes unreachable).
+\end{itemize}
+
+\subsection{Concurrent Copying}\label{sec:concurrent-copying}
+
+Concurrent copying is more challenging because objects may be moved while the mutator holds references to them. Solutions include:
+\begin{itemize}
+  \item \textbf{Read barriers}: intercept reads to check if an object has been forwarded.
+  \item \textbf{Colored pointers}: use bits in the pointer to indicate the object's state.
+  \item \textbf{Brooks pointers}: each object has an indirection pointer; forwarding updates the indirection.
+\end{itemize}
+
+\subsection{Incremental Collection}\label{sec:incremental}
+
+\emph{Incremental} collection interleaves collection work with mutator execution at a fine granularity, ensuring that no single pause is long. This is distinct from concurrent collection (which runs in parallel) but achieves similar pause-time goals.
+
+\section{Write Barriers and Read Barriers}\label{sec:barriers}
+
+\subsection{Write Barrier Implementations}\label{sec:wb-impl}
+
+The write barrier is the most performance-critical GC infrastructure. Implementations include:
+
+\begin{table}[htbp]
+\centering
+\caption{Write barrier strategies}
+\label{tab:write-barriers}
+\begin{tabular}{lll}
+\hline
+\textbf{Strategy} & \textbf{Mechanism} & \textbf{Overhead} \\
+\hline
+Card table & Mark card dirty on write & Store + bit set \\
+Object barrier & Log modified object & Store + list append \\
+SATB & Log pre-write value & Load + store + branch \\
+Region-based & Mark region dirty & Store + bit set \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Read Barrier Implementations}\label{sec:rb-impl}
+
+Read barriers are used in concurrent copying and self-adjusting heaps:
+
+\begin{itemize}
+  \item \textbf{Forwarding check}: check if the object has been moved; if so, follow the forwarding pointer.
+  \item \textbf{Load barrier}: on every pointer load, check a side table or use colored pointers.
+  \item \textbf{Lazy rematerialization}: instead of moving objects, update references lazily when they are read.
+\end{itemize}
+
+\section{GC for Modern Languages}\label{sec:gc-modern}
+
+\subsection{Java: G1 and ZGC}\label{sec:java-gc}
+
+\begin{itemize}
+  \item \textbf{G1 (Garbage-First)}: region-based generational collector. Divides the heap into regions, each of which can be eden, survivor, old, or humongous. Collects regions with the most garbage first.
+  \item \textbf{ZGC}: a low-latency collector with sub-millisecond pause times regardless of heap size (up to multi-terabyte heaps). Uses colored pointers and load barriers.
+  \item \textbf{Shenandoah}: another low-latency collector using Brooks pointers for concurrent compaction.
+\end{itemize}
+
+\subsection{Go: Concurrent Mark-Sweep}\label{sec:go-gc}
+
+Go's garbage collector is a concurrent, non-generational mark-and-sweep collector:
+\begin{itemize}
+  \item Uses a tri-color mark abstraction (white, grey, black) with write barriers.
+  \item Aims for low pause times (typically $< 1$ms) rather than high throughput.
+  \item Uses a pacer to spread GC work proportionally to allocation rate.
+\end{itemize}
+
+\subsection{JavaScript: V8's Orinoco}\label{sec:v8-gc}
+
+V8 (Chrome's JavaScript engine) uses a generational collector called Orinoco:
+\begin{itemize}
+  \item \textbf{Young generation}: semi-space copying with parallel scavenging.
+  \item \textbf{Old generation}: mark-sweep-compact with concurrent marking.
+  \item \textbf{Incremental marking}: interleaved with mutator execution.
+  \item \textbf{Parallel/Concurrent}: uses multiple threads for marking, sweeping, and compaction.
+\end{itemize}
+
+\subsection{Python: Cyclic GC}\label{sec:python-gc}
+
+CPython uses reference counting as its primary mechanism, with a cyclic garbage collector for breaking reference cycles:
+\begin{itemize}
+  \item Tracks objects that may participate in cycles (containers: lists, dicts, etc.).
+  \item Periodically scans tracked objects to find and collect unreachable cycles.
+  \item Uses three generations with different collection thresholds.
+\end{itemize}
+
+\section{GC Tuning and Diagnostics}\label{sec:gc-tuning}
+
+\subsection{GC Metrics}\label{sec:gc-metrics}
+
+Key metrics for garbage collection performance:
+\begin{itemize}
+  \item \textbf{Throughput}: the fraction of total execution time spent doing useful work (as opposed to GC).
+  \item \textbf{Pause time}: the maximum duration of a stop-the-world pause.
+  \item \textbf{Footprint}: the total memory used by the application, including GC overhead.
+  \item \textbf{Allocation rate}: the rate at which the application allocates objects.
+\end{itemize}
+
+\subsection{Tuning Parameters}\label{sec:gc-tuning}
+
+GC tuners adjust parameters to optimize for specific workloads:
+\begin{itemize}
+  \item \textbf{Heap size}: larger heaps reduce collection frequency but increase footprint.
+  \item \textbf{Nursery size}: larger nurseries collect less frequently but increase pause time.
+  \item \textbf{GC thread count}: more threads reduce pause time but increase overhead.
+  \item \textbf{Promotion threshold}: how many collections an object must survive before promotion.
+\end{itemize}
+
+\subsection{GC-Friendly Programming}\label{sec:gc-friendly}
+
+Programmers can write code that is friendlier to the garbage collector:
+\begin{itemize}
+  \item \textbf{Object pooling}: reuse objects instead of allocating new ones.
+  \item \textbf{Avoiding allocation in hot loops}: pre-allocate buffers and reuse them.
+  \item \textbf{Value types}: use structs instead of classes for small, short-lived values.
+  \item \textbf{Reducing pointer density}: fewer pointers mean less work for the collector.
+\end{itemize}
+
+\section{Emerging GC Research}\label{sec:gc-research}
+
+\subsection{Colored Pointers}\label{sec:colored-pointers}
+
+ZGC and similar collectors use \emph{colored pointers}: bits in the pointer encode metadata about the object's state (e.g., whether it has been forwarded, whether it is marked). This eliminates the need for separate mark bits or side tables.
+
+\subsection{Region-Based GC}\label{sec:region-gc}
+
+Region-based collectors (like G1 and ZGC's successor) divide the heap into fixed-size regions. Each region can independently be eden, survivor, old, or free. This enables:
+\begin{itemize}
+  \item Partial heap collection (collect only the regions with the most garbage).
+  \item Concurrent compaction (compact regions while the mutator runs).
+  \item Predictable pause times (limit the number of regions collected per pause).
+\end{itemize}
+
+\subsection{Generational GC Without Write Barriers}\label{sec:barrierless}
+
+Some recent research explores generational collection without write barriers:
+\begin{itemize}
+  \item \textbf{Page-protection-based}: use OS page protection to detect writes to old-generation pages.
+  \item \textbf{Hardware-assisted}: use hardware memory protection (e.g., ARM Memory Tagging Extension) to track writes.
+  \item \textbf{Ephemeron-based}: use ephemerons to associate data with objects without modifying the objects.
+\end{itemize}
+
+\section{Summary}\label{sec:gc-summary}
+
+Garbage collection is a rich and active area of research and engineering. The choice of GC algorithm profoundly affects a language's performance characteristics: throughput, latency, memory consumption, and scalability. Modern collectors combine multiple techniques---generational, concurrent, parallel, region-based---to achieve the best balance for their target workloads. The trend is toward lower and more predictable pause times, enabling garbage-collected languages to be used in latency-sensitive applications.
+
+\begin{historical}
+Garbage collection was invented by John McCarthy in 1960 for LISP, using a simple mark-and-sweep algorithm. Cheney's copying algorithm (1970) improved collection time for programs with high mortality. The generational hypothesis was articulated by Lieberman and Hewitt (1983), leading to generational collectors. Concurrent collection was pioneered by Dijkstra et al.\ (1978) and Baker (1978). The modern era of low-latency collectors began with IBM's Metronome (2003) and continued with Azul's C4 (2006), Java's ZGC (2018), and Go's low-latency collector. Each generation of collectors has pushed the boundaries of what is achievable, making garbage collection viable for increasingly demanding applications.
+\end{historical}

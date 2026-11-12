@@ -1,0 +1,488 @@
+%%
+%% chapter-55.ltx — Control-Flow Graphs
+%%
+
+\label{ch:cfg-ir}
+
+The control-flow graph (CFG) is the foundational data structure for program analysis and optimization. It represents the flow of control through a program as a directed graph, where nodes are basic blocks (sequences of instructions with a single entry and exit) and edges represent possible transfers of control. This chapter develops the theory and practice of CFGs, from construction to analysis.
+
+%% ============================================================
+%% Section 55.1
+%% ============================================================
+\section{Basic Blocks and Edges}\label{sec:basic-blocks}
+
+A \emph{basic block} is a maximal sequence of instructions that is always executed linearly: control enters at the beginning and leaves at the end, with no branches in or out.
+
+\subsection{Definition}\label{sec:bb-def}
+
+\begin{definition}[Basic Block]\label{def:basic-block}
+A \emph{basic block} is a sequence of instructions $i_1, i_2, \ldots, i_n$ such that:
+\begin{enumerate}
+  \item Control can only enter the block at $i_1$ (no branches into the middle).
+  \item Control leaves only after executing $i_n$ (no branches out of the middle).
+\end{enumerate}
+\end{definition}
+
+\subsection{Block Boundaries}\label{sec:block-boundaries}
+
+A new basic block begins at:
+\begin{itemize}
+  \item The first instruction of the program.
+  \item Any instruction that is the target of a branch.
+  \item Any instruction immediately following a branch or jump.
+\end{itemize}
+
+\subsection{Edges}\label{sec:cfg-edges}
+
+Edges in a CFG represent possible transfers of control:
+\begin{itemize}
+  \item \textbf{Unconditional edges.} From a block ending in an unconditional jump to the target block.
+  \item \textbf{Conditional edges.} From a block ending in a conditional branch to both the true and false targets.
+  \item \textbf{Fall-through edges.} From a block to the immediately following block (when there is no explicit jump).
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={rectangle, draw, minimum width=3cm, minimum height=0.8cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk},
+  node distance=1.2cm
+]
+  \node[block] (b1) {B1: x = 1\\if (x > 0)};
+  \node[block, below left=1.5cm and 1.5cm of b1] (b2) {B2: y = x + 1\\goto B4};
+  \node[block, below right=1.5cm and 1.5cm of b1] (b3) {B3: y = x - 1\\goto B4};
+  \node[block, below=1.5cm of b2] (b4) {B4: z = y * 2\\return z};
+
+  \draw[arrow] (b1) -- node[left, font=\small] {true} (b2);
+  \draw[arrow] (b1) -- node[right, font=\small] {false} (b3);
+  \draw[arrow] (b2) -- (b4);
+  \draw[arrow] (b3) -- (b4);
+\end{tikzpicture}
+\caption{A simple control-flow graph with four basic blocks. B1 branches to B2 (true) or B3 (false); both B2 and B3 flow into B4.}\label{fig:cfg-simple}
+\end{figure}
+
+%% ============================================================
+%% Section 55.2
+%% ============================================================
+\section{CFG Construction from AST/IR}\label{sec:cfg-construction}
+
+Constructing a CFG from an AST or high-level IR involves identifying basic blocks and connecting them with edges.
+
+\subsection{Algorithm}\label{sec:cfg-algorithm}
+
+\begin{algorithm}[H]
+\caption{CFG Construction}\label{alg:cfg-construction}
+\begin{algorithmic}[1]
+\Function{BuildCFG}{$\mathrm{stmts}$}
+  \State $\mathrm{leaders} \gets \{\mathrm{stmts}[0]\}$
+  \For{each statement $s$ in $\mathrm{stmts}$}
+    \If{$s$ is a branch target}
+      \State $\mathrm{leaders} \gets \mathrm{leaders} \cup \{s\}$
+    \EndIf
+    \If{$s$ is a branch or jump}
+      \State $\mathrm{leaders} \gets \mathrm{leaders} \cup \{\mathrm{next}(s)\}$
+    \EndIf
+  \EndFor
+  \State $\mathrm{blocks} \gets \{\}$
+  \For{each leader $l$ in $\mathrm{leaders}$}
+    \State $\mathrm{block} \gets \{l\}$
+    \State $s \gets \mathrm{next}(l)$
+    \While{$s \notin \mathrm{leaders}$}
+      \State $\mathrm{block} \gets \mathrm{block} \cup \{s\}$
+      \State $s \gets \mathrm{next}(s)$
+    \EndWhile
+    \State $\mathrm{blocks} \gets \mathrm{blocks} \cup \{\mathrm{block}\}$
+  \EndFor
+  \State \Comment{Add edges based on branches and fall-through}
+  \State \Return $\mathrm{blocks}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Structured Control Flow}\label{sec:structured-cfg}
+
+For structured programs (if/else, while, for), the CFG has a regular structure:
+
+\begin{verbatim}
+  // Source:
+  if (cond) {
+    x = 1;
+  } else {
+    x = 2;
+  }
+  y = x + 1;
+
+  // CFG:
+  // B1: if (cond) -> B2 (true), B3 (false)
+  // B2: x = 1 -> B4
+  // B3: x = 2 -> B4
+  // B4: y = x + 1
+\end{verbatim}
+
+\subsection{Unstructured Control Flow}\label{sec:unstructured-cfg}
+
+For unstructured programs (goto, break, continue), the CFG may have arbitrary edges:
+
+\begin{verbatim}
+  // Source:
+  loop:
+    x = x + 1;
+    if (x > 10) goto done;
+    goto loop;
+  done:
+    return x;
+
+  // CFG:
+  // B1: x = x + 1; if (x > 10) -> B2 (true), B3 (false)
+  // B2: return x
+  // B3: goto B1
+\end{verbatim}
+
+%% ============================================================
+%% Section 55.3
+%% ============================================================
+\section{Entry and Exit Nodes}\label{sec:entry-exit}
+
+A CFG has a distinguished \emph{entry node} (the first block executed) and one or more \emph{exit nodes} (blocks that return or halt).
+
+\subsection{Single Entry, Single Exit}\label{sec:seSE}
+
+For analysis purposes, it is convenient to have a single entry and a single exit:
+\begin{itemize}
+  \item Add an \emph{entry block} with an unconditional edge to the original entry.
+  \item Add an \emph{exit block} with edges from all return/halt blocks.
+\end{itemize}
+
+\subsection{Multiple Exits}\label{sec:multiple-exits}
+
+Functions with multiple return statements have multiple exit blocks. For analysis, these are typically merged into a single virtual exit.
+
+%% ============================================================
+%% Section 55.4
+%% ============================================================
+\section{Exceptional Control Flow}\label{sec:exceptional-cfg}
+
+Exceptions introduce additional control flow edges that are often implicit.
+
+\subsection{Exception Edges}\label{sec:exception-edges}
+
+Any instruction that may throw an exception has an implicit edge to an exception handler:
+
+\begin{verbatim}
+  // B1: x = a / b  (may throw DivisionByZero)
+  // Implicit edge to exception handler block
+\end{verbatim}
+
+\subsection{Try-Catch-Finally}\label{sec:try-catch}
+
+Try-catch-finally constructs create complex CFG structures:
+
+\begin{verbatim}
+  try {
+    // B1: may throw
+  } catch (E) {
+    // B2: handler
+  } finally {
+    // B3: cleanup (always executed)
+  }
+  // B4: continuation
+
+  // CFG edges:
+  // B1 -> B2 (exception)
+  // B1 -> B3 (normal)
+  // B2 -> B3 (after handler)
+  // B3 -> B4 (after cleanup)
+\end{verbatim}
+
+\subsection{Impact on Analysis}\label{sec:exception-analysis}
+
+Exception edges complicate dataflow analysis because they create additional paths through the CFG. Optimizations that are safe for normal control flow may be unsafe in the presence of exceptions.
+
+%% ============================================================
+%% Section 55.5
+%% ============================================================
+\section{CFG Properties: Reachability, Dominance}\label{sec:cfg-properties}
+
+The CFG has several important structural properties that underpin program analysis.
+
+\subsection{Reachability}\label{sec:reachability}
+
+\begin{definition}[Reachability]\label{def:reachability}
+A block $B$ is \emph{reachable} from block $A$ if there is a path from $A$ to $B$ in the CFG. A block is \emph{reachable} if it is reachable from the entry block.
+\end{definition}
+
+Unreachable blocks (dead code) can be removed without affecting program behavior.
+
+\subsection{Dominance}\label{sec:dominance}
+
+\begin{definition}[Dominance]\label{def:dominance}
+Block $D$ \emph{dominates} block $N$ (written $D \;\mathrm{dom}\; N$) if every path from the entry to $N$ must pass through $D$. The entry block dominates all blocks.
+\end{definition}
+
+\begin{definition}[Immediate Dominator]\label{def:idom}
+The \emph{immediate dominator} of $N$ (written $\mathrm{idom}(N)$) is the unique block $D$ that strictly dominates $N$ but does not strictly dominate any other block that strictly dominates $N$.
+\end{definition}
+
+The dominance relation forms a tree (the \emph{dominator tree}), where the parent of each node is its immediate dominator.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={circle, draw, minimum size=0.8cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk},
+  node distance=1.5cm
+]
+  \node[block] (b1) {1};
+  \node[block, below left=1.2cm of b1] (b2) {2};
+  \node[block, below right=1.2cm of b1] (b3) {3};
+  \node[block, below=1.2cm of b2] (b4) {4};
+  \node[block, below=1.2cm of b3] (b5) {5};
+  \node[block, below=1.2cm of b4] (b6) {6};
+
+  \draw[arrow] (b1) -- (b2);
+  \draw[arrow] (b1) -- (b3);
+  \draw[arrow] (b2) -- (b4);
+  \draw[arrow] (b3) -- (b5);
+  \draw[arrow] (b4) -- (b6);
+  \draw[arrow] (b5) -- (b6);
+  \draw[arrow, dashed, color=TomeGold] (b4) -- (b2);
+  \draw[arrow, dashed, color=TomeGold] (b5) -- (b3);
+
+  \node[font=\small, right=1cm of b5, align=left] {
+    Solid: CFG edges\\
+    Dashed: back edges\\
+    1 dominates all; idom(4) = 2; idom(5) = 3
+  };
+\end{tikzpicture}
+\caption{A CFG with dominance relationships. Block 1 dominates all blocks. The immediate dominator of block 4 is block 2; the immediate dominator of block 5 is block 3.}\label{fig:cfg-dominance}
+\end{figure}
+
+\subsection{Dominance Frontiers}\label{sec:dominance-frontiers}
+
+\begin{definition}[Dominance Frontier]\label{def:dominance-frontier}
+The \emph{dominance frontier} of a block $D$ is the set of blocks $N$ such that $D$ dominates a predecessor of $N$ but does not strictly dominate $N$:
+\[
+  \mathrm{DF}(D) = \{N \mid \exists P \in \mathrm{pred}(N).\, D \;\mathrm{dom}\; P \text{ and } D \not\mathrm{sdom}\; N\}
+\]
+\end{definition}
+
+Dominance frontiers are used to place phi functions in SSA construction (see \cref{ch:ssa}).
+
+\subsection{Computing Dominators}\label{sec:computing-dominators}
+
+The classic algorithm for computing dominators is iterative dataflow:
+
+\begin{algorithm}[H]
+\caption{Iterative Dominator Computation}\label{alg:dominators}
+\begin{algorithmic}[1]
+\Function{ComputeDominators}{$\mathrm{CFG}$}
+  \State $\mathrm{dom}(\mathrm{entry}) \gets \{\mathrm{entry}\}$
+  \For{all blocks $B \neq \mathrm{entry}$}
+    \State $\mathrm{dom}(B) \gets \mathrm{AllBlocks}$
+  \EndFor
+  \State $\mathrm{changed} \gets \mathrm{true}$
+  \While{$\mathrm{changed}$}
+    \State $\mathrm{changed} \gets \mathrm{false}$
+    \For{all blocks $B \neq \mathrm{entry}$}
+      \Let{\mathrm{new\_dom}}{\{B\} \cup \bigcap_{P \in \mathrm{pred}(B)} \mathrm{dom}(P)}
+      \If{$\mathrm{new\_dom} \neq \mathrm{dom}(B)$}
+        \State $\mathrm{dom}(B) \gets \mathrm{new\_dom}$
+        \State $\mathrm{changed} \gets \mathrm{true}$
+      \EndIf
+    \EndFor
+  \EndWhile
+  \State \Return $\mathrm{dom}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+More efficient algorithms exist: the Lengauer--Tarjan algorithm~\cite{lengauer1979} computes dominators in $O(E \log V)$ time.
+
+%% ============================================================
+%% Section 55.6
+%% ============================================================
+\section{Visualization and Analysis}\label{sec:cfg-visualization}
+
+CFGs are visualized using graph drawing tools (Graphviz, DOT) and analyzed using graph algorithms.
+
+\subsection{Graph Drawing}\label{sec:graph-drawing}
+
+CFGs are typically drawn with the entry at the top and edges flowing downward. Back edges (for loops) are drawn as curved arrows going upward.
+
+\subsection{Analysis Algorithms}\label{sec:analysis-algorithms}
+
+Many analyses operate on the CFG:
+\begin{itemize}
+  \item \textbf{Reachability.} Which blocks can be reached from the entry?
+  \item \textbf{Dominance.} Which blocks dominate which?
+  \item \textbf{Loop detection.} Which blocks form natural loops?
+  \item \textbf{Cycle detection.} Are there irreducible loops?
+\end{itemize}
+
+\begin{historical}
+The control-flow graph was introduced by Frances Allen~\cite{allen1970} in her pioneering work on program optimization at IBM. The concepts of dominance and dominance frontiers, developed by Lengauer and Tarjan~\cite{lengauer1979}, became central to SSA construction and optimization. The treatment of exceptional control flow in CFGs was developed in the context of Java and C\# compilers, where exceptions are pervasive. Modern CFG-based analyses underpin virtually all compiler optimizations, from constant propagation to loop-invariant code motion.
+\end{historical}
+
+%% ============================================================
+%% Section 55.7
+%% ============================================================
+\section{Advanced CFG Properties and Exceptional Control Flow}\label{sec:cfg-advanced}
+
+\subsection{Reducibility and Irreducibility}\label{sec:reducibility-cfg}
+
+A CFG is \emph{reducible} if its edges can be partitioned into forward edges (forming a DAG) and back edges (going from a node to its dominator). Most structured programs produce reducible CFGs.
+
+\begin{definition}[Reducible CFG]\label{def:reducible}
+A CFG is \emph{reducible} if every strongly connected component has a unique entry point (a node that dominates all other nodes in the component). Equivalently, the back edges go only from a node to its dominator.
+\end{definition}
+
+\begin{definition}[Irreducible CFG]\label{def:irreducible}
+A CFG is \emph{irreducible} if it contains a strongly connected component with multiple entry points. This arises from unstructured control flow (e.g., \texttt{goto} into the middle of a loop).
+\end{definition}
+
+\begin{verbatim}
+  // Reducible:
+  loop:
+    x = x + 1;
+    if (x > 10) goto done;
+    goto loop;
+  done:
+
+  // Irreducible:
+  // Two entries into the loop body from different sources
+  if (cond) goto A; else goto B;
+  A: x = 1; goto C;
+  B: x = 2; goto C;
+  C: x = x + 1;
+     if (x > 10) goto done;
+     if (cond) goto A; else goto B;  // loop with two entries
+  done:
+\end{verbatim}
+
+\subsection{Natural Loops}\label{sec:natural-loops}
+
+\begin{definition}[Natural Loop]\label{def:natural-loop}
+A \emph{natural loop} is the set of nodes that can reach a back edge's target without going through the target. The target is the \emph{header} of the loop and dominates all nodes in the loop.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Natural Loop Detection}\label{alg:natural-loop}
+\begin{algorithmic}[1]
+\Function{FindNaturalLoop}{$\mathrm{back\_edge}(n, d)$}
+  \State $\mathrm{loop} \gets \{d\}$
+  \State $\mathrm{stack} \gets [n]$
+  \If{$n \neq d$}
+    \State $\mathrm{loop} \gets \mathrm{loop} \cup \{n\}$
+  \EndIf
+  \While{$\mathrm{stack}$ is not empty}
+    \State $m \gets \mathrm{stack}.\mathrm{pop}()$
+    \For{each predecessor $p$ of $m$}
+      \If{$p \notin \mathrm{loop}$}
+        \State $\mathrm{loop} \gets \mathrm{loop} \cup \{p\}$
+        \State $\mathrm{stack}.\mathrm{push}(p)$
+      \EndIf
+    \EndFor
+  \EndWhile
+  \State \Return $\mathrm{loop}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Exceptional Control Flow in Detail}\label{sec:exceptional-detail}
+
+Exceptions create implicit control flow edges that complicate analysis and optimization.
+
+\begin{verbatim}
+  // Exception edges in a CFG:
+  // B1: x = a / b  (may throw DivisionByZero)
+  //     y = f(x)   (may throw any exception)
+  //     z = x + 1  (no exception possible)
+  //
+  // Exception edges:
+  // B1 -> Handler (from division)
+  // B1 -> Handler (from f(x))
+  // B1 -> B2 (normal continuation)
+  //
+  // The handler block is reached from any instruction that may throw
+\end{verbatim}
+
+\begin{definition}[Exceptional Edge]\label{def:exceptional-edge}
+An \emph{exceptional edge} is a control flow edge from a block $B$ to an exception handler $H$, representing the possibility that an instruction in $B$ raises an exception that is caught by $H$.
+\end{definition}
+
+\subsection{Impact of Exceptions on Optimization}\label{sec:exception-optimization}
+
+Exceptional control flow constrains optimizations in several ways:
+
+\begin{itemize}
+  \item \textbf{Code motion.} Instructions that may throw cannot be moved past a catch block boundary.
+  \item \textbf{Dead code elimination.} A call that may throw cannot be eliminated even if its result is unused (the side effect of throwing must be preserved).
+  \item \textbf{Common subexpression elimination.} Two calls that may throw cannot be merged even if they have the same arguments (each must perform its own exception check).
+  \item \textbf{Speculative optimization.} The compiler may speculatively assume that exceptions do not occur, but must insert checks to deoptimize if they do.
+\end{itemize}
+
+\begin{table}[htbp]
+\centering
+\caption{CFG properties and their applications}\label{tab:cfg-properties}
+\begin{tabular}{p{3cm}p{3.5cm}p{5cm}}
+\hline
+\textbf{Property} & \textbf{Algorithm} & \textbf{Application} \\
+\hline
+Reachability & BFS/DFS & Dead code elimination \\
+Dominance & Iterative / LT & SSA construction, loop detection \\
+Dominance frontiers & Walk idom chain & Phi function placement \\
+Natural loops & Back edge analysis & Loop optimization \\
+Reducibility & Check loop entries & Code generation strategy \\
+Strong connectivity & Tarjan's SCC & Cycle detection, irreducibility \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Post-Dominance}\label{sec:post-dominance}
+
+\begin{definition}[Post-Dominance]\label{def:post-dominance}
+Block $D$ \emph{post-dominates} block $N$ if every path from $N$ to the exit must pass through $D$.
+\end{definition}
+
+Post-dominance is used for:
+\begin{itemize}
+  \item \textbf{Control dependence.} Block $B$ is control-dependent on block $A$ if $A$ post-dominates the successor of $B$ but not $B$ itself.
+  \item \textbf{Speculation safety.} An instruction can be speculatively executed if it is post-dominated by its original position.
+  \item \textbf{Predication.} Instructions in post-dominated blocks can be converted to predicated instructions.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk},
+  excp/.style={->, >=latex, thick, color=red, dashed},
+  node distance=1.2cm
+]
+  \node[block] (b1) {B1: x = a / b};
+  \node[block, below=of b1] (b2) {B2: y = f(x)};
+  \node[block, below=of b2] (b3) {B3: z = x + 1};
+  \node[block, right=3cm of b2] (handler) {Handler:\\catch block};
+
+  \draw[arrow] (b1) -- (b2);
+  \draw[arrow] (b2) -- (b3);
+  \draw[excp] (b1) -- node[above, font=\small] {throw} (handler);
+  \draw[excp] (b2) -- node[above, font=\small] {throw} (handler);
+
+  \node[font=\small, below=0.5cm of b3, align=center] {
+    Normal edges: solid. Exception edges: dashed red.\\
+    B1 and B2 have exception edges to the handler.\\
+    B3 has no exception edges (no throwing operations).
+  };
+\end{tikzpicture}
+\caption{Exceptional control flow in a CFG. Instructions that may throw (division, function call) have implicit edges to the exception handler. Instructions that cannot throw (integer addition) have no exception edges.}\label{fig:exceptional-cfg}
+\end{figure}
+
+%% ============================================================
+%% Section 55.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-55}
+
+The control-flow graph is the foundational data structure for program analysis and optimization. Basic blocks partition the program into linear sequences; edges represent control flow. Dominance, reachability, and dominance frontiers are structural properties that enable efficient analysis and transformation.
+
+For further reading, we recommend Muchnick's comprehensive treatment~\cite{muchnick1997}, the classic paper by Allen~\cite{allen1970}, and the Lengauer--Tarjan algorithm~\cite{lengauer1979}.

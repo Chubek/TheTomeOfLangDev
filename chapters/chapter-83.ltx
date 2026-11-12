@@ -1,0 +1,556 @@
+%%
+%% chapter-83.ltx — Target Machine Models
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:target-machines}
+
+\section{Introduction}\label{sec:target-intro}
+
+The code generator's ultimate task is to translate an intermediate representation into a sequence of machine instructions that execute correctly and efficiently on a specific target architecture. Before any translation can occur, the compiler must possess a precise model of the target machine: its instruction set, register file, addressing modes, memory hierarchy, pipeline structure, and special-purpose functional units. This chapter develops a comprehensive theory of target machine modeling, providing the formal infrastructure upon which instruction selection, register allocation, and instruction scheduling---the subjects of subsequent chapters---are built.
+
+A target machine model is not merely a list of instructions. It is a mathematical abstraction that captures those aspects of the hardware relevant to code generation while eliding those details that are the province of microarchitectural engineering. The art lies in choosing the right level of abstraction: too coarse, and the compiler cannot exploit important hardware features; too fine, and the model becomes unwieldy and the generated code overly sensitive to microarchitectural details that change between processor revisions.
+
+We begin with instruction set architectures (ISAs), the programmer-visible contract between hardware and software. We then examine register files and addressing modes, the mechanisms by which instructions access operands. Pipeline models and hazard detection follow, capturing the temporal constraints that govern instruction throughput. The memory hierarchy---caches, TLBs, and main memory---introduces spatial and temporal considerations that profoundly affect performance. We conclude with SIMD and vector units, which expose data-level parallelism, and a discussion of how these models are integrated into compiler infrastructure.
+
+\section{Instruction Set Architectures}\label{sec:isa}
+
+\subsection{What Is an ISA?}\label{sec:isa-definition}
+
+\begin{definition}[Instruction Set Architecture]\label{def:isa}
+An \emph{instruction set architecture} (ISA) is a formal specification of the programmer-visible state of a processor and the instructions that manipulate that state. Formally, an ISA is a tuple
+\[
+  \mathcal{A} = (\mathcal{S}, \mathcal{I}, \mathcal{M}, \mathcal{E})
+\]
+where $\mathcal{S}$ is the set of architecturally visible states (register files, memory, status flags), $\mathcal{I}$ is the set of instructions, $\mathcal{M}$ is the memory model defining how instructions interact with the address space, and $\mathcal{E}$ is the exception and interrupt model.
+\end{definition}
+
+The ISA is the boundary between hardware and software. It is the contract that allows a compiler to generate code without knowledge of the specific microarchitectural implementation---the pipeline depth, the cache sizes, the branch prediction algorithm---while still guaranteeing correct execution. This separation of concerns is one of the great engineering achievements of computer science.
+
+\subsection{ISA Classification}\label{sec:isa-classification}
+
+Historically, ISAs have been classified along several axes. The most fundamental distinction is between \emph{load--store} (RISC) architectures and \emph{register--memory} (CISC) architectures.
+
+\begin{definition}[Load--Store Architecture]\label{def:load-store}
+A \emph{load--store architecture} is one in which arithmetic and logical operations can only access operands in registers; memory is accessed exclusively through explicit load and store instructions.
+\end{definition}
+
+\begin{definition}[Register--Memory Architecture]\label{def:reg-mem}
+A \emph{register--memory architecture} (also called a \emph{memory--memory architecture}) permits arithmetic and logical operations to reference operands directly in memory, using various addressing modes.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Comparison of ISA design philosophies}
+\label{tab:isa-comparison}
+\begin{tabular}{lcc}
+\hline
+\textbf{Feature} & \textbf{RISC (Load--Store)} & \textbf{CISC (Reg--Mem)} \\
+\hline
+Instruction length & Fixed or limited & Variable \\
+Addressing modes & Few, simple & Many, complex \\
+Memory operations & Explicit load/store & Embedded in arithmetic \\
+Pipeline friendliness & High & Moderate \\
+Compiler complexity & Higher (more instructions) & Lower (complex instr.) \\
+Microcode & Minimal & Extensive \\
+Examples & ARM, RISC-V, MIPS & x86, VAX \\
+\hline
+\end{tabular}
+\end{table}
+
+Modern ISAs blur this distinction. The x86-64 architecture, while historically CISC, has an internal RISC-like micro-operation decomposition. ARM, while historically RISC, has added instructions like \texttt{LDR} with auto-indexing that approach CISC complexity. The classification remains useful as a design philosophy, but the practical differences have narrowed considerably.
+
+\subsection{Instruction Encoding}\label{sec:instruction-encoding}
+
+Every instruction in an ISA has an \emph{encoding}: a binary representation that the instruction decoder interprets. The encoding determines the instruction's opcode, operand specifiers, and immediate values.
+
+\begin{definition}[Instruction Format]\label{def:instr-format}
+An \emph{instruction format} is a partitioning of the instruction's binary encoding into fields, each with a specific interpretation:
+\begin{itemize}
+  \item \emph{Opcode field}: identifies the operation
+  \item \emph{Register specifier fields}: identify source and destination registers
+  \item \emph{Immediate field}: encodes a constant operand
+  \item \emph{Address field}: encodes a memory address or displacement
+\end{itemize}
+\end{definition}
+
+\begin{example}[RISC-V Instruction Formats]\label{ex:riscv-formats}
+The RISC-V ISA defines several instruction formats, each 32 bits wide in the base ISA:
+\begin{itemize}
+  \item \textbf{R-type}: \texttt{[funct7(7)][rs2(5)][rs1(5)][funct3(3)][rd(5)][opcode(7)]}
+  \item \textbf{I-type}: \texttt{[imm[11:0](12)][rs1(5)][funct3(3)][rd(5)][opcode(7)]}
+  \item \textbf{S-type}: \texttt{[imm[11:5](7)][rs2(5)][rs1(5)][funct3(3)][imm[4:0](5)][opcode(7)]}
+  \item \textbf{B-type}: \texttt{[imm[12|10:5](7)][rs2(5)][rs1(5)][funct3(3)][imm[4:1|11](5)][opcode(7)]}
+\end{itemize}
+The opcode field determines the format; the funct3 and funct7 fields further distinguish operations within a format.
+\end{example}
+
+For the compiler, instruction encoding matters primarily in two respects: (1)~code size, which affects instruction cache performance and memory bandwidth, and (2)~the constraints it imposes on instruction selection, since not all combinations of operands and operations may be directly encodable.
+
+\subsection{Orthogonality and Regularity}\label{sec:orthogonality}
+
+An ideal ISA is \emph{orthogonal}: any instruction can be combined with any addressing mode and any register. Real ISAs deviate from this ideal in various ways.
+
+\begin{definition}[Orthogonality]\label{def:orthogonality}
+An ISA is \emph{orthogonal} if the set of available addressing modes is independent of the instruction being encoded, and if all general-purpose registers are interchangeable.
+\end{definition}
+
+Deviations from orthogonality are common and important for code generation:
+\begin{itemize}
+  \item x86-64 restricts certain shift and rotate instructions to use \texttt{CL} as the shift count register.
+  \item ARM's legacy 32-bit ISA has register \texttt{r15} (PC) that cannot always be used as a general-purpose register.
+  \item x86's \texttt{MUL}/\texttt{DIV} instructions implicitly use the \texttt{RAX}/\texttt{RDX} register pair.
+  \item Many architectures restrict the set of registers usable as base registers in certain addressing modes.
+\end{itemize}
+
+The compiler must model these irregularities precisely. Failure to do so leads to illegal instruction sequences or missed optimization opportunities.
+
+\section{Register Files and Addressing Modes}\label{sec:registers}
+
+\subsection{Register File Organization}\label{sec:reg-file-org}
+
+Modern processors expose multiple register files, each serving a distinct purpose:
+
+\begin{definition}[Register File]\label{def:reg-file}
+A \emph{register file} is a finite collection of named storage locations, each holding a value of fixed width, that are directly accessible by name in the instruction encoding.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{Register file organization in modern ISAs}
+\label{tab:reg-files}
+\begin{tabular}{lccc}
+\hline
+\textbf{Architecture} & \textbf{GPRs} & \textbf{FP/SIMD} & \textbf{Width} \\
+\hline
+x86-64 & 16 & 16 (XMM/YMM/ZMM) & 64 / 128--512 \\
+ARM AArch64 & 31 + SP & 32 (V0--V31) & 64 / 128 \\
+RISC-V RV64 & 32 & 32 (F/D/Q ext.) & 64 / 32--128 \\
+MIPS64 & 32 & 32 & 64 / 64 \\
+Power ISA 3.0 & 32 & 32 + 64 VSX & 64 / 128 \\
+\hline
+\end{tabular}
+\end{table}
+
+The number and organization of registers profoundly affects code quality. More registers reduce the pressure on the register allocator (\cref{ch:register-allocation}), allowing more values to be kept in fast storage. However, more registers also increase the encoding size needed to specify them and increase context-switch overhead.
+
+\subsection{Special-Purpose Registers}\label{sec:special-regs}
+
+Beyond general-purpose registers, ISAs define various special-purpose registers:
+
+\begin{itemize}
+  \item \textbf{Program counter (PC)}: holds the address of the next instruction to execute. May be implicit (x86) or explicit (ARM, RISC-V).
+  \item \textbf{Stack pointer (SP)}: points to the top of the hardware stack. Some ISAs provide hardware stack push/pop; others require explicit arithmetic.
+  \item \textbf{Frame pointer (FP)}: points to a fixed location in the current stack frame, enabling reliable stack traversal. Often omitted in optimized code.
+  \item \textbf{Status/condition flags}: carry, zero, overflow, sign, and other flags set by arithmetic operations and tested by conditional branches.
+  \item \textbf{Link register (LR)}: on architectures with branch-and-link instructions (ARM, PowerPC), stores the return address for subroutine calls.
+\end{itemize}
+
+\subsection{Addressing Modes}\label{sec:addressing-modes}
+
+An addressing mode specifies how the effective address of a memory operand is computed from the fields of an instruction.
+
+\begin{definition}[Addressing Mode]\label{def:addr-mode}
+An \emph{addressing mode} is a rule for computing the \emph{effective address} (EA) of an operand from the instruction's fields and the processor's register state.
+\end{definition}
+
+Common addressing modes include:
+
+\begin{table}[htbp]
+\centering
+\caption{Common addressing modes}
+\label{tab:addr-modes}
+\begin{tabular}{lll}
+\hline
+\textbf{Mode} & \textbf{Effective Address} & \textbf{Example} \\
+\hline
+Register & EA = $R_i$ & \texttt{MOV R1, R2} \\
+Immediate & operand = $\mathit{imm}$ & \texttt{ADD R1, \#42} \\
+Absolute & EA = $\mathit{addr}$ & \texttt{LOAD R1, [0x1000]} \\
+Register indirect & EA = $R_i$ & \texttt{LOAD R1, [R2]} \\
+Base + displacement & EA = $R_i + d$ & \texttt{LOAD R1, 8(R2)} \\
+Base + index & EA = $R_i + R_j$ & \texttt{LOAD R1, [R2+R3]} \\
+Base + index $\times$ scale & EA = $R_i + R_j \times s$ & \texttt{LOAD R1, [R2+R4*4]} \\
+PC-relative & EA = $\text{PC} + d$ & \texttt{LOAD R1, \text{label}(PC)} \\
+Pre-indexed & EA = $R_i + d$; $R_i \leftarrow \text{EA}$ & \texttt{LDR R1, [R2, \#8]!} \\
+Post-indexed & EA = $R_i$; $R_i \leftarrow R_i + d$ & \texttt{LDR R1, [R2], \#8} \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}
+The choice of addressing modes is a critical design decision for ISA architects. Rich addressing modes reduce instruction count (and thus code size) but complicate the instruction decoder and pipeline. The modern trend favors a small set of addressing modes---register indirect with displacement, and base-plus-index with scale---that cover the vast majority of access patterns in compiled code.
+\end{insight}
+
+\subsection{Addressing Mode Selection}\label{sec:addr-mode-selection}
+
+For the code generator, addressing mode selection is a key subproblem of instruction selection. Given a memory access in the IR, the compiler must choose which addressing mode to use, considering:
+
+\begin{enumerate}
+  \item \textbf{Availability}: not all modes are available for all instructions on all architectures.
+  \item \item \textbf{Cost}: complex modes may take more cycles or require additional micro-operations.
+  \item \textbf{Code size}: some modes encode more compactly than others.
+  \item \textbf{Register pressure}: using a register as a base or index consumes that register.
+  \item \textbf{Address computation reuse}: if the same address is computed multiple times, a single base register with varying displacements is preferable.
+\end{enumerate}
+
+\section{Pipeline Models and Hazards}\label{sec:pipeline}
+
+\subsection{Pipeline Structure}\label{sec:pipeline-structure}
+
+Modern processors execute instructions in a \emph{pipeline}: a sequence of stages through which each instruction passes. The classical five-stage RISC pipeline consists of:
+
+\begin{enumerate}
+  \item \textbf{Instruction Fetch (IF)}: retrieve the instruction from the instruction cache.
+  \item \textbf{Instruction Decode (ID)}: decode the opcode and read register operands.
+  \item \textbf{Execute (EX)}: perform the arithmetic or address computation.
+  \item \textbf{Memory (MEM)}: access data memory (for loads and stores).
+  \item \textbf{Write Back (WB)}: write the result to the register file.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  stage/.style={draw, minimum width=2cm, minimum height=0.8cm, fill=TomeBg, font=\small\bfseries},
+  arrow/.style={->, thick, >=stealth}
+]
+  % Stages
+  \node[stage] (if) at (0, 0) {IF};
+  \node[stage] (id) at (3, 0) {ID};
+  \node[stage] (ex) at (6, 0) {EX};
+  \node[stage] (mem) at (9, 0) {MEM};
+  \node[stage] (wb) at (12, 0) {WB};
+
+  % Arrows between stages
+  \draw[arrow] (if) -- (id);
+  \draw[arrow] (id) -- (ex);
+  \draw[arrow] (ex) -- (mem);
+  \draw[arrow] (mem) -- (wb);
+
+  % Pipeline labels
+  \node[below=0.3cm of if, font=\small\itshape] {Fetch};
+  \node[below=0.3cm of id, font=\small\itshape] {Decode};
+  \node[below=0.3cm of ex, font=\small\itshape] {Execute};
+  \node[below=0.3cm of mem, font=\small\itshape] {Memory};
+  \node[below=0.3cm of wb, font=\small\itshape] {Write Back};
+\end{tikzpicture}
+\caption{Classic five-stage RISC pipeline}
+\label{fig:five-stage-pipeline}
+\end{figure}
+
+While real pipelines are far more complex (modern superscalar processors may have 14+ stages with multiple parallel execution paths), the five-stage model captures the essential structure needed for the compiler to reason about hazards.
+
+\subsection{Structural Hazards}\label{sec:structural-hazards}
+
+A \emph{structural hazard} occurs when two instructions in the pipeline simultaneously require the same hardware resource.
+
+\begin{definition}[Structural Hazard]\label{def:structural-hazard}
+A \emph{structural hazard} arises at cycle $t$ when instructions $I_i$ and $I_j$, both active in the pipeline at cycle $t$, require access to the same hardware resource, and that resource cannot service both requests simultaneously.
+\end{definition}
+
+Common structural hazards include:
+\begin{itemize}
+  \item \textbf{Memory port conflicts}: a unified instruction/data cache cannot serve both an instruction fetch and a data load in the same cycle.
+  \item \textbf{Register file write conflicts}: multiple instructions completing in the same cycle may require simultaneous writes to the register file.
+  \item \textbf{Functional unit conflicts}: two instructions requiring the same ALU or multiplier.
+\end{itemize}
+
+For the compiler, structural hazards are typically handled by the hardware (through resource duplication or stalling). However, the compiler can improve performance by scheduling instructions to avoid resource conflicts.
+
+\subsection{Data Hazards}\label{sec:data-hazards}
+
+A \emph{data hazard} occurs when an instruction depends on the result of a prior instruction that is still in the pipeline.
+
+\begin{definition}[Data Hazard Types]\label{def:data-hazards}
+Given two instructions $I_1$ (earlier) and $I_2$ (later) in program order:
+\begin{itemize}
+  \item \textbf{Read After Write (RAW)}: $I_2$ reads a register/memory location that $I_1$ writes. This is a \emph{true dependency}.
+  \item \textbf{Write After Read (WAR)}: $I_2$ writes a location that $I_1$ reads. This is an \emph{anti-dependency}.
+  \item \textbf{Write After Write (WAW)}: $I_2$ writes the same location as $I_1$. This is an \emph{output dependency}.
+\end{itemize}
+\end{definition}
+
+\begin{example}[Load-Use Hazard]\label{ex:load-use}
+Consider the instruction sequence:
+\begin{verbatim}
+  LOAD  R1, 0(R2)     ; R1 <- Mem[R2]
+  ADD   R3, R1, R4    ; R3 <- R1 + R4
+\end{verbatim}
+The \texttt{ADD} depends on the result of \texttt{LOAD}. In a five-stage pipeline, the \texttt{LOAD} produces its result at the end of the MEM stage, but the \texttt{ADD} needs the value at the beginning of the EX stage---one cycle earlier. This is a \emph{load-use hazard} requiring a one-cycle stall (or \emph{bubble}) unless the processor supports \emph{data forwarding} (bypassing).
+\end{example}
+
+\subsection{Control Hazards}\label{sec:control-hazards}
+
+A \emph{control hazard} arises when the pipeline must fetch the next instruction but the target of a branch or jump is not yet known.
+
+\begin{definition}[Control Hazard]\label{def:control-hazard}
+A \emph{control hazard} occurs when a branch or jump instruction is in the pipeline and the fetch stage must decide which instruction to retrieve next, but the branch target or outcome has not yet been resolved.
+\end{definition}
+
+The penalty for a control hazard depends on the branch resolution latency and the effectiveness of branch prediction. Modern processors achieve prediction accuracies above 95\%, but the remaining mispredictions are a significant source of performance loss.
+
+For the compiler, control hazards motivate several optimizations:
+\begin{itemize}
+  \item \textbf{Branch delay slots}: on some architectures (MIPS, SPARC), the instruction after a branch is always executed. The compiler must fill this slot with a useful instruction.
+  \item \textbf{Code layout}: placing the likely-taken branch target immediately after the branch reduces the prediction penalty.
+  \item \textbf{Branch reduction}: transforming conditional branches into conditional moves or predicated instructions eliminates the hazard entirely.
+\end{itemize}
+
+\subsection{Modeling Pipelines for the Compiler}\label{sec:pipeline-modeling}
+
+The compiler does not need a cycle-accurate pipeline model. Instead, it needs an abstract model that captures the constraints relevant to instruction scheduling. This model typically consists of:
+
+\begin{definition}[Pipeline Model for Scheduling]\label{def:pipeline-model}
+A \emph{pipeline model} for instruction scheduling is a triple $(\mathcal{R}, \mathcal{L}, \mathcal{D})$ where:
+\begin{itemize}
+  \item $\mathcal{R}$ is a set of \emph{resources} (functional units, ports, buses) with capacities
+  \item $\mathcal{L}: \mathcal{I} \to \mathbb{N}$ is a \emph{latency function} mapping each instruction to its execution latency
+  \item $\mathcal{D}: \mathcal{I} \times \mathcal{I} \to \mathbb{N}$ is a \emph{delay function} mapping pairs of instructions to the minimum issue delay between them
+\end{itemize}
+\end{definition}
+
+This model is sufficient for list scheduling (\cref{ch:instruction-scheduling}) and captures the essential timing constraints without requiring a full microarchitectural simulation.
+
+\section{Memory Hierarchy}\label{sec:memory-hierarchy}
+
+\subsection{The Memory Hierarchy}\label{sec:mem-hierarchy-structure}
+
+The memory system of a modern processor is organized as a hierarchy of storage levels, each trading capacity for speed:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  level/.style={draw, fill=TomeBg, minimum height=0.7cm, font=\small},
+  every node/.style={align=center}
+]
+  \node[level, minimum width=2cm] (regs) at (0, 0) {Registers};
+  \node[level, minimum width=3.5cm] (l1) at (0, -1.2) {L1 Cache\\(32--64 KB, 3--4 cycles)};
+  \node[level, minimum width=5cm] (l2) at (0, -2.6) {L2 Cache\\(256 KB--1 MB, 10--14 cycles)};
+  \node[level, minimum width=7cm] (l3) at (0, -4.2) {L3 Cache\\(4--64 MB, 30--50 cycles)};
+  \node[level, minimum width=9cm] (mem) at (0, -6.0) {Main Memory (DRAM)\\(4--256 GB, 100--300 cycles)};
+  \node[level, minimum width=11cm] (disk) at (0, -7.8) {Secondary Storage\\(TB, $10^6$--$10^8$ cycles)};
+
+  \draw[<->, thick] (regs) -- (l1);
+  \draw[<->, thick] (l1) -- (l2);
+  \draw[<->, thick] (l2) -- (l3);
+  \draw[<->, thick] (l3) -- (mem);
+  \draw[<->, thick] (mem) -- (disk);
+
+  \node[right=0.5cm of regs, font=\small\itshape, text=TomeRule] {Fastest, smallest};
+  \node[right=0.5cm of disk, font=\small\itshape, text=TomeRule] {Slowest, largest};
+\end{tikzpicture}
+\caption{The memory hierarchy}
+\label{fig:memory-hierarchy}
+\end{figure}
+
+The compiler's interaction with the memory hierarchy is primarily through the \emph{locality} of the generated code. Two forms of locality are relevant:
+
+\begin{definition}[Locality]\label{def:locality}
+\begin{itemize}
+  \item \emph{Temporal locality}: a memory location accessed at time $t$ is likely to be accessed again in the near future.
+  \item \emph{Spatial locality}: a memory location accessed at time $t$ is likely to have nearby locations accessed in the near future.
+\end{itemize}
+\end{definition}
+
+\subsection{Cache Organization}\label{sec:cache-org}
+
+Caches are organized into \emph{lines} (or \emph{blocks}), typically 64 bytes on modern processors. Each line is the unit of transfer between cache levels.
+
+\begin{definition}[Cache Parameters]\label{def:cache-params}
+A cache is characterized by:
+\begin{itemize}
+  \item $C$: total cache capacity in bytes
+  \item $B$: line (block) size in bytes
+  \item $E$: associativity (number of lines per set)
+  \item $S = C / (B \times E)$: number of sets
+  \item A line with address $a$ maps to set $s = (a / B) \bmod S$
+\end{itemize}
+\end{definition}
+
+The compiler must be aware of cache behavior for several reasons:
+\begin{itemize}
+  \item \textbf{Cache-friendly data layouts}: structure layout, array ordering (row-major vs. column-major), and padding affect cache utilization.
+  \item \textbf{Loop transformations}: interchange, fusion, fission, and tiling (\cref{ch:loop-opt}) restructure access patterns to improve locality.
+  \item \textbf{Prefetching}: explicit prefetch instructions can hide memory latency when access patterns are predictable.
+  \item \textbf{Cache coloring}: partitioning the address space to reduce cache conflicts between critical code paths.
+\end{itemize}
+
+\subsection{Virtual Memory and TLB}\label{sec:virtual-memory}
+
+Modern systems use \emph{virtual memory}, where each process sees a large, contiguous address space that is mapped to physical memory by the hardware \emph{memory management unit} (MMU). The translation is cached in the \emph{translation lookaside buffer} (TLB).
+
+\begin{definition}[TLB]\label{def:tlb}
+The \emph{translation lookaside buffer} (TLB) is a hardware cache that stores recent virtual-to-physical address translations. A TLB miss requires a page table walk, which may take hundreds of cycles.
+\end{definition}
+
+For the compiler, TLB behavior matters when code accesses many distinct pages. Large arrays accessed with large strides can cause TLB thrashing. The compiler can mitigate this through:
+\begin{itemize}
+  \item Using \emph{huge pages} (2MB or 1GB) when available, reducing the number of TLB entries needed.
+  \item Restructuring data layouts to reduce the working set's page footprint.
+  \item Avoiding unnecessary pointer indirections that scatter accesses across memory.
+\end{itemize}
+
+\section{SIMD and Vector Units}\label{sec:simd}
+
+\subsection{Data-Level Parallelism}\label{sec:data-parallelism}
+
+\emph{Single Instruction, Multiple Data} (SIMD) architectures exploit data-level parallelism by applying the same operation to multiple data elements simultaneously.
+
+\begin{definition}[SIMD]\label{def:simd}
+A \emph{SIMD} (Single Instruction, Multiple Data) instruction performs the same operation on $w$ data elements packed into a wide register, where $w$ is the \emph{vector width}. For example, a 256-bit SIMD register can hold eight 32-bit integers, and a single SIMD \texttt{ADD} instruction adds all eight pairs simultaneously.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\caption{SIMD extensions across architectures}
+\label{tab:simd-extensions}
+\begin{tabular}{llcc}
+\hline
+\textbf{Architecture} & \textbf{Extension} & \textbf{Max Width} & \textbf{Elements (32-bit)} \\
+\hline
+x86 & SSE & 128-bit & 4 \\
+x86 & AVX2 & 256-bit & 8 \\
+x86 & AVX-512 & 512-bit & 16 \\
+ARM & NEON & 128-bit & 4 \\
+ARM & SVE & 128--2048-bit & variable \\
+RISC-V & RVV 1.0 & variable & variable \\
+Power & VSX/VMX & 128-bit & 4 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Vectorization}\label{sec:vectorization}
+
+\emph{Vectorization} is the compiler transformation that converts scalar loops into SIMD instructions. The key challenge is determining when vectorization is legal and beneficial.
+
+\begin{definition}[Vectorization Condition]\label{def:vectorization}
+A loop is \emph{vectorizable} if:
+\begin{enumerate}
+  \item The loop has a known trip count (or can be handled with masking for the tail).
+  \item There are no loop-carried dependencies that prevent parallel execution of iterations.
+  \item Memory accesses are contiguous (or can be gathered/scattered).
+  \item The operations in the loop body have corresponding SIMD instructions.
+\end{enumerate}
+\end{definition}
+
+\begin{example}[Vectorizable Loop]\label{ex:vectorizable}
+The following loop is vectorizable because each iteration is independent:
+\begin{verbatim}
+  for (int i = 0; i < N; i++)
+    C[i] = A[i] + B[i];
+\end{verbatim}
+A SIMD implementation processes 8 elements at a time (with AVX2):
+\begin{verbatim}
+  for (int i = 0; i < N; i += 8)
+    _mm256_store_ps(&C[i],
+      _mm256_add_ps(_mm256_load_ps(&A[i]),
+                     _mm256_load_ps(&B[i])));
+\end{verbatim}
+\end{example}
+
+\subsection{Vector Length Agnosticism}\label{sec:vla}
+
+A modern trend in SIMD design is \emph{vector length agnosticism} (VLA), where the compiler generates code that works correctly regardless of the hardware vector width. ARM's SVE and RISC-V's RVV both support this approach.
+
+\begin{definition}[Vector Length Agnostic Code]\label{def:vla}
+\emph{Vector length agnostic} (VLA) code is written in terms of an abstract vector length that is determined at runtime. The same binary executes correctly on hardware with different vector widths.
+\end{definition}
+
+VLA code typically uses \emph{predication} or \emph{masking} to handle the tail of a loop when the trip count is not a multiple of the vector width. This eliminates the need for multiple code versions for different vector widths.
+
+\section{Modeling Targets for Code Generation}\label{sec:target-modeling}
+
+\subsection{Machine Descriptions}\label{sec:machine-descriptions}
+
+A compiler's \emph{machine description} (or \emph{target description}) is a data structure that encodes all the information the compiler needs about the target machine. It typically includes:
+
+\begin{itemize}
+  \item \textbf{Register definitions}: names, classes, sizes, and costs of all registers.
+  \item \textbf{Instruction definitions}: opcodes, formats, latencies, resource usage, and semantics.
+  \item \textbf{Addressing mode definitions}: available modes and their costs.
+  \item \textbf{Calling convention}: argument passing, return values, callee-saved registers.
+  \item \textbf{Cost model}: relative costs of operations for instruction selection.
+\end{itemize}
+
+\subsection{TableGen and Machine Descriptions}\label{sec:tablegen}
+
+LLVM's \emph{TableGen} system provides a domain-specific language for describing target machines. A TableGen description includes:
+
+\begin{itemize}
+  \item \texttt{Register} definitions with register classes and sub-registers
+  \item \texttt{Instruction} definitions with patterns mapping IR operations to machine instructions
+  \item \texttt{Predicate} definitions for conditional instruction availability
+  \item \texttt{Scheduling} models for instruction latencies and resource usage
+\end{itemize}
+
+\begin{example}[TableGen Register Definition]\label{ex:tablegen-reg}
+A simplified TableGen description of x86-64 general-purpose registers:
+\begin{verbatim}
+  def GR64 : RegisterClass<"X86", [i64], 64,
+    (add RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
+         R8,  R9,  R10, R11, R12, R13, R14, R15)>;
+\end{verbatim}
+This defines a register class \texttt{GR64} containing 16 64-bit registers, each holding an \texttt{i64} value.
+\end{example}
+
+\subsection{Constraint Solving for Target Modeling}\label{sec:constraint-solving}
+
+Some target constraints are naturally expressed as a constraint satisfaction problem. For example, instruction selection with addressing mode constraints can be modeled as:
+
+\begin{definition}[Instruction Selection as CSP]\label{def:is-csp}
+Given an IR expression tree $T$, instruction selection is the problem of finding a covering of $T$ by instruction patterns such that:
+\begin{enumerate}
+  \item Every node in $T$ is covered by exactly one pattern.
+  \item The patterns used are valid for the target (respecting register constraints, addressing mode restrictions, etc.).
+  \item The total cost (sum of pattern costs) is minimized.
+\end{enumerate}
+\end{definition}
+
+This formulation connects instruction selection to well-studied problems in combinatorial optimization, enabling the use of integer linear programming or constraint programming techniques for optimal code generation.
+
+\subsection{Retargetable Compilation}\label{sec:retargetable}
+
+A \emph{retargetable} compiler can generate code for multiple target architectures from a single compiler codebase. The key to retargetability is the separation of the machine-independent and machine-dependent components:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={draw, fill=TomeBg, minimum width=3.5cm, minimum height=0.8cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[block, fill=TomeExBg] (front) at (0, 3) {Front End\\(Source Language)};
+  \node[block] (mid) at (0, 1.5) {Machine-Independent\\Optimization};
+  \node[block, fill=TomeDefBg] (isel) at (-3, 0) {Instruction\\Selection};
+  \node[block, fill=TomeDefBg] (regalloc) at (0, 0) {Register\\Allocation};
+  \node[block, fill=TomeDefBg] (isched) at (3, 0) {Instruction\\Scheduling};
+  \node[block, fill=TomeExBg] (emit) at (0, -1.5) {Code Emission\\(Target Machine)};
+
+  \draw[arr] (front) -- (mid);
+  \draw[arr] (mid) -- (isel);
+  \draw[arr] (mid) -- (regalloc);
+  \draw[arr] (mid) -- (isched);
+  \draw[arr] (isel) -- (emit);
+  \draw[arr] (regalloc) -- (emit);
+  \draw[arr] (isched) -- (emit);
+
+  \node[left=0.3cm of isel, font=\small\itshape, text=TomeRule] {Machine-dependent};
+  \node[right=0.3cm of isched, font=\small\itshape, text=TomeRule] {Machine-dependent};
+\end{tikzpicture}
+\caption{Retargetable compiler structure: machine-independent and machine-dependent components}
+\label{fig:retargetable-compiler}
+\end{figure}
+
+The machine-dependent components (instruction selection, register allocation, instruction scheduling, and code emission) are parameterized by the machine description, allowing the same compiler infrastructure to target different architectures.
+
+\section{Summary and Outlook}\label{sec:target-summary}
+
+The target machine model is the foundation upon which all back-end compiler phases are built. A precise, well-structured model enables effective instruction selection, register allocation, and scheduling. An imprecise model leads to incorrect or suboptimal code.
+
+The trends in modern processor design---increasing pipeline depth, out-of-order execution, heterogeneous cores, and specialized accelerators---continually challenge the compiler's target model. The model must be rich enough to capture the features that matter for performance while remaining abstract enough to be portable across microarchitectural generations.
+
+In the chapters that follow, we build on this foundation. \Cref{ch:code-emission} addresses the production of object files and executables. \Cref{ch:calling-conventions} formalizes the interface between compiled code units. \Cref{ch:instruction-selection,ch:register-allocation,ch:instruction-scheduling} develop the core back-end phases that transform IR into efficient machine code.
+
+\begin{historical}
+The study of target machine modeling for compilers began with the early work on machine-independent code generation by Cocke and others at IBM in the 1970s. The idea of using tree pattern matching for instruction selection, developed by Aho, Johnson, and others, was a breakthrough that made retargetable compilation practical. The TableGen approach, pioneered by LLVM in the early 2000s, further advanced retargetability by providing a declarative language for machine descriptions. The increasing complexity of modern ISAs---with SIMD extensions, heterogeneous cores, and accelerator interfaces---continues to push the boundaries of target modeling.
+\end{historical}

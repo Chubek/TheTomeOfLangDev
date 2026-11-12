@@ -1,0 +1,459 @@
+%%
+%% chapter-102.ltx — Proof-Carrying Code
+%%
+%% Part X: Modern Compiler Architecture
+%%
+
+\label{ch:proof-carrying}
+
+\section{Introduction}\label{sec:pcc-intro}
+
+When untrusted code is loaded into a trusted system---a browser plugin, a kernel module, a mobile app---how can the system ensure that the code is safe? Traditional approaches rely on sandboxing, type checking, or bytecode verification. \emph{Proof-carrying code} (PCC) offers a more fundamental solution: the code producer attaches a formal proof that the code satisfies a safety policy, and the code consumer checks the proof before loading the code. If the proof is valid, the code is guaranteed to be safe.
+
+This chapter explores the concept of proof-carrying code, the proof obligations for compiler optimizations, SMT-based validation, and the practical systems that implement these ideas.
+
+\section{Proof-Carrying Code: Concept}\label{sec:pcc-concept}
+
+\subsection{The Problem}\label{sec:pcc-problem}
+
+When a code consumer (the operating system, a browser, a runtime) receives code from an untrusted producer, it must decide whether to execute the code. The options are:
+
+\begin{itemize}
+  \item \textbf{Trust the producer}: risky, the code may be malicious or buggy.
+  \item \textbf{Sandbox the code}: restrict what the code can do, at the cost of functionality and performance.
+  \item \textbf{Verify the code}: check that the code satisfies a safety policy. This is the PCC approach.
+\end{itemize}
+
+\subsection{The PCC Protocol}\label{sec:pcc-protocol}
+
+\begin{definition}[Proof-Carrying Code]\label{def:pcc}
+\emph{Proof-carrying code} (PCC) is a mechanism in which:
+\begin{enumerate}
+  \item The code \emph{producer} generates code and a proof that the code satisfies a safety policy $P$.
+  \item The code \emph{consumer} receives the code and the proof.
+  \item The consumer checks the proof using a \emph{proof validator} (a small, trusted component).
+  \item If the proof is valid, the consumer loads and executes the code.
+  \item If the proof is invalid, the consumer rejects the code.
+\end{enumerate}
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={draw, fill=TomeBg, minimum width=3cm, minimum height=0.8cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[block, fill=TomeExBg] (producer) at (0, 3) {Code Producer};
+  \node[block, fill=TomeDefBg] (code) at (0, 1.5) {Code + Proof};
+  \node[block, fill=TomeWarnBg] (consumer) at (0, 0) {Code Consumer};
+  \node[block, fill=TomeDefBg] (validator) at (4, 0) {Proof\\Validator};
+  \node[block, fill=TomeExBg] (load) at (0, -1.5) {Load and Execute};
+  \node[block, fill=TomeWarnBg] (reject) at (4, -1.5) {Reject};
+
+  \draw[arr] (producer) -- node[right, font=\small] {Generate} (code);
+  \draw[arr] (code) -- node[right, font=\small] {Send} (consumer);
+  \draw[arr] (consumer) -- (validator);
+  \draw[arr] (validator) -- node[right, font=\small] {Valid} (load);
+  \draw[arr] (validator) -- node[right, font=\small] {Invalid} (reject);
+\end{tikzpicture}
+\caption{The proof-carrying code protocol}
+\label{fig:pcc-protocol}
+\end{figure}
+
+\subsection{Key Properties}\label{sec:pcc-properties}
+
+\begin{itemize}
+  \item \textbf{No trust in the producer}: the producer does not need to be trusted; only the proof matters.
+  \item \textbf{Small TCB}: the proof validator is small and can be carefully audited or even formally verified.
+  \item \textbf{Flexible policies}: the safety policy can be customized for each consumer.
+  \item \textbf{No runtime overhead}: once the proof is checked, the code runs at full speed (no sandboxing overhead).
+\end{itemize}
+
+\subsection{Historical Context}\label{sec:pcc-history}
+
+Proof-carrying code was introduced by Necula and Lee (1996) at Carnegie Mellon University. The original system used a type-theoretic approach: the proof was a derivation in a typed logical framework, and the proof checker was a type checker for that framework.
+
+\section{Proof Obligations for Optimizations}\label{sec:proof-obligations}
+
+\subsection{Optimization Correctness}\label{sec:opt-correctness}
+
+When a compiler optimization transforms a program, it must preserve the program's semantics. This can be expressed as a proof obligation:
+
+\begin{definition}[Optimization Proof Obligation]\label{def:opt-proof}
+For an optimization that transforms program $P$ to program $P'$, the proof obligation is:
+\[
+  \forall \sigma.\; \sembrack{P}\sigma = \sembrack{P'}\sigma
+\]
+where $\sembrack{P}\sigma$ is the semantics of $P$ in state $\sigma$.
+\end{definition}
+
+\subsection{Proof Obligations for Specific Optimizations}\label{sec:specific-obligations}
+
+\begin{table}[htbp]
+\centering
+\caption{Proof obligations for common optimizations}
+\label{tab:proof-obligations}
+\begin{tabular}{ll}
+\hline
+\textbf{Optimization} & \textbf{Proof Obligation} \\
+\hline
+Constant folding & The constant value equals the expression's value. \\
+Dead code elimination & The eliminated code has no observable effect. \\
+Common subexpression elimination & The two expressions compute the same value. \\
+Loop unrolling & The unrolled loop has the same semantics. \\
+Instruction selection & The selected instruction computes the same value. \\
+Register allocation & The allocated code respects the calling convention. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Generating Proof Obligations}\label{sec:generating-obligations}
+
+The compiler can generate proof obligations as a byproduct of optimization:
+\begin{enumerate}
+  \item The optimizer applies a transformation.
+  \item The optimizer generates a proof obligation for the transformation.
+  \item The obligation is discharged by an automated prover (SMT solver, theorem prover).
+  \item If the obligation is discharged, the transformation is accepted.
+  \item If not, the transformation is rolled back.
+\end{enumerate}
+
+\section{SMT-Based Validation}\label{sec:smt-validation}
+
+\subsection{SMT Solvers}\label{sec:smt-solvers}
+
+\begin{definition}[SMT Solver]\label{def:smt}
+An \emph{SMT} (Satisfiability Modulo Theories) solver determines whether a logical formula is satisfiable with respect to a combination of background theories (e.g., linear arithmetic, bitvectors, arrays, uninterpreted functions).
+\end{definition}
+
+Common SMT solvers:
+\begin{itemize}
+  \item \textbf{Z3} (Microsoft): the most widely used SMT solver.
+  \item \textbf{CVC4/CVC5}: developed at Stanford and the University of Iowa.
+  \item \textbf{Boogie}: a verification condition generator built on Z3.
+\end{itemize}
+
+\subsection{Encoding Compiler Semantics in SMT}\label{sec:encoding}
+
+To validate compiler optimizations, the semantics of the source and target programs are encoded as SMT formulas:
+
+\begin{example}[Encoding Constant Folding]\label{ex:smt-constant-folding}
+To verify that \texttt{x + 0} can be replaced by \texttt{x}:
+\begin{verbatim}
+  (declare-fun x () (_ BitVec 32))
+  (assert (not (= (bvadd x (_ bv0 32)) x)))
+  (check-sat)  ; Should return UNSAT (the negation is unsatisfiable)
+\end{verbatim}
+If the solver returns \texttt{UNSAT}, the optimization is correct for all values of \texttt{x}.
+\end{example}
+
+\subsection{Bounded Translation Validation}\label{sec:bounded-tv}
+
+\begin{definition}[Bounded Translation Validation]\label{def:bounded-tv}
+\emph{Bounded translation validation} validates a compiler optimization for all inputs up to a bounded size (e.g., all bitvector inputs of width $\leq 32$). This is incomplete (does not prove correctness for all input sizes) but can be fully automated.
+\end{definition}
+
+\section{Alive2 and Bounded Translation Validation}\label{sec:alive2}
+
+\subsection{Overview}\label{sec:alive2-overview}
+
+\begin{definition}[Alive2]\label{def:alive2}
+\emph{Alive2} is a bounded translation validation tool for LLVM's optimization passes. It validates that each LLVM optimization correctly transforms the source IR to the target IR, for all inputs up to a bounded size.
+\end{definition}
+
+Alive2 was developed to address the problem of optimization bugs in LLVM. It works by:
+\begin{enumerate}
+  \item Parsing the source and target LLVM IR (as optimization test cases).
+  \item Encoding the semantics of both IR fragments as SMT formulas.
+  \item Checking that the target refines the source (every behavior of the target is allowed by the source).
+  \item Reporting any counterexamples (inputs where the optimization is incorrect).
+\end{enumerate}
+
+\subsection{Alive2's Impact}\label{sec:alive2-impact}
+
+Alive2 has discovered dozens of previously unknown bugs in LLVM's optimization passes, including:
+\begin{itemize}
+  \item Incorrect handling of \texttt{undef} and \texttt{poison} values.
+  \item Incorrect handling of undefined behavior (e.g., signed overflow).
+  \item Incorrect peephole optimizations.
+  \item Incorrect instruction combining.
+\end{itemize}
+
+\subsection{Alive2's Architecture}\label{sec:alive2-arch}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={draw, fill=TomeBg, minimum width=3cm, minimum height=0.7cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[block, fill=TomeExBg] (src) at (0, 3) {Source LLVM IR};
+  \node[block, fill=TomeExBg] (tgt) at (4, 3) {Target LLVM IR};
+  \node[block] (encode) at (2, 1.5) {SMT Encoding};
+  \node[block, fill=TomeDefBg] (z3) at (2, 0) {Z3 Solver};
+  \node[block, fill=TomeDefBg] (result) at (2, -1.5) {Valid / Counterexample};
+
+  \draw[arr] (src) -- (encode);
+  \draw[arr] (tgt) -- (encode);
+  \draw[arr] (encode) -- (z3);
+  \draw[arr] (z3) -- (result);
+\end{tikzpicture}
+\caption{Alive2 architecture}
+\label{fig:alive2-arch}
+\end{figure}
+
+\subsection{Poison and UB in LLVM}\label{sec:poison-ub}
+
+One of Alive2's major contributions is clarifying the semantics of \texttt{poison} and undefined behavior in LLVM:
+\begin{itemize}
+  \item \texttt{undef}: a value that can be anything. Reading \texttt{undef} gives an unspecified value.
+  \item \texttt{poison}: a value that makes any computation using it also \texttt{poison}. Unlike \texttt{undef}, \texttt{poison} is ``infectious.''
+  \item \textbf{Undefined behavior}: certain operations (signed division by zero, out-of-bounds shift) cause undefined behavior, meaning the compiler can assume they never happen.
+\end{itemize}
+
+Alive2's formal model of these concepts has led to significant changes in LLVM's semantics.
+
+\section{Certifying Compilers}\label{sec:certifying}
+
+\subsection{From Validation to Certification}\label{sec:validation-to-certification}
+
+Translation validation checks each compilation individually. A \emph{certifying compiler} goes further: it produces a proof with every compilation that can be checked independently.
+
+\begin{definition}[Certifying Compiler]\label{def:certifying}
+A \emph{certifying compiler} is one that produces, along with each compiled program, a proof that the compiled program correctly implements the source program's semantics.
+\end{definition}
+
+\subsection{Proof Formats}\label{sec:proof-formats}
+
+The proof must be in a format that can be checked by a small, trusted proof checker:
+\begin{itemize}
+  \item \textbf{LF (Logical Framework)}: the original PCC approach, using a typed lambda calculus as the proof language.
+  \item \textbf{SMT-LIB}: proofs generated by SMT solvers, checkable by an SMT proof checker.
+  \item \textbf{Dedukti}: a universal proof format that can encode proofs from multiple systems.
+  \item \textbf{ERCOF}: a proof format for compiler optimization verification.
+\end{itemize}
+
+\subsection{The Proof Checker}\label{sec:proof-checker}
+
+The proof checker must be:
+\begin{itemize}
+  \item \textbf{Small}: a small codebase is easier to audit and verify.
+  \item \textbf{Trusted}: the entire security argument depends on the checker's correctness.
+  \item \textbf{Fast}: proof checking should be much faster than proof generation.
+\end{itemize}
+
+Ideally, the proof checker itself is formally verified (e.g., using CompCert or a similar tool).
+
+\section{Practical Considerations}\label{sec:practical}
+
+\subsection{Proof Size}\label{sec:proof-size}
+
+Proofs can be large:
+\begin{itemize}
+  \item A proof of correctness for a single optimization may be thousands of SMT assertions.
+  \item A proof for an entire compilation may be megabytes.
+  \item Proof compression and serialization are important practical concerns.
+\end{itemize}
+
+\subsection{Proof Generation Time}\label{sec:proof-time}
+
+Generating proofs adds overhead to compilation:
+\begin{itemize}
+  \item SMT solving can be slow for complex formulas.
+  \item Proof generation may not scale to very large programs.
+  \item Selective certification (certifying only critical code) may be practical.
+\end{itemize}
+
+\subsection{Integration with Existing Compilers}\label{sec:integration}
+
+Integrating PCC with existing compilers requires:
+\begin{itemize}
+  \item Formal semantics for the source and target languages.
+  \item A proof generation infrastructure.
+  \item A proof checking infrastructure.
+  \item Modifications to the compiler to emit proofs.
+\end{itemize}
+
+\subsection{Applications}\label{sec:applications}
+
+PCC and related techniques are applicable to:
+\begin{itemize}
+  \item \textbf{Verified compilation}: ensuring that optimized code is correct.
+  \item \textbf{Secure loading}: ensuring that loaded code satisfies a security policy.
+  \item \textbf{Bug detection}: finding optimization bugs in compilers.
+  \item \textbf{Regularity enforcement}: ensuring that compiler output conforms to a specification.
+\end{itemize}
+
+\section{Advanced SMT Validation}\label{sec:advanced-smt}
+
+\subsection{Encoding Control Flow in SMT}\label{sec:smt-control-flow}
+
+Validating optimizations that involve control flow requires encoding the program's control-flow structure:
+
+\begin{example}[Encoding a Branch Optimization]\label{ex:smt-branch}
+To verify that simplifying \texttt{if (x > 0 \&\& x < 10)} to \texttt{if (x > 0)} is correct when we know \texttt{x < 10}:
+\begin{verbatim}
+  (declare-fun x () (_ BitVec 32))
+  ; Assume x < 10 (signed)
+  (assert (bvslt x (_ bv10 32)))
+  ; Check: does (x > 0 && x < 10) == (x > 0)?
+  (assert (not (=
+    (and (bvsgt x (_ bv0 32)) (bvslt x (_ bv10 32)))
+    (bvsgt x (_ bv0 32)))))
+  (check-sat)  ; Should return UNSAT
+\end{verbatim}
+\end{example}
+
+\subsection{Memory Reasoning in SMT}\label{sec:smt-memory}
+
+Validating memory optimizations (e.g., load/store reordering, dead store elimination) requires encoding the memory model:
+
+\begin{verbatim}
+  ; Encoding a store-load forwarding optimization:
+  ; If we store value v to address a, then load from address a,
+  ; the load returns v.
+  
+  (declare-fun mem () (Array (_ BitVec 32) (_ BitVec 32)))
+  (declare-fun a () (_ BitVec 32))
+  (declare-fun v () (_ BitVec 32))
+  
+  ; After store: mem' = store(mem, a, v)
+  ; Load from a: result = select(mem', a)
+  ; Check: result == v
+  (assert (not (= (select (store mem a v) a) v)))
+  (check-sat)  ; UNSAT - the optimization is correct
+\end{verbatim}
+
+\subsection{Handling Quantifiers in SMT}\label{sec:smt-quantifiers}
+
+Some verification conditions require quantifiers, which are harder for SMT solvers:
+
+\begin{itemize}
+  \item \textbf{Loop invariants}: proving that a loop optimization preserves semantics may require universally quantified invariants.
+  \item \textbf{Array properties}: proving properties about all elements of an array requires quantification over array indices.
+  \item \textbf{Unbounded programs}: proving correctness for all input sizes requires quantification.
+\end{itemize}
+
+SMT solvers handle quantifiers using \emph{instantiation strategies} (e.g., E-matching, model-based quantifier instantiation), but completeness is not guaranteed.
+
+\section{Alive2: Deep Dive}\label{sec:alive2-deep}
+
+\subsection{Alive2's Semantic Model}\label{sec:alive2-semantics}
+
+Alive2 defines a precise semantic model for LLVM IR that captures:
+
+\begin{definition}[Alive2 Semantic Model]\label{def:alive2-semantics}
+Alive2's semantic model defines the meaning of each LLVM instruction as a function from states to states, where a state consists of:
+\begin{itemize}
+  \item A mapping from registers to values (including \texttt{poison} and \texttt{undef}).
+  \item A memory state (a map from addresses to values, with alignment and provenance information).
+  \item The current basic block and instruction pointer.
+\end{itemize}
+\end{definition}
+
+\subsection{Refinement Checking}\label{sec:refinement-checking}
+
+Alive2 checks \emph{refinement}: the target must produce a result that is allowed by the source's semantics.
+
+\begin{definition}[Refinement]\label{def:refinement}
+Target program $T$ \emph{refines} source program $S$ if for every input:
+\begin{itemize}
+  \item If $S$ produces a value $v$, then $T$ produces a value $v'$ that refines $v$.
+  \item If $S$ produces \texttt{poison}, then $T$ can produce any value (including \texttt{poison}).
+  \item If $S$ produces \texttt{undef}, then $T$ can produce any value of the correct type.
+  \item If $S$ has undefined behavior, then $T$ can do anything.
+  \item If $S$ does not return (diverges), then $T$ can either diverge or return any value.
+\end{itemize}
+\end{definition}
+
+\begin{verbatim}
+  ; Refinement for values:
+  ; v' refines v iff:
+  ;   v is poison => v' can be anything
+  ;   v is a concrete value => v' must be the same value
+  ;   v is undef (any value) => v' can be any value
+  
+  ; Refinement for memory:
+  ; T's memory state refines S's if:
+  ;   All reads from non-local memory return the same values
+  ;   T does not access memory outside what S allows
+  ;   T preserves alignment constraints
+\end{verbatim}
+
+\subsection{Alive2's Bug-Finding Impact}\label{sec:alive2-bugs}
+
+Alive2 has discovered significant categories of bugs in LLVM:
+
+\begin{table}[htbp]
+\centering
+\caption{Categories of bugs found by Alive2}
+\label{tab:alive2-bugs}
+\begin{tabular}{lll}
+\hline
+\textbf{Category} & \textbf{Examples} & \textbf{Count} \\
+\hline
+Poison/undef confusion & Incorrect propagation of poison & 15+ \\
+Missing UB checks & Optimization assuming no UB incorrectly & 10+ \\
+Incorrect peephole opts & Wrong algebraic identity & 20+ \\
+Instruction combining & Incorrect merging of instructions & 8+ \\
+Bit manipulation errors & Wrong shift/mask operations & 12+ \\
+Memory model violations & Incorrect alias assumptions & 5+ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Scaling Alive2}\label{sec:alive2-scaling}
+
+Alive2 faces scalability challenges:
+\begin{itemize}
+  \item \textbf{Large functions}: SMT encoding grows with function size. Mitigation: validate basic blocks individually.
+  \item \textbf{Complex memory operations}: memory encoding is expensive. Mitigation: use abstract memory models.
+  \item \textbf{Many optimization passes}: each pass must be validated separately. Mitigation: batch validation of related passes.
+  \item \textbf{Timeout}: SMT solving may time out for complex queries. Mitigation: use bounded model checking with smaller bitwidths.
+\end{itemize}
+
+\section{Integrating PCC with Build Systems}\label{sec:pcc-build}
+
+\subsection{Continuous Verification}\label{sec:continuous-verification}
+
+Translation validation can be integrated into the build process:
+
+\begin{itemize}
+  \item \textbf{CI/CD integration}: every compilation in the CI pipeline is validated. If validation fails, the build is rejected.
+  \item \textbf{Regression testing}: validation catches optimization bugs before they reach production.
+  \item \textbf{Compiler development}: compiler developers run validation on their changes to catch introduced bugs.
+\end{itemize}
+
+\subsection{Selective Certification}\label{sec:selective-certification}
+
+Full certification of every compilation is expensive. Selective certification certifies only critical code:
+
+\begin{algorithm}[htbp]
+\caption{Selective Certification Policy}
+\label{alg:selective-cert}
+\begin{algorithmic}[1]
+\Procedure{ShouldCertify}{$\text{function}, \text{policy}$}
+  \If{function.\text{is\_safety\_critical}}
+    \State \Return \textbf{true}
+  \EndIf
+  \If{function.\text{is\_security\_sensitive}}
+    \State \Return \textbf{true}
+  \EndIf
+  \If{function.\text{has\_optimization\_history}}
+    \State \Return \textbf{true} \Comment{Previously had bugs}
+  \EndIf
+  \If{policy.\text{certify\_percentage} > \textsc{Random}()}
+    \State \Return \textbf{true} \Comment{Random sampling}
+  \EndIf
+  \State \Return \textbf{false}
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\section{Summary}\label{sec:pcc-summary}
+
+Proof-carrying code and translation validation provide powerful techniques for ensuring the correctness of compiled code. By attaching formal proofs to compiled programs, these techniques enable code consumers to verify safety properties without trusting the compiler or the code producer. Tools like Alive2 have demonstrated the practical value of these techniques, discovering real bugs in production compilers. As SMT solvers and proof infrastructure continue to improve, we can expect these techniques to become more widely used in both compiler development and secure code loading.
+
+\begin{historical}
+Proof-carrying code was introduced by Necula and Lee in 1996, using a type-theoretic framework for proof generation and checking. The idea was ahead of its time: SMT solvers were not yet powerful enough, and the overhead of proof generation was prohibitive. The modern revival began with the development of powerful SMT solvers (Z3, CVC4) and the recognition that compiler bugs are a serious problem. Alive (2013) and its successor Alive2 (2019) brought bounded translation validation to LLVM, discovering dozens of real bugs. The connection between PCC and compiler verification was further strengthened by work on certifying compilers and proof-carrying optimization. Today, the ideas behind PCC are finding practical application in compiler testing, optimization validation, and secure code loading, fulfilling the vision that Necula and Lee articulated more than a quarter century ago.
+\end{historical}

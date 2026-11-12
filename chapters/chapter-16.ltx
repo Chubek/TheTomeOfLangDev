@@ -1,0 +1,600 @@
+%% chapter-16.ltx — Lexical Structure
+%% Part II: Programming Language Design
+
+%% ============================================================
+%% 16.1 Introduction
+%% ============================================================
+\section{Introduction}\label{sec:lexical-intro}
+
+Before a program can be parsed, it must be decomposed into \emph{tokens}---
+the atomic units of the language's syntax.  This decomposition is performed
+by the \emph{lexical analyzer} (lexer, scanner), the first phase of every
+compiler and interpreter.
+
+Lexical analysis transforms a flat sequence of characters into a sequence of
+tokens, each annotated with its kind (keyword, identifier, operator,
+literal) and its attributes (the identifier's name, the literal's value).
+This transformation is governed by the language's \emph{lexical grammar},
+which is typically a regular grammar specified using regular expressions.
+
+In this chapter, we develop the theory and practice of lexical analysis.
+We begin with the fundamental concepts of tokens, lexemes, and patterns.
+We then develop the theory of regular expressions and finite automata, which
+underlies all lexical analysis.  We survey lexer generators (Lex, Flex,
+re2c), discuss Unicode and internationalization, examine
+whitespace-sensitive languages, and explore implementation techniques.
+
+\begin{definition}[Lexical Analysis]\label{def:lexical-analysis}
+  \emph{Lexical analysis} is the process of converting a sequence of
+  characters (the source program) into a sequence of tokens.  Formally, it
+  is a function:
+  \[
+    \texttt{lex} : \Sigma^* \to \texttt{Token}^*
+  \]
+  where $\Sigma$ is the character alphabet and $\texttt{Token}$ is the set
+  of token types.
+\end{definition}
+
+%% ============================================================
+%% 16.2 Tokens, Lexemes, and Patterns
+%% ============================================================
+\section{Tokens, Lexemes, and Patterns}\label{sec:tokens-lexemes-patterns}
+
+\subsection{Fundamental Concepts}\label{sec:fundamental-concepts}
+
+\begin{definition}[Token, Lexeme, Pattern]\label{def:token-lexeme-pattern}
+  \begin{itemize}
+    \item A \emph{token} is a category (type) of lexical unit: identifier,
+      keyword, number, operator, etc.
+    \item A \emph{lexeme} is the actual character sequence that matches a
+      token: \texttt{x}, \texttt{while}, \texttt{42}, \texttt{+}.
+    \item A \emph{pattern} is the rule that describes the set of lexemes
+      that belong to a token: the regular expression that defines what
+      counts as an identifier, a number, etc.
+  \end{itemize}
+\end{definition}
+
+\begin{example}[Tokens in C]\label{ex:tokens-c}
+  For the C source text \texttt{int x = 42;}:
+  \begin{table}[H]
+    \centering
+    \begin{tabular}{lll}
+      \hline
+      \textbf{Token} & \textbf{Lexeme} & \textbf{Pattern} \\
+      \hline
+      \texttt{KEYWORD} & \texttt{int} & \texttt{"int"} \\
+      \texttt{IDENTIFIER} & \texttt{x} & \texttt{[a-zA-Z\_][a-zA-Z0-9\_]*} \\
+      \texttt{ASSIGN} & \texttt{=} & \texttt{"="} \\
+      \texttt{NUMBER} & \texttt{42} & \texttt{[0-9]+} \\
+      \texttt{SEMICOLON} & \texttt{;} & \texttt{";"} \\
+      \hline
+    \end{tabular}
+  \end{table}
+\end{example}
+
+\subsection{Token Classification}\label{sec:token-classification}
+
+Tokens are typically classified into the following categories:
+
+\begin{enumerate}
+  \item \textbf{Keywords}: Reserved words with special meaning
+    (\texttt{if}, \texttt{while}, \texttt{return}).
+  \item \textbf{Identifiers}: User-defined names for variables, functions,
+    types, etc.
+  \item \textbf{Literals}: Constant values (integer, floating-point,
+    string, character, boolean).
+  \item \textbf{Operators}: Symbols that denote operations (\texttt{+},
+    \texttt{*}, \texttt{==}, \texttt{!}).
+  \item \textbf{Punctuation}: Structural symbols (\texttt{(}, \texttt{)},
+    \texttt{\{}, \texttt{\}}, \texttt{;}, \texttt{,}).
+  \item \textbf{Whitespace}: Spaces, tabs, newlines (usually discarded, but
+    significant in some languages).
+  \item \textbf{Comments}: Text ignored by the compiler (line comments,
+    block comments).
+\end{enumerate}
+
+\subsection{The Maximal Munch Principle}\label{sec:maximal-munch}
+
+\begin{definition}[Maximal Munch]\label{def:maximal-munch}
+  The \emph{maximal munch} (longest match) principle states that the lexer
+  should always consume the longest possible lexeme at each position.  If
+  two patterns match the same length, the one listed first (or with higher
+  priority) wins.
+\end{definition}
+
+\begin{example}[Maximal Munch]\label{ex:maximal-munch}
+  Given the source text \texttt{>=}, the lexer should produce a single
+  \texttt{GEQ} token, not two tokens \texttt{GT} and \texttt{EQ}.  Given
+  \texttt{intx}, the lexer should produce a single \texttt{IDENTIFIER}
+  token \texttt{intx}, not \texttt{KEYWORD(int)} followed by
+  \texttt{IDENTIFIER(x)}.
+\end{example}
+
+\subsection{Reserved Words and Context-Sensitive Lexing}\label{sec:reserved-words}
+
+\begin{definition}[Reserved Word]\label{def:reserved-word}
+  A \emph{reserved word} (keyword) is a lexeme that has a fixed meaning in
+  the language and cannot be used as an identifier.
+\end{definition}
+
+Some languages have \emph{context-sensitive} lexical rules where the set of
+valid tokens depends on the parsing context:
+
+\begin{example}[Context-Sensitive Lexing in C]\label{ex:c-context-sensitive}
+  In C, the token \texttt{T} could be either:
+  \begin{itemize}
+    \item A \texttt{TYPEDEF\_NAME} (if \texttt{T} was declared as a type).
+    \item An \texttt{IDENTIFIER} (otherwise).
+  \end{itemize}
+  The lexer must consult the symbol table to determine which interpretation
+  is correct.  This is a rare example of context-sensitive lexical analysis
+  in a mainstream language.
+\end{example}
+
+%% ============================================================
+%% 16.3 Regular Expressions and Finite Automata
+%% ============================================================
+\section{Regular Expressions and Finite Automata}\label{sec:regex-automata}
+
+The theory of regular expressions and finite automata is the mathematical
+foundation of lexical analysis.  We develop it here with an emphasis on its
+application to lexer construction.
+
+\subsection{Regular Expressions}\label{sec:regular-expressions}
+
+\begin{definition}[Regular Expression]\label{def:regex}
+  A \emph{regular expression} over an alphabet $\Sigma$ is defined
+  inductively:
+  \begin{enumerate}
+    \item $\varepsilon$ is a regex; it denotes $\{\varepsilon\}$.
+    \item For each $a \in \Sigma$, $a$ is a regex; it denotes $\{a\}$.
+    \item $\emptyset$ is a regex; it denotes $\emptyset$.
+    \item If $r$ and $s$ are regexes, then so are:
+      \begin{itemize}
+        \item $r \mid s$ (alternation): denotes $L(r) \cup L(s)$.
+        \item $r \cdot s$ (concatenation): denotes $L(r) \cdot L(s)$.
+        \item $r^*$ (Kleene star): denotes $L(r)^*$.
+      \end{itemize}
+  \end{enumerate}
+\end{definition}
+
+\begin{example}[Regex for Lexical Patterns]\label{ex:regex-patterns}
+  \begin{align*}
+    \texttt{identifier} & = [a\text{--}zA\text{--}Z\_][a\text{--}zA\text{--}Z0\text{--}9\_]^* \\
+    \texttt{integer} & = [0\text{--}9]^+ \\
+    \texttt{float} & = [0\text{--}9]^+\texttt{.}[0\text{--}9]^+([\texttt{eE}][\texttt{+-}]?[0\text{--}9]^+)? \\
+    \texttt{string} & = \texttt{"}(\texttt{\textbackslash\textbackslash} . \mid [^\texttt{"\textbackslash\textbackslash}])^*\texttt{"}
+  \end{align*}
+\end{example}
+
+\subsection{Finite Automata}\label{sec:finite-automata}
+
+\begin{definition}[NFA]\label{def:nfa}
+  A \emph{nondeterministic finite automaton} (NFA) is a quintuple
+  $(Q, \Sigma, \delta, q_0, F)$ where:
+  \begin{itemize}
+    \item $Q$ is a finite set of states.
+    \item $\Sigma$ is the input alphabet.
+    \item $\delta : Q \times (\Sigma \cup \{\varepsilon\}) \to \mathcal{P}(Q)$
+      is the transition function.
+    \item $q_0 \in Q$ is the start state.
+    \item $F \subseteq Q$ is the set of accepting states.
+  \end{itemize}
+\end{definition}
+
+\begin{definition}[DFA]\label{def:dfa}
+  A \emph{deterministic finite automaton} (DFA) is an NFA where:
+  \begin{itemize}
+    \item $\delta : Q \times \Sigma \to Q$ (no $\varepsilon$-transitions,
+      no nondeterminism).
+  \end{itemize}
+\end{definition}
+
+\begin{theorem}[Regex to NFA (Thompson's Construction)]\label{thm:thompson}
+  For every regular expression $r$, there exists an NFA $M$ such that
+  $L(M) = L(r)$.  The NFA can be constructed in $O(|r|)$ time and has at
+  most $2|r|$ states.
+\end{theorem}
+
+\begin{theorem}[NFA to DFA (Subset Construction)]\label{thm:subset}
+  For every NFA $M$ with $n$ states, there exists a DFA $M'$ with at most
+  $2^n$ states such that $L(M') = L(M)$.
+\end{theorem}
+
+\begin{theorem}[DFA Minimization]\label{thm:minimize}
+  For every DFA $M$, there exists a unique (up to isomorphism) minimal DFA
+  $M'$ such that $L(M') = L(M)$.  The minimal DFA can be constructed in
+  $O(n \log n)$ time.
+\end{theorem}
+
+\subsection{From Regex to Lexer}\label{sec:regex-to-lexer}
+
+The standard pipeline for constructing a lexer from regex specifications is:
+
+\begin{enumerate}
+  \item \textbf{Regex to NFA}: Thompson's construction.
+  \item \textbf{NFA to DFA}: Subset construction (powerset construction).
+  \item \textbf{DFA minimization}: Hopcroft's algorithm or Moore's algorithm.
+  \item \textbf{Code generation}: Emit a table-driven or direct-coded lexer.
+\end{enumerate}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    ->, >=stealth, shorten >=1pt, auto, node distance=2.5cm,
+    state/.style={circle, draw, minimum size=0.7cm}
+  ]
+    \node[state, initial] (q0) {$q_0$};
+    \node[state] (q1) [right of=q0] {$q_1$};
+    \node[state] (q2) [right of=q1] {$q_2$};
+    \node[state, accepting] (q3) [right of=q2] {$q_3$};
+    
+    \path (q0) edge node {a} (q1)
+          (q1) edge[loop above] node {a,b} (q1)
+          (q1) edge node {b} (q2)
+          (q2) edge node {a,b} (q3);
+  \end{tikzpicture}
+  \caption{DFA for identifiers: start with a letter, then letters or digits.}
+  \label{fig:dfa-identifier}
+\end{figure}
+
+%% ============================================================
+%% 16.4 Lexer Generators
+%% ============================================================
+\section{Lexer Generators}\label{sec:lexer-generators}
+
+Lexer generators automate the construction of lexers from regex
+specifications.  We survey the most important tools.
+
+\subsection{Lex and Flex}\label{sec:lex-flex}
+
+\begin{historical}
+Lex was developed by Mike Lesk and Eric Schmidt at Bell Labs in 1975, as
+part of the Unix toolchain~\cite{lesk1975lex}.  It was the first widely
+used lexer generator.  Flex (Fast Lexical Analyzer Generator) by Vern Paxson
+is the modern successor, producing faster scanners.
+\end{historical}
+
+A Lex/Flex specification has three sections:
+\begin{verbatim}
+  definitions
+  %%
+  rules
+  %%
+  user code
+\end{verbatim}
+
+\begin{example}[Flex Specification]\label{ex:flex}
+  \begin{verbatim}
+  %{
+  #include "parser.tab.h"
+  %}
+  
+  digit    [0-9]
+  letter   [a-zA-Z_]
+  
+  %%
+  "if"       { return IF; }
+  "else"     { return ELSE; }
+  "while"    { return WHILE; }
+  {letter}({letter}|{digit})*  { yylval.str = strdup(yytext); return ID; }
+  {digit}+   { yylval.num = atoi(yytext); return NUMBER; }
+  [ \t\n]+   { /* skip whitespace */ }
+  "//".*     { /* skip line comment */ }
+  .          { return yytext[0]; }
+  %%
+  \end{verbatim}
+\end{example}
+
+\subsection{re2c}\label{sec:re2c}
+
+re2c is a lexer generator that produces C code optimized for speed:
+
+\begin{itemize}
+  \item \textbf{Direct coding}: Generates switch-based code instead of
+    table-driven code, enabling compiler optimizations.
+  \item \textbf{No runtime library}: The generated code is self-contained.
+  \item \textbf{Used in practice}: PHP, V8, and other performance-critical
+    projects use re2c.
+\end{itemize}
+
+\begin{example}[re2c Specification]\label{ex:re2c}
+  \begin{verbatim}
+  /*!re2c
+    re2c:define:YYCTYPE = char;
+    re2c:yyfill:enable = 0;
+    
+    digit = [0-9];
+    alpha = [a-zA-Z_];
+    
+    alpha (alpha | digit)* { return IDENT; }
+    digit+                  { return NUMBER; }
+    [ \t\n]+               { continue; }
+    *                      { return ERROR; }
+  */
+  \end{verbatim}
+\end{example}
+
+\subsection{ANTLR Lexer Mode}\label{sec:antlr-lexer}
+
+ANTLR (ANother Tool for Language Recognition) combines lexer and parser
+generation in a single tool:
+
+\begin{example}[ANTLR Lexer Rules]\label{ex:antlr-lexer}
+  \begin{verbatim}
+  lexer grammar ExprLexer;
+  
+  IF     : 'if';
+  ELSE   : 'else';
+  WHILE  : 'while';
+  ID     : [a-zA-Z_] [a-zA-Z0-9_]*;
+  NUMBER : [0-9]+;
+  WS     : [ \t\n\r]+ -> skip;
+  \end{verbatim}
+\end{example}
+
+\subsection{Comparison of Lexer Generators}\label{sec:lexer-comparison}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Lexer Generator Comparison}
+  \label{tab:lexer-comparison}
+  \begin{tabular}{llll}
+    \hline
+    \textbf{Tool} & \textbf{Output} & \textbf{Algorithm} & \textbf{Features} \\
+    \hline
+    Lex & C & DFA & Basic \\
+    Flex & C & DFA, table compression & Fast, POSIX \\
+    re2c & C (direct-coded) & DFA & High performance \\
+    ANTLR & Java/C\#/Python/etc. & ALL(*) & Combined lexer/parser \\
+    Alex & Haskell & DFA & Functional \\
+    ocamllex & OCaml & DFA & Integrated with Menhir \\
+    \hline
+  \end{tabular}
+\end{table}
+
+%% ============================================================
+%% 16.5 Unicode and Internationalization
+%% ============================================================
+\section{Unicode and Internationalization}\label{sec:unicode}
+
+Modern programming languages must support Unicode identifiers, string
+literals, and source files.  This introduces significant complexity into
+lexical analysis.
+
+\subsection{Unicode in Identifiers}\label{sec:unicode-identifiers}
+
+\begin{definition}[Unicode Identifier]\label{def:unicode-identifier}
+  A \emph{Unicode identifier} is an identifier that may contain characters
+  from any Unicode script, subject to the rules of Unicode Standard Annex
+  \#31 (UAX~\#31).
+\end{definition}
+
+\begin{example}[Unicode Identifiers]\label{ex:unicode-ids}
+  \begin{itemize}
+    \item Python 3: \texttt{名前} (Japanese), \texttt{π值} (Chinese), \texttt{объем} (Russian).
+    \item Java: Supports Unicode identifiers since Java~1.1.
+    \item Rust: Supports Unicode identifiers with \texttt{XID\_Start} and
+      \texttt{XID\_Continue} categories.
+    \item Swift: Full Unicode support for identifiers.
+  \end{itemize}
+\end{example}
+
+\subsection{Unicode Normalization}\label{sec:unicode-normalization}
+
+Unicode allows the same character to be represented in multiple ways (e.g.,
+é can be a single codepoint or e + combining accent).  Lexers must handle
+this:
+
+\begin{itemize}
+  \item \textbf{NFC} (Normalization Form C): Composed form.  Most common.
+  \item \textbf{NFD} (Normalization Form D): Decomposed form.
+  \item \textbf{NFKC/NFKD}: Compatibility forms (normalize confusables).
+\end{itemize}
+
+\subsection{Source File Encoding}\label{sec:source-encoding}
+
+Source files can be encoded in various character encodings:
+
+\begin{itemize}
+  \item \textbf{UTF-8}: The dominant encoding for source files.
+    ASCII-compatible, variable-width (1--4 bytes per character).
+  \item \textbf{UTF-16}: Used by Java internally.  Variable-width (2 or 4
+    bytes).
+  \item \textbf{UTF-32}: Fixed-width (4 bytes per character).  Rarely used
+    for source files.
+  \item \textbf{BOM} (Byte Order Mark): A prefix that indicates the
+    encoding.  UTF-8 BOM is \texttt{EF BB BF}.
+\end{itemize}
+
+\subsection{Implementation Challenges}\label{sec:unicode-challenges}
+
+Unicode support creates challenges for lexer implementation:
+
+\begin{enumerate}
+  \item \textbf{Variable-width encoding}: UTF-8 characters are 1--4 bytes;
+    the DFA must operate on bytes, not characters.
+  \item \textbf{Character classes}: Unicode property classes (e.g.,
+    \texttt{Letter}, \texttt{Number}) are large and complex.
+  \item \textbf{Confusable characters}: Some Unicode characters look like
+    ASCII but are different (e.g., Cyrillic \texttt{а} vs.\ Latin
+    \texttt{a}).
+  \item \textbf{Performance}: Unicode-aware lexers are slower than
+    ASCII-only lexers.
+\end{enumerate}
+
+%% ============================================================
+%% 16.6 Whitespace-Sensitive Languages
+%% ============================================================
+\section{Whitespace-Sensitive Languages}\label{sec:whitespace-sensitive}
+
+Most languages treat whitespace (spaces, tabs, newlines) as insignificant,
+using it only to separate tokens.  But some languages use indentation as a
+syntactic element.
+
+\subsection{Off-Side Rule Languages}\label{sec:off-side-rule}
+
+\begin{definition}[Off-Side Rule]\label{def:off-side-rule}
+  The \emph{off-side rule} (named after the football rule by Peter Landin)
+  uses indentation to delimit blocks.  A block begins at the indentation
+  level of its first statement and ends when the indentation decreases.
+\end{definition}
+
+Languages using the off-side rule:
+\begin{itemize}
+  \item \textbf{Python}: The most well-known indentation-sensitive language.
+  \item \textbf{Haskell}: Uses layout (with optional explicit braces).
+  \item \textbf{F\#}: Uses indentation for scoping.
+  \item \textbf{CoffeeScript}: Inspired by Python's indentation.
+  \item \textbf{Miranda}: The original layout language.
+\end{itemize}
+
+\subsection{Implementing Indentation-Sensitive Lexing}\label{sec:indent-lexing}
+
+The lexer for an indentation-sensitive language must track indentation
+levels and emit synthetic tokens:
+
+\begin{algorithm}[H]
+  \caption{Indentation-Sensitive Lexer}
+  \label{alg:indent-lexer}
+  \begin{algorithmic}[1]
+    \State Initialize stack with $[0]$
+    \For{each line}
+      \State $indent \gets$ number of leading spaces
+      \If{$indent > \texttt{stack.top()}$}
+        \State Push $indent$ onto stack
+        \State Emit \texttt{INDENT} token
+      \ElsIf{$indent < \texttt{stack.top()}$}
+        \While{$indent < \texttt{stack.top()}$}
+          \State Pop stack
+          \State Emit \texttt{DEDENT} token
+        \EndWhile
+      \EndIf
+      \State Process rest of line normally
+    \EndFor
+    \While{stack has more than one element}
+      \State Pop stack
+      \State Emit \texttt{DEDENT} token
+    \EndWhile
+  \end{algorithmic}
+\end{algorithm}
+
+\subsection{Advantages and Disadvantages}\label{sec:whitespace-pros-cons}
+
+\textbf{Advantages}:
+\begin{itemize}
+  \item Eliminates bracket clutter; cleaner visual appearance.
+  \item ``What you see is what you get''---indentation matches structure.
+  \item Forces consistent formatting.
+\end{itemize}
+
+\textbf{Disadvantages}:
+\begin{itemize}
+  \item Mixing tabs and spaces can cause subtle bugs.
+  \item Copy-pasting code can break indentation.
+  \item Harder to generate code programmatically.
+  \item Error messages for indentation errors can be confusing.
+\end{itemize}
+
+%% ============================================================
+%% 16.7 Implementation Techniques
+%% ============================================================
+\section{Implementation Techniques}\label{sec:lexical-implementation}
+
+\subsection{Table-Driven Lexers}\label{sec:table-driven}
+
+A table-driven lexer represents the DFA as a transition table:
+
+\begin{verbatim}
+  state  | 'a'-'z' | '0'-'9' | other
+  -------+---------+---------+------
+  q0     | q1      | ERROR   | ERROR
+  q1     | q1      | q1      | ACCEPT(ID)
+\end{verbatim}
+
+The lexer loop is:
+\begin{algorithmic}[1]
+\State $s \gets q_0$
+\While{true}
+  \State $c \gets$ next character
+  \State $s \gets \texttt{table}[s][c]$
+  \If{$s$ is accepting}
+    \State Return token
+  \ElsIf{$s$ is error}
+    \State Report error
+  \EndIf
+\EndWhile
+\end{algorithmic}
+
+\subsection{Direct-Coded Lexers}\label{sec:direct-coded}
+
+A direct-coded lexer translates the DFA directly into code (nested
+switches or gotos), avoiding the overhead of table lookup:
+
+\begin{verbatim}
+  state_q0:
+    c = next_char()
+    if is_alpha(c): goto state_q1
+    else: goto error
+  
+  state_q1:
+    c = next_char()
+    if is_alpha(c) || is_digit(c): goto state_q1
+    else: goto accept_id
+\end{verbatim}
+
+Direct-coded lexers are faster but less portable than table-driven lexers.
+
+\subsection{Buffer Management}\label{sec:buffer-management}
+
+Efficient lexers use buffered input with sentinel characters to minimize
+I/O:
+
+\begin{itemize}
+  \item \textbf{Double buffering}: Two buffers are loaded alternately; the
+    lexer can always look ahead to the end of the buffer.
+  \item \textbf{Sentinel characters}: A special character marks the end of
+    the buffer, avoiding a bounds check on every character.
+  \item \textbf{Read-ahead}: The lexer maintains a pointer to the current
+    position and a pointer to the end of the current lexeme.
+\end{itemize}
+
+\subsection{Lexer--Parser Interaction}\label{sec:lexer-parser-interaction}
+
+The lexer and parser must cooperate:
+
+\begin{itemize}
+  \item \textbf{Token interface}: The lexer provides a \texttt{next\_token()}
+    function that the parser calls.
+  \item \textbf{Token lookahead}: The parser may need to look ahead $k$
+    tokens; the lexer must support this.
+  \item \textbf{Error recovery}: When the parser encounters a syntax error,
+    the lexer may need to resynchronize.
+  \item \textbf{Context sensitivity}: In rare cases (e.g., C typedef
+    names), the parser must inform the lexer of the current context.
+\end{itemize}
+
+\begin{insight}
+The lexer--parser boundary is a design decision.  Some systems put more
+responsibility in the lexer (e.g., handling nested comments); others put
+more in the parser (e.g., handling context-sensitive tokens).  The right
+balance depends on the language's complexity and the desired error messages.
+\end{insight}
+
+%% ============================================================
+%% 16.8 Summary
+%% ============================================================
+\section{Summary}\label{sec:lexical-summary}
+
+Lexical analysis is the first phase of compilation, transforming a character
+stream into a token stream.  The theory of regular expressions and finite
+automata provides the mathematical foundation, and lexer generators automate
+the construction of efficient lexers.
+
+Modern lexical analysis must handle Unicode, whitespace sensitivity, and
+interaction with the parser.  Tools like Flex, re2c, and ANTLR provide
+different trade-offs between performance, flexibility, and ease of use.
+
+The lexer's design affects the entire compilation pipeline: error messages,
+performance, portability, and the parser's complexity.  A well-designed
+lexer is essential for a well-designed compiler.

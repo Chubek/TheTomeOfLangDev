@@ -1,0 +1,487 @@
+%%
+%% chapter-54.ltx — Abstract Syntax Trees and Concrete Representations
+%%
+
+\label{ch:ast}
+
+The abstract syntax tree (AST) is the compiler's internal representation of the program's syntactic structure. It strips away the concrete syntax (parentheses, semicolons, whitespace) and retains only the essential hierarchical structure of the program. This chapter examines AST node types, memory representations, traversal patterns, and the role of ASTs in IDE support and incremental compilation.
+
+%% ============================================================
+%% Section 54.1
+%% ============================================================
+\section{AST Node Types and Structures}\label{sec:ast-nodes}
+
+An AST is a tree where each node represents a syntactic construct. The node types correspond to the productions of the language's grammar.
+
+\subsection{Node Classification}\label{sec:node-classification}
+
+AST nodes can be classified into several categories:
+
+\begin{itemize}
+  \item \textbf{Expressions.} Nodes that produce values: literals, variables, binary operations, function calls, lambdas.
+  \item \textbf{Statements.} Nodes that perform actions: assignments, if/else, loops, return.
+  \item \textbf{Declarations.} Nodes that introduce names: variable declarations, function declarations, class declarations.
+  \item \textbf{Types.} Nodes that represent types: named types, function types, generic types.
+  \item \textbf{Patterns.} Nodes that match values: literal patterns, variable patterns, constructor patterns.
+\end{itemize}
+
+\subsection{AST for a Simple Language}\label{sec:ast-simple}
+
+\begin{grammar}{Simple Expression Language AST}
+  \production{Expr}{\mathtt{Lit}(\mathrm{value}) \mid \mathtt{Var}(\mathrm{name}) \mid \mathtt{BinOp}(\mathrm{op}, \mathrm{lhs}, \mathrm{rhs}) \mid \mathtt{Call}(\mathrm{fn}, \mathrm{args}) \mid \mathtt{Lambda}(\mathrm{params}, \mathrm{body})} \\
+  \production{Stmt}{\mathtt{Let}(\mathrm{name}, \mathrm{expr}) \mid \mathtt{If}(\mathrm{cond}, \mathrm{then}, \mathrm{else}) \mid \mathtt{While}(\mathrm{cond}, \mathrm{body}) \mid \mathtt{Return}(\mathrm{expr})} \\
+  \production{Decl}{\mathtt{FnDecl}(\mathrm{name}, \mathrm{params}, \mathrm{retType}, \mathrm{body}) \mid \mathtt{VarDecl}(\mathrm{name}, \mathrm{type}, \mathrm{init})}
+\end{grammar}
+
+\subsection{AST with Annotations}\label{sec:ast-annotations}
+
+In practice, AST nodes carry additional information beyond the syntactic structure:
+
+\begin{itemize}
+  \item \textbf{Source location.} File name, line number, column number, for error reporting.
+  \item \textbf{Type information.} The inferred or annotated type of each expression.
+  \item \textbf{Symbol information.} Pointers to symbol table entries for name resolution.
+  \item \textbf{Comments.} Associated comments for documentation generation.
+\end{itemize}
+
+\begin{verbatim}
+  struct ExprNode {
+    SourceLocation loc;     // source position
+    Type type;              // inferred type (filled by type checker)
+    Symbol symbol;          // resolved symbol (filled by name resolver)
+    ExprKind kind;          // the syntactic kind
+  };
+\end{verbatim}
+
+%% ============================================================
+%% Section 54.2
+%% ============================================================
+\section{Memory Representation of ASTs}\label{sec:ast-memory}
+
+The memory representation of ASTs affects traversal speed, memory usage, and cache performance.
+
+\subsection{Pointer-Based Trees}\label{sec:pointer-trees}
+
+The classical representation uses heap-allocated nodes connected by pointers:
+
+\begin{verbatim}
+  struct BinOpNode {
+    Expr* lhs;
+    Expr* rhs;
+    Op op;
+  };
+\end{verbatim}
+
+\textbf{Advantages:} Flexible, easy to modify, supports sharing (DAGs).\\
+\textbf{Disadvantages:} Poor cache locality (nodes scattered in memory), pointer overhead (8 bytes per pointer on 64-bit systems), allocation overhead.
+
+\subsection{Arena Allocation}\label{sec:arena-allocation}
+
+Arena (pool) allocation allocates all AST nodes from a contiguous memory region:
+
+\begin{verbatim}
+  class Arena {
+    char* buffer;
+    size_t offset;
+    T* alloc<T>(args...) {
+      T* node = (T*)(buffer + offset);
+      offset += sizeof(T);
+      return new(node) T(args...);
+    }
+  };
+\end{verbatim}
+
+\textbf{Advantages:} Fast allocation (bump pointer), good cache locality, bulk deallocation.\\
+\textbf{Disadvantages:} Cannot free individual nodes (must free the entire arena).
+
+\subsection{Index-Based Representation}\label{sec:index-rep}
+
+Instead of pointers, nodes are stored in arrays and referenced by index:
+
+\begin{verbatim}
+  struct BinOpNode {
+    u32 lhs;    // index into expression array
+    u32 rhs;    // index into expression array
+    Op op;
+  };
+  Vec<ExprNode> expressions;
+\end{verbatim}
+
+\textbf{Advantages:} Compact (4-byte indices vs. 8-byte pointers), serializable, supports interning.\\
+\textbf{Disadvantages:} Indirect access (must index into array), less natural to manipulate.
+
+\subsection{Interning and Hash-Consing}\label{sec:interning}
+
+\emph{Interning} stores each unique AST node only once, returning the same reference for identical nodes. \emph{Hash-consing} uses a hash table to detect duplicates.
+
+\begin{verbatim}
+  // Hash-consed expression:
+  Expr intern_lit(int value) {
+    return hash_table.lookup_or_insert(Lit(value));
+  }
+  // intern_lit(42) always returns the same reference
+\end{verbatim}
+
+Interning enables $O(1)$ equality comparison (pointer equality) and reduces memory usage for programs with many identical subexpressions.
+
+%% ============================================================
+%% Section 54.3
+%% ============================================================
+\section{Traversal and Transformation Patterns}\label{sec:ast-traversal}
+
+ASTs are traversed and transformed by a variety of patterns, each suited to different tasks.
+
+\subsection{Visitor Pattern}\label{sec:visitor-pattern}
+
+The \emph{visitor pattern} separates traversal from operation:
+
+\begin{verbatim}
+  interface ExprVisitor<R> {
+    R visit_lit(LitNode node);
+    R visit_var(VarNode node);
+    R visit_binop(BinOpNode node);
+    // ...
+  }
+
+  interface ExprNode {
+    <R> R accept(ExprVisitor<R> visitor);
+  }
+\end{verbatim}
+
+\textbf{Advantages:} Clean separation, easy to add new operations.\\
+\textbf{Disadvantages:} Adding new node types requires modifying all visitors; boilerplate-heavy.
+
+\subsection{Generic Traversals}\label{sec:generic-traversals}
+
+A \emph{generic traversal} applies a function to every node in the AST:
+
+\begin{verbatim}
+  fn map_expr(f: Expr -> Expr, e: Expr) -> Expr {
+    match e {
+      BinOp(op, lhs, rhs) => BinOp(op, map_expr(f, lhs), map_expr(f, rhs)),
+      Call(fn, args) => Call(map_expr(f, fn), args.map(|a| map_expr(f, a))),
+      other => f(other),
+    }
+  }
+\end{verbatim}
+
+Generic traversals can be:
+\begin{itemize}
+  \item \textbf{Bottom-up.} Transform children before parents.
+  \item \textbf{Top-down.} Transform parents before children.
+  \item \textbf{Fold.} Accumulate a value while traversing.
+  \item \textbf{Zip.} Traverse two ASTs in parallel.
+\end{itemize}
+
+\subsection{Rewrite Rules}\label{sec:rewrite-rules}
+
+Many compiler transformations are expressed as \emph{rewrite rules}: patterns that match a subtree and replace it with a new subtree.
+
+\begin{verbatim}
+  // Constant folding:
+  rule BinOp(+, Lit(a), Lit(b)) => Lit(a + b)
+  // Identity elimination:
+  rule BinOp(+, x, Lit(0)) => x
+  rule BinOp(*, x, Lit(1)) => x
+\end{verbatim}
+
+%% ============================================================
+%% Section 54.4
+%% ============================================================
+\section{Visitor Pattern and Generic Traversals}\label{sec:visitor-generic}
+
+\subsection{The Expression Problem}\label{sec:expression-problem}
+
+The \emph{expression problem} (Wadler~\cite{wadler1998}) asks: can a design support both adding new node types and adding new operations, without modifying existing code?
+
+\begin{itemize}
+  \item \textbf{Visitor pattern.} Easy to add new operations; hard to add new node types.
+  \item \textbf{Pattern matching (functional).} Easy to add new node types; hard to add new operations.
+  \item \textbf{Data types a la carte.} Supports both, using type classes to compose node types.
+\end{itemize}
+
+\subsection{Scrap Your Boilerplate}\label{sec:scrap-boilerplate}
+
+Generic programming techniques (e.g., Haskell's \emph{Scrap Your Boilerplate}~\cite{lohmuller2024}) allow writing traversals that work uniformly over any AST type, without boilerplate for each node type.
+
+\subsection{Strategic Programming}\label{sec:strategic-programming}
+
+\emph{Strategic programming} (Visser~\cite{visser2004}) combines rewrite rules with traversal strategies:
+
+\begin{verbatim}
+  // Apply constant folding everywhere in the AST:
+  bottomup(constant_fold)
+\end{verbatim}
+
+Strategies compose: \texttt{try}, \texttt{repeat}, \texttt{sequence}, \texttt{choice}.
+
+%% ============================================================
+%% Section 54.5
+%% ============================================================
+\section{Incremental AST Updates}\label{sec:incremental-ast}
+
+IDEs and incremental compilers need to update the AST efficiently when the source code changes.
+
+\subsection{Rope-Based Source Representation}\label{sec:rope-source}
+
+A \emph{rope} is a tree-based data structure for representing strings that supports efficient insertion, deletion, and concatenation. The source code is stored as a rope, and the AST references spans of the rope.
+
+\subsection{Incremental Parsing}\label{sec:incremental-parsing}
+
+When the source changes, only the affected portion of the AST needs to be reparsed:
+
+\begin{enumerate}
+  \item Identify the changed region of the source.
+  \item Find the AST nodes that overlap the changed region.
+  \item Reparse only those nodes.
+  \item Splice the new nodes into the existing AST.
+\end{enumerate}
+
+\subsection{Tree-Sitter}\label{sec:tree-sitter}
+
+Tree-sitter is an incremental parsing framework that maintains a concrete syntax tree (CST) that is updated incrementally as the source changes. It uses GLR parsing with error recovery, enabling parsing of incomplete or invalid code.
+
+\begin{insight}
+Incremental AST updates are essential for IDE responsiveness. A full reparse of a large codebase can take seconds; an incremental update takes milliseconds. The key insight is that most edits affect only a small region of the code, and the AST can be updated locally without disturbing the rest.
+\end{insight}
+
+%% ============================================================
+%% Section 54.6
+%% ============================================================
+\section{ASTs for IDE Support}\label{sec:ast-ide}
+
+Modern IDEs rely heavily on ASTs for features like code completion, refactoring, and semantic highlighting.
+
+\subsection{Semantic Analysis}\label{sec:semantic-analysis}
+
+The AST, annotated with type and symbol information, enables:
+\begin{itemize}
+  \item \textbf{Go to definition.} Follow the symbol reference to its declaration.
+  \item \textbf{Find references.} Search the AST for all uses of a symbol.
+  \item \textbf{Code completion.} Use the type of the current expression to suggest completions.
+  \item \textbf{Semantic highlighting.} Color identifiers based on their role (variable, type, function).
+\end{itemize}
+
+\subsection{Refactoring}\label{sec:refactoring}
+
+Refactoring operations (rename, extract method, inline variable) are implemented as AST transformations:
+
+\begin{enumerate}
+  \item Identify the AST node(s) to be refactored.
+  \item Compute the transformation (e.g., rename all references to a symbol).
+  \item Apply the transformation to the AST.
+  \item Regenerate the source code from the modified AST.
+\end{enumerate}
+
+\subsection{Language Server Protocol}\label{sec:lsp}
+
+The Language Server Protocol (LSP) standardizes the communication between IDEs and language servers. The language server maintains the AST and provides services like completion, diagnostics, and hover information.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.5cm and 3cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.8cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (ide) {IDE (Client)};
+  \node[block, right=of ide] (lsp) {LSP};
+  \node[block, right=of lsp] (server) {Language Server};
+  \node[block, below=1cm of server] (ast) {AST};
+  \node[block, below=1cm of ast] (analyzer) {Analyzer};
+
+  \draw[arrow] (ide) -- (lsp);
+  \draw[arrow] (lsp) -- (server);
+  \draw[arrow] (server) -- (ast);
+  \draw[arrow] (ast) -- (analyzer);
+\end{tikzpicture}
+\caption{Language Server Protocol architecture: the IDE communicates with the language server via LSP; the server maintains the AST and provides analysis services.}\label{fig:lsp-arch}
+\end{figure}
+
+\begin{historical}
+ASTs have been central to compiler design since the development of the first optimizing compilers in the 1960s. The term ``abstract syntax tree'' was coined to distinguish the tree representation from the concrete syntax (parse tree). The visitor pattern, popularized by the Gang of Four~\cite{gamma1994}, became the standard way to traverse ASTs in object-oriented languages. The rise of IDEs in the 2000s (Eclipse, IntelliJ) drove the development of incremental parsing and AST manipulation frameworks. Modern tools like Tree-sitter, Roslyn, and the Rust Analyzer have pushed the boundaries of IDE-quality parsing and analysis.
+\end{historical}
+
+%% ============================================================
+%% Section 54.7
+%% ============================================================
+\section{Advanced Traversal Patterns and Incremental Updates}\label{sec:ast-traversal-advanced}
+
+\subsection{Fold and Map Patterns}\label{sec:fold-map}
+
+The two fundamental AST traversal patterns are \emph{fold} (reduce) and \emph{map} (transform):
+
+\begin{verbatim}
+  // Fold: accumulate a value while traversing
+  fn fold_expr<B>(f: (B, &Expr) -> B, init: B, e: &Expr) -> B {
+    let acc = f(init, e);
+    match e {
+      BinOp(_, lhs, rhs) => {
+        let acc = fold_expr(f, acc, lhs);
+        fold_expr(f, acc, rhs)
+      }
+      Call(func, args) => {
+        let acc = fold_expr(f, acc, func);
+        args.iter().fold(acc, |a, arg| fold_expr(f, a, arg))
+      }
+      _ => acc,
+    }
+  }
+
+  // Map: transform each node
+  fn map_expr(f: &dyn Fn(Expr) -> Expr, e: Expr) -> Expr {
+    let e = match e {
+      BinOp(op, lhs, rhs) => BinOp(op, map_expr(f, lhs), map_expr(f, rhs)),
+      Call(func, args) => Call(map_expr(f, func),
+                                args.into_iter().map(|a| map_expr(f, a)).collect()),
+      other => other,
+    };
+    f(e)  // apply transformation at this node
+  }
+\end{verbatim}
+
+\subsection{Attribute Grammars}\label{sec:attribute-grammars}
+
+\emph{Attribute grammars} provide a declarative framework for AST traversal by associating \emph{attributes} with each node:
+
+\begin{definition}[Attribute Grammar]\label{def:attribute-grammar}
+An \emph{attribute grammar} extends a context-free grammar with:
+\begin{itemize}
+  \item \textbf{Synthesized attributes.} Computed from children to parent (bottom-up).
+  \item \textbf{Inherited attributes.} Computed from parent to children (top-down).
+\end{itemize}
+Each attribute is defined by an equation in terms of other attributes.
+\end{definition}
+
+\begin{example}[Type checking as attribute grammar]\label{ex:attr-type-check}
+\begin{verbatim}
+  // Synthesized attribute: type of each expression
+  Expr.type : Type
+
+  Lit(n).type = Int
+  Var(x).type = env.lookup(x)
+  BinOp(+, lhs, rhs).type = Int  // requires lhs.type = rhs.type = Int
+  Call(f, args).type = f.type.return_type
+
+  // Inherited attribute: environment
+  Expr.env : Environment
+  Block(stmts).env = parent_env
+  Let(x, e, body).env[x] = e.type  // extend environment
+\end{verbatim}
+\end{example}
+
+\subsection{Incremental AST Updates in Detail}\label{sec:incremental-detail}
+
+Modern IDEs maintain a persistent AST that is updated incrementally as the user edits the source code.
+
+\begin{algorithm}[H]
+\caption{Incremental AST Update}\label{alg:incremental-ast}
+\begin{algorithmic}[1]
+\Function{IncrementalUpdate}{$\mathrm{AST}, \mathrm{edit}$}
+  \State $\mathrm{region} \gets \mathrm{affected\_region}(\mathrm{edit})$
+  \State $\mathrm{nodes} \gets \mathrm{find\_overlapping}(\mathrm{AST}, \mathrm{region})$
+  \State $\mathrm{parent} \gets \mathrm{lowest\_common\_ancestor}(\mathrm{nodes})$
+  \State $\mathrm{new\_source} \gets \mathrm{apply\_edit}(\mathrm{source}, \mathrm{edit})$
+  \State $\mathrm{new\_subtree} \gets \mathrm{reparse}(\mathrm{new\_source}[\mathrm{parent.span}])$
+  \State $\mathrm{AST}.\mathrm{replace}(\mathrm{parent}, \mathrm{new\_subtree})$
+  \State \Comment{Update annotations for affected nodes}
+  \State $\mathrm{reanalyze}(\mathrm{AST}, \mathrm{affected\_nodes})$
+  \State \Return $\mathrm{AST}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Tree-Sitter's Incremental Parsing}\label{sec:tree-sitter-detail}
+
+Tree-sitter uses an incremental GLR parser that can handle ambiguous grammars and recover from errors:
+
+\begin{itemize}
+  \item \textbf{Error recovery.} When parsing fails, Tree-sitter inserts an \texttt{ERROR} node and continues parsing, producing a tree even for incomplete or invalid code.
+  \item \textbf{Incremental updates.} When the source changes, Tree-sitter identifies the affected region and re-parses only that portion, reusing the rest of the tree.
+  \item \textbf{Ambiguity handling.} Tree-sitter uses GLR parsing to handle ambiguous grammars, maintaining multiple parse trees until disambiguation.
+\end{itemize}
+
+\begin{verbatim}
+  // Tree-sitter edit workflow:
+  let mut parser = Parser::new();
+  parser.set_language(&language()).unwrap();
+
+  // Initial parse:
+  let mut tree = parser.parse(source, None).unwrap();
+
+  // After edit:
+  let edit = InputEdit { start_byte, old_end_byte, new_end_byte, ... };
+  tree.edit(&edit);
+  // Re-parse only the affected region:
+  let new_tree = parser.parse(new_source, Some(&tree)).unwrap();
+  // Time: O(changed region) instead of O(entire file)
+\end{verbatim}
+
+\subsection{AST Serialization and Caching}\label{sec:ast-serialization}
+
+Compilers cache parsed ASTs to avoid re-parsing unchanged files:
+
+\begin{verbatim}
+  // AST serialization format:
+  struct SerializedAST {
+    version: u32,
+    checksum: u64,           // hash of source file
+    nodes: Vec<SerializedNode>,  // flat array of nodes
+    // Each node: (kind, children_offset, children_count, data)
+  }
+
+  // Cache lookup:
+  // 1. Compute checksum of source file
+  // 2. Look up cached AST by checksum
+  // 3. If found, deserialize and reuse
+  // 4. If not found, parse from scratch and cache
+\end{verbatim}
+
+\begin{table}[htbp]
+\centering
+\caption{AST representation strategies compared}\label{tab:ast-representations}
+\begin{tabular}{p{2.5cm}p{2.5cm}p{2.5cm}p{2.5cm}p{2.5cm}}
+\hline
+\textbf{Strategy} & \textbf{Allocation} & \textbf{Locality} & \textbf{Sharing} & \textbf{Serialization} \\
+\hline
+Pointer tree & Individual & Poor & Natural & Hard \\
+Arena & Bulk & Good & Natural & Medium \\
+Index-based & Array & Excellent & Via index & Easy \\
+Hash-consed & Deduplicated & Good & Automatic & Compact \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (source) {Source Code};
+  \node[block, below=of source] (parser) {Parser};
+  \node[block, below=of parser] (ast) {AST};
+  \node[block, below left=1.5cm and 0.5cm of ast] (analyze) {Type Checker};
+  \node[block, below right=1.5cm and 0.5cm of ast] (ide) {IDE Services};
+  \node[block, below=1.2cm of analyze] (ir) {Lowered IR};
+  \node[block, below=1.2cm of ide] (lsp) {LSP Protocol};
+
+  \draw[arrow] (source) -- (parser);
+  \draw[arrow] (parser) -- (ast);
+  \draw[arrow] (ast) -- (analyze);
+  \draw[arrow] (ast) -- (ide);
+  \draw[arrow] (analyze) -- (ir);
+  \draw[arrow] (ide) -- (lsp);
+\end{tikzpicture}
+\caption{AST as the central data structure: the parser produces the AST, which is consumed by both the type checker (for compilation) and IDE services (for developer tools).}\label{fig:ast-central}
+\end{figure}
+
+%% ============================================================
+%% Section 54.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-54}
+
+The AST is the compiler's primary representation of the program's structure. Its design---node types, memory representation, traversal patterns---affects every phase of compilation. Arena allocation and index-based representations improve performance; visitor patterns and generic traversals provide flexibility; incremental updates enable IDE responsiveness.
+
+For further reading, we recommend Appel's treatment of tree representations~\cite{appel1992}, the Tree-sitter documentation~\cite{treesitter2024}, and the Roslyn compiler's architecture~\cite{roslyn2024}.

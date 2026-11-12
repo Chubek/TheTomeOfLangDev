@@ -1,0 +1,457 @@
+%%
+%% chapter-72.ltx — Path-Sensitive and Context-Sensitive Analysis
+%%
+
+\section{Introduction}\label{sec:path-context-intro}
+
+Standard dataflow and abstract interpretation analyses compute a single abstract state at each program point, merging information from all incoming paths. This \emph{path-insensitive} approach can lose precision when different paths lead to contradictory information. \emph{Path-sensitive} analyses maintain separate abstract states for different execution paths, preserving precision at the cost of increased complexity. Similarly, \emph{context-sensitive} analyses distinguish different calling contexts for procedures.
+
+This chapter develops the theory and practice of path-sensitive and context-sensitive analysis, including predicate abstraction, CEGAR (counterexample-guided abstraction refinement), and modern tools that implement these techniques at industrial scale.
+
+\section{Path Sensitivity: Predicate Abstraction}\label{sec:predicate-abstraction}
+
+\subsection{The Idea of Predicate Abstraction}\label{sec:predicate-idea}
+
+\emph{Predicate abstraction} represents the program state by the truth values of a fixed set of \emph{predicates} (boolean expressions over program variables).
+
+\begin{definition}[Predicate Abstraction]\label{def:predicate-abs}
+Given a set of predicates $\{p_1, p_2, \ldots, p_k\}$ over program variables, the \textbf{predicate abstraction} of a concrete state $\sigma$ is the boolean vector $(b_1, b_2, \ldots, b_k)$ where $b_i = \text{true}$ iff $\sigma \models p_i$.
+\end{definition}
+
+\begin{example}[Predicate Abstraction]\label{ex:predicate-abs}
+With predicates $\{x > 0, y > x, z = 0\}$:
+\begin{itemize}
+  \item State $\{x = 5, y = 10, z = 0\}$ maps to $(T, T, T)$
+  \item State $\{x = -1, y = 3, z = 1\}$ maps to $(F, T, F)$
+  \item State $\{x = 5, y = 3, z = 0\}$ maps to $(T, F, T)$
+\end{itemize}
+\end{example}
+
+\subsection{Boolean Programs}\label{sec:boolean-programs}
+
+\begin{definition}[Boolean Program]\label{def:boolean-program}
+Given a program $P$ and a set of predicates $\{p_1, \ldots, p_k\}$, the \textbf{boolean program} $\mathit{BP}(P, \{p_i\})$ is an abstract program over boolean variables $b_1, \ldots, b_k$ that simulates $P$ at the level of the predicates.
+\end{definition}
+
+The boolean program is computed by \emph{weakest precondition} computation: for each statement $s$ and predicate $p_i$, we compute $\mathit{wp}(s, p_i)$ and express it as a boolean function of the predicates.
+
+\begin{definition}[Weakest Precondition for Predicates]\label{def:wp-pred}
+For a statement $s$ and predicate $p$:
+\[
+\mathit{wp}(s, p) = \text{the condition on the pre-state such that } p \text{ holds after } s
+\]
+For example, for $s: x = x + 1$ and $p: x > 0$: $\mathit{wp}(x = x + 1, x > 0) = (x + 1 > 0) = (x > -1)$.
+\end{definition}
+
+\section{Abstract Interpretation with Refinement}\label{sec:ai-refinement}
+
+Predicate abstraction can be viewed as a form of abstract interpretation where the abstract domain is the boolean lattice $2^{\{p_1, \ldots, p_k\}}$. The key challenge is choosing the right set of predicates.
+
+\begin{definition}[Predicate Discovery]\label{def:predicate-discovery}
+\textbf{Predicate discovery} is the process of finding predicates that are precise enough to prove a property but not so numerous as to make the analysis intractable.
+\end{definition}
+
+\subsection{CEGAR: Counterexample-Guided Abstraction Refinement}\label{sec:cegar}
+
+\emph{CEGAR} is an iterative approach that starts with a coarse abstraction and refines it based on spurious counterexamples.
+
+\begin{definition}[CEGAR Loop]\label{def:cegar}
+The \textbf{CEGAR loop} consists of:
+\begin{enumerate}
+  \item \textbf{Abstract}: Build an abstract model with the current set of predicates.
+  \item \textbf{Verify}: Check the property on the abstract model.
+  \item \textbf{Validate}: If the property holds, it holds on the concrete program (sound). If a counterexample is found, check if it is \emph{spurious} (an artifact of the abstraction).
+  \item \textbf{Refine}: If the counterexample is spurious, add predicates to distinguish the spurious path and repeat.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{CEGAR Algorithm}
+\label{alg:cegar}
+\begin{algorithmic}[1]
+\Require Program $P$, property $\varphi$
+\Ensure $\varphi$ holds on $P$, or a concrete counterexample
+\State $\Pi \gets$ initial set of predicates (possibly empty)
+\Loop
+  \State $A \gets$ build abstract model from $P$ using $\Pi$
+  \State $\mathit{result} \gets$ model-check $\varphi$ on $A$
+  \If{$\mathit{result} = \text{true}$}
+    \State \Return ``Property holds''
+  \ElsIf{$\mathit{result}$ is a counterexample $\pi$}
+    \State $\mathit{feasible} \gets$ check if $\pi$ is feasible in $P$
+    \If{$\mathit{feasible}$}
+      \State \Return ``Counterexample: $\pi$''
+    \Else
+      \State $\Pi \gets \Pi \cup \mathit{refine}(\pi)$ \Comment{Add discriminating predicates}
+    \EndIf
+  \EndIf
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Spurious Counterexample Analysis}\label{sec:spurious-analysis}
+
+A counterexample is \emph{spurious} if it does not correspond to any actual execution of the concrete program. Detecting spurious counterexamples requires checking the feasibility of the abstract path.
+
+\begin{definition}[Path Feasibility]\label{def:path-feasibility}
+An abstract path $\pi = s_1, s_2, \ldots, s_n$ is \textbf{feasible} if there exists a concrete execution that follows this path. This is checked by computing the weakest precondition of the path condition:
+\[
+\mathit{wp}(\pi, \text{true}) = \mathit{wp}(s_1, \mathit{wp}(s_2, \ldots \mathit{wp}(s_n, \text{true})\ldots))
+\]
+If $\mathit{wp}(\pi, \text{true})$ is satisfiable, the path is feasible.
+\end{definition}
+
+\subsection{Interpolation-Based Refinement}\label{sec:interpolation}
+
+\emph{Craig interpolation} provides a systematic method for finding refinement predicates.
+
+\begin{definition}[Craig Interpolant]\label{def:interpolant}
+Given an unsatisfiable formula $A \wedge B$, a \textbf{Craig interpolant} is a formula $I$ such that:
+\begin{itemize}
+  \item $A \implies I$
+  \item $I \wedge B$ is unsatisfiable
+  \item $I$ contains only variables common to $A$ and $B$
+\end{itemize}
+\end{definition}
+
+For a spurious counterexample, the path is split at each program point into a prefix $A$ and a suffix $B$. The interpolants at each split point provide the refinement predicates.
+
+\section{Context Sensitivity for Interprocedural Analysis}\label{sec:context-sensitivity}
+
+Context sensitivity distinguishes different calling contexts for procedures, preventing the conflation of information from unrelated call sites.
+
+\subsection{Inlining-Based Context Sensitivity}\label{sec:inlining-cs}
+
+The simplest form of context sensitivity is \emph{inlining}: replacing each call site with a copy of the called procedure's body. This naturally distinguishes calling contexts but can cause code explosion.
+
+\begin{definition}[Bounded Inlining]\label{def:bounded-inline}
+\textbf{Bounded inlining} inlines procedure calls up to a depth $k$. Calls at depth greater than $k$ are treated as context-insensitive.
+\end{definition}
+
+\subsection{Cloning-Based Context Sensitivity}\label{sec:cloning-cs}
+
+\begin{definition}[Procedure Cloning]\label{def:proc-cloning}
+\textbf{Procedure cloning} creates separate copies of a procedure for each distinct calling context. Each clone is analyzed independently with the specific information from its calling context.
+\end{definition}
+
+\section{Combination of Path and Context Sensitivity}\label{sec:combined-sensitivity}
+
+Combining path and context sensitivity provides the highest precision but at significant computational cost.
+
+\begin{definition}[Path-Context Sensitive Analysis]\label{def:path-context}
+A \textbf{path-context sensitive} analysis maintains separate abstract states for each combination of execution path and calling context. The abstract state space is the product of the path domain and the context domain.
+\end{definition}
+
+\subsection{Trace Partitioning}\label{sec:trace-partitioning}
+
+\begin{definition}[Trace Partitioning]\label{def:trace-partition}
+\textbf{Trace partitioning} divides the set of execution traces into equivalence classes and analyzes each class separately. The partition can be based on:
+\begin{itemize}
+  \item Path conditions (which branches were taken)
+  \item Calling context (which call sites were traversed)
+  \item Both
+\end{itemize}
+\end{definition}
+
+\section{Tools: Astr\'ee, ELINA, Infer}\label{sec:tools}
+
+\subsection{Astr\'ee}\label{sec:astree}
+
+\emph{Astr\'ee}~\cite{cousot2003astree} is a static analyzer for C programs developed at \'Ecole Normale Sup\'erieure. It uses abstract interpretation with:
+\begin{itemize}
+  \item A combination of numerical abstract domains (intervals, octagons)
+  \item Sophisticated widening with thresholds
+  \item Trace partitioning for path sensitivity
+  \item Industrial-scale applications (avionics software)
+\end{itemize}
+
+Astr\'ee has been used to prove the absence of runtime errors in critical avionics software, demonstrating that abstract interpretation can scale to industrial applications.
+
+\subsection{ELINA}\label{sec:elina}
+
+\emph{ELINA} (ETH Library for Abstract Interpretation) is a high-performance library for numerical abstract domains. It provides optimized implementations of:
+\begin{itemize}
+  \item Intervals, octagons, and polyhedra
+  \item Template polyhedra
+  \item Zoned abstract domains
+  \item Zones with congruences
+\end{itemize}
+
+\subsection{Infer}\label{sec:infer}
+
+\emph{Infer}~\cite{calcagno2015infer} is a static analysis tool developed at Facebook (Meta) for detecting bugs in large-scale mobile and web applications. It uses:
+\begin{itemize}
+  \item \emph{Bi-abduction}: A technique for compositional reasoning about heap-manipulating programs
+  \item \emph{Iterative analysis}: Combining summary-based analysis with refinement
+  \item \emph{Pulse}: A memory safety analyzer based on abstract interpretation
+\end{itemize}
+
+Infer analyzes millions of lines of code and has been integrated into the development workflow of major mobile applications.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcccc}
+\hline
+\textbf{Tool} & \textbf{Language} & \textbf{Domain} & \textbf{Sensitivity} & \textbf{Scale} \\
+\hline
+Astr\'ee & C & Numerical & Path + Context & $10^5$ LOC \\
+ELINA & Library & Numerical & Configurable & N/A \\
+Infer & Java/C/ObjC & Heap & Context & $10^7$ LOC \\
+\hline
+\end{tabular}
+\caption{Comparison of modern abstract interpretation tools.}
+\label{tab:ai-tools}
+\end{table}
+
+\begin{historical}
+The development of path-sensitive analysis has been driven by the need to verify safety-critical software. The CEGAR approach was pioneered by Clarke et al.~\cite{clarke2000counterexample} (2000) in the model checking community and adapted to abstract interpretation by Ball and Rajamani~\cite{ball2001automatically} (2001). The BLAST and SLAM tools were among the first to apply CEGAR to software verification. Modern tools like Astr\'ee, ELINA, and Infer bring these techniques to industrial scale, analyzing millions of lines of code with high precision.
+\end{historical}
+
+\section{Predicate Discovery Strategies}\label{sec:predicate-discovery-strategies}
+
+The effectiveness of CEGAR depends critically on the ability to discover useful predicates. Several strategies have been developed:
+
+\subsection{Weakest-Predicate Approach}\label{sec:weakest-predicate}
+
+Given a spurious counterexample $\pi$, compute the \emph{weakest precondition} of the postcondition along $\pi$. The predicates that appear in this weakest precondition are candidates for refinement.
+
+\subsection{Cartesian Predicate Abstraction}\label{sec:cartesian}
+
+\begin{definition}[Cartesian Predicate Abstraction]\label{def:cartesian}
+\textbf{Cartesian predicate abstraction} restricts the abstract domain to conjunctions of predicates (rather than arbitrary boolean combinations). This reduces the cost of abstraction at the expense of precision.
+\end{definition}
+
+\section{Refinement Strategies}\label{sec:refinement-strategies}
+
+\subsection{Predicate-Based Refinement}\label{sec:predicate-refinement}
+
+Add new predicates to distinguish the spurious counterexample from real executions. The new predicates are chosen to separate the spurious path from feasible paths.
+
+\subsection{Trace-Based Refinement}\label{sec:trace-refinement}
+
+Instead of adding predicates, add \emph{trace constraints} that exclude the specific spurious path. This is less general but can be more efficient.
+
+\begin{definition}[Trace Refinement]\label{def:trace-refinement}
+\textbf{Trace refinement} adds a constraint to the abstract model that excludes the specific sequence of states in the spurious counterexample. This is equivalent to adding a predicate that distinguishes the spurious path.
+\end{definition}
+
+\section{Summary}\label{sec:path-context-summary}
+
+Path-sensitive and context-sensitive analyses provide higher precision than their insensitive counterparts by distinguishing different execution paths and calling contexts. Predicate abstraction provides a practical framework for path sensitivity, and CEGAR automates the refinement of abstractions. Predicate discovery strategies include weakest-precondition analysis and interpolation-based methods. Refinement can be predicate-based (adding new predicates) or trace-based (excluding specific paths). Modern tools like Astr\'ee, ELINA, and Infer demonstrate that these techniques can scale to industrial applications. The key challenge remains balancing precision against computational cost: more sensitivity provides more precision but requires more time and memory.
+
+\section{CEGAR: Counterexample-Guided Abstraction Refinement}\label{sec:cegar-detail}
+
+CEGAR is the dominant paradigm for scalable verification. It starts with a coarse abstraction and iteratively refines it based on spurious counterexamples.
+
+\begin{definition}[CEGAR Loop]\label{def:cegar-loop}
+The \textbf{CEGAR loop} consists of four phases:
+\begin{enumerate}
+  \item \textbf{Abstract}: Build an abstract model $M_A$ of the program.
+  \item \textbf{Verify}: Check the property on $M_A$. If it holds, the property holds on the concrete program (soundness). If not, obtain a counterexample $\pi$.
+  \item \textbf{Simulate}: Check whether $\pi$ is feasible in the concrete program. If infeasible (spurious), proceed to refinement. If feasible, report a real bug.
+  \item \textbf{Refine}: Strengthen the abstraction to exclude $\pi$ and repeat.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{CEGAR Algorithm}
+\label{alg:cegar}
+\begin{algorithmic}[1]
+\Require Program $P$, property $\varphi$, initial abstraction $\alpha_0$
+\Ensure \textsc{Safe} or concrete counterexample
+\State $\alpha \gets \alpha_0$
+\Loop
+  \State $M_A \gets$ abstract model of $P$ under $\alpha$
+  \State $result \gets$ model check $\varphi$ on $M_A$
+  \If{$result = \textsc{Safe}$}
+    \State \Return \textsc{Safe}
+  \EndIf
+  \State $\pi \gets$ counterexample path from model checker
+  \State $feasible \gets$ simulate $\pi$ on concrete $P$
+  \If{$\neg feasible$}
+    \State $\alpha \gets$ refine($\alpha$, $\pi$)
+  \Else
+    \State \Return $\pi$ \Comment{Real bug found}
+  \EndIf
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Predicate Abstraction for CEGAR}\label{sec:pred-abs-cegar}
+
+\begin{definition}[Predicate Abstraction]\label{def:predicate-abstraction}
+Given a set of predicates $P = \{p_1, p_2, \ldots, p_k\}$ over program variables, \textbf{predicate abstraction} maps each concrete state to a boolean vector $(b_1, \ldots, b_k)$ where $b_i = p_i(state)$. The abstract state space is $\{true, false\}^k$, which has $2^k$ elements.
+\end{definition}
+
+\begin{example}[Predicate Abstraction]\label{ex:pred-abs}
+\begin{verbatim}
+  // Program:
+  x = input();
+  if (x > 0) { y = x; } else { y = -x; }
+  assert(y > 0);
+  
+  // Predicates: P = {x > 0, y > 0}
+  // Abstract states: (x>0, y>0), (x>0, ¬y>0), (¬x>0, y>0), (¬x>0, ¬y>0)
+  
+  // Abstract transition:
+  // (T, _) → after y=x → (T, T)   [if x>0 branch]
+  // (F, _) → after y=-x → (F, T)  [if x≤0 branch]
+  // Both lead to y>0=T, so assert passes
+\end{verbatim}
+\end{example}
+
+\section{Interpolation-Based Refinement}\label{sec:interpolation-refinement}
+
+Craig interpolation provides an automated method for discovering useful predicates.
+
+\begin{definition}[Craig Interpolant]\label{def:craig-interpolant}
+Given formulas $A$ and $B$ such that $A \wedge B$ is unsatisfiable, a \textbf{Craig interpolant} $I$ satisfies:
+\begin{itemize}
+  \item $A \implies I$
+  \item $I \wedge B$ is unsatisfiable
+  \item $I$ mentions only variables common to $A$ and $B$
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Interpolation-Based CEGAR Refinement}
+\label{alg:interpolation-cegar}
+\begin{algorithmic}[1]
+\Require Spurious counterexample $\pi = s_0, s_1, \ldots, s_n$
+\ensure New predicates for refinement
+\State Let $A_i$ be the formula for prefix $s_0, \ldots, s_i$
+\State Let $B_i$ be the formula for suffix $s_i, \ldots, s_n$
+\For{$i = 1$ to $n-1$}
+  \State $I_i \gets$ CraigInterpolant($A_i$, $B_i$)
+  \State Add $I_i$ to predicate set $P$
+\EndFor
+\State \Return $P$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Interpolation Example]\label{ex:interpolation}
+\begin{verbatim}
+  // Spurious path: x=0 → x=x+1 → x=x+1 → assert(x > 5)
+  // The path is spurious because x starts at 0 and increments by 1 twice,
+  // so x=2 at the assertion, which violates x > 5.
+  
+  // At point i=1 (after first increment):
+  // A₁: x = 0 ∧ x' = x + 1  (prefix: x = 1)
+  // B₁: x' = x + 1 ∧ x' > 5  (suffix: need x' > 5)
+  // Interpolant: x ≤ 1  (captures: x is small after first step)
+\end{verbatim}
+\end{example}
+
+\section{Tools for Path-Sensitive Analysis}\label{sec:path-tools}
+
+\subsection{BLAST and SLAM}\label{sec:blast-slam}
+
+\emph{BLAST} (Berkeley Lazy Abstraction Software Verification Tool) implements CEGAR for C programs using predicate abstraction and interpolation-based refinement.
+
+\begin{definition}[Lazy Abstraction]\label{def:lazy-abstraction}
+\textbf{Lazy abstraction} maintains different levels of precision at different program locations. Only the parts of the state space near a spurious counterexample are refined; other parts remain at a coarser level of abstraction.
+\end{definition}
+
+\subsection{Microsoft Tools: SLAM and SDV}\label{sec:msft-tools}
+
+\emph{SLAM} (Software for Logic and Analysis of Models) was developed at Microsoft Research for verifying device drivers. It uses:
+\begin{itemize}
+  \item Boolean programs as abstract models
+  \item CEGAR for iterative refinement
+  \item Specialized predicate discovery for API usage rules
+\end{itemize}
+
+\emph{SDV} (Static Driver Verifier) is Microsoft's production tool for verifying Windows device drivers against a set of API usage rules.
+
+\subsection{CBMC and Bounded Model Checking}\label{sec:cbmc}
+
+\begin{definition}[Bounded Model Checking]\label{def:bmc}
+\textbf{Bounded model checking} (BMC) unrolls loops up to a bound $k$ and checks whether the property can be violated within $k$ iterations. This reduces verification to a SAT problem.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Bounded Model Checking}
+\label{alg:bmc}
+\begin{algorithmic}[1]
+\Require Program $P$, property $\varphi$, bound $k$
+\Ensure \textsc{Safe} up to bound $k$, or counterexample
+\State Unroll $P$ to depth $k$: $P^{(k)}$
+\State Encode $\neg\varphi$ on $P^{(k)}$ as SAT formula $\Phi$
+\State $result \gets$ SAT solver on $\Phi$
+\If{$result = \textsc{SAT}$}
+  \State \Return counterexample from satisfying assignment
+\Else
+  \State \Return \textsc{Safe} up to bound $k$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{SeaHorn and CHC Solvers}\label{sec:seahorn}
+
+\begin{definition}[Constrained Horn Clauses]\label{def:chc}
+Program verification can be encoded as a system of \textbf{Constrained Horn Clauses} (CHCs). Each predicate represents an invariant at a program point, and each clause represents a transition. Solving the CHC system proves the property.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{llll}
+\hline
+\textbf{Tool} & \textbf{Technique} & \textbf{Language} & \textbf{Application} \\
+\hline
+BLAST & CEGAR + interpolation & C & General verification \\
+CBMC & Bounded model checking & C, C++ & Bug finding \\
+SeaHorn & CHC solving & C, LLVM IR & Verification \\
+Infer & Bi-abduction & Java, C, Obj-C & Bug finding at scale \\
+Astr\'ee & Abstract interpretation & C & Safety-critical systems \\
+Sparkada & Abstract interpretation & C & Industrial code \\
+\hline
+\end{tabular}
+\caption{Modern tools for path-sensitive program analysis.}
+\label{tab:path-tools}
+\end{table}
+
+\section{Refinement Strategies Compared}\label{sec:refinement-comparison}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{Strategy} & \textbf{Precision Gain} & \textbf{Cost} & \textbf{Termination} \\
+\hline
+Predicate-based & High & Medium & Guaranteed (finite preds) \\
+Trace-based & Low & Low & Guaranteed \\
+Interpolation-based & High & High (SMT) & Guaranteed \\
+Path-sensitive (explicit) & Maximum & Exponential & Not guaranteed \\
+Lazy refinement & Adaptive & Low initially & Guaranteed \\
+\hline
+\end{tabular}
+\caption{Comparison of refinement strategies for CEGAR.}
+\label{tab:refinement-comparison}
+\end{table}
+
+\section{Predicate Discovery Strategies}\label{sec:predicate-discovery}
+
+The effectiveness of CEGAR depends critically on the ability to discover useful predicates automatically.
+
+\subsection{Weakest Precondition Analysis}\label{sec:wp-analysis}
+
+\begin{definition}[Weakest Precondition for Refinement]\label{def:wp-refine}
+Given a spurious counterexample path $\pi = s_0 \xrightarrow{t_1} s_1 \xrightarrow{t_2} \cdots \xrightarrow{t_n} s_n$ where the postcondition $\varphi$ is violated, the \textbf{weakest precondition} $wp(\pi, \varphi)$ is computed by backward substitution:
+\[
+wp(\pi, \varphi) = wp(t_1, wp(t_2, \ldots wp(t_n, \varphi)\ldots))
+\]
+The predicates appearing in $wp(\pi, \varphi)$ are candidates for refinement.
+\end{definition}
+
+\subsection{Predicate Abstraction Precision}\label{sec:pred-precision}
+
+\begin{definition}[Cartesian Abstraction]\label{def:cartesian-abs}
+\textbf{Cartesian abstraction} computes the strongest boolean combination of predicates that holds at each program point. For predicates $\{p_1, \ldots, p_k\}$, the abstract state is:
+\[
+\alpha_{cart}(S) = (b_1, \ldots, b_k) \text{ where } b_i = \begin{cases} true & \text{if } S \subseteq \llbracket p_i \rrbracket \\ false & \text{if } S \cap \llbracket p_i \rrbracket = \emptyset \\ \top & \text{otherwise} \end{cases}
+\]
+\end{definition}
+
+\begin{theorem}[CEGAR Termination]\label{thm:cegar-termination}
+CEGAR with a finite set of reachable predicates terminates: either the property is proved safe, or a real counterexample is found. This follows from the fact that each refinement step strictly strengthens the abstraction, and there are finitely many abstract states.
+\end{theorem}

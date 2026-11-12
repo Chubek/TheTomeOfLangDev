@@ -1,0 +1,692 @@
+%%
+%% chapter-86.ltx — Runtime Organization
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:runtime-org}
+
+\section{Introduction}\label{sec:runtime-org-intro}
+
+A compiled program does not exist in isolation. When the operating system loads an executable, it establishes a runtime environment: a virtual address space partitioned into segments for code, data, heap, and stack; a set of initialization routines; and a collection of runtime services. The compiler must generate code that conforms to this environment, and for many languages, must also provide a runtime library that implements higher-level services such as memory management, exception handling, and concurrency.
+
+This chapter examines the organization of a program's runtime environment, from the layout of its address space to the details of stack frames, heap management, and dynamic loading. Understanding runtime organization is essential for compiler developers, who must generate code that interacts correctly with the operating system and runtime library.
+
+\section{Program Segments}\label{sec:program-segments}
+
+\subsection{The Address Space Layout}\label{sec:address-space}
+
+A typical process address space on a modern 64-bit system is divided into the following segments:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  seg/.style={draw, minimum width=8cm, minimum height=0.7cm, font=\small, align=center},
+]
+  \node[seg, fill=TomeExBg] (kernel) at (0, 5) {Kernel Space (top of address space)};
+  \node[seg, fill=TomeBg] (stack) at (0, 4) {Stack (grows downward)};
+  \node[seg, fill=TomeBg] (gap1) at (0, 3.2) {\textit{gap}};
+  \node[seg, fill=TomeDefBg] (mmap) at (0, 2.2) {Memory-mapped regions (shared libraries, files)};
+  \node[seg, fill=TomeBg] (gap2) at (0, 1.4) {\textit{gap}};
+  \node[seg, fill=TomeExBg] (heap) at (0, 0.4) {Heap (grows upward)};
+  \node[seg, fill=TomeDefBg] (bss) at (0, -0.4) {BSS (uninitialized data)};
+  \node[seg, fill=TomeDefBg] (data) at (0, -1.2) {Data (initialized data)};
+  \node[seg, fill=TomeExBg] (rodata) at (0, -2.0) {Read-Only Data (.rodata)};
+  \node[seg, fill=TomeWarnBg] (text) at (0, -2.8) {Text (executable code)};
+  \node[seg, fill=TomeBg] (null) at (0, -3.6) {Null Page (guard against null pointer dereference)};
+
+  \node[right=0.3cm of kernel, font=\small\itshape, text=TomeRule] {0xFFFF...};
+  \node[right=0.3cm of text, font=\small\itshape, text=TomeRule] {0x400000 (typical)};
+  \node[right=0.3cm of null, font=\small\itshape, text=TomeRule] {0x0000...};
+\end{tikzpicture}
+\caption{Typical process address space layout (Linux x86-64)}
+\label{fig:address-space}
+\end{figure}
+
+\subsection{Text Segment}\label{sec:text-segment}
+
+The text segment contains the executable instructions. It is typically:
+\begin{itemize}
+  \item \textbf{Read-only}: the OS maps it with read and execute permissions but not write.
+  \item \textbf{Shareable}: multiple processes running the same program can share the same physical pages.
+  \item \textbf{Position-dependent or independent}: depending on whether the executable is relocatable.
+\end{itemize}
+
+The compiler places all generated code in the text segment. Constant data (string literals, literal pools) may also be placed here or in a separate read-only data segment.
+
+\subsection{Data Segment}\label{sec:data-segment}
+
+The data segment contains initialized global and static variables. It is:
+\begin{itemize}
+  \item \textbf{Readable and writable}: the program modifies these values during execution.
+  \item \textbf{Initialized from the executable}: the initial values are stored in the object file and loaded by the OS.
+  \item \textbf{Copy-on-write}: if the executable is shared, modifications create private copies of the affected pages.
+\end{itemize}
+
+\subsection{BSS Segment}\label{sec:bss-segment}
+
+The BSS (Block Started by Symbol) segment contains uninitialized global and static variables. By convention, these are zero-initialized. The BSS segment:
+\begin{itemize}
+  \item Does not occupy space in the executable file (only its size is recorded).
+  \item Is zero-filled by the OS loader at program startup.
+  \item Reduces executable file size for programs with large uninitialized arrays.
+\end{itemize}
+
+\subsection{Heap}\label{sec:heap-overview}
+
+The heap is the region from which dynamic memory is allocated (via \texttt{malloc}, \texttt{new}, etc.). It grows upward (toward higher addresses) as memory is allocated. The heap's organization is discussed in detail in \cref{ch:memory-management,ch:garbage-collection}.
+
+\subsection{Stack}\label{sec:stack-overview}
+
+The stack grows downward (toward lower addresses) and is used for function call management. Each function call creates a new stack frame containing local variables, saved registers, and the return address. The stack's structure is discussed in \cref{sec:stack-frames}.
+
+\section{Stack Frames and Activation Records}\label{sec:stack-frames}
+
+\subsection{Anatomy of a Stack Frame}\label{sec:frame-anatomy}
+
+A stack frame (activation record) contains all the state associated with a single function invocation:
+
+\begin{definition}[Activation Record]\label{def:activation-record}
+An \emph{activation record} is the collection of data associated with a single invocation of a procedure. It includes:
+\begin{itemize}
+  \item The return address
+  \item The control link (pointer to the caller's frame)
+  \item The arguments (if passed on the stack)
+  \item Local variables
+  \item Saved register values
+  \item Temporaries
+\end{itemize}
+\end{definition}
+
+\subsection{Prologue and Epilogue}\label{sec:prologue-epilogue}
+
+The function \emph{prologue} sets up the stack frame; the \emph{epilogue} tears it down.
+
+\begin{example}[x86-64 Prologue and Epilogue]\label{ex:prologue-epilogue}
+A typical x86-64 function prologue:
+\begin{verbatim}
+  push rbp              ; save caller's frame pointer
+  mov  rbp, rsp         ; set up frame pointer
+  sub  rsp, N           ; allocate local variable space
+  mov  [rbp - off], rbx ; save callee-saved registers
+\end{verbatim}
+The corresponding epilogue:
+\begin{verbatim}
+  mov  rbx, [rbp - off] ; restore callee-saved registers
+  mov  rsp, rbp         ; deallocate locals
+  pop  rbp              ; restore caller's frame pointer
+  ret                   ; return to caller
+\end{verbatim}
+\end{example}
+
+\subsection{Leaf Function Optimization}\label{sec:leaf-optimization}
+
+A \emph{leaf function} (one that calls no other functions) can often avoid setting up a full stack frame:
+\begin{itemize}
+  \item No need to save the frame pointer.
+  \item Can use the red zone (x86-64: 128 bytes below SP) for local storage.
+  \item May not need to adjust the stack pointer at all.
+\end{itemize}
+
+\subsection{Variable-Size Stack Frames}\label{sec:variable-frames}
+
+Some languages support variable-size stack allocations (C's \texttt{alloca}, VLAs). These require:
+\begin{itemize}
+  \item Dynamic adjustment of the stack pointer at runtime.
+  \item A frame pointer to maintain a stable reference point.
+  \item Special handling in the epilogue (cannot simply restore SP from FP if the frame size is dynamic).
+\end{itemize}
+
+\section{Heap Organization}\label{sec:heap-org}
+
+\subsection{The Allocator Interface}\label{sec:allocator-interface}
+
+The heap allocator provides:
+\begin{itemize}
+  \item \texttt{malloc(size)}: allocate \texttt{size} bytes, returning a pointer.
+  \item \texttt{free(ptr)}: deallocate the block pointed to by \texttt{ptr}.
+  \item \texttt{realloc(ptr, size)}: resize an allocated block.
+  \item \texttt{calloc(n, size)}: allocate and zero-initialize.
+\end{itemize}
+
+\subsection{Allocation Strategies}\label{sec:allocation-strategies}
+
+Heap allocators use various strategies:
+
+\begin{definition}[Allocation Strategy]\label{def:alloc-strategy}
+Common allocation strategies include:
+\begin{itemize}
+  \item \textbf{First fit}: scan from the beginning, use the first block large enough.
+  \item \textbf{Best fit}: find the smallest block that is large enough.
+  \item \textbf{Next fit}: like first fit, but continue from where the last allocation ended.
+  \item \textbf{Segregated free lists}: maintain separate lists for different size classes.
+  \item \textbf{Slab allocation}: pre-allocate fixed-size objects for common sizes.
+\end{itemize}
+\end{definition}
+
+\subsection{The Runtime's Role}\label{sec:runtime-heap}
+
+For languages with garbage collection, the runtime system provides the heap allocator as part of the GC infrastructure. The allocator must:
+\begin{itemize}
+  \item Provide fast allocation (often a bump pointer in the nursery).
+  \item Cooperate with the garbage collector (write barriers, allocation triggers).
+  \item Handle large objects specially (direct allocation to old generation).
+\end{itemize}
+
+\section{Runtime Initialization}\label{sec:runtime-init}
+
+\subsection{Startup Sequence}\label{sec:startup-sequence}
+
+When a program starts, the following sequence occurs:
+
+\begin{enumerate}
+  \item The OS loader maps the executable and its shared libraries into memory.
+  \item The dynamic linker resolves symbols and performs relocations.
+  \item Control is transferred to the \emph{entry point} (typically \texttt{\_start}).
+  \item The C runtime initialization code (\texttt{\_start} in \texttt{crt0.o}):
+    \begin{itemize}
+      \item Sets up the initial stack (argc, argv, envp).
+      \item Calls constructor functions (\texttt{.init\_array} / \texttt{.ctors}).
+      \item Calls \texttt{main()}.
+      \item Calls \texttt{exit()} with \texttt{main}'s return value.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Constructor and Destructor Functions}\label{sec:ctors-dtors}
+
+Many languages need to run initialization code before \texttt{main} and cleanup code after:
+
+\begin{itemize}
+  \item \textbf{C/C++}: global constructors (C++ static objects), \texttt{\_\_attribute\_\_((constructor))}.
+  \item \textbf{Java}: static initializers, class loading.
+  \item \textbf{Rust}: \texttt{std::rt::lang\_start} sets up the runtime before calling \texttt{main}.
+\end{itemize}
+
+The compiler emits constructor/destructor references in special sections (\texttt{.init\_array}, \texttt{.fini\_array}) that the runtime iterates over during startup/shutdown.
+
+\subsection{Language Runtime Initialization}\label{sec:lang-runtime-init}
+
+Languages with rich runtime systems perform additional initialization:
+
+\begin{itemize}
+  \item \textbf{Garbage collector}: initialize the heap, set up GC threads.
+  \item \textbf{Thread system}: initialize the thread scheduler.
+  \item \textbf{Exception handling}: set up unwind tables.
+  \item \textbf{Module system}: initialize module state.
+  \item \textbf{I/O system}: initialize standard streams.
+\end{itemize}
+
+\section{Thread-Local Storage}\label{sec:tls}
+
+\subsection{The Need for Thread-Local Data}\label{sec:tls-need}
+
+In multithreaded programs, each thread needs its own copy of certain variables (e.g., \texttt{errno} in C, the current exception in Java). Thread-local storage (TLS) provides this.
+
+\begin{definition}[Thread-Local Storage]\label{def:tls}
+\emph{Thread-local storage} (TLS) is a mechanism by which each thread in a process has its own instance of a variable. Accessing a TLS variable yields the calling thread's instance.
+\end{definition}
+
+\subsection{TLS Implementation Models}\label{sec:tls-models}
+
+On ELF systems, TLS is implemented through several models:
+
+\begin{table}[htbp]
+\centering
+\caption{TLS access models (ELF)}
+\label{tab:tls-models}
+\begin{tabular}{lll}
+\hline
+\textbf{Model} & \textbf{Mechanism} & \textbf{Use Case} \\
+\hline
+General Dynamic & Runtime call to \texttt{tls\_get\_addr} & Shared libraries, dynamic loading \\
+Local Dynamic & One runtime call, multiple offsets & Multiple TLS vars in one module \\
+Initial Exec & Fixed offset from TP register & Executable, loaded at startup \\
+Local Exec & Direct offset from TP register & Variable in executable \\
+\hline
+\end{tabular}
+\end{table}
+
+The \emph{thread pointer} (TP) is a register that points to the current thread's TLS block:
+\begin{itemize}
+  \item x86-64: \texttt{FS} segment register (the TP is at \texttt{FS:0}).
+  \item ARM64: \texttt{TPIDR\_EL0} system register.
+  \item RISC-V: \texttt{tp} (\texttt{x4}) register.
+\end{itemize}
+
+\section{Dynamic Loading and Symbol Resolution}\label{sec:dynamic-loading}
+
+\subsection{Dynamic Loading}\label{sec:dynamic-loading-mech}
+
+Programs can load shared libraries at runtime using \texttt{dlopen()} (POSIX) or \texttt{LoadLibrary()} (Windows). This enables:
+\begin{itemize}
+  \item Plugin architectures.
+  \item Lazy loading of optional features.
+  \item Hot-swapping of implementations.
+\end{itemize}
+
+\subsection{Symbol Resolution at Runtime}\label{sec:runtime-symbol-resolution}
+
+When a shared library is loaded, the dynamic linker:
+\begin{enumerate}
+  \item Maps the library's segments into memory.
+  \item Performs relocations (adjusting PC-relative and GOT entries).
+  \item Resolves imported symbols (possibly loading additional libraries).
+  \item Runs the library's initialization functions.
+\end{enumerate}
+
+\subsection{Symbol Interposition}\label{sec:symbol-interposition}
+
+In the ELF model, a symbol defined in an executable or an earlier-loaded library can \emph{interpose} (override) a symbol with the same name in a later-loaded library. This enables:
+\begin{itemize}
+  \item \textbf{LD\_PRELOAD}: loading a library before all others to override functions (used for profiling, debugging, security).
+  \item \textbf{Weak symbols}: library functions that can be overridden by the application.
+\end{itemize}
+
+The compiler must be aware of interposition when optimizing: a call to a function in a shared library cannot be inlined or devirtualized if the symbol might be interposed.
+
+\section{Runtime Support for Language Features}\label{sec:runtime-support}
+
+\subsection{Reflection and Introspection}\label{sec:reflection}
+
+Languages with reflection (Java, C\#, Python) require runtime data structures that describe types, methods, fields, and annotations. The compiler emits \emph{metadata} alongside the code:
+
+\begin{itemize}
+  \item \textbf{Type descriptors}: structures describing each type's layout, methods, and interfaces.
+  \item \textbf{Method tables}: virtual dispatch tables (vtables) mapping method names to implementations.
+  \item \textbf{Field maps}: descriptions of object layouts for garbage collection and serialization.
+\end{itemize}
+
+\subsection{Dynamic Dispatch}\label{sec:dynamic-dispatch}
+
+Object-oriented languages use dynamic dispatch to select the implementation of a method at runtime. Common implementation strategies include:
+
+\begin{itemize}
+  \item \textbf{Virtual method tables (vtables)}: each object contains a pointer to a table of method implementations. Dispatch is a double indirection: object $\to$ vtable $\to$ method.
+  \item \textbf{Inline caches}: cache the result of the last dispatch for each call site, exploiting the observation that most call sites are monomorphic.
+  \item \textbf{Dispatch trees}: for languages with multiple dispatch (e.g., Common Lisp), more complex data structures are needed.
+\end{itemize}
+
+\subsection{Closures and Environments}\label{sec:closures-runtime}
+
+Languages with first-class closures must represent closures at runtime:
+
+\begin{definition}[Closure Representation]\label{def:closure-rep}
+A \emph{closure} is a pair $(code, env)$ where $code$ is a pointer to the compiled function and $env$ is an \emph{environment} containing the values of the free variables captured by the closure.
+\end{definition}
+
+The environment may be represented as:
+\begin{itemize}
+  \item A fixed-size record (when the set of free variables is known at compile time).
+  \item A hash map (for dynamic languages).
+  \item A linked chain of frames (for statically-scoped languages with nested functions).
+\end{itemize}
+
+\section{Signal Handling and the Runtime}\label{sec:signals}
+
+\subsection{Signals and the Runtime}\label{sec:signals-runtime}
+
+Operating system signals (SIGSEGV, SIGINT, SIGFPE, etc.) interact with the runtime in important ways:
+
+\begin{itemize}
+  \item \textbf{Segmentation faults}: the runtime may install a signal handler to implement garbage collection (for conservative collectors), stack overflow detection, or null pointer detection.
+  \item \textbf{Floating-point exceptions}: the runtime may configure the FPU to trap or ignore certain exceptions.
+  \item \textbf{Interrupts}: SIGINT (Ctrl+C) is typically handled by the runtime to support clean shutdown.
+\end{itemize}
+
+\subsection{Signal-Safe Code}\label{sec:signal-safe}
+
+Code that runs in signal handlers must be signal-safe: it cannot use locks, allocate memory, or call non-reentrant functions. The compiler's runtime must be designed with this constraint in mind.
+
+\section{Profiling Support}\label{sec:profiling-support}
+
+\subsection{Runtime Profiling Infrastructure}\label{sec:profiling-infra}
+
+The runtime provides infrastructure for profiling:
+
+\begin{itemize}
+  \item \textbf{Sampling profilers}: the OS periodically interrupts the process and records the call stack. The runtime must provide stack unwinding information (via \texttt{.eh\_frame} or frame pointers).
+  \item \textbf{Instrumenting profilers}: the compiler inserts profiling code at function entry/exit and basic block boundaries.
+  \item \textbf{Hardware performance counters}: the runtime provides interfaces for reading CPU performance counters (cache misses, branch mispredictions, etc.).
+\end{itemize}
+
+\subsection{Stack Unwinding for Profilers}\label{sec:unwinding-profiling}
+
+Profilers need to walk the call stack. This requires:
+\begin{itemize}
+  \item Frame pointer chains (if the frame pointer is not omitted).
+  \item DWARF \texttt{.eh\_frame} information (for frame-pointer-omitted code).
+  \item JIT-compiled code must register its unwind information with the runtime.
+\end{itemize}
+
+\section{Code Signing and Security}\label{sec:code-signing}
+
+\subsection{Runtime Security}\label{sec:runtime-security}
+
+Modern runtimes must consider security:
+\begin{itemize}
+  \item \textbf{Code signing}: on platforms like iOS and Android, all code must be signed. The runtime verifies signatures before execution.
+  \item \textbf{W\^{}X policy}: memory pages must not be both writable and executable simultaneously. JIT compilers must use \texttt{mprotect} to switch between writing and executing.
+  \item \textbf{Stack canaries}: the runtime inserts canary values on the stack to detect buffer overflows.
+  \item \textbf{ASLR}: the runtime supports address space layout randomization by using position-independent code.
+\end{itemize}
+
+%% ============================================================
+%% Section: Advanced Thread-Local Storage
+%% ============================================================
+\section{Advanced Thread-Local Storage}\label{sec:advanced-tls}
+
+Thread-local storage is a critical mechanism for modern multithreaded programs. Beyond the basic models described earlier, TLS implementation involves several subtleties that compiler developers must understand.
+
+\subsection{TLS Variable Layout}\label{sec:tls-layout}
+
+Each thread's TLS block is organized as a contiguous region of memory. The layout depends on the TLS model and the number of TLS variables:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  seg/.style={draw, minimum width=7cm, minimum height=0.5cm, font=\small, align=center},
+]
+  \node[seg, fill=TomeExBg] (dtv) at (0, 3) {DTV Pointer (Dynamic TLS Vector)};
+  \node[seg, fill=TomeBg] (static) at (0, 2.2) {Static TLS Block (Initial Exec / Local Exec)};
+  \node[seg, fill=TomeDefBg] (padding) at (0, 1.6) {Padding / Alignment};
+  \node[seg, fill=TomeWarnBg] (tcb) at (0, 0.8) {Thread Control Block (TCB)};
+  \node[seg, fill=TomeBg] (dtvblock) at (0, 0) {DTV Entries (for General/Local Dynamic)};
+  
+  \node[right=0.3cm of dtv, font=\small\itshape, text=TomeRule] {TP (Thread Pointer)};
+  \node[right=0.3cm of tcb, font=\small\itshape, text=TomeRule] {TCB base};
+\end{tikzpicture}
+\caption{Thread-local storage block layout (Variant II, used by glibc on x86-64)}
+\label{fig:tls-layout}
+\end{figure}
+
+In Variant II (used by glibc, musl, and most modern Unix systems), the thread pointer points to the end of the static TLS block, and offsets are negative. In Variant I (used by some older systems), the thread pointer points to the beginning, and offsets are positive.
+
+\subsection{TLS Access Code Generation}\label{sec:tls-codegen}
+
+The compiler generates different code sequences depending on the TLS model:
+
+\begin{verbatim}
+  // Local Exec (fastest, variable in main executable):
+  //   mov %fs:var@tpoff, %eax
+  
+  // Initial Exec (variable in shared library loaded at startup):
+  //   mov var@gottpoff(%rip), %rax
+  //   mov %fs:(%rax), %eax
+  
+  // General Dynamic (most general, supports dlopen):
+  //   lea var@tlsgd(%rip), %rdi
+  //   call __tls_get_addr@plt
+  //   mov (%rax), %eax
+  
+  // Local Dynamic (multiple vars in one module, one call):
+  //   lea var1@tlsld(%rip), %rdi
+  //   call __tls_get_addr@plt
+  //   mov var1@dtpoff(%rax), %ebx   // first variable
+  //   mov var2@dtpoff(%rax), %ecx   // second variable
+\end{verbatim}
+
+\subsection{TLS Optimization: Model Relaxation}\label{sec:tls-relaxation}
+
+The linker can \emph{relax} TLS access sequences from more general to more efficient models when it determines that a less general model suffices:
+
+\begin{table}[htbp]
+\centering
+\caption{TLS model relaxation transitions}
+\label{tab:tls-relaxation}
+\begin{tabular}{lll}
+\hline
+\textbf{From} & \textbf{To} & \textbf{Condition} \\
+\hline
+General Dynamic & Local Dynamic & Variable is local (not preemptible) \\
+General Dynamic & Initial Exec & Library loaded at startup \\
+Local Dynamic & Initial Exec & Only one TLS variable in module \\
+Initial Exec & Local Exec & Variable is in the executable \\
+\hline
+\end{tabular}
+\end{table}
+
+The compiler can emit the most general model and rely on the linker to relax it, or it can use visibility attributes (\texttt{hidden}, \texttt{protected}) to indicate the appropriate model at compile time.
+
+\subsection{TLS and the Garbage Collector}\label{sec:tls-gc}
+
+For garbage-collected languages, TLS variables present a challenge: the GC must be able to find all TLS variables to scan them for root pointers. Solutions include:
+\begin{itemize}
+  \item \textbf{TLS root sets}: each thread maintains a list of its TLS variable addresses, registered with the GC.
+  \item \textbf{Conservative scanning}: the GC scans the entire TLS block for potential pointers.
+  \item \textbf{Precise TLS maps}: the compiler generates metadata describing the layout of TLS variables, including which slots contain pointers.
+\end{itemize}
+
+%% ============================================================
+%% Section: Dynamic Loading in Depth
+%% ============================================================
+\section{Dynamic Loading in Depth}\label{sec:dynamic-loading-depth}
+
+Dynamic loading is the mechanism by which shared libraries are loaded into a running process's address space. Understanding this mechanism is essential for compiler developers who must generate code that interacts with dynamically loaded libraries.
+
+\subsection{The Dynamic Linking Process}\label{sec:dynamic-linking-process}
+
+When a shared library is loaded (either at program startup or via \texttt{dlopen}), the dynamic linker performs the following steps:
+
+\begin{enumerate}
+  \item \textbf{Map segments.} The library's ELF segments are mapped into the process's address space using \texttt{mmap}.
+  \item \textbf{Process dependencies.} The library's required libraries (recorded in \texttt{DT\_NEEDED} entries) are loaded recursively.
+  \item \textbf{Assign addresses.} If the library is not position-independent, the dynamic linker assigns it a load address.
+  \item \textbf{Perform relocations.} The library's relocation entries are processed, adjusting addresses to reflect the actual load address.
+  \item \textbf{Resolve symbols.} Imported symbols are resolved by searching the global symbol table.
+  \item \textbf{Initialize.} The library's initialization functions (\texttt{.init\_array}) are called.
+\end{enumerate}
+
+\subsection{Lazy Binding and the PLT}\label{sec:lazy-binding}
+
+To minimize startup time, function calls to shared library functions use \emph{lazy binding}: the function's address is not resolved until the first call.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  block/.style={draw, fill=TomeBg, minimum width=2.5cm, minimum height=0.6cm, font=\small, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  \node[block] (call) at (0, 3) {Call site};
+  \node[block, fill=TomeExBg] (plt) at (0, 1.5) {PLT entry\\(jump stub)};
+  \node[block, fill=TomeDefBg] (got) at (3, 1.5) {GOT entry\\(initially -> PLT+6)};
+  \node[block, fill=TomeWarnBg] (plt0) at (0, 0) {PLT[0]\\(resolver stub)};
+  \node[block, fill=TomeExBg] (resolver) at (3, 0) {Dynamic linker\\resolver};
+  \node[block, fill=TomeBg] (target) at (6, 1.5) {Library function\\(actual code)};
+
+  \draw[arr] (call) -- (plt);
+  \draw[arr] (plt) -- (got);
+  \draw[arr, dashed] (got) -- node[right, font=\tiny] {1st call} (plt0);
+  \draw[arr] (plt0) -- (resolver);
+  \draw[arr, dotted, blue] (resolver) -- node[below, font=\tiny] {resolves} (target);
+  \draw[arr, dashed, red] (got.north) to[bend left] node[right, font=\tiny] {After resolution} (target.north);
+\end{tikzpicture}
+\caption{Lazy binding: PLT/GOT interaction during dynamic symbol resolution}
+\label{fig:lazy-binding}
+\end{figure}
+
+The first time a function is called:
+\begin{enumerate}
+  \item The PLT entry jumps to the GOT entry.
+  \item The GOT entry initially points back to PLT+6 (the resolver stub).
+  \item The resolver pushes the symbol's relocation index and calls the dynamic linker.
+  \item The dynamic linker resolves the symbol, writes the actual address to the GOT entry, and jumps to the function.
+\end{enumerate}
+
+Subsequent calls go directly through the GOT entry to the function, with no dynamic linker involvement.
+
+\subsection{Position-Independent Code (PIC)}\label{sec:pic}
+
+Shared libraries must be compiled as \emph{position-independent code} (PIC) so they can be loaded at any address:
+
+\begin{itemize}
+  \item \textbf{Global Offset Table (GOT).} All global variable accesses go through the GOT, which is relocated at load time.
+  \item \textbf{Procedure Linkage Table (PLT).} All function calls to external symbols go through the PLT.
+  \item \textbf{PC-relative addressing.} Modern x86-64 uses RIP-relative addressing to access the GOT, avoiding the need for a dedicated register.
+\end{itemize}
+
+\begin{verbatim}
+  // Non-PIC (absolute addressing):
+  mov global_var, %eax       // Direct absolute address
+  
+  // PIC (x86-64, RIP-relative):
+  mov global_var@GOTPCREL(%rip), %rax   // Load GOT entry
+  mov (%rax), %eax                       // Load through GOT
+\end{verbatim}
+
+\subsection{Symbol Visibility and Interposition}\label{sec:symbol-visibility}
+
+The compiler controls symbol visibility through attributes:
+
+\begin{table}[htbp]
+\centering
+\caption{Symbol visibility levels (ELF)}
+\label{tab:symbol-visibility}
+\begin{tabular}{llp{5cm}}
+\hline
+\textbf{Visibility} & \textbf{Attribute} & \textbf{Effect} \\
+\hline
+Default & (none) & Symbol is visible and can be interposed \\
+Hidden & \texttt{\_\_attribute\_\_((visibility("hidden")))} & Symbol is not exported; cannot be interposed \\
+Protected & \texttt{\_\_attribute\_\_((visibility("protected")))} & Symbol is exported but references bind to the definition in this library \\
+Internal & \texttt{\_\_attribute\_\_((visibility("internal")))} & Like hidden, but not available to other components \\
+\hline
+\end{tabular}
+\end{table}
+
+Hidden visibility enables more aggressive optimization: the compiler can inline functions, devirtualize calls, and perform constant propagation on global variables that are not visible to other libraries.
+
+%% ============================================================
+%% Section: Runtime Initialization in Depth
+%% ============================================================
+\section{Runtime Initialization in Depth}\label{sec:runtime-init-depth}
+
+The initialization of a program's runtime environment is a complex process that varies significantly across languages and platforms.
+
+\subsection{The Startup Sequence in Detail}\label{sec:startup-detail}
+
+On a modern Linux system, the complete startup sequence is:
+
+\begin{enumerate}
+  \item The kernel creates a process and maps the executable.
+  \item The kernel maps the \emph{virtual dynamic shared object} (vDSO) for fast system calls.
+  \item The kernel transfers control to the dynamic linker (\texttt{ld-linux-x86-64.so}).
+  \item The dynamic linker reads the executable's \texttt{PT\_INTERP} segment to find itself.
+  \item The dynamic linker maps all required shared libraries.
+  \item The dynamic linker performs symbol resolution and relocations.
+  \item The dynamic linker calls the executable's entry point (\texttt{\_start}).
+  \item \texttt{\_start} (in \texttt{crt1.o}):
+  \begin{itemize}
+    \item Sets up the initial stack frame (\texttt{argc}, \texttt{argv}, \texttt{envp}).
+    \item Calls \texttt{\_\_libc\_start\_main}.
+  \end{itemize}
+  \item \texttt{\_\_libc\_start\_main} (in glibc):
+  \begin{itemize}
+    \item Initializes the C library (locale, stdio buffers).
+    \item Calls \texttt{\_\_libc\_csu\_init}, which calls functions in \texttt{.init\_array}.
+    \item Calls \texttt{main(argc, argv, envp)}.
+    \item Calls \texttt{exit(main\_return\_value)}.
+  \end{itemize}
+  \item \texttt{exit} calls functions in \texttt{.fini\_array}, then terminates the process.
+\end{enumerate}
+
+\subsection{Language-Specific Initialization}\label{sec:lang-specific-init}
+
+Languages with rich runtimes perform additional initialization before \texttt{main}:
+
+\begin{table}[htbp]
+\centering
+\caption{Language runtime initialization tasks}
+\label{tab:lang-init}
+\begin{tabular}{lp{8cm}}
+\hline
+\textbf{Language} & \textbf{Initialization Tasks} \\
+\hline
+Java & Start JVM, load bootstrap classes, initialize system class loader, run \texttt{main} \\
+Go & Initialize goroutine scheduler, set up GC, run \texttt{init()} functions, call \texttt{main} \\
+Rust & Call \texttt{std::rt::lang\_start}, set up allocator, run \texttt{init} functions, call \texttt{main} \\
+Python & Initialize interpreter, import \texttt{site} module, run \texttt{\_\_main\_\_} \\
+Node.js & Initialize V8, set up event loop, load \texttt{module} system, run entry script \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Static Initialization Order}\label{sec:static-init-order}
+
+A subtle issue in languages with global constructors (C++, Java, D) is the \emph{static initialization order fiasco}: the order in which global objects in different translation units are initialized is not guaranteed.
+
+\begin{definition}[Static Initialization Order Fiasco]\label{def:siof}
+The \emph{static initialization order fiasco} is the problem that global objects in different translation units may be initialized in an arbitrary order. If one global object's initialization depends on another global object that has not yet been initialized, the behavior is undefined.
+\end{definition}
+
+Solutions include:
+\begin{itemize}
+  \item \textbf{Construct on first use} (Meyers' singleton): wrap the global in a function that initializes it on first call.
+  \item \textbf{Nifty counters}: use a translation-unit-local counter to ensure initialization order.
+  \item \textbf{Module-level initialization}: languages like Rust and Go guarantee that module-level initialization runs in dependency order.
+  \item \textbf{Lazy initialization}: defer initialization until the object is first accessed.
+\end{itemize}
+
+\subsection{Runtime Teardown}\label{sec:runtime-teardown}
+
+Program termination is as complex as startup:
+
+\begin{enumerate}
+  \item \texttt{main} returns.
+  \item \texttt{exit} is called (explicitly or implicitly).
+  \item Functions registered with \texttt{atexit} are called in reverse order.
+  \item Functions in \texttt{.fini\_array} are called (destructors for global objects).
+  \item Shared library finalizers are called in reverse load order.
+  \item The C library flushes and closes stdio streams.
+  \item The process calls \texttt{\_exit} to terminate.
+\end{enumerate}
+
+For garbage-collected languages, the runtime may or may not run finalizers during shutdown. Java runs finalizers for reachable objects; Go does not run finalizers at all during shutdown.
+
+%% ============================================================
+%% Section: Runtime Code Patching and Hot Swapping
+%% ============================================================
+\section{Runtime Code Patching and Hot Swapping}\label{sec:code-patching}
+
+Modern runtimes sometimes modify code at runtime, either for optimization or for updating running programs.
+
+\subsection{Inline Caching and Code Patching}\label{sec:ic-patching}
+
+Dynamic languages use inline caches that are patched at runtime:
+
+\begin{verbatim}
+  // Before patching (generic dispatch):
+  //   call generic_dispatch    // Slow path
+  
+  // After patching (monomorphic, type X observed):
+  //   cmp [obj.type], TYPE_X   // Check type
+  //   jne slow_path            // Fall back if wrong type
+  //   call optimized_X         // Fast path for type X
+\end{verbatim}
+
+Code patching requires:
+\begin{itemize}
+  \item The code page must be made writable (\texttt{mprotect}).
+  \item The patch must be atomic (to avoid races with other threads executing the same code).
+  \item The instruction cache must be flushed (on architectures with separate I-cache and D-cache, e.g., ARM).
+  \item The code page must be made executable again.
+\end{itemize}
+
+\subsection{Hot Code Loading}\label{sec:hot-code-loading}
+
+Some runtimes support \emph{hot code loading}: replacing the implementation of a function while the program is running. This requires:
+\begin{itemize}
+  \item \textbf{Version management}: each compiled version of a function has a unique version number.
+  \item \textbf{On-stack replacement (OSR)}: existing activations of the old version must be migrated to the new version.
+  \item \textbf{State mapping}: the new version's local variables must be initialized from the old version's state.
+  \item \textbf{Atomic switching}: the transition from old to new code must be atomic.
+\end{itemize}
+
+Erlang/OTP is the canonical example: processes can be upgraded to new code versions while running, with state transformation functions mapping old state to new state.
+
+\section{Summary}\label{sec:runtime-org-summary}
+
+The runtime organization of a compiled program encompasses the layout of its address space, the structure of its stack frames, the management of its heap, and the initialization and support services provided by the runtime system. The compiler must generate code that conforms to these conventions and, for many languages, must also provide the runtime infrastructure that implements higher-level language features.
+
+\begin{historical}
+The concept of a runtime system evolved alongside programming languages. Early compiled languages like FORTRAN and C had minimal runtimes---essentially just the C library and the operating system. As languages grew more sophisticated, so did their runtimes: Java's JVM, .NET's CLR, and the Go runtime all provide extensive services including garbage collection, concurrency, and dynamic loading. The trend toward ``thick'' runtimes has been partially reversed in recent years by languages like Rust and Zig, which minimize runtime overhead by shifting more responsibility to compile time. The tension between runtime richness and runtime minimalism remains one of the central design decisions in language implementation.
+\end{historical}

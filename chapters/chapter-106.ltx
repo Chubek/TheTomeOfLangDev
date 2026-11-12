@@ -1,0 +1,457 @@
+%%
+%% chapter-106.ltx — Model Checking
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:mc-intro}
+
+Model checking is an automated technique for verifying that a finite-state
+system satisfies a temporal property.  Unlike deductive verification, which
+requires user-provided invariants and proof effort, model checking is
+\emph{fully automatic}: given a model (typically a state transition system) and
+a property (expressed in a temporal logic), the model checker either confirms
+that the property holds or produces a \emph{counterexample trace} demonstrating
+the violation.
+
+The technique was introduced by Clarke and Emerson~\cite{clarke1981design} and
+Quielle and Sifakis~\cite{quielle1981model} in 1981, earning its creators the
+2007 Turing Award.  Model checking has been spectacularly successful in hardware
+verification, where it is now a standard part of the chip design process.
+Applications to software verification---while more challenging due to the
+potentially infinite state space of software---have also yielded significant
+results, particularly through bounded model checking and abstraction techniques.
+
+In this chapter, we develop the theory and practice of model checking.
+We begin with finite-state model checking (\cref{sec:mc-finite}), introduce
+temporal logics (\cref{sec:mc-temporal}), examine symbolic model checking with
+BDDs (\cref{sec:mc-symbolic}), discuss bounded and abstract model checking
+(\cref{sec:mc-bounded}, \cref{sec:mc-abstract}), and conclude with applications
+to software verification (\cref{sec:mc-software}).
+
+% ============================================================
+% Finite-State Model Checking
+% ============================================================
+\section{Finite-State Model Checking}\label{sec:mc-finite}
+
+\subsection{Transition Systems}\label{sec:mc-transitions}
+
+A \emph{transition system} is the standard model for the systems verified by
+model checking.
+
+\begin{definition}[Transition System]\label{def:transition-system}
+A \emph{transition system} (or \emph{Kripke structure}) is a tuple
+$M = (S, S_0, R, L)$ where:
+\begin{itemize}
+\item $S$ is a finite set of states.
+\item $S_0 \subseteq S$ is the set of initial states.
+\item $R \subseteq S \times S$ is a total transition relation (every state has
+      at least one successor).
+\item $L : S \to 2^{AP}$ is a labeling function assigning to each state the set
+      of atomic propositions true in that state.
+\end{itemize}
+\end{definition}
+
+A \emph{path} in $M$ is an infinite sequence of states $\pi = s_0, s_1, s_2, \ldots$
+such that $(s_i, s_{i+1}) \in R$ for all $i \geq 0$.
+
+\subsection{The Model Checking Problem}\label{sec:mc-problem}
+
+\begin{definition}[Model Checking Problem]\label{def:mc-problem}
+Given a transition system $M$ and a temporal logic formula $\varphi$, the
+\emph{model checking problem} is to decide whether $M \models \varphi$, i.e.,
+whether $\varphi$ holds in all initial states of $M$.
+\end{definition}
+
+\begin{theorem}[Complexity of Model Checking]\label{thm:mc-complexity}
+The model checking problem for CTL (see \cref{sec:mc-ctl}) is polynomial in the
+size of the model and the formula: $O(|M| \cdot |\varphi|)$.  For LTL
+(\cref{sec:mc-ltl}), the problem is PSPACE-complete in the size of the formula
+but linear in the size of the model.
+\end{theorem}
+
+\subsection{The Basic Algorithm}\label{sec:mc-basic-alg}
+
+The model checking algorithm for CTL works by recursively labeling each state
+with the sub-formulae that hold in it.
+
+\begin{algorithm}[htbp]
+\caption{CTL Model Checking}\label{alg:ctl-mc}
+\begin{algorithmic}[1]
+\Require Kripke structure $M = (S, S_0, R, L)$, CTL formula $\varphi$
+\Ensure Set of states satisfying $\varphi$
+\Function{Sat}{$\varphi$}
+  \Switch{$\varphi$}
+    \Case{$p$ (atomic proposition)}
+      \State \Return $\{s \in S \mid p \in L(s)\}$
+    \EndCase
+    \Case{$\neg \psi$}
+      \State \Return $S \setminus \Call{Sat}{\psi}$
+    \EndCase
+    \Case{$\psi_1 \land \psi_2$}
+      \State \Return $\Call{Sat}{\psi_1} \cap \Call{Sat}{\psi_2}$
+    \EndCase
+    \Case{$\mathbf{EX}\ \psi$}
+      \State \Return $\{s \in S \mid \exists s'.\; (s,s') \in R \land s' \in \Call{Sat}{\psi}\}$
+    \EndCase
+    \Case{$\mathbf{E}[\psi_1\ \mathbf{U}\ \psi_2]$}
+      \State \Return \Call{ComputeEU}{$\psi_1, \psi_2$}
+    \EndCase
+    \Case{$\mathbf{EG}\ \psi$}
+      \State \Return \Call{ComputeEG}{$\psi$}
+    \EndCase
+  \EndSwitch
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+The $\mathbf{EU}$ (Exists Until) and $\mathbf{EG}$ (Exists Globally) operators
+require fixed-point computations:
+\begin{align*}
+  \mathbf{E}[\psi_1\ \mathbf{U}\ \psi_2] &= \mu Z.\; \Sat{\psi_2} \cup (\Sat{\psi_1} \cap \mathbf{EX}\ Z) \\
+  \mathbf{EG}\ \psi &= \nu Z.\; \Sat{\psi} \cap \mathbf{EX}\ Z
+\end{align*}
+where $\mu$ and $\nu$ denote the least and greatest fixed points, respectively.
+
+% ============================================================
+% Temporal Logics
+% ============================================================
+\section{Temporal Logics: LTL, CTL, CTL*}\label{sec:mc-temporal}
+
+\subsection{Linear Temporal Logic (LTL)}\label{sec:mc-ltl}
+
+LTL~\cite{pnueli1977temporal} reasons about \emph{linear} time---individual
+paths through the system.
+
+\begin{definition}[LTL Syntax]\label{def:ltl-syntax}
+LTL formulae over a set of atomic propositions $AP$ are defined by:
+\[
+\varphi ::= p \mid \neg\varphi \mid \varphi_1 \land \varphi_2 \mid \mathbf{X}\varphi \mid \varphi_1\ \mathbf{U}\ \varphi_2 \mid \mathbf{F}\varphi \mid \mathbf{G}\varphi
+\]
+where $p \in AP$, $\mathbf{X}$ is ``next,'' $\mathbf{U}$ is ``until,''
+$\mathbf{F}$ is ``eventually'' ($\mathbf{F}\varphi \equiv \top\ \mathbf{U}\ \varphi$),
+and $\mathbf{G}$ is ``globally'' ($\mathbf{G}\varphi \equiv \neg\mathbf{F}\neg\varphi$).
+\end{definition}
+
+The semantics of LTL is defined over paths:
+\begin{align*}
+  \pi, i &\models p &&\iff p \in L(\pi(i)) \\
+  \pi, i &\models \mathbf{X}\varphi &&\iff \pi, i+1 \models \varphi \\
+  \pi, i &\models \varphi_1\ \mathbf{U}\ \varphi_2 &&\iff \exists j \geq i.\; \pi, j \models \varphi_2 \land \forall k.\; i \leq k < j \implies \pi, k \models \varphi_1 \\
+  \pi, i &\models \mathbf{G}\varphi &&\iff \forall j \geq i.\; \pi, j \models \varphi \\
+  \pi, i &\models \mathbf{F}\varphi &&\iff \exists j \geq i.\; \pi, j \models \varphi
+\end{align*}
+
+\begin{example}[LTL Properties]\label{ex:ltl-props}
+Common properties expressed in LTL:
+\begin{itemize}
+\item \textbf{Safety:} $\mathbf{G}\neg\mathit{error}$ (``error never occurs'').
+\item \textbf{Liveness:} $\mathbf{F}\ \mathit{done}$ (``eventually done'').
+\item \textbf{Fairness:} $\mathbf{G}\mathbf{F}\ \mathit{enabled} \implies \mathbf{G}\mathbf{F}\ \mathit{executed}$
+      (``if enabled infinitely often, then executed infinitely often'').
+\item \textbf{Response:} $\mathbf{G}(\mathit{request} \implies \mathbf{F}\ \mathit{response})$
+      (``every request is eventually followed by a response'').
+\end{itemize}
+\end{example}
+
+\subsection{Computation Tree Logic (CTL)}\label{sec:mc-ctl}
+
+CTL~\cite{clarke1981design} reasons about \emph{branching} time---the tree of
+all possible futures from each state.
+
+\begin{definition}[CTL Syntax]\label{def:ctl-syntax}
+CTL formulae are defined by:
+\[
+\varphi ::= p \mid \neg\varphi \mid \varphi_1 \land \varphi_2 \mid \mathbf{EX}\varphi \mid \mathbf{E}[\varphi_1\ \mathbf{U}\ \varphi_2] \mid \mathbf{AX}\varphi \mid \mathbf{A}[\varphi_1\ \mathbf{U}\ \varphi_2]
+\]
+where every temporal operator is paired with a path quantifier ($\mathbf{E}$ for
+``exists a path'' or $\mathbf{A}$ for ``for all paths'').
+\end{definition}
+
+Derived CTL operators include:
+\begin{align*}
+  \mathbf{EF}\ \varphi &\equiv \mathbf{E}[\top\ \mathbf{U}\ \varphi] && \text{(possibly eventually)} \\
+  \mathbf{AF}\ \varphi &\equiv \mathbf{A}[\top\ \mathbf{U}\ \varphi] && \text{(inevitably eventually)} \\
+  \mathbf{EG}\ \varphi &\equiv \neg\mathbf{AF}\neg\varphi && \text{(possibly always)} \\
+  \mathbf{AG}\ \varphi &\equiv \neg\mathbf{EF}\neg\varphi && \text{(invariant)}
+\end{align*}
+
+\subsection{CTL*}\label{sec:mc-ctlstar}
+
+CTL*~\cite{emerson1986real} is the most expressive of the three logics,
+combining the path quantifiers of CTL with the temporal operators of LTL.  In
+CTL*, temporal operators need not be paired with path quantifiers; the pairing
+is only required at the top level.
+
+\begin{definition}[CTL* Syntax]\label{def:ctlstar-syntax}
+CTL* distinguishes \emph{state formulae} and \emph{path formulae}:
+\begin{align*}
+  \text{State:}\quad \Phi &::= p \mid \neg\Phi \mid \Phi_1 \land \Phi_2 \mid \mathbf{E}\varphi \mid \mathbf{A}\varphi \\
+  \text{Path:}\quad \varphi &::= \Phi \mid \neg\varphi \mid \varphi_1 \land \varphi_2 \mid \mathbf{X}\varphi \mid \varphi_1\ \mathbf{U}\ \varphi_2
+\end{align*}
+\end{definition}
+
+\begin{theorem}[Expressiveness Hierarchy]\label{thm:expressiveness}
+\[
+\text{CTL} \subsetneq \text{CTL}^* \supsetneq \text{LTL}
+\]
+CTL and LTL are \emph{incomparable}: there are properties expressible in CTL
+but not in LTL (e.g., $\mathbf{AG}\mathbf{EF}\ p$), and vice versa (e.g.,
+$\mathbf{F}\mathbf{G}\ p$).
+\end{theorem}
+
+% ============================================================
+% Symbolic Model Checking
+% ============================================================
+\section{Symbolic Model Checking (BDDs)}\label{sec:mc-symbolic}
+
+\subsection{The State Explosion Problem}\label{sec:mc-explosion}
+
+The fundamental limitation of explicit-state model checking is the \emph{state
+explosion problem}: the number of states grows exponentially with the number of
+state variables.  A system with $n$ boolean variables has $2^n$ states; a system
+with $n$ variables of $k$ values each has $k^n$ states.
+
+\subsection{Binary Decision Diagrams}\label{sec:mc-bdd}
+
+\emph{Binary Decision Diagrams} (BDDs)~\cite{bryant1986graph} provide a compact
+representation of Boolean functions, enabling model checking without explicitly
+constructing the state space.
+
+\begin{definition}[BDD]\label{def:bdd}
+A \emph{Binary Decision Diagram} is a directed acyclic graph representing a
+Boolean function.  Each internal node is labeled with a variable and has two
+successors (the \emph{then} and \emph{else} edges).  Each leaf is labeled 0 or 1.
+A \emph{reduced ordered BDD} (ROBDD) is a BDD where:
+\begin{itemize}
+\item No two distinct nodes represent the same sub-function.
+\item No node has identical then and else successors.
+\item Variables appear in a fixed order along all paths.
+\end{itemize}
+\end{definition}
+
+\begin{insight}
+BDDs can represent sets of states \emph{symbolically}: a set of states is
+represented by a Boolean function that is true exactly for the encodings of
+states in the set.  Operations on state sets (union, intersection, complement)
+become Boolean operations on BDDs.  The key question is whether the BDDs remain
+small---which depends critically on the variable ordering.
+\end{insight}
+
+\subsection{Symbolic CTL Model Checking}\label{sec:mc-symbolic-ctl}
+
+In symbolic model checking~\cite{mcmmillan1992symbolic}, sets of states are
+represented as BDDs, and the model checking algorithm operates on these
+representations directly:
+
+\begin{itemize}
+\item A set of states $S' \subseteq S$ is represented by its characteristic
+      function $\chi_{S'} : \{0,1\}^n \to \{0,1\}$.
+\item The transition relation $R$ is represented as a Boolean function
+      $\chi_R(s, s')$.
+\item The image operation $\mathbf{EX}\ S' = \{s \mid \exists s'.\; R(s,s') \land S'(s')\}$
+      is computed as:
+      \[
+      \chi_{\mathbf{EX}\ S'}(s) = \exists s'.\; \chi_R(s, s') \land \chi_{S'}(s')
+      \]
+      using Boolean quantification on BDDs.
+\end{itemize}
+
+\subsection{Variable Ordering}\label{sec:mc-ordering}
+
+The size of a BDD is highly sensitive to the variable ordering.  Finding the
+optimal ordering is NP-hard, but good heuristics exist:
+\begin{itemize}
+\item Keep variables that are closely related (e.g., bits of the same variable)
+      adjacent in the ordering.
+\item Use dynamic variable reordering during the computation.
+\end{itemize}
+
+% ============================================================
+% Bounded Model Checking
+% ============================================================
+\section{Bounded Model Checking}\label{sec:mc-bounded}
+
+\subsection{The BMC Approach}\label{sec:mc-bmc-approach}
+
+\emph{Bounded model checking} (BMC)~\cite{biere1999symbolic} checks whether a
+property holds for all paths of length at most $k$.  The key insight is that
+bounded model checking can be reduced to a SAT problem, enabling the use of
+highly optimized SAT solvers.
+
+\begin{definition}[Bounded Model Checking]\label{def:bmc}
+Given a transition system $M$, a property $\varphi$, and a bound $k$, bounded
+model checking decides whether $M, s_0 \models_k \varphi$, i.e., whether
+$\varphi$ holds for all paths from $s_0$ of length at most $k$.
+\end{definition}
+
+\subsection{Encoding as SAT}\label{sec:mc-bmc-sat}
+
+The BMC encoding unrolls the transition relation $k$ times:
+\begin{align*}
+  \Phi_k &= I(s_0) \land \bigwedge_{i=0}^{k-1} R(s_i, s_{i+1}) \land \neg\varphi(s_0, \ldots, s_k)
+\end{align*}
+where $I$ is the initial state predicate and $\neg\varphi$ is the negation of
+the property.  If $\Phi_k$ is satisfiable, a counterexample of length at most
+$k$ exists.  If $\Phi_k$ is unsatisfiable, no counterexample of length $\leq k$
+exists.
+
+\subsection{Completeness}\label{sec:mc-bmc-completeness}
+
+BMC is \emph{incomplete} for liveness properties: if no counterexample of length
+$\leq k$ exists, it does not follow that no counterexample exists at all.
+However, for safety properties ($\mathbf{G}\ \neg p$), BMC is complete if $k$
+exceeds the \emph{diameter} of the state space.
+
+\begin{theorem}[BMC Completeness for Safety]\label{thm:bmc-complete}
+For a safety property $\mathbf{G}\ \neg p$ on a transition system with diameter
+$d$, BMC with $k \geq d$ is complete: if no counterexample of length $\leq d$
+exists, the property holds.
+\end{theorem}
+
+In practice, the diameter may be exponential in the number of state variables,
+so BMC is typically used as a \emph{bug-finding} technique: it can find bugs
+quickly (by checking small bounds) but cannot prove the absence of bugs in
+general.
+
+% ============================================================
+% Abstract Model Checking
+% ============================================================
+\section{Abstract Model Checking}\label{sec:mc-abstract}
+
+\subsection{Abstraction}\label{sec:mc-abstraction}
+
+\emph{Abstract model checking}~\cite{clarke2000abstraction} reduces the state
+space by constructing an \emph{abstract model} that is smaller than the concrete
+model but preserves the properties of interest.
+
+\begin{definition}[Abstraction]\label{def:abstraction}
+An \emph{abstraction} of a transition system $M = (S, S_0, R, L)$ is a
+transition system $\hat{M} = (\hat{S}, \hat{S}_0, \hat{R}, \hat{L})$ together
+with an abstraction function $\alpha : S \to \hat{S}$ such that:
+\begin{enumerate}
+\item $\alpha(S_0) \subseteq \hat{S}_0$.
+\item If $(s, s') \in R$ then $(\alpha(s), \alpha(s')) \in \hat{R}$.
+\item $\hat{L}(\alpha(s)) \supseteq L(s)$ (over-approximation of labels).
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Preservation of Universal Properties]\label{thm:abstraction}
+If $\hat{M} \models \varphi$ for a universal property $\varphi$ (one built from
+$\mathbf{A}$, $\mathbf{G}$, $\mathbf{X}$, $\land$, $\lor$), then $M \models \varphi$.
+\end{theorem}
+
+The contrapositive is the basis of \emph{counterexample-guided abstraction
+refinement} (CEGAR): if the abstract model violates a property, the
+counterexample may be \emph{spurious} (an artifact of the abstraction).  If so,
+the abstraction is refined to eliminate the spurious counterexample.
+
+\subsection{CEGAR}\label{sec:mc-cegar}
+
+\begin{algorithm}[htbp]
+\caption{CEGAR Loop}\label{alg:cegar}
+\begin{algorithmic}[1]
+\Require Concrete model $M$, property $\varphi$
+\Ensure ``Verified'' or counterexample trace
+\State $\hat{M} \gets \text{initial abstraction of } M$
+\Loop
+  \State $\hat{M} \models \varphi$?
+  \If{yes}
+    \State \Return ``Verified''
+  \EndIf
+  \State $\hat{\pi} \gets$ counterexample from $\hat{M}$
+  \State $\pi \gets \text{simulate } \hat{\pi} \text{ in } M$
+  \If{$\pi$ is a real counterexample}
+    \State \Return $\pi$
+  \Else
+    \State Refine $\hat{M}$ to eliminate $\hat{\pi}$
+  \EndIf
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% Model Checking for Software
+% ============================================================
+\section{Model Checking for Software}\label{sec:mc-software}
+
+\subsection{Challenges}\label{sec:mc-sw-challenges}
+
+Applying model checking to software presents unique challenges:
+\begin{itemize}
+\item \textbf{Infinite state space:} Programs with unbounded integers, dynamic
+      allocation, or recursion have infinitely many states.
+\item \textbf{Complex data structures:} Pointers, arrays, and objects create
+      complex state spaces.
+\item \textbf{Rich semantics:} C-style languages have complex semantics
+      (undefined behavior, type punning, etc.).
+\end{itemize}
+
+\subsection{SPIN}\label{sec:mc-spin}
+
+SPIN~\cite{holzmann1997spin} is the most widely used model checker for software.
+It verifies Promela models of concurrent systems, using explicit-state search
+with partial-order reduction.  SPIN has been used to verify communication
+protocols, operating system components, and concurrent algorithms.
+
+\subsection{CBMC}\label{sec:mc-cbmc}
+
+CBMC~\cite{clarke2004bounded} is a bounded model checker for C programs.  It
+unrolls loops and function calls up to a given bound, encodes the resulting
+program as a SAT formula, and uses a SAT solver to check for assertion
+violations.  CBMC can handle complex C features including pointers, dynamic
+memory allocation, and floating-point arithmetic.
+
+\subsection{Java PathFinder}\label{sec:mc-jpf}
+
+Java PathFinder (JPF)~\cite{havelund2000model} is an explicit-state model
+checker for Java bytecode.  It executes Java programs symbolically, exploring
+all possible thread interleavings and non-deterministic choices.  JPF has been
+used to find bugs in NASA flight software and other safety-critical systems.
+
+\subsection{TLA+}\label{sec:mc-tla}
+
+TLA+~\cite{lamport2002specifying} is a specification language based on temporal
+logic of actions.  The TLC model checker verifies TLA+ specifications by
+exhaustive state-space exploration.  TLA+ has been used at Amazon Web Services,
+Microsoft, and Intel to find subtle bugs in distributed protocols and storage
+systems.
+
+\begin{historical}
+Model checking was invented in 1981 by Clarke and Emerson and independently by
+Quielle and Sifakis.  The first model checkers could handle systems with at most
+a few thousand states.  The development of symbolic model checking using BDDs by
+McMillan~\cite{mcmmillan1992symbolic} in 1992 extended the reach to systems with
+$10^{20}$ or more states.  The introduction of SAT-based bounded model checking
+by Biere et al.~\cite{biere1999symbolic} in 1999 opened the door to software
+verification.  Today, model checking is a standard technique in hardware design
+and is increasingly used in software engineering.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:mc-summary}
+
+Model checking provides fully automatic verification of finite-state systems
+against temporal properties.  Its key strength is the ability to produce
+counterexamples, making it invaluable for debugging.  Its key limitation is the
+state explosion problem, which limits its applicability to large systems.
+
+Active research areas include:
+\begin{itemize}
+\item \textbf{SMT-based model checking:} Using SMT solvers to handle infinite-state
+      systems and complex theories.
+\item \textbf{Compositional model checking:} Verifying system components
+      independently and composing the results.
+\item \textbf{Integration with deductive verification:} Combining model checking
+      (for automated analysis) with theorem proving (for full verification).
+\item \textbf{Continuous model checking:} Integrating model checking into the
+      development cycle for ongoing verification.
+\end{itemize}
+
+The textbook by Baier and Katoen~\cite{baier2008principles} is the standard
+reference, while Clarke et al.~\cite{clarke1999model} provide a comprehensive
+treatment of the algorithmic aspects.

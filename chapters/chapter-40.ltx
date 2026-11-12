@@ -1,0 +1,640 @@
+%% Chapter 40: Parser Combinators
+\label{ch:parser-combinators}
+
+\section{Introduction to Parser Combinators}
+\label{sec:combinators-intro}
+
+Parser combinators provide a \emph{functional} approach to parsing: parsers are first-class values that can be constructed, combined, and passed as arguments to other functions. Rather than generating a parser from a grammar specification (as Yacc or ANTLR do), parser combinators build the parser directly in the host programming language using a library of combinator functions.
+
+The combinator approach is particularly natural in functional programming languages like Haskell, OCaml, and Scala, where higher-order functions and algebraic data types are first-class citizens. However, combinator libraries have been developed for imperative languages as well, including Rust (nom), Python (parsy), and Java (JParsec).
+
+\begin{historical}
+The idea of parser combinators dates to the work of Burge (1975) and was further developed by Wadsworth (1985), Hutton (1992), and Fokker (1995). The Parsec library (Leijen and Meijer, 2001) brought parser combinators to a wide audience with its efficient implementation and rich combinator library. Megaparsec (Mark Karpov, 2015) improved on Parsec with better error messages. In the Rust ecosystem, nom (Geoffroy Couprie, 2015) provides a zero-copy parser combinator library. The connection between parser combinators and monads was established by Wadler (1992) and Hutton (1992).
+\end{historical}
+
+\section{Functional Approach to Parsing}
+\label{sec:functional-parsing}
+
+\subsection{Parsers as Functions}
+\label{sec:parsers-as-functions}
+
+In the combinator approach, a parser is simply a function that takes an input string and returns a parse result:
+
+\begin{definition}[Parser Type]
+\label{def:parser-type}
+A \textbf{parser} is a function of type:
+\[
+\texttt{Parser } a = \texttt{String} \to [(a, \texttt{String})]
+\]
+The parser takes an input string and returns a list of possible results, where each result is a pair of the parsed value and the remaining input. The list may be empty (parse failure), contain one element (unambiguous parse), or contain multiple elements (ambiguous parse).
+\end{definition}
+
+\begin{example}[Simple Parsers]
+\label{ex:simple-parsers}
+\begin{verbatim}
+  -- Parse a specific character
+  char :: Char -> Parser Char
+  char c = \input -> case input of
+    (x:xs) | x == c -> [(c, xs)]
+    _                -> []
+  
+  -- Parse any digit
+  digit :: Parser Char
+  digit = satisfy isDigit
+  
+  -- Parse any character satisfying a predicate
+  satisfy :: (Char -> Bool) -> Parser Char
+  satisfy p = \input -> case input of
+    (x:xs) | p x -> [(x, xs)]
+    _            -> []
+\end{verbatim}
+\end{example}
+
+\section{Combinator Libraries}
+\label{sec:combinator-libraries}
+
+\subsection{Basic Combinators}
+\label{sec:basic-combinators}
+
+The fundamental combinators are:
+
+\begin{definition}[Choice Combinator]
+\label{def:choice}
+$\texttt{p <|> q}$ tries parser $\texttt{p}$ first; if it fails, tries parser $\texttt{q}$:
+\[
+(\texttt{p <|> q})\; s = \texttt{p}\; s \;{+\!+}\; \texttt{q}\; s
+\]
+(where $++$ is list concatenation, or $\texttt{q}\; s$ is tried only if $\texttt{p}\; s = []$)
+\end{definition}
+
+\begin{definition}[Sequence Combinator (Bind)]
+\label{def:bind}
+$\texttt{p >>= f}$ applies parser $\texttt{p}$, then applies the function $\texttt{f}$ to the result to obtain a new parser, which is applied to the remaining input:
+\[
+(\texttt{p >>= f})\; s = [(b, s'') \mid (a, s') \leftarrow \texttt{p}\; s, (b, s'') \leftarrow \texttt{f}\; a\; s']
+\]
+\end{definition}
+
+\begin{definition}[Many Combinator]
+\label{def:many}
+$\texttt{many}\; \texttt{p}$ applies parser $\texttt{p}$ zero or more times, collecting the results in a list:
+\begin{verbatim}
+  many p = many1 p <|> return []
+  many1 p = do { x <- p; xs <- many p; return (x:xs) }
+\end{verbatim}
+\end{definition}
+
+\begin{definition}[SepBy Combinator]
+\label{def:sepby}
+$\texttt{sepBy}\; p\; sep$ parses zero or more occurrences of $\texttt{p}$, separated by $\texttt{sep}$:
+\begin{verbatim}
+  sepBy p sep = sepBy1 p sep <|> return []
+  sepBy1 p sep = do { x <- p; xs <- many (sep >> p); return (x:xs) }
+\end{verbatim}
+\end{definition}
+
+\subsection{Combinator Examples}
+\label{sec:combinator-examples}
+
+\begin{example}[Parsing Arithmetic Expressions]
+\label{ex:combinator-expr}
+\begin{verbatim}
+  expr   = term `chainl1` addop
+  term   = factor `chainl1` mulop
+  factor = nat <|> char '(' *> expr <* char ')'
+  
+  addop  = char '+' *> return (+) <|> char '-' *> return (-)
+  mulop  = char '*' *> return (*) <|> char '/' *> return (div)
+  
+  chainl1 p op = do
+    x <- p
+    rest x
+    where rest x = (do f <- op; y <- p; rest (f x y)) <|> return x
+\end{verbatim}
+\end{example}
+
+\section{Monadic Parser Combinators}
+\label{sec:monadic-combinators}
+
+\subsection{Parsers as Monads}
+\label{sec:parsers-monads}
+
+The bind combinator $(>>=)$ and the return combinator make parsers an instance of the \emph{monad} type class. This provides a clean, compositional interface for building parsers.
+
+\begin{definition}[Parser Monad]
+\label{def:parser-monad}
+The parser monad is defined by:
+\begin{verbatim}
+  instance Monad Parser where
+    return a = \input -> [(a, input)]
+    p >>= f  = \input -> concatMap (\(a, rest) -> f a rest) (p input)
+\end{verbatim}
+\end{definition}
+
+The monadic interface allows parsers to be written in \texttt{do}-notation, which reads like a sequence of parsing steps:
+
+\begin{verbatim}
+  ifStmt = do
+    string "if"
+    whitespace
+    cond <- expr
+    whitespace
+    string "then"
+    whitespace
+    thenBranch <- stmt
+    whitespace
+    string "else"
+    whitespace
+    elseBranch <- stmt
+    return (If cond thenBranch elseBranch)
+\end{verbatim}
+
+\subsection{Applicative Parsing}
+\label{sec:applicative}
+
+The \emph{applicative} interface is a simpler alternative to monadic parsing that provides better static analysis and optimization opportunities:
+
+\begin{definition}[Applicative Parser]
+\label{def:applicative-parser}
+\begin{verbatim}
+  instance Functor Parser where
+    fmap f p = fmap (\(a, s) -> (f a, s)) p
+  
+  instance Applicative Parser where
+    pure a = \input -> [(a, input)]
+    pf <*> px = \input -> [(f x, s'') | (f, s') <- pf input, (x, s'') <- px s']
+\end{verbatim}
+\end{definition}
+
+Applicative parsers can be analyzed statically (e.g., to determine the set of possible first tokens) because the structure of the parser is known in advance.
+
+\subsection{MonadPlus and Alternative}
+\label{sec:monadplus}
+
+\begin{definition}[MonadPlus Parser]
+\label{def:monadplus-parser}
+\begin{verbatim}
+  instance MonadPlus Parser where
+    mzero = \input -> []
+    p `mplus` q = \input -> case p input of
+      [] -> q input
+      rs -> rs
+\end{verbatim}
+\end{definition}
+
+The \texttt{mplus} combinator implements \emph{committed choice}: if the first parser succeeds, the second is not tried. This is essential for efficient parsing.
+
+\section{Packrat Parsing and Memoization}
+\label{sec:packrat}
+
+\subsection{The Problem with Backtracking}
+\label{sec:backtracking-problem}
+
+Simple parser combinators with backtracking can have exponential worst-case time complexity. For example, the parser:
+
+\begin{verbatim}
+  p = (string "aaa" <|> string "aab") >> string "ac"
+\end{verbatim}
+
+on the input \texttt{aaac} will try both alternatives for the first part, each consuming two characters and then failing.
+
+\subsection{Packrat Parsing}
+\label{sec:packrat-parsing}
+
+\emph{Packrat parsing} (Ford, 2002) solves this problem by \emph{memoizing} the results of all parser calls:
+
+\begin{definition}[Packrat Parser]
+\label{def:packrat}
+A \textbf{packrat parser} memoizes the result of every parser at every input position. Before parsing, the parser checks if the result for the current position is already in the memo table. If so, it returns the cached result. Otherwise, it parses normally and stores the result in the memo table.
+\end{definition}
+
+\begin{theorem}[Packrat Complexity]
+\label{thm:packrat-complexity}
+Packrat parsing runs in $O(n)$ time and $O(n)$ space for any parsing expression grammar (PEG), where $n$ is the length of the input.
+\end{theorem}
+
+\subsection{Implementation of Packrat Parsing}
+\label{sec:packrat-impl}
+
+Packrat parsing is implemented by wrapping each parser with a memoization layer:
+
+\begin{verbatim}
+  memo :: Parser a -> Parser a
+  memo p = \input pos ->
+    case lookup (p, pos) memoTable of
+      Just result -> result
+      Nothing     -> let result = p input pos
+                     in  memoTable[pos := result]
+                         result
+\end{verbatim}
+
+The memo table is a hash map from (parser identity, input position) to parse result.
+
+\subsection{Limitations of Packrat Parsing}
+\label{sec:packrat-limits}
+
+Packrat parsing has several limitations:
+\begin{itemize}
+  \item \textbf{Memory usage}: The memo table requires $O(n \cdot |G|)$ space, where $|G|$ is the size of the grammar. For large inputs, this can be significant.
+  \item \textbf{Left recursion}: Packrat parsers (like PEGs in general) do not handle left recursion directly. Special extensions are required.
+  \item \textbf{No ambiguity}: Packrat parsing always produces a single parse tree (the first successful alternative).
+\end{itemize}
+
+\section{Comparison with Generated Parsers}
+\label{sec:combinator-vs-generated}
+
+\subsection{Advantages of Combinators}
+\label{sec:combinator-advantages}
+
+\begin{itemize}
+  \item \textbf{Integration with host language}: Parsers are written in the same language as the rest of the compiler, with full access to the type system, libraries, and debugging tools.
+  \item \textbf{Composability}: Parsers are first-class values that can be combined, parameterized, and abstracted over.
+  \item \textbf{Type safety}: The type system ensures that parsers are well-formed and that parse results have the correct types.
+  \item \textbf{No separate tool}: No need for a separate parser generator tool or build step.
+\end{itemize}
+
+\subsection{Advantages of Generated Parsers}
+\label{sec:generated-advantages}
+
+\begin{itemize}
+  \item \textbf{Performance}: Generated parsers (especially LR) are typically faster than combinator parsers.
+  \item \textbf{Error recovery}: Generated parsers have well-developed error recovery mechanisms.
+  \item \textbf{Grammar analysis}: Generated parsers analyze the grammar for conflicts and ambiguities at generation time.
+  \item \textbf{Familiarity}: Yacc/Bison and ANTLR are widely known and used.
+\end{itemize}
+
+\subsection{When to Use Each}
+\label{sec:when-to-use}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{4cm}p{4cm}p{4cm}}
+\hline
+\textbf{Scenario} & \textbf{Combinators} & \textbf{Generated} \\
+\hline
+Quick prototype & \checkmark & \\
+Production compiler & & \checkmark \\
+DSL embedded in host & \checkmark & \\
+Complex error recovery & & \checkmark \\
+Type-safe AST construction & \checkmark & \\
+Maximum performance & & \checkmark \\
+\hline
+\end{tabular}
+\caption{When to use combinators vs.\ generated parsers}
+\label{tab:combinator-vs-generated}
+\end{table}
+
+\section{Implementations}
+\label{sec:combinator-implementations}
+
+\subsection{Parsec}
+\label{sec:parsec}
+
+Parsec (Leijen and Meijer, 2001) is the most widely used parser combinator library for Haskell. It provides:
+\begin{itemize}
+  \item Monadic and applicative interfaces
+  \item Committed choice (no backtracking after a committed parse)
+  \item Descriptive error messages with source positions
+  \item A rich library of combinators
+\end{itemize}
+
+\subsection{Megaparsec}
+\label{sec:megaparsec}
+
+Megaparsec (Karpov, 2015) is a modern replacement for Parsec with:
+\begin{itemize}
+  \item Better error messages (including hints and expected tokens)
+  \item Better performance
+  \item More flexible token streams (not just strings)
+  \item Improved API design
+\end{itemize}
+
+\subsection{nom (Rust)}
+\label{sec:nom}
+
+\texttt{nom} (Couprie, 2015) is a parser combinator library for Rust that emphasizes:
+\begin{itemize}
+  \item Zero-copy parsing (parsers operate on byte slices without copying)
+  \item Streaming support (incremental parsing of data arriving in chunks)
+  \item High performance through inlining and specialization
+\end{itemize}
+
+\begin{verbatim}
+  fn parse_number(input: &[u8]) -> IResult<&[u8], u32> {
+    map_res(
+      take_while1(|c: u8| c.is_ascii_digit()),
+      |s: &[u8]| std::str::from_utf8(s).unwrap().parse::<u32>()
+    )(input)
+  }
+\end{verbatim}
+
+\subsection{Other Implementations}
+\label{sec:other-combinators}
+
+\begin{itemize}
+  \item \textbf{parboiled2} (Scala): Type-safe parser combinators with compile-time grammar checking
+  \item \textbf{parsy} (Python): Simple parser combinator library for Python
+  \item \textbf{Parsimonious} (Python): PEG-based parser using combinators
+  \item \textbf{LanguageExt} (C\#): Parser combinators for C\#
+  \item \textbf{chumsky} (Rust): Modern parser combinator library with good error recovery
+\end{itemize}
+
+\section{Summary}
+\label{sec:combinator-summary}
+
+Parser combinators provide an elegant, functional approach to parsing that integrates naturally with the host programming language. Key concepts include:
+
+\begin{itemize}
+  \item Parsers as first-class functions that can be combined and composed
+  \item Monadic and applicative interfaces for clean, compositional parser construction
+  \item Packrat parsing for guaranteed linear-time performance
+  \item Rich combinator libraries for common parsing patterns
+  \item Trade-offs between combinators (flexibility, type safety) and generated parsers (performance, error recovery)
+\end{itemize}
+
+\begin{historical}
+Parser combinators have evolved from a theoretical curiosity to a practical tool used in production systems. Key milestones include: Burge's early work (1975); Wadsworth's combinator framework (1985); Hutton's monadic parsers (1992); Wadler's ``How to Replace Failure by a List of Successes'' (1985); Leijen and Meijer's Parsec (2001); Ford's packrat parsing and PEGs (2002, 2004); Karpov's Megaparsec (2015); Couprie's nom (2015); and the ongoing development of modern combinator libraries with better error messages, streaming support, and performance.
+\end{historical}
+
+%% ------------------------------------------------------------------
+%% Expanded sections for Chapter 40
+%% ------------------------------------------------------------------
+
+\section{Packrat Parsing: Detailed Treatment}
+\label{sec:packrat-detailed}
+
+\subsection{Parsing Expression Grammars}
+\label{sec:peg}
+
+Packrat parsing is closely associated with \emph{Parsing Expression Grammars} (PEGs), introduced by Ford (2004):
+
+\begin{definition}[Parsing Expression Grammar]
+\label{def:peg}
+A \textbf{Parsing Expression Grammar} is a tuple $(N, T, R, S)$ where:
+\begin{itemize}
+  \item $N$ is a set of nonterminals
+  \item $T$ is a set of terminals
+  \item $R$ is a set of rules $A \leftarrow e$ where $A \in N$ and $e$ is a \emph{parsing expression}
+  \item $S \in N$ is the start symbol
+\end{itemize}
+Parsing expressions are defined by:
+\begin{align*}
+  e &::= \texttt{``} a \texttt{''} \quad (a \in T) & &\text{(terminal)} \\
+    &\mid A \quad (A \in N) & &\text{(nonterminal)} \\
+    &\mid e_1 \; e_2 & &\text{(sequence)} \\
+    &\mid e_1 / e_2 & &\text{(ordered choice)} \\
+    &\mid e* & &\text{(zero or more)} \\
+    &\mid e+ & &\text{(one or more)} \\
+    &\mid \texttt{!}e & &\text{(not predicate)} \\
+    &\mid \texttt{\&}e & &\text{(and predicate)}
+\end{align*}
+\end{definition}
+
+The key difference from CFGs is the \emph{ordered choice} operator $/$: it tries the first alternative and commits to it if it succeeds, never trying the second alternative. This eliminates ambiguity but makes the grammar sensitive to the order of alternatives.
+
+\subsection{PEG vs.\ CFG}
+\label{sec:peg-vs-cfg}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{4cm}p{4cm}p{4cm}}
+\hline
+\textbf{Feature} & \textbf{CFG} & \textbf{PEG} \\
+\hline
+Choice & Unordered ($A \mid B$) & Ordered ($A / B$) \\
+Ambiguity & Possible & Never ambiguous \\
+Expressiveness & All CFLs & Strict subset of CFLs \\
+Parsing & $O(n^3)$ worst case & $O(n)$ with packrat \\
+Left recursion & Supported & Not directly supported \\
+\hline
+\end{tabular}
+\caption{Comparison of CFGs and PEGs}
+\label{tab:peg-vs-cfg}
+\end{table}
+
+\begin{theorem}[PEG Expressiveness]
+\label{thm:peg-expressiveness}
+PEGs can express some non-context-free languages (e.g., $a^n b^n c^n$) but cannot express all context-free languages. Specifically, PEGs cannot express left-recursive grammars without extension.
+\end{theorem}
+
+\begin{example}[PEG for $a^n b^n c^n$]
+\label{ex:peg-anbncn}
+\begin{align*}
+  S &\leftarrow \texttt{\&}(A \; \texttt{''c''}*) \; \texttt{[a]+} \; B \\
+  A &\leftarrow \texttt{''a''} \; A \; \texttt{''b''} \mid \epsilon \\
+  B &\leftarrow \texttt{''b''} \; B \; \texttt{''c''} \mid \epsilon
+\end{align*}
+The and-predicate $\texttt{\&}(A \; \texttt{''c''}*)$ checks that the input is of the form $a^n b^n$ before matching, then $B$ matches $b^n c^n$. The combined effect recognizes $a^n b^n c^n$.
+\end{example}
+
+\subsection{Left Recursion in Packrat Parsers}
+\label{sec:left-recursion-packrat}
+
+Standard packrat parsers (and PEGs) do not handle left recursion. Several extensions have been proposed:
+
+\begin{definition}[Direct Left Recursion]
+\label{def:direct-left-rec}
+A rule $A \leftarrow A \; e$ is \textbf{directly left-recursive}: the nonterminal $A$ appears as the first element of its own definition.
+\end{definition}
+
+\begin{definition}[Indirect Left Recursion]
+\label{def:indirect-left-rec}
+A set of rules is \textbf{indirectly left-recursive} if $A \leftarrow B \; e_1$, $B \leftarrow C \; e_2$, \ldots, $Z \leftarrow A \; e_k$.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Handle left recursion in packrat parsing}
+\begin{algorithmic}[1]
+\Function{Parse}{$rule, pos$}
+  \State $\text{memo} \gets \text{lookup}(rule, pos)$
+  \If{memo is ``in progress''}
+    \State \textbf{return} failure \Comment{Left recursion detected}
+  \EndIf
+  \If{memo exists}
+    \State \textbf{return} memo
+  \EndIf
+  \State Mark $(rule, pos)$ as ``in progress''
+  \State $\text{result} \gets \text{evaluate rule at } pos$
+  \If{result is failure}
+    \State Store failure in memo table
+    \State \textbf{return} failure
+  \EndIf
+  \State $\text{seed} \gets \text{result}$
+  \Repeat
+    \State Store $\text{seed}$ in memo table
+    \State $\text{new\_result} \gets \text{evaluate rule at } pos$
+    \If{$\text{new\_result}$ consumes more input than $\text{seed}$}
+      \State $\text{seed} \gets \text{new\_result}$
+    \Else
+      \State \textbf{break}
+    \EndIf
+  \Until{no progress}
+  \State \textbf{return} $\text{seed}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Left-Recursive Packrat Correctness]
+\label{thm:left-rec-packrat}
+The Warth et al.\ algorithm correctly handles left-recursive PEG rules and produces the same result as a leftmost derivation. The time complexity remains $O(n)$ per rule per position, but the number of iterations depends on the depth of left recursion.
+\end{theorem}
+
+\section{Performance Analysis and Optimization}
+\label{sec:performance-analysis}
+
+\subsection{Complexity of Parser Combinators}
+\label{sec:combinator-complexity}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{4cm}p{3cm}p{3cm}p{3cm}}
+\hline
+\textbf{Style} & \textbf{Best} & \textbf{Worst} & \textbf{Space} \\
+\hline
+Naive backtracking & $O(n)$ & $O(2^n)$ & $O(n)$ \\
+Committed choice (Parsec) & $O(n)$ & $O(n)$ & $O(n)$ \\
+Packrat & $O(n)$ & $O(n)$ & $O(n \cdot |G|)$ \\
+Memoized (selective) & $O(n)$ & $O(n^2)$ & $O(n \cdot k)$ \\
+\hline
+\end{tabular}
+\caption{Complexity of parser combinator styles}
+\label{tab:combinator-complexity}
+\end{table}
+
+\subsection{Optimization Techniques}
+\label{sec:combinator-optimization}
+
+Several techniques can improve the performance of parser combinators:
+
+\begin{itemize}
+  \item \textbf{Fusion}: Combine adjacent parsers to eliminate intermediate data structures. For example, $\texttt{char 'a'} >> \texttt{char 'b'}$ can be fused into a single two-character match.
+  \item \textbf{Speculative parsing}: Before trying an expensive alternative, check a quick predicate (e.g., first character) to avoid unnecessary work.
+  \item \textbf{Selective memoization}: Memoize only the parsers that are called repeatedly at the same position, rather than all parsers.
+  \item \textbf{Continuation-based parsing}: Represent parsers as continuations to enable tail-call optimization and avoid stack overflow on deep inputs.
+\end{itemize}
+
+\begin{definition}[Parser Fusion]
+\label{def:parser-fusion}
+\textbf{Parser fusion} is an optimization that combines two parsers $p_1$ and $p_2$ into a single parser $p_1 \gg p_2$ that avoids creating intermediate results:
+\begin{verbatim}
+  fused :: Parser a -> Parser b -> Parser (a, b)
+  fused p1 p2 = \input pos ->
+    case p1 input pos of
+      Fail -> Fail
+      Ok a pos1 -> case p2 input pos1 of
+        Fail -> Fail
+        Ok b pos2 -> Ok (a, b) pos2
+\end{verbatim}
+\end{definition}
+
+\subsection{Benchmarking Parser Combinators}
+\label{sec:benchmarking}
+
+Empirical benchmarks of parser combinator libraries reveal significant performance differences:
+
+\begin{itemize}
+  \item \textbf{nom} (Rust): Fastest for byte-level parsing due to zero-copy and inlining.
+  \item \textbf{Parsec/Megaparsec} (Haskell): Moderate performance; good for complex grammars.
+  \item \textbf{Peggy/Pegjs} (JavaScript): Good for PEG grammars with packrat optimization.
+  \item \textbf{chumsky} (Rust): Competitive with nom, with better error recovery.
+\end{itemize}
+
+\section{Error Handling in Parser Combinators}
+\label{sec:combinator-errors}
+
+\subsection{Error Representation}
+\label{sec:error-representation}
+
+Modern parser combinator libraries use rich error representations:
+
+\begin{definition}[Parse Error]
+\label{def:parse-error}
+A \textbf{parse error} consists of:
+\begin{itemize}
+  \item \textbf{Position}: The input position where the error occurred.
+  \item \textbf{Expected}: A set of tokens or patterns that were expected.
+  \item \textbf{Encountered}: The actual token or pattern found.
+  \item \textbf{Context}: A stack of parser labels (for ``in expression'', ``in statement'', etc.)
+\end{itemize}
+\end{definition}
+
+\begin{example}[Rich Error Message]
+\label{ex:rich-error}
+\begin{verbatim}
+  Error at line 5, column 12:
+    expected: ')'
+    encountered: '+'
+    in expression, in function call, in statement
+\end{verbatim}
+This error message tells the user exactly where the error occurred, what was expected, what was found, and the parsing context.
+\end{example}
+
+\subsection{Error Recovery in Combinators}
+\label{sec:combinator-recovery}
+
+Some parser combinator libraries support error recovery:
+
+\begin{itemize}
+  \item \textbf{chumsky} (Rust): Supports error recovery by inserting ``synthetic'' tokens and continuing parsing.
+  \item \textbf{Megaparsec}: Supports custom error recovery through the \texttt{recover} combinator.
+  \item \textbf{Custom recovery}: Users can implement recovery by catching parse failures and inserting tokens.
+\end{itemize}
+
+\begin{verbatim}
+  -- Error recovery: skip tokens until a semicolon
+  recoverStmt = recover (skipUntil (char ';')) stmt
+\end{verbatim}
+
+\section{Advanced Combinator Patterns}
+\label{sec:advanced-patterns}
+
+\subsection{Indentation-Sensitive Parsing}
+\label{sec:indentation-parsing}
+
+Languages like Python and Haskell use indentation to delimit blocks. Parser combinators can handle this with a custom \emph{layout} combinator:
+
+\begin{definition}[Layout Combinator]
+\label{def:layout}
+A \textbf{layout combinator} $\texttt{layout}\; p$ parses a sequence of $p$-results that are indented more than the current indentation level:
+\begin{verbatim}
+  layout p = do
+    indent <- currentIndent
+    items <- many (do
+      checkIndent (> indent)
+      item <- p
+      return item)
+    return items
+\end{verbatim}
+\end{definition}
+
+\subsection{Operator Parsing with Precedence}
+\label{sec:operator-parsing}
+
+The \texttt{chainl1} and \texttt{makeExprParser} combinators handle operator precedence:
+
+\begin{definition}[Expression Parser]
+\label{def:expr-parser}
+\begin{verbatim}
+  makeExprParser :: Parser a -> [[Operator a]] -> Parser a
+  data Operator a = InfixN (Parser (a -> a -> a))  -- non-assoc
+                  | InfixL (Parser (a -> a -> a))  -- left-assoc
+                  | InfixR (Parser (a -> a -> a))  -- right-assoc
+                  | Prefix (Parser (a -> a))
+                  | Postfix (Parser (a -> a))
+\end{verbatim}
+The table of operators is organized by precedence level (highest first).
+\end{definition}
+
+\begin{example}[Expression Parser with Precedence]
+\label{ex:expr-parser}
+\begin{verbatim}
+  exprParser = makeExprParser term
+    [ [ InfixL (char '*' *> return (*))
+      , InfixL (char '/' *> return (div)) ]
+    , [ InfixL (char '+' *> return (+))
+      , InfixL (char '-' *> return (-)) ]
+    , [ Prefix (char '-' *> return negate) ]
+    ]
+  term = char '(' *> exprParser <* char ')' <|> natural
+\end{verbatim}
+\end{example}

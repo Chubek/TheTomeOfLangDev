@@ -1,0 +1,2945 @@
+18
+
+Checking Type Safety of Foreign
+Function Calls
+MICHAEL FURR and JEFFREY S. FOSTER
+University of Maryland, College Park
+
+Foreign function interfaces (FFIs) allow components in different languages to communicate directly
+with each other. While FFIs are useful, they often require writing tricky low-level code and include
+little or no static safety checking, thus providing a rich source of hard-to-find programming errors.
+In this article, we study the problem of enforcing type safety across the OCaml-to-C FFI and
+the Java Native Interface (JNI). We present O-Saffire and J-Saffire, a pair of multilingual type
+inference systems that ensure C code that uses these FFIs accesses high-level data safely. Our
+inference systems use representational types to model C’s low-level view of OCaml and Java values,
+and singleton types to track integers, strings, memory offsets, and type tags through C. J-Saffire,
+our Java system, uses a polymorphic flow-insensitive, unification-based analysis. Polymorphism
+is important because it allows us to precisely model user-defined wrapper functions and the more
+than 200 JNI functions. O-Saffire, our OCaml system, uses a monomorphic flow-sensitive analysis
+because, while polymorphism is much less important for the OCaml FFI flow-sensitivity is critical
+to track conditional branches, which are used when pattern matching OCaml data in C. O-Saffire
+also tracks garbage collection information to ensure that local C pointers to the OCaml heap are
+registered properly, which is not necessary for the JNI. We have applied O-Saffire and J-Saffire to a
+set of benchmarks and found many bugs and questionable coding practices. These results suggest
+that static checking of FFIs can be a valuable tool in writing correct multilingual software.
+Categories and Subject Descriptors: D.2.4 [Software Engineering]: Software/Program Verification; D.3.3 [Programming Languages]: Language Constructs and Features; F.3.1 [Logics and
+Meanings of Programs]: Specifying and Verifying and Reasoning about Programs
+General Terms: Languages, Verification
+Additional Key Words and Phrases: Foreign function interface, FFI, foreign function calls, representational type, multilingual type system, multilingual type inference, flow-sensitive type system,
+dataflow analysis, OCaml, Java, JNI, Java Native Interface
+ACM Reference Format:
+Furr, M. and Foster, J. S. 2008. Checking type safety of foreign function calls. ACM Trans.
+Program. Lang. Syst. 30, 4, Article 18 (July 2008), 63 pages. DOI = 10.1145/1377492.1377493
+http://doi.acm.org/10.1145/1377492.1377493
+
+This research was supported in part by NSF CCF-0346982 and CCF-0430118.
+Author’s address: University of Maryland, College Park, MD; email: M. Furr (corresponding author), furr@cs.umd.edu.
+Permission to make digital or hard copies of part or all of this work for personal or classroom use is
+granted without fee provided that copies are not made or distributed for profit or direct commercial
+advantage and that copies show this notice on the first page or initial screen of a display along
+with the full citation. Copyrights for components of this work owned by others than ACM must be
+honored. Abstracting with credit is permitted. To copy otherwise, to republish, to post on servers,
+to redistribute to lists, or to use any component of this work in other works requires prior specific
+permission and/or a fee. Permissions may be requested from Publications Dept., ACM, Inc., 2 Penn
+Plaza, Suite 701, New York, NY 10121-0701 USA, fax +1 (212) 869-0481, or permissions@acm.org.
+
+C 2008 ACM 0164-0925/2008/07-ART18 $5.00 DOI 10.1145/1377492.1377493 http://doi.acm.org/
+10.1145/1377492.1377493
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:2
+
+•
+
+M. Furr and J. S. Foster
+
+1. INTRODUCTION
+Many programming languages contain a foreign function interface (FFI) that
+allows programs to invoke functions written in other languages. FFIs are important for high-level languages because they allow programs to access a multitude
+of system and user libraries that would be otherwise unavailable. Moreover, different languages make different programming idioms either harder or easier
+and have various performance trade-offs, and thus the ability to write multilingual programs has important software engineering benefits.
+Unfortunately, FFIs are difficult to use correctly, especially when there
+are mismatches between native and foreign type systems, data representations, and run-time environments. In all of the FFIs we are aware of, there
+is little or no consistency checking between foreign and native code [Blume
+2001; Finne et al. 1999; Huelsbergen 1996; Leroy 2004; Liang 1999]. As a
+consequence, adding an FFI to a safe language potentially provides a rich
+source of operations that can violate safety in subtle and difficult-to-find
+ways.
+In this article, we present O-Saffire and J-Saffire,1 a pair of type inference
+systems that ensure type safety across the OCaml FFI and the Java Native
+Interface (JNI), respectively. In these FFIs, both of which interface to C, most
+of the work is done in C glue code, which translates data between the highlevel language and C, and then invokes other routines, often in system or user
+libraries. It is easy to make mistakes in glue code, both because it is low-level
+and because the C compiler does not check that glue code accesses high-level
+data at the right types. For example, we found OCaml FFI glue code that uses
+integers as pointers and vice-versa and JNI glue code that accesses nonexistent classes. These errors can result in silent memory corruption or runtime
+exceptions, and they are often extremely difficult to debug.
+O-Saffire and J-Saffire detect these kinds of problems by performing
+constraint-based type inference on C glue code. The first challenge in analyzing
+glue code is tracking types from OCaml or Java through C. In both FFIs, all
+high-level types are conflated to a single type in C, either value for OCaml or
+jobject for Java. Thus we perform inference by extending these to multilingual
+types of the form mt value and jt jobject. Here mt is an OCaml type and jt is
+a Java type. O-Saffire and J-Saffire compare the inferred types in glue code to
+type information extracted from OCaml or Java and report any inconsistencies
+to the user.
+As it turns out, C glue code has a richer view of types than is available
+in the high-level language. Thus the types mt and jt are actually representational types that model C’s low-level view of OCaml and Java data. In particular, OCaml glue code can observe that many high-level types have the same
+physical representation. For example, the value of OCaml type unit has the
+same representation as the OCaml integer 0, nullary OCaml data constructors are represented using integers, and OCaml records and tuples can be
+silently injected into sum types if they have the right dynamic tag. Thus our
+1 Saffire = Static Analysis of Foreign Function InteRfacEs.
+
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:3
+
+representational types model OCaml data as tagged unions of primitive and
+pointer types of various shapes. JNI glue code cannot manipulate Java objects
+directly, but it accesses fields and methods by specifying their names and types
+with C strings, and thus JNI glue code can be polymorphic in ways not allowed
+in Java except with reflection. Our representational types model Java types
+using strings, which may be quantified variables, to label classes, fields, and
+methods.
+O-Saffire and J-Saffire use similar core ideas but are structured slightly
+differently because the OCaml FFI and the JNI provide different data access
+mechanisms. OCaml glue code directly manipulates OCaml data using integer arithmetic and pointer operations and can form pointers into the middle
+of OCaml records and tuples. Moreover, since C (unsurprisingly) provides no
+linguistic support for pattern matching OCaml data types, C glue code must
+explicitly perform dynamic type tag tests. To model these operations, O-Saffire
+uses an iterative, intraprocedural, flow-sensitive dataflow analysis to track integer values, represented with singleton types, as well as offset and tag information. Our dataflow analysis is fairly simple, which turns out to be sufficient
+in practice because most programs use the FFI in a simple way in part to avoid
+making mistakes.
+The OCaml FFI also gives C low-level control over references to the OCaml
+heap, which is managed by the OCaml garbage collector. To avoid memory
+corruption, before a C program calls OCaml (which might invoke the garbage
+collector), it must notify the OCaml runtime system of any pointers it has to the
+OCaml heap. This is easy to forget to do, especially when the OCaml runtime
+is called indirectly. O-Saffire uses effects to track functions that may invoke
+the OCaml garbage collector, and O-Saffire ensures that pointers to the OCaml
+heap are registered as necessary.
+In contrast, JNI glue code must invoke special functions to manipulate
+jobjects, which are opaque, and pointers to the Java heap are automatically
+registered with the garbage collector. JNI functions take as arguments specially formatted strings that identify class, field, and method names as well
+as their types. We have found that JNI glue code uses strings fairly directly,
+for example, string constants are passed around the program without manipulating them (e.g., via substring or concatenation). Thus J-Saffire uses flowinsensitive unification to track string values, which it represents with singleton
+types.
+We have found that, unlike OCaml glue code, JNI glue code often contains
+wrapper functions that group together common operations, and the Java types
+used by these functions depend on the strings passed in by callers. Thus representational types inferred by J-Saffire can model partially specified Java classes
+in which class, field, and method names and type information may depend on
+string variables in the program. During type inference, these variables are
+resolved to constants and replaced with the structured types they represent.
+Moreover, J-Saffire performs polymorphic type inference, including polymorphism in types representing string values, which allows J-Saffire to precisely
+analyze wrapper functions and directly assign universal type signatures to the
+more than 200 functions in the JNI.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:4
+
+•
+
+M. Furr and J. S. Foster
+
+We have proven that restricted versions of O-Saffire and J-Saffire are sound
+modulo certain features of C such as out-of-bounds array accesses and type
+casting.
+We have implemented both O-Saffire and J-Saffire and applied them to a
+set of 11 and 12 benchmarks, respectively. In our experiments, we found many
+outright errors (24 for O-Saffire and 156 for J-Saffire) and suspicious but nonfatal programming mistakes (22 for O-Saffire and 124 for J-Saffire). We have
+reported all of the errors to developers, and they have been confirmed. Both
+O-Saffire and J-Saffire run efficiently in practice and usually take only a few
+second for analysis.
+As far as we are aware, ours is the first work that attempts to check richer
+properties on the foreign language side between two general-purpose programming languages, and we believe that our core ideas are applicable to other FFIs
+as well. Our results suggest that multilingual type inference is a beneficial,
+practical addition to a language with a foreign function interface.
+In summary, the main contributions of this article are the following.
+—We develop multilingual, representational types that embed OCaml and Java
+type information into C in a way that matches C’s low-level view of high-level
+data. As a result, we are able to check that C glue code uses high-level data
+and functions at the right type.
+—We present multilingual type inference systems O-Saffire and J-Saffire for
+the OCaml FFI and the JNI, respectively. Our type systems use singleton
+types to track the values of integers and strings through C glue code. We
+infer these types either using standard unification, which is sufficient for the
+JNI, or using a flow-sensitive dataflow analysis, which tracks integer values,
+offset, and tag information for the OCaml FFI. Additionally, O-Saffire uses
+effects to ensure that garbage collector invariants are obeyed in the foreign
+language, and J-Saffire supports polymorphism for JNI functions and userdefined wrapper functions.
+—We show that restricted versions of O-Saffire and J-Saffire are sound so
+that multilingual programs that pass our type systems will not violate type
+safety.
+—We describe implementations of O-Saffire and J-Saffire, along with experiments in which we apply our implementations to a number of benchmarks.
+We found many bugs and questionable coding practices as a result.
+O-Saffire and J-Saffire were both presented separately in earlier conference
+versions [Furr and Foster 2005a; Furr and Foster 2006b]. The current article
+gives a more cohesive presentation of both systems, comparing and contrasting them as they are developed. This article also includes checking versions of
+O-Saffire and J-Saffire, which were omitted from the conference papers, and
+a more algorithmic presentation of type inference. We include sketches of our
+soundness theorems, including a detailed operational semantics; these theorems were only stated without proof and without semantics in the conference
+versions. Our discussion of the JNI inference system includes more details on
+methods and polymorphism. Finally, we include a new discussion section that
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:5
+
+Fig. 1. OCaml and C source type languages.
+
+explores the relationship between the two systems, discusses the applicability
+of these ideas to other FFIs, and sketches future work.
+2. BACKGROUND
+In a typical use of an FFI, the high-level language invokes a C routine, which
+in turn invokes a system or user library routine. The C routine usually contains glue code to manipulate data from the high-level language and translate
+between the different data representations of the two languages. Glue code is
+structured somewhat differently for OCaml and Java since each provides a different view of foreign data types. OCaml’s FFI exposes a very low-level view of
+OCaml types, corresponding to exactly how they are represented in memory. To
+use the OCaml FFI, the C programmer must directly manipulate OCaml values using bit-shifting operations and pointer dereferences. OCaml provides C
+macros for these purposes, but their use is not mandatory and does not provide
+any safety checking. The JNI, on the other hand, provides a more opaque interface. Java objects are modeled as pointers that must be passed to JNI functions
+to be manipulated, and classes, fields, methods are all described using strings.
+The JNI includes over 200 functions, and it is easy to call the wrong function
+or to make typos in string-valued parameters neither of which produces a compiler warning. We begin by discussing how each interface is typically used by a
+C programmer.
+2.1 The OCaml FFI
+Figure 1 shows the basic OCaml and C source language types. OCaml types
+include unit and int types, product types (records or tuples), and sum types.
+Sums are composed of type constructors S, which may optionally take an argument. OCaml also includes types for updatable references and functions. Other
+OCaml types, such as objects and polymorphic variants, are not supported by
+our system; see Section 5.1 for a discussion. C includes types void, int, pointer
+types constructed with postfix ∗, and functions. C also includes the type value
+to which all OCaml data is assigned.
+To invoke a C function called c name, an OCaml program must contain a
+declaration of the form
+external f : mltype = “c name”
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:6
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 2. Example OCaml type.
+
+where mltype is an OCaml function type. When the OCaml program calls f ,
+the OCaml runtime invokes the corresponding C function declared as
+value c name(value arg1, . . . , value argn);
+Although different OCaml types have different physical representations,
+there is no protection in C from mistakenly using data at the wrong type. As an
+example, consider the OCaml sum type declaration shown in Figure 2(a). This
+type has nullary (no-argument) constructors X and Z and nonnullary constructors W and Y.
+Each nullary constructor in a sum type is numbered from 0 and is represented
+in memory directly as that integer as shown in Figure 2(b). Thus to C functions,
+nullary constructors look just like OCaml ints, for example, X:t and 0:int are
+identical. Additionally, the value of type unit is also represented by the OCaml
+integer 0.
+The low-order bit of such unboxed values is always set to 1 to distinguish
+them from pointers. C routines use the macro Val int to convert to tagged
+integers and Int val to convert back. There are no checks, however, to ensure
+that these macros are used correctly or even at all. In particular, in the standard
+OCaml distribution, the type value is a typedef (alias) of long. Thus one could
+mistakenly apply Int val to a pointer or apply Val int to a value. We found
+several examples of these sorts of mistakes in our experiments.
+Each nonnullary constructor in a sum type is also numbered separately from
+0. These constructors are represented as boxed values or pointers to structured
+blocks on the heap. A structured block is an array of value s preceded by a
+header that contains, among other things, a tag with the constructor number.
+Figure 2(b) shows the representations of W and Y for our example type t. Products that are not part of a sum are represented as structured blocks with tag
+0. For example, W (1,2) and (1,2) both have the same representation.
+Boxed values are manipulated using the macro Field(x,i), which expands
+to *((value*)x+i), that is, it accesses the ith element in the structured block
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:7
+
+Fig. 3. Java and C source type languages.
+
+pointed to by x. There are no checks to prevent a programmer from applying
+Field to an unboxed value (notice the type cast in the macro expansion) or
+from accessing past the end of a structured block.
+OCaml provides several macros for testing tags and for checking boxedness
+of a value . We illustrate these tests in Figure 2(c), which contains glue code to
+perform pattern matching on a C value x of OCaml type t. The macro Is long()
+on line 1 checks whether x is a pointer by examining its low-order bit. If it is
+unboxed, Int val() on line 2 is used to extract the tag, and thus, on line 3, we
+know x is X, and, on line 5, we know it is Z. Otherwise, we know on line 8 that x
+is boxed, and so Tag val() is used to extract the tag from the structured block.
+Then on line 10, since x must be constructed from W, we may access the second
+field of the structured block, and, on line 13, x is Y, and so we may access its
+first field.
+Notice that because C has no linguistic support for OCaml pattern matching,
+what would be a simple match expression in OCaml has been expanded into
+its constituent parts with all of the dynamic tag tests explicitly coded by the
+programmer. This is a common phenomenon in FFIs where operations that
+have direct syntactic support in one language must be clumsily reproduced in
+the other, and we will see a similar phenomenon in the JNI. Analyzing this
+kind of pattern-matching code is the principal challenge in type inference for
+OCaml glue code.
+In addition to using OCaml data at the correct type, C FFI functions that
+call the OCaml runtime must notify the garbage collector of any C pointers to
+the OCaml heap. To do so, C functions use macros CAMLparam and CAMLlocal
+to register parameters and locals, respectively. If a function registers any such
+pointers, it must call CAMLreturn upon exiting to release the pointers. We have
+found in our experiments that it is easy to forget to use these macros and
+discovering these errors with testing is difficult.
+2.2 The Java FFI (JNI)
+Figure 3 shows the basic Java source language types, along with the C
+types used by the FFI. Java includes void and integer types as well as class
+types that contain fields and methods. The base C type language is as before, but this time it is extended to include the type jobject for Java objects, and jfieldID and jmethodID, which identify fields and methods in the
+JNI.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:8
+
+•
+
+M. Furr and J. S. Foster
+
+Unlike the OCaml FFI, which exposes OCaml data representations to C,
+users of the JNI do not directly manipulate Java data. However, using the JNI
+is still complicated, and it is easy to make many kinds of mistakes. To call a
+C function from Java, the programmer first declares a Java method with the
+native keyword and no body, for example,
+package edu.cs.umd;
+class Foo { native void bar(int x, float y); }
+When the native method bar is invoked, the Java runtime finds and invokes the
+correspondingly-named C function. Unlike OCaml, the C function name is not
+up to the programmer but is strictly specified by the JNI. To avoid ambiguity,
+the name includes not only the Java method name, but also its enclosing class
+and package. If the method is overloaded, then the types of the parameters
+are appended to its name using field descriptors, which are discussed in the
+following. For our example, assuming bar is overloaded, the corresponding C
+function must be
+void Java_edu_cs_umd_Foo_bar__IF(jint x, jfloat y);
+As this example shows, the C function names can be long and cryptic and are
+easy to misspell, and as the JVM dynamically loads C libraries at runtime,
+there is no check during compilation or linking to ensure that these names are
+correctly specified.
+Unlike in the OCaml FFI, Java and C share the same representation for
+primitive types such as integers and floating point numbers. Thus C glue code
+requires no special support to manipulate them—the types jint and jfloat
+used previously are simply typedefs of int and float. In contrast, Java objects,
+such as instances of Object, Class, or int[], are all represented with a single
+opaque C type jobject, often an alias of void *, and glue code invokes functions
+in the JNI to manipulate jobjects. For example, to get the object Point.class,
+which represents the class Point, a programmer might write the following C
+code:2
+jobject pointClass = FindClass("java/awt/Point");
+Here the FindClass function looks up a class by name. The resulting object
+pointClass is used to access fields and methods as well as create new instances
+of class Point. For example, to access a field, the programmer next writes
+jfieldID fid = GetFieldID(pointClass, "x", "I");
+After this call, fid contains a representation of the location of the field x with
+type I (a Java int) in class Point. This last parameter is a terse encoding of Java
+types called a field descriptor [Lindholm and Yellin 1997]. Other examples are
+F for float, as we saw earlier, [I for array of integers, and Ljava/lang/String;
+for class String. Notice this is a slightly different encoding of class names than
+2 The JNI functions discussed in this section are actually invoked slightly differently and take an
+
+additional parameter as discussed in Section 5.3.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:9
+
+Fig. 4. JNI wrapper function example.
+
+used by FindClass, which omits the initial L and trailing semicolon. Our implementation enforces this difference, but we omit it from our formal system for
+simplicity.
+Finally, to read this field from a Point object p, the programmer writes
+jobject p = ...;
+int y = GetIntField(p, fid);
+The function GetIntField returns an int, and there is one such function for
+each primitive type and one function GetObjectField for objects.
+Thus we can see that a simple field access that would be written int y = p.x
+in Java requires three JNI calls, each corresponding to one internal step of the
+JVM: getting the type of the object, finding the offset of the field, and retrieving
+its contents. This is similar to what happens with OCaml pattern matching in
+C, which is also expanded out into its constituent parts in glue code.
+Moreover, while a Java compiler only accepts the code y = p.x if it is type
+correct, errors in C glue code, such as typos in the string java/awt/Point, x,
+or I, will produce a runtime error. There are also several other places where
+mistakes could hide. For example, the programmer must be careful to maintain
+the dependence between the type of x and the call to GetIntField. If the type of
+x were changed to float, then the call must also be changed to GetFloatField,
+something that is easy to overlook. Moreover, since pointClass and p both have
+type jobject, either could be passed where the other is expected with no C compiler warning, which we have seen happen in our benchmarks. Invoking a Java
+method is similar to extracting a field. First the programmer calls GetMethodID,
+which accepts a string that encodes a list of parameter types to retrieve a
+methodID. Then they call the appropriate dispatch function, Call<Type>Method,
+where <type> is the return type of the method. Like the field functions above,
+there is one such function for each primitive Java type and one for objects.
+One common pattern we have seen in JNI code is wrapper functions that
+specialize JNI routines to particular classes, fields, or methods. Figure 4 shows
+an example wrapper function my getObjectField that extracts a field of type
+Object from an object. This routine invokes the JNI function GetObjectClass,
+which returns an object representing the class of its argument (as opposed to
+FindClass, which looks up a class by name). The contents of the field are extracted via a call to GetObjectField, which behaves the same as GetIntField
+but returns a Java object. Calling my getObjectField is safe if the first parameter has an Object field whose name is given by the second parameter. Thus
+this function is parameterized by the object from which to extract the field and
+by the name of the field but not its type. Since this wrapper function might
+be called multiple times with different objects and different field names, to
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:10
+
+•
+
+M. Furr and J. S. Foster
+
+precisely analyze this code we need polymorphism, not only in the types of objects but also in the values of string parameters. Note that our experience with
+OCaml glue code shows that it most often is not polymorphic, and thus our
+OCaml FFI type inference system is monomorphic.
+Finally, like OCaml, Java is a garbage collected language. However, unlike
+OCaml, Java does not require the C programmer to register all local C references to Java objects. Instead, since all such references are returned from JNI
+function calls, they are automatically registered until the C code returns execution to the JVM. An early release mechanism is also available. Thus the JNI
+provides a layer of safety to the C programmer in exchange for (possibly) less
+efficient garbage collection while in C code.
+2.3 Saffire
+As the previous discussion illustrates, using an FFI correctly requires careful programming, and there is little or no compiler support for preventing
+errors. The goal of Saffire is to address this problem by providing compiletime type checking across these FFIs. In both the OCaml FFI and the JNI,
+most of the work occurs in C glue code rather than in the high-level language
+and so the focus of Saffire is on analyzing glue code. There are several major
+challenges.
+— In these FFIs, most or all foreign types are conflated to only one C type, either value for OCaml or jobject for Java. Thus our first step is to develop
+an extended type system to make the high-level language types available to
+our analysis of glue code. In particular, Saffire will infer types of the form
+mt value and jt jobject where mt and jt are OCaml and Java types, respectively.
+— C glue code can use data in ways either not possible or not common in the
+high-level language. For instance, C glue code can freely use the OCaml integer 0 where types unit, int, or an unboxed nullary constructor are expected,
+and the pattern-matching code in Figure 2(c) can be applied to any data type
+with the same structure even if it has a different name (or, in fact, even if it
+has fewer constructors). In the JNI, the wrapper function in Figure 4 can be
+applied to any object with the appropriate integer field, which could only be
+achieved with reflection within Java. Our solution is to make types mt and
+jt richer than source-level types mltype and jtype so that we can model C’s
+view of the high-level language types directly.
+— Determining how C code uses data from the high-level language requires
+tracking detailed information that depends on the particular FFI programming idioms. For example, to analyze the pattern-matching code in
+Figure 2(c), we need to track the values of integers and model conditional
+branches precisely, and to compute the type of Field(x,i), we need to know
+the value of pointer offset i. The JNI instead uses strings to find classes,
+fields, and methods and tends to use polymorphic wrapper functions more.
+Our approach is to use the appropriate style of analysis for each system.
+For the OCaml FFI, we use a monomorphic dataflow analysis to track
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:11
+
+Fig. 5. Architecture of O-Saffire and J-Saffire.
+
+integers and pointers, and, for the JNI, we use a polymorphic unificationbased analysis to track strings.
+In the next sections, we present two type inference systems, O-Saffire for the
+OCaml FFI (Section 3) and J-Saffire for the JNI (Section 4). Figure 5 gives a
+overview of the architecture of the systems, which is the same for both. The
+input is a program written in OCaml and C or Java and C. We begin by extracting high-level type information from the source code and standard library code,
+and we create a database containing all of the high-level language types. (Our
+implementation of J-Saffire actually creates this database on demand, but the
+concept is the same.) Since OCaml and Java are both type and memory safe,
+we know that these types are used correctly in the high-level source code. We
+then take the C source code and analyze it, inferring the shapes of the highlevel types used by the C code. Then we compare the inferred types against the
+types declared in OCaml and Java in the type repository and issue warnings if
+there are any type errors. Note that we need to perform inference rather than
+pure checking to account for intermediate functions that are not directly called
+from the high-level language. For the OCaml FFI, we also check that pointers
+to the OCaml heap are registered with the garbage collector as we perform type
+inference.
+3. O-SAFFIRE: TYPE INFERENCE FOR THE OCAML FFI
+In this section, we present O-Saffire, our multilingual type inference system
+for the OCaml FFI. As discussed in Section 2.3, O-Saffire has two phases:
+first we extract type information from OCaml, and then we perform type inference on glue code to find any inconsistencies with the extracted OCaml types.
+We begin our presentation with the second phase, first developing our multilingual type language (Section 3.1) and a type checking system for glue code
+(Section 3.2), and then proving it sound (Section 3.3). Finally, we present the
+type extraction process and give an algorithmic presentation of type inference
+(Section 3.4). Sections 5.1 and 5.2 discuss our implementation and experimental
+results.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:12
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 6. Simplified C grammar.
+
+Source Language. Figure 6 presents the C-like language we use for glue
+code in our formal system. This language is based on the intermediate representation of CIL [Necula et al. 2002] which we used in our implementation. In
+this language, expressions e are side-effect free. We include integers n, pointer
+dereferences ∗e, as well as the usual arithmetic operators. L-values lval are
+the restricted subset of expressions that can appear on the left-hand side of an
+assignment, namely, variables x and pointer dereferences.
+Expressions include pointer arithmetic e1 +p e2 for computing the address
+of offset e2 from the start of the structured block pointed to by e1 . In actual
+C source code, pointer arithmetic can be distinguished from other forms using
+standard C type information. Our type system currently only supports pointer
+arithmetic on value types since our focus is on FFI safety not general C type
+safety which can be addressed with other techniques [Chandra and Reps 1999;
+Necula et al. 2002]. Our formal system allows value s to be treated directly
+as pointers, though in C they must first be cast to value * . We also include
+the Val int and Int val conversion functions as primitives. Note that we omit
+the address-of operation & . Variables whose addresses are taken are treated
+as globals by the implementation and uses of & that interact with * can be
+eliminated. Finally, the code in our benchmark suite rarely stores foreign data
+directly into C struct types, and thus we omit C structures from our formal system for simplicity. Implementation details about these heuristics and omitted
+C constructs are discussed in Section 5.1.
+In our source language, statements s can be associated with a label L, and
+sequencing is written with a semicolon. We also have assignment statements
+lval := e and lval := f (e, . . . , e), the latter of which stores in lval the result of
+invoking function f with the specified arguments. A branch goto L unconditionally jumps to the statement labeled L; we assume that labels are unique
+within a function, and jumping across function boundaries is not allowed. A
+conditional branch if e then L jumps to the statement labeled L if the integer
+e evaluates to a nonzero number. Loop constructs and switch statements are
+omitted because they can be transformed into if and goto statements.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:13
+
+Fig. 7. OCaml/C multilingual type language.
+
+We include three primitive conditional tests for inspecting a value at runtime. The conditional if unboxed (x) checks to see whether x is not a pointer,
+that is, its low-order bit is 1. The conditional if sum tag (x) tests the runtime tag
+of a structured block pointed to by x, and if int tag (x), tests the runtime value
+of unboxed variable x. In actual C source code, these tests are made by applying
+Is long , Tag val , or Int val , respectively, and then checking the result.
+Statements also include return e, which exits the current function and returns the value of e. The special form CAMLreturn is used for returning from a
+function and releasing all variables registered with the garbage collector. This
+statement should be used in place of return if and only if local variables have
+been registered by CAMLprotect, our formalism for CAMLlocal and CAMLparam .
+We restrict occurrences of CAMLprotect to the top of a function so that the set
+of registered variables is constant throughout the body of a function.
+Programs P consist of a sequence of function declarations and definitions
+f . We omit global variables, and our implementation forbids (via a warning
+message) value s from being stored in them and does not check if they are
+correctly registered with the garbage collector. We assume all local variables
+are defined at the top level of the function.
+3.1 Multilingual Types
+We begin our discussion by developing multilingual, representational types to
+model C’s view of OCaml data. Figure 7(a) presents the basic flow-insensitive
+types in our multilingual type language which integrates and generalizes the
+basic OCaml and C types in Figure 1. Our grammar for C types ct embeds
+extended OCaml types mt in the type value so that we can track OCaml type
+information through C. Additionally, we augment function types with an effect
+GC to track which functions may cause a garbage collection as discussed in the
+following. Our grammar for OCaml types mt includes type variables α, which
+we treat monomorphically and will be solved for in our inference system as well
+as function types.
+All of the other OCaml types from Figure 1(a)—unit, int, products, sums,
+and references—are modeled with a representational type (, ). In this type,
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:14
+
+•
+
+M. Furr and J. S. Foster
+
+ describes the unboxed values the type may represent. For a sum type, 
+is an exact value n counting the number of nullary constructors of the sum.
+Integers have the same physical representation as nullary constructors but
+could have any value so for integers,  is . In our inference algorithm,  may
+also be a variable ψ to be solved for. The  component of a representational
+type describes its possible boxed values, if any, that is, it describes the shapes
+of the structured blocks the type represents.  is a sequence of products ,
+one for each nonnullary constructor of the type. The position of each  in the
+sequence corresponds to its constructor tag number, and each  itself contains
+the types of the elements of the structured block. For example, the OCaml type
+t in Figure 2(a) has representational type
+(2, (, ∅) × (, ∅) × ∅ + (, ∅) × ∅ + ∅)
+Here,  = 2 since t has two nullary constructors (X and Z), and  contains
+two product types, the integer pair type (, ∅) × (, ∅) × ∅ for W, and the boxed
+integer type (, ∅) × ∅ for Y.
+Notice in Figure 2(c) that our C code to examine a value of type t does not
+by itself fully specify the type of x. For example, the type could have another
+nullary constructor or a nonnullary constructor that is not checked for. Thus
+our grammars for  and  include variables σ and π that range over sums and
+products [Rémy 1989] which we use to allow sum and product types to grow
+during inference. Only when an inferred type is unified with an OCaml type
+can we know its size exactly.
+Our type language also annotates each function type with a garbage collection effect GC, which can either be a variable γ (used in inference), gc if
+the function may invoke the OCaml runtime (and thus the garbage collector),
+or nogc if it definitely will not. GC naturally forms the two-point lattice with
+order nogc  gc. Note that we reserve ≤ for the total ordering over the integers and use  for other partial orders. O-Saffire ensures that all necessary
+variables are registered before calling a function with effect gc.
+Flow-Sensitive Types. Recall the example code in Figure 2(c) for testing
+the tags of a value . In order to analyze such a program, we need to track
+information that may differ at each program point, for example, on each of the
+branches after a boxedness test, we know whether or not the tested value is
+boxed. Thus, O-Saffire extends the basic types ct to types of the form ct{B, I, T },
+where B tracks boxedness (i.e., the result of if unboxed ), I tracks an offset into
+a structured block, and T tracks the type tag of a structured block or the value
+of an integer. In O-Saffire, B, I , and T are flow-sensitive, while ct is flowinsensitive.
+Figure 7(b) gives grammars for B, I , and T , which form lattices with the
+orders ⊥  boxed   and ⊥  unboxed   for B, and ⊥  n   for I
+and T . In our type rules,  is used for an unknown type, and ⊥ is used for
+unreachable code, for example, following an unconditional branch. We extend
+arithmetic on integers to offsets I as  aop n = , ⊥ aop I = ⊥, and similarly
+for T . We also extend the lattice orders to types ct{B, I, T } in the natural way.
+We define ct{B, I, T }  ct {B , I , T } if ct = ct , B  B , I  I , and T  T .
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:15
+
+We use to denote the least upper bound operator, and we extend to types
+ct{B, I, T } similarly. Notice that B, I , and T do not appear in the grammar for
+ct in Figure 7, and thus we do not track them for values stored in the heap. In
+our experience, this is sufficient in practice.
+The meaning of ct{B, I, T } depends on ct. If ct is value, then B represents
+whether the data is boxed or unboxed. If B is unboxed, then T represents the
+value of the data (which is either an integer or nullary constructor), and I is
+always 0. For example, on line 3 of Figure 2(c), x has type ct{ unboxed, 0, 0} since
+it represents the constructor X. If B is boxed, then T represents the tag of the
+structured block and I represents the offset into the block. For example, on line
+12 of Figure 2(c), x has type ct{ boxed, 0, 1} since it represents constructor Y.
+Otherwise, if ct is int, then B is , I is 0, and T tracks the value of the
+integer, either ⊥ for unreachable code, a known integer n, or an unknown value
+. For example, the C integer 5 has type int{, 0, 5}. Finally, for all other ct
+types, B = T =  and I = 0.
+We say that a value is safe if it is either unboxed or a pointer to the first
+element of a structured block, and we say that any other ct that is not value is
+also safe. In O-Saffire, data with a type where I = 0 is safe. A safe value can be
+used directly at its type, and, for boxed types, the header can be checked with
+the regular dynamic tag tests. This is not true of a value that points into the
+middle of a structured block. O-Saffire only allows offsets into OCaml data to be
+calculated locally within a function and so we require that any data passed to
+another function or stored in the heap is safe. Since all data passed from OCaml
+is safe, this property also holds for functions called directly from OCaml.
+3.2 Type Checking Glue Code
+We now present O-Saffire’s type checking rules for C glue code. In our type
+checking rules, we assume we have concrete multilingual type information for
+the program, meaning that types in general have no variables (e.g., sum and
+product types all end with ∅). We divide our type rules into those for expressions
+and those for statements.
+Type Checking for Expressions. Figure 8 give our type checking rules for
+expressions. These rules include type environments , which map variables to
+types ct{B, I, T }, and a protection set P , which contains those variables that
+have been registered with the garbage collector by CAMLprotect. Our rules for
+expressions prove judgments of the form , P
+e : ct{B, I, T }, meaning that
+in type environment and protection set P , the C expression e has type ct,
+boxedness B, offset I , and tag/value T .
+We discuss the rules briefly. In all of the rules, we assume that the program
+is correct with respect to the standard C types and that full C type and ct
+type information is available. Thus some of the rules apply to the same source
+construct but are distinguished by the types of subexpressions.
+The rule (INT EXP) gives integers the appropriate type, and (VAR EXP) looks
+up the type of a variable in the type environment. (AOP EXP) performs the
+operation aop on T and T in the types. (VAL DEREF EXP) extracts a field from
+a structured block. Here e must have a known tag m and offset n so that we
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:16
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 8. Type checking for C expressions.
+
+can determine the appropriate field type. Notice that the resulting B and T
+information is  since they are unknown, but the offset is 0 since we will get back
+safe OCaml data. Rule (VAL DEREF BOXED EXP) handles the case when B and T
+are , which occurs when records or tuples are accessed directly without first
+testing their boxedness. This rule requires that the type have one, nonnullary
+constructor and no nullary constructors. We could similarly add a rule when B
+is boxed but T is , which is included in our implementation, but this adds no
+interesting issues.
+The rule (C DEREF EXP) checks a C pointer dereference. Notice that B and T
+are always  for C pointers. (ADD C EXP) performs pointer arithmetic on C types
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:17
+
+other than value. Note that in order to ensure soundness, we only allow pointer
+arithmetic on C pointers with an offset of 0 in our formal system. (VAL ADD EXP)
+computes an offset into a structured block. Notice that it must be possible to
+safely dereference the resulting pointer as the offset cannot be larger than the
+width of the block. While this is not strictly necessary (we could wait until the
+actual dereference to enforce the size requirement), it seems like good practice
+not to form invalid pointers. We use (VAL ADD BOXED EXP) for computing offsets
+into tuples that are not part of sums. Similar to (VAL DEREF BOXED EXP), we allow
+B and T to be  but require that the type have one nonnullary constructor and
+no nullary constructors.
+(VAL INT EXP) and (INT VAL EXP) translate between C and OCaml integers.
+When we form an OCaml integer from a C integer, we require T + 1 ≤ ,
+meaning that the resulting representational type have at least T + 1 constructors ( is the count of the constructors, which are numbered from 0). Similar to
+(VAL DEREF BOXED EXP), (INT VAL UNBOXED EXP) handles the case where a value
+is used immediately as an integer without a boxedness test.
+Finally, (APP) type checks a function call. Technically, function calls are not
+expressions in our grammar, but we put this rule here to make the rules for
+statements a bit more compact. To invoke a function, the actual and the formal
+types must match. Notice that the Bi and Ti are discarded, but we require that
+all actual arguments are safe (Ii = 0). Additionally, we require that GC 
+GC since if f might call the garbage collector, so might the current function
+cur func where the type of cur func is bound in the environment at function
+definition.
+The last hypothesis of (APP) requires that if this function can call the garbage
+collector, then every variable that points into the OCaml heap and is still live
+must have been registered with a call to CAMLprotect. Here ValPtrs( ) is the set
+of all variables in with a type (, ) value where || > 0, that is, the set of all
+variables that are pointers into the OCaml heap. The set live( ) is all variables
+live at the program point corresponding to . We omit the computation of live
+since it is standard.
+Type Checking for Statements. Unlike our type rules for expressions, which
+have no side effects, our type rules for statements are flow-sensitive, which
+we model by allowing the type environment to vary from one statement to another even in the same scope. This allows us to precisely track facts about local
+variables. To support branches, our rules use a label environment G, mapping
+labels to type environments where G(L) is the environment at the beginning of
+statement L.
+Since type environments are flow-sensitive, some of our type rules need to
+constrain type environments to be compatible with each other. Let dom( ) =
+dom( ). Then we define  if (x)  (x) for all x ∈ dom( ), and we define
+(
+)(x) = (x)
+(x) for all x ∈ dom( ). Also, for the fall-through case for an
+unconditional branch, our rules need to reset all flow-sensitive information to
+⊥ to remove all flow-sensitive constraints from the type environment. This is
+required so that the types in the environment will correctly join with those in the
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:18
+
+•
+
+M. Furr and J. S. Foster
+
+incoming environment of a subsequent label statement. We define reset( )(x) =
+ct{⊥, ⊥, ⊥}, where (x) = ct{B, I, T }.
+The top part of Figure 9 gives our type rules for statements, which prove
+judgments of the form , G, P
+s, , meaning that in type environment ,
+label environment G, and protection set P , statement s type checks, and after
+s, the new environment is .
+(SEQ STMT) is straightforward, and (LBL STMT) and (GOTO STMT) constrain
+the type environment G(L) to be compatible with the current environment .
+(RET STMT) checks that the type of e is the same as the return type of the current
+function. We also require that e is safe and that P is empty so that no variables were registered with the garbage collector. (CAMLRET STMT) is identical
+to (RET STMT) except that we require P to be nonempty since it must be paired
+with at least one CAMLprotect declaration. In each of (GOTO STMT), (RET STMT),
+and (CAMLRET STMT), we use reset to compute a new unconstrained type environment following these statements since they are unconditional branches.
+(LSET STMT) typechecks writes to memory. We abuse notation slightly and
+allow e3 on the right-hand side to be either an expression or a function call,
+which is checked with rule (APP) in Figure 8. Notice that since we do not model
+such heap writes flow-sensitively, we require that the type of e3 is safe and
+that the output type environment is the same as the input environment. In
+contrast, (VSET STMT) models writes to local variables, which are treated flowsensitively. Again, we abuse notation and allow the right-hand side to be a
+function application checked with (APP). We also perform an extra check to
+ensure that any variable registered with the garbage collector is safe.
+The rule (IF STMT) models a branch on a C integer. (IF UNBOXED STMT) models
+one of our three dynamic tag tests. At label L, we know that local variable x
+is unboxed, and in the else branch (the fall-through case), we know x is boxed.
+We can only apply if unboxed to expressions known to be safe. In particular,
+in the else branch, we must know the offset of the boxed data is 0 to allow us
+to do further tag tests.
+Similarly, in (IF SUM TAG STMT), we set x to have tag n at label L. Notice that
+this test is only valid if we already know (e.g., by calling if unboxed ) that x
+is boxed and at offset 0 since otherwise the header cannot be read. In the else
+branch, nothing more is known about x. In either case, we require that if this
+test is performed, then mt must have at least n possible tags. While omitting
+this last requirement would not create a runtime error, it may imply a coding
+error since the program would be testing for more constructors than are defined
+by the type. Therefore our heuristic is to warn about this case by including that
+clause in our rules. In (IF INT TAG STMT), variable x is known to have value n at
+label L. Analogously with the previous rule, we require x to be unboxed, and
+with the constraint n + 1 ≤ , we require that x must have at least n+1 nullary
+constructors. Our implementation also includes variations on (IF SUM TAG STMT)
+and (IF INT TAG STMT) that allow B =  in exchange for stricter constraints on
+mt, but we omit these rules since they add no new issues.
+The bottom part of Figure 9 gives type rules for declarations and definitions.
+For declarations, we use judgments of the form , P
+s, , P , where
+and
+P are the output environment and protection set. (VAR DECL) binds a local
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:19
+
+Fig. 9. Type checking for C statements, declarations, and definitions.
+
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:20
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 10. Type rules for values and the empty statement.
+
+variable to the environment, and the protection set does not change. Here we
+define |·| : ct → ctype to be the operation of removing mt annotations from
+ct’s to yield ctypes, defined in the natural way. (CAMLPROTECT DECL) takes a
+variable in the environment and adds it to the protection set P .
+The last two rules, (FUN DECL) and (FUN DEFN), handle function declarations
+and definitions. We again use the |·| operator to check that the source types of
+the parameters match the annotated ct types. (FUN DECL) adds the type of f to
+the output environment, checking that it matches any previous declarations.
+(FUN DEFN) checks the type of a function definition. Note that for simplicity
+we assume all functions are declared before use, and we check the type of the
+function matches the type previously assigned to it. We also bind cur func to
+the type of the current function, and we assume that all parameters are safe,
+which is enforced in (APP).
+3.3 Soundness
+We now sketch a proof of soundness for a slightly simplified version of our multilingual type checking system that omits function calls, and CAMLprotect and
+CAMLreturn. We believe these features can be added without difficulty, though
+with more tedium. We omit some details of the proofs, which can be found in
+full in a companion technical report [Furr and Foster 2006a].
+The first step is to extend our grammar for expressions to include new semantic values: C locations l , OCaml integers {n}, and OCaml locations {l + n},
+which represents a pointer to the OCaml heap with base address l and offset
+n. We write {l + −1} for the location of the type tag in the header of an OCaml
+block. We define the syntactic values v as these three forms plus C integers n:
+v ::= l | {n} | {l + n} | n.
+As is standard, in our soundness proof, we overload so that in addition to
+containing types for variables, it contains types for C locations and OCaml locations. We also add the empty statement () to our grammar for statements.
+The type checking rules for these new forms are given in Figure 10. Rules
+(EMPTY STMT), (INT EXP), and (LOC EXP) are as expected. In rule (ML INT EXP),
+we assign an OCaml integer {n} a representational type. Note that although
+our type system does use  at joins, otherwise the system does not include subsumption. Thus to support preservation, we integrate a notion of subsumption
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:21
+
+into (ML INT EXP) to allow {n} to be assigned a more general type. This rule
+requires that {n}’s type have at least n + 1 constructors but places no constraint
+on the boxed component of the type. Similarly, rule (ML LOC EXP) assigns {l +
+n} its type in , which must be a representational type that has a tag m where
+the mth component of the sum has a product with at least n components. In
+our proof, our inductive hypothesis will add additional conditions on so that
+{l + n} is consistent with the tag {l + −1}.
+Figure 11(a) defines reduction contexts R, which specify the order of evaluation in our semantics. Here, each expression contains a hole [] that shows what
+must be evaluated next. Statements such as if unboxed (x) are not present as
+they do not contain any subexpressions. We use the notation R[e] to mean the
+reduction context R where the hole is replaced by e.
+Our operational semantics uses three stores to model updatable references:
+SC maps C locations to values, SML maps OCaml locations to values, and V maps
+local variables to values. Our small-step operational semantics for expressions
+is shown in Figure 11(b), which defines a reduction relation of the form
+SC , SML , V , e → SC , SML , V , e .
+Here, an expressions e in state SC , SML , and V , reduces to a new expression e
+and yields new stores SC , SML , and V following the style of Felleisen and Hieb
+[1992]. We define →∗ as the reflexive, transitive closure of →.
+We discuss the reduction rules briefly. Rule (o-var) looks up a variable in the
+variable store V . (o-ml-add) performs pointer arithmetic on a OCaml location.
+Similarly, (o-c-add) performs pointer arithmetic on a C location. However, as
+mentioned earlier, we only allow offsets of 0 for C locations in this system.
+(o-c-deref) and (o-ml-deref) each dereference a location by looking up its value
+in the appropriate store. (o-aop) performs arithmetic on two C integers, and
+(o-valint) and (o-intval) convert between C integers and OCaml integers.
+Our operational semantics for statements is shown in Figure 11(c). To model
+branches, we also include a global statement store D, which maps labels L
+to a sequence of statements s. That is, D(L) returns the sequence of statements that would be executed after a jump to L. The rule (o-label) evaluates
+to the statement following a label. (o-goto) unconditionally jumps to the label
+L, looking up the next statement to execute in D. (o-c-assign), (o-ml-assign),
+and (o-var-assign) update a C location, OCaml location, and local variable,
+respectively, by modifying the store SC , SML , or V , as appropriate. (o-if) jumps
+to label L when n is nonzero, and (o-if2) executes the fall-through statement
+otherwise. The remaining conditional rules are similar, jumping to label L when
+x has the correct dynamic tag (o-ifsum), the correct integer value (o-ifi), or is
+unboxed (o-iflong).
+Since contains type information about the stores, we must ensure that
+this information correctly types values in the stores. Therefore, we introduce a
+notion of compatibility.
+Definition 3.1 (Compatibility).
+V , written ∼ SC , SML , V , if
+
+is said to be compatible with SC , SML , and
+
+(1) dom( ) = dom(SC ) ∪ dom(SML ) ∪ dom(V );
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:22
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 11. Small-step semantics rules.
+
+(2) for all l ∈ SC , there exists ct such that
+l : ct∗{, 0, } and
+SC (l ) :
+ct{, 0, };
+(3) for all {l + n} ∈ SML , there exist , , j , k, m, 0 , . . . ,  j , and mt0 , . . . , mtk
+such that
+—
+{l + n} : (, ) value{ boxed, n, m}
+—  = 0 + · · · +  j , m ≤ j
+— m = mt0 × · · · × mtk , n ≤ k
+—
+SML ({l + n}) : mtn value{, 0, }
+— SML ({l + −1}) = m;
+(4) for all x ∈ V ,
+V (x) : (x).
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:23
+
+This definition first ensures that every location in each of our stores is given
+a type by . Second, it requires that the types of all C locations correctly correspond to the type of the value to which they point. Third, an OCaml location
+{l + n} must have the correct type: it must point to a sum type with at least m
+nonnullary constructors, the mth constructor must be a structured block with
+header tag m and contain at least n values, and the nth value must have the
+same type as the value stored at SML ({l + n}). Finally, the value stored in a
+variable x must have the same type as x itself.
+We begin by showing that given any well-typed expression that is not a
+value, one of the reduction rules from Figure 11(b) applies, and the result of the
+reduction preserves the type of the expression.
+LEMMA 3.2 (PROGRESS AND PRESERVATION FOR EXPRESSIONS). If e is an expression and
+e : ct{B, I, T } and ∼ SC , SML , V , then either e is a value or
+there exists e such that
+(1) SC , SML , V , e → SC , SML , V , e , and
+(2)
+e : ct{B, I, T }.
+PROOF SKETCH. Proceed by induction on the structure of e. If e has a subexpression that is reduced, then the conclusion holds by induction. Otherwise we
+assume all subexpressions are values and proceed by case analysis. If e = x,
+then by compatibility of and V , we can apply (o-var) and preservation holds.
+If e = ∗e1 , we have three possibilities, depending on which type rule applies.
+If (C DEREF EXP) applies, then e1 is a C pointer, and by compatibility with SC
+we can reduce using (o-c-deref) and preservation holds. Otherwise either
+(VAL DEREF EXP) or (VAL DEREF BOXED EXP) applies, and, in both cases, e1 must
+be an OCaml location. Thus by compatibility with SML , for both cases we can
+reduce using (o-ml-deref), and preservation holds.
+If e = e1 + p e2 , then one of (ADD C EXP), (VAL ADD EXP), or (VAL ADD BOXED
+EXP) must apply. If (ADD C EXP) applies, then e1 is a C location and e2 must be
+the integer 0. Therefore, we can take a step with (o-c-add) and preservation is
+implied by (LOC EXP). In the other two cases, e1 must be an OCaml location {l +
+n}, and e2 must be a C integer. Therefore we can reduce using (o-ml-add), and
+the respective type rule and compatibility ensure that the extracted value is of
+the right type, implying preservation. If e = e1 aop e2 , then the (AOP EXP) must
+apply, and so we can reduce using (o-aop) and preservation follows because
+the reduction result is an integer.
+If e = Val int e1 , then (VAL INT EXP) must apply, and we can reduce using
+(o-valint), and preservation holds via (ML INT EXP). If e = Int val e1 , then we
+can reduce using (o-intval), and preservation holds via (INT EXP).
+We next show progress and preservation for statements. However, first recall
+that typing judgments for statements include label environments G, which map
+labels L to type environments . Thus, when we branch to a label L, we need to
+ensure that the next statement executed (D(L)) is well-typed under the environment provided by G (i.e., G(L)). Thus we introduce a notion of compatibility
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:24
+
+•
+
+M. Furr and J. S. Foster
+
+of G with our statement store D, similar to the ∼ relation defined above:
+Definition 3.3 (L-Compatibility). A statement store D is said to Lcompatible with a label environment G, written D ∼ L G, if for all L ∈ D,
+there exists a such that G(L), G D(L), .
+As mentioned before, whenever we branch to a label L, the next statement
+to be evaluated is D(L). This is only valid if the statement to which D maps L
+is a labeled statement. Formally, the definition is as follows.
+Definition 3.4 (Well-Formedness of D). D is said to be well-formed if for all
+L ∈ D, D(L) is a statement of the form L : s.
+Recall from Section 3.2 that we define
+
+if (x)  (x) for all x ∈
+dom( ) ∩ dom( ). Since compatibility is an important property to preserve in
+our progress and preservation lemma for statements, we first present a lemma
+that shows that store compatibility follows this relation.
+LEMMA 3.5.
+
+If
+
+1 
+
+2 and
+
+1 ∼ SC , SML , V  then
+
+2 ∼ SC , SML , V .
+
+Several statements in our source language contain a label L which the program may branch to. Therefore we first present a lemma that shows that
+progress and preservation hold for this common case.
+LEMMA 3.6.
+
+If
+
+1 ∼ SC , SML , V  and D ∼ L
+
+1  G(L), then for any statement s such that
+
+G and D is well-formed and
+s, 2 and
+
+1, G
+
+SC , SML , V , s → SC , SML , V , D(L)
+there exist
+
+3, s
+
+such that
+
+(1) SC , SML , V , s → SC , SML , V , L : s ,
+(2) G(L) ∼ SC , SML , V , and
+(3) G(L), G L : s , 3 .
+Finally, we show progress and preservation for statements. All of our statements will be reduced in one of three ways that correspond to the three possible conclusions that follow. Either (1) the statement contains a subexpression which can be reduced, (2) the statement is part of a sequence s1 ; s2 and
+reduces to the second statement, or (3) the statement makes a branch to a
+label. Each conclusion is similar in that it ensures that at every step of the
+program, (a) it is possible to take a step, (b) the stores are still compatible
+with the type environments at that step, and (c) the new statement is still
+well-typed.
+LEMMA 3.7 (PROGRESS AND PRESERVATION FOR STATEMENTS). If s is a statement
+and 1 , G
+s, 2 and 1 ∼ SC , SML , V  and D ∼ L G and D is well-formed,
+then either s = () or s = s1 ; s2 and one of the following must hold.
+(1) There exist 1 , s1 such that
+(a) SC , SML , V , s1 ; s2  → SC , SML , V , s1 ; s2 
+(b) 1 ∼ SC , SML , V 
+(c) 1 , G s1 ; s2 , 2 .
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:25
+
+(2) There exist 1 , SC , SML , V such that
+(a) SC , SML , V , s1 ; s2  → SC , SML , V , s2 
+(b) 1 ∼ SC , SML , V 
+(c) 1 , G s2 , 2 .
+(3) There exist 4 , s3 such that
+(a) SC , SML , V , s1 ; s2  → SC , SML , V , L : s3 
+(b) G(L) ∼ SC , SML , V 
+(c) G(L), G L : s3 , 4 .
+PROOF SKETCH. Proceed by case analysis on s1 . If s1 = L : s , then we can
+reduce using (o-label), and then by (LBL STMT) and Lemma 3.5, we have conclusion (1). If s1 = goto L, we can reduce with (o-goto) and by (GOTO STMT) and
+Lemma 3.6, we satisfy conclusion (3).
+If s1 = e1 := e2 , then we have several subcases depending on e1 and e2 . If
+either e1 or e2 are not a value, then we can show (1) using Lemma 3.2. If e1
+and e2 are values, then e1 must be one of x, a C location l , or an OCaml location {l + n}. In each case, we will show conclusion (2). If e1 = x, then we
+can apply (o-var-assign) to take a step. The type rule (VSET STMT) must apply and therefore
+is updated along with V (from (o-var-assign)), which
+preserves compatibility. If e1 is a C location l , then we can take a step
+with (o-c-assign) and (LSET STMT) implies compatibility with SC . Otherwise,
+if e1 is an OCaml location {l + n}, then we can take a step with (o-ml-assign)
+and compatibility with SML is again implied by (LSET STMT).
+If s1 = if e then L, then we have several subcases depending on e. If e
+is not a value, then we can show conclusion (1) using Lemma 3.2. If e is a
+value, then it must be an integer n by (IF STMT) and (INT EXP). If n = 0, then
+we can reduce using (o-if), and, using Lemma 3.6, we can show conclusion
+(3). Otherwise, if n = 0, we can reduce using (o-if2) and show conclusion
+(2).
+If s1 = if sum tag (x) == n then L, then the type rule (IF SUM TAG STMT)
+applies. Therefore, when we look up x in V , it must be a OCaml location {l + 0}
+by compatibility. If the tag is n (i.e., {l + −1} = n), then we can reduce using
+(o-ifsum), and, using Lemma 3.6, we can show conclusion (3). Otherwise
+{l + −1} = n, and we can reduce using (o-ifsum2) and show conclusion (2).
+If s1 = if int tag (x) == n then L, then the type rule (IF INT TAG STMT)
+applies. Therefore when we look up x in V , it must be an OCaml integer {m} by
+compatibility. If n = m, then we can reduce using (o-ifi), and, by Lemma 3.6,
+we can show conclusion (3). If n = m, then we can reduce using (o-ifi2) and
+show conclusion (2).
+Finally, if s1 = if unboxed (x) then L, then the type rule (IF UNBOXED STMT)
+applies, and x must have an OCaml type (mt value). Therefore when we look
+up x in V , it can either be an OCaml integer {n} or an OCaml location {l + 0}
+by compatibility. If V (x) = {n} then we can reduce using (o-iflong), and, by
+Lemma 3.6, we can show conclusion (3). Otherwise, if V (x) = {l + 0}, we can
+reduce using (o-iflong2) and show conclusion (2).
+To show soundness, we prove that every statement either diverges or eventually reduces to ().
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:26
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 12. Translation rules for OCaml types.
+
+THEOREM 3.8 (SOUNDNESS). If
+s, and ∼ SC , SML , V  and D ∼ L G
+and D is well-formed, then either SC , SML , V , s diverges or SC , SML , V , s →∗
+SC , SML , V , ().
+PROOF. By Lemma 3.7, we can continually reduce the statement and
+reestablish our compatibly assumptions. Therefore either this process will continue forever or there exists s such that SC , SML , V , s →∗ SC , SML , V , s ,
+and, for all s , SC , SML , V , s  → SC , SML , V , s . Since s is well typed by
+Lemma 3.7, it must be () or else we could apply Lemma 3.7 again and produce
+s .
+3.4 Type Inference
+Finally, we present our type inference algorithm. Unlike the type checking
+system, we do not assume that we have OCaml types everywhere. Instead,
+as described in Figure 5, we assume we are given an OCaml program and an
+unannotated C program, and then proceed in two stages. First we convert the
+source types of FFI functions as declared in OCaml into our multilingual types.
+Then we perform type inference on the C code, beginning in a type environment
+containing the converted types, and check for any potential type errors. We
+discuss each stage in turn.
+Translating OCaml Types to Representational Types. The first stage of our
+inference algorithm is to translate each external function type declared in
+OCaml into our multilingual types. We only examine OCaml type information
+and not code because the OCaml type system ensures there are no type errors.
+We then store the converted types in an offline type repository, which is used
+during the second stage of our algorithm.
+We convert external declarations using the type translation
+given in
+Figure 12, which translates OCaml function types into representational types.
+In this definition, we implicitly assume that mltypen is not constructed with →,
+that is, the arity of the translated function type is n − 1. is defined in terms
+of helper function ρ. The function ρ gives unit and int both pure unboxed types
+with no  component. Since unit is a singleton type, we know its physical representation is the value 0, and we assign it type (1, ∅). This is the same as the
+representational type for a degenerate sum type with a single nullary constructor, for example, type t’ = A, which is correct because that one nullary constructor
+has the same representation as unit. As we have seen before, int is translated
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:27
+
+Fig. 13. Pattern matching code with inferred types and constraints.
+
+to (, ∅), making it incompatible with any sum type. The ρ function encodes
+mutable references as a boxed type with a single nonnullary constructor of size
+1. Regular function types are converted to mt function types.
+Finally, sum types are handled by counting the nullary constructors and
+mapping each nonnullary constructor to a product type representing its arguments. Rather than give the general case for sums and products, we illustrate
+the translation with two sample cases. In the definition of ρ in Figure 12, we
+show the translation of a sum type with one nullary constructor and one nonnullary constructor. Product types are handled by making an appropriate boxed
+type with no nullary constructors and a single nonnullary constructor of the appropriate shape.
+Consider the following OCaml program, which declares a foreign function:
+type s = P of int ref | R | Q
+external fML : int → s → unit = “ f C
+The
+function converts this function type as follows. The first argument of
+f C has type int and is thus represented as (, ∅). The second argument has
+type s, which has one nonnullary constructor and two nullary constructors.
+The nonnullary constructor takes as its argument an int ref, which corresponds
+to the representational type (0, (, ∅) × ∅ + ∅). Therefore the representational
+type for s is (2, (0, (, ∅) × ∅ + ∅) × ∅ + ∅). Finally, the return type of f C is unit,
+which is represented as (1, ∅) as in Figure 12. Therefore, the multilingual type
+of this function, which is stored in the type repository, is as follows, where γ is
+a fresh variable to be solved for in the next stage of analysis:
+f C : (, ∅) × (2, (0, (, ∅) × ∅ + ∅) × ∅ + ∅) →γ (1, ∅)
+The second stage of our analysis then assigns this signature to the function f C
+in the C code and ensures that it is consistent with body of f C .
+Type Inference Example. To motivate the discussion of the next phase of
+type inference, Figure 13 shows the inference process for the example from
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:28
+
+•
+
+M. Furr and J. S. Foster
+
+Figure 2(c), which has been rewritten in our formal language. Assume this code
+starts with x initialized to some data passed from OCaml. To enhance readability, we omit labels and jumps and instead show control-flow with indentation.
+We have annotated the example with the types assigned by our inference rules.
+The variable x begins on line 1 with an unknown type α value{, 0, }. B and
+T are  here because the boxedness and tag of x are unknown at this program
+point, and I is set to zero since all data passed from OCaml is safe. Upon seeing
+the if unboxed call, α unifies with the representational type (ψ, σ ), where ψ
+and σ are variables to be solved for based on the constraints generated in the
+remaining code. On the true branch, we give x an unboxed type but still an
+unknown tag. Since the flow-insensitive part of x’s type does not change (it is
+always α value throughout the function), we elide it from here on in the figure.
+Line 4 checks the unboxed constructor for x and adds the constraint 1 ≤ ψ since
+x can only be from a sum with at least 1 nullary constructor. Thus on line 5, x
+is now fully known and can safely be used as the nullary type constructor X.
+Similarly, on line 7, x is known to be the constructor Z, and we generate the
+constraint 2 ≤ ψ from the tag test on line 6.
+On the false branch of the if unboxed test, our type rules give x a boxed
+type with offset 0 (since x is safe). After testing the tag of x against 0 on line
+10, we know that x has at least one nonnullary constructor which we enforce
+with the constraint σ = π0 + σ . On line 11, then, x can be safely treated as
+the constructor W (tag 0). Line 12 accesses the second field of x and treats it as
+an integer. Therefore we unify π0 with a product with at least two types, the
+second of which is the integer type (, ∅). Similarly, on line 14, we know that x
+has constructor Y (tag 1), and, on line 15, we know the constructor has at least
+one field, which is an integer. Finally, on line 16, we join the branches together
+and lose information about the boxedness or tag of x.
+When we solve the unification constraints on α, π0 , and π1 and inequality
+constraints on ψ, we discover α = (ψ, α1 × (, ∅) × π0 + (, ∅) × π1 + σ ) with
+2 ≤ ψ, which correctly unifies with our original type OCaml type t, which
+corresponds to representational type (2, (, ∅)×(, ∅)×∅ + (, ∅)×∅ + ∅). After
+unification, we therefore also discover that α1 = (, ∅) and that π0 , π1 , and σ are
+all ∅.
+Type Inference for Glue Code. The second phase of our inference algorithm infers types for C source code, incorporating the representational types
+gathered in the first phase. Recall that our system uses types of the form
+ct{B, I, T }, where ct represents the structure of OCaml data and is flowinsensitive, whereas B, I , and T are flow-sensitive. During inference, O-Saffire
+generates constraints on flow-insensitive type structure, and uses dataflow
+analysis to infer the flow-sensitive B, I , and T . We generate four kinds of
+constraints C:
+C ::= τ = τ | T + 1 ≤  | GC  GC | gc  GC ⇒ P ⊆ P
+From left-to-right, we have equality constraints of the form τ = τ , where τ
+ranges over ct, mt, , and ; inequality constraints T + 1 ≤  that give lower
+bounds on the number of primitive tags of a representational type; inequality
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:29
+
+Fig. 14. Expression type rules modified for inference.
+
+constraints GC  GC among garbage collection effects; and conditional constraints gc  GC ⇒ P ⊆ P , used to check that C pointers to the OCaml heap
+are correctly registered with the garbage collector.
+Figure 14 shows our type inference rules for expressions, which are almost
+the same as the type checking rules in Figure 8, except that they introduce
+fresh variables where appropriate. When we apply these rules to an expression, we view any constraints C listed as side-conditions of the hypotheses as
+being generated, and at the end of type inference, we gather all the generated
+constraints and solve them.
+Figure 14 only lists rules that are different than their type checking counterparts. For example, in the rule (VAL DEREF EXP), the exact number of nonnullary constructors may not be known, and therefore we generate a constraint
+mt = (ψ, π0 + · · · + πm + σ ) to unify mt with a representational type whose sum
+component ends in variable σ , and thus may grow during inference. Only when
+we unify this type with a known OCaml type will the exact size be fixed. As
+another example, in (VAL INT EXP), we generate the constraint T + 1 ≤ ψ to
+require that e have at least T + 1 nonnullary constructors.
+Note that none of our expression type inference rules allow I = . This can
+occur after a join point when a variable has been used to point to two different
+offsets of a block on two separate branches. In practice, if I is ever , O-Saffire
+emits a message warning that it does not have enough information to analyze
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:30
+
+•
+
+M. Furr and J. S. Foster
+
+the expression and proceeds to optimistically check the rest of the program in
+search of further errors. Examples of this are discussed in Section 5.2.
+Unlike our type rules for expressions, our type rules for statements are somewhat nonstandard. They allow the type environment to change from one program point to another, and they include a label environment G used to model
+jumps. Thus we use dataflow analysis to infer types for statements, and, in lieu
+of more traditional type inference judgments, we present statement inference
+as a pair of algorithms. We define an algorithm INFERFUNC to perform inference
+on a function body by iteratively applying another algorithm INFERSTMT which
+infers types for statements. To integrate the expression type inference rules in
+Figure 14 into the algorithm, we use the notation INFEREXPR(C, , P, e) to mean
+the type ct{B, I, T } such that , P
+e : ct{B, I, T } according to the rules in
+Figure 14. Any constraints generated while applying these rules are added to
+C as a side effect.
+Algorithm 1. INFERFUNC( , C, f ) – Type inference for C functions
+Input: A type environment , a constraint set C, and a function f of the form
+function ctype0 f (ctype1 x1 , . . . , ctypen xn ) d 1 . . . d m ; s1 ; . . . ; sk
+Side effects: Updates constraint set C
+1: cti ← η(ctypei ) for i ∈ 0..n
+2: C ← C ∪ { ( f ) = ct1 × . . . × ctn →γ ct0 } where γ fresh
+3: ← [xi → cti {, 0, }, cur func → ( f )]
+4: P ← ∅
+5: for i ∈ 1..m do
+6: switch d i
+7: case ctypex x = e:
+8:
+ct{B, I, T } ← INFEREXPR(C, , P, e)
+9:
+← [x → ct{B, I, T }]
+10: case CAMLprotect(x):
+11:
+P ← P ∪ {x}
+12: end switch
+13: end for
+14: ∀L ∈ body of f , G(L) ← reset( )
+15: ∀s ∈ body of f , out [s] ← reset( )
+16: out [start] =
+17: W ← {s1 }
+18: while W is not empty do
+19: remove a statement s from W
+
+20: in [s] ← p∈pred[s] out [ p]
+21: G old ← G
+22:
+new ← INFERSTMT(C, in [s], P, G, s)
+23: if out [s] = new or G = G old then
+24:
+add all successors of s to W
+25:
+out [s] ← new
+26: end if
+27: end while
+
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:31
+
+Algorithm 1 defines INFERFUNC( , C, f ), which takes as input a type environment (containing its type and the type of other functions in the program), a
+constraint set C (added to during inference), and a function definition f , and
+performs type inference on the function body. To perform inference on a program, we apply this algorithm to each function definition in order, building up
+a set of constraints that are solved at the end. In essence, this algorithm takes
+the place of the (FUN DEFN) rule in Figure 9. We omit the part of the algorithm
+for handling function declarations since it simply adds those declarations to the
+current global type environment.
+We assume we have access to a control-flow graph for the body of f and that
+in the body of the function s1 ; . . . ; sk each si is not itself a sequence statement
+(but may be labeled). We also assume that s1 has a distinguished predecessor
+named start. The algorithm INFERFUNC computes a type environment out [s]
+that holds immediately after each statement s.
+The algorithm begins on line 1 by translating ctypes, which are present in
+the C code, to cts, which include OCaml type information. Since we do not
+know the OCaml types yet, we introduce fresh variables everywhere using the
+function η:
+η(void) = void
+η(int) = int
+
+η(value) = α value
+η(ctype∗) = η(ctype)∗
+
+α fresh
+
+We do not translate C function types because they are not first class in
+our language. Then line 2 adds a constraint that the cts for parameters
+and return unify with the existing function type, and line 3 creates an initial type environment
+that includes the formal parameters and the name
+cur func.
+Next, lines 4–13 handle local variable declarations. Lines 7–9 bind local
+variables in , using INFEREXPR to infer types of initializers. Lines 10–11 add
+variables to the protection set P . Then line 14 uses reset to initialize the label environment G to map each label L to the initial type environment with
+all of the flow-sensitive elements set to ⊥. Then we initialize the dataflow
+facts for each statement in the CFG where the start, an empty node preceding s1 , ends in environment . Lastly, we initialize the worklist with the first
+statement.
+The heart of the algorithm is lines 18–27 which iterate over the worklist.
+We remove a statement from the worklist, and then join the type environments
+from all predecessors. Line 21 saves a copy of the current label environment G,
+and then we call INFERSTMT to infer the output environment new after statement
+s is executed. As we discuss in the following, this may also update C and G. If
+G is updated, or if new is different than out [s], then we place all successors of
+s on the worklist and update out [s].
+Algorithm 2 defines INFERSTMT(C, , P, G, s) which performs type inference
+on a statement s. The other inputs to the algorithm are the constraint set C,
+an initial type environment , a protection set P , and a label environment G.
+The algorithm is a simple case analysis depending on s.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:32
+
+•
+
+M. Furr and J. S. Foster
+
+Algorithm 2. INFERSTMT(C, , P, G, s) – Type inference for C statements
+Input: An initial type environment , a label environment G, a protection set P , a
+statement s, and a constraint set C
+Output: A type environment that holds at the end of statement s
+Side effects: Updates constraint set C, label environment G
+1: switch s
+2: case L : s
+3:
+G ← G[L → G(L)
+]
+4:
+return INFERSTMT(C, G(L), P, G, s )
+5: case goto L
+6:
+G ← G[L → G(L)
+]
+7:
+return reset( )
+8: case return e or CAMLreturn(e):
+9:
+fail if (s = return e ∧ P = ∅) ∨ (s = CAMLreturn(e) ∧ P = ∅)
+10:
+ct{B, I, T } ← INFEREXPR(C, , P, e)
+11:
+fail if I = 0
+12:
+(cur func) = ct1 × . . . × ctn →GC ct0
+13:
+C ← C ∪ {ct = ct0 }
+14:
+return reset( )
+15: case ∗(e1 + p e2 ) := e3 :
+16:
+ct{B, I, T } ← INFEREXPR(C, , P, ∗(e1 + p e2 ))
+17:
+ct {B , I , T } ← INFEREXPR(C, , P, e3 )
+18:
+fail if (I = 0 ∨ I = 0)
+19:
+C ← C ∪ {ct = ct }
+20:
+return
+21: case x := e
+22:
+ct{B, I, T } ← INFEREXPR(C, , P, e)
+23:
+fail if (x ∈ P ∧ I = 0)
+24:
+return [x → ct{B, I, T }]
+25: case if e then L:
+26:
+INFEREXPR(C, , P, e) (C compiler ensures result is int)
+27:
+G ← G[L → G(L)
+]
+28:
+return
+29: case if unboxed (x) then L:
+30:
+ct{B, I, T } ← INFEREXPR(C, , P, x)
+31:
+fail if I = 0
+32:
+← [x → ct{ unboxed, I, T }]
+33:
+G ← G[L → G(L)
+]
+34:
+return [x → ct{ boxed, I, T }]
+35: case if sum tag (x) == n then L
+36:
+ct{B, I, T } ← INFEREXPR(C, , P, x)
+37:
+fail if I = 0 or B = boxed
+38:
+C ← C ∪ {ct = (ψ, π0 + · · · + πn + σ ) value}
+ψ, πi , σ fresh
+39:
+← [x → ct{ boxed, 0, n}]
+40:
+G ← G[L → G(L)
+]
+41:
+return
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+42: case if int tag (x) == n then L
+43:
+ct{B, I, T } ← INFEREXPR(C, , P, x)
+44:
+fail if I = 0 or B = unboxed
+45:
+C ← C ∪ {ct = (ψ, σ ) value)} ∪ {n + 1 ≤ ψ}
+46:
+← [x → ct{ unboxed, 0, n}]
+47:
+G ← G[L → G(L)
+]
+48:
+return
+49: end switch
+
+•
+
+18:33
+
+ψ, σ fresh
+
+Lines 2–4 infer the type of a labeled statement, checking the inner statement
+in environment G(L) where G has been imperatively updated to join the initial
+environment with the previous G(L). If G is actually changed by this case,
+then Algorithm 1 places the successors of s on the worklist which will cause
+them to be visited. Lines 5–7 handle goto , imperatively updating the G and
+returning an environment with all flow-sensitive components set to ⊥.
+Lines 8–14 handle the two forms of return , ensuring that CAMLreturn is used
+if and only if variables have been registered with CAMLprotect (which places the
+variables in P ). This case uses INFEREXPR to infer the type of e and generates a
+constraint unifying this type with the return type of the function. Note that the
+returned value must be safe. Lines 15–20 handle assignment through a pointer,
+unifying the types of the left- and right-hand sides on line 19. Line 18 ensures
+that only safe data is stored in the heap. Lines 21–24 handle assignment to a
+local variable, which updates the type of x in the output type environment and
+ensures that, if x has been registered with the garbage collector, then it is safe.
+The remaining four cases on lines 25–48 handle branches. In each case, we
+update the label environment G by joining the current G(L) with information
+determined by the conditional test, if any. The last three cases also require I = 0
+so that the tests can be performed safely and update the output environment
+to also reflect the conditional. Lastly, the cases for if sum tag and if int tag
+require that x is boxed or unboxed, respectively, and add equality constraints
+to C to ensure the type of x has the right shape.
+Constraint Solving. Algorithm 1 clearly terminates because updates monotonically increase facts about B, I , and T , which are finite height lattices. After
+we have applied Algorithm 1 to all of the functions in our program, we are left
+with a constraint set C. We solve the equality constraints τ = τ with ordinary
+unification. When solving a constraint (, ·) = ( , ·), we require that  and
+ are the same, that is, if  = n, then  does not unify with , as required
+by our type rules. Several rules also produce inequality constraints of the form
+T + 1 ≤ . Recall that these ensure that nullary constructors can only be used
+with a sum type that is large enough. Thus in this constraint, if T is negative, we require  =  since negative numbers are never constructors. After
+the unification constraints have been solved, we can walk through the list of
+T + 1 ≤  constraints and check whether they are satisfiable.
+Finally, we are left with constraints involving garbage collection effects. The
+atomic subtyping constraints GC  GC can be solved via graph reachability.
+We can think of the constraint GC  GC as an edge from GC to GC . Such
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:34
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 15. JNI source language.
+
+edges form a call graph, that is, there is an edge from GC to GC if the function
+with effect GC is called by the function with effect GC . To determine whether a
+function with effect variable γ may call the garbage collector, we simply check
+whether there is a path from gc to γ in this graph, and, using this information,
+we ensure that any conditional constraints gc  GC ⇒ P ⊆ P from (APP) are
+satisfied for gc functions.
+4. J-SAFFIRE: TYPE INFERENCE FOR THE JNI
+In this section, we present J-Saffire, our multilingual type inference system for
+the Java Native Interface (JNI). The overall design of J-Saffire is the same as OSaffire, but the systems differ substantially in detail because of differences between the JNI and the OCaml FFI. First, although we found little use of objects
+in the OCaml FFI, objects are critical for the JNI. Indeed, J-Saffire’s main focus
+is on inferring representations of Java object types. Second, while the OCaml
+FFI uses integer tags and pointer offsets to access OCaml data, in the JNI,
+fields, methods, and classes are all described using specially-formatted strings,
+and those strings typically do not change during execution. Thus J-Saffire uses
+a flow-insensitive analysis to track string values through glue code. Finally, we
+found that parametric polymorphism is important for the JNI because it allows
+J-Saffire to model user-defined wrapper functions precisely and directly assign
+type signatures to the multitude of JNI functions rather than give separate
+type rules for each function as O-Saffire does. Thus J-Saffire uses instantiation
+constraints discussed later to perform parametric polymorphic type inference.
+This last point is especially important for our implementation as we do not
+need to handle each JNI function specially but rather simply write down a type
+signature for each.
+Source Language. In Section 3, we described O-Saffire in terms of a source
+language that was very close to C, which was helpful because C language constructs (pointer arithmetic, conditional tests, etc.) are directly used to manipulate OCaml data in the OCaml FFI. However, as we saw in Section 2.2, the
+JNI is much more opaque, and glue code does almost all of its work by invoking
+JNI functions. Thus to make J-Saffire simpler to present and soundness easier
+to prove, we describe J-Saffire in terms of the language in Figure 15, which is
+the lambda calculus extended with primitive strings “Str” and JNI functions
+δ, which are not curried. In our source language, let introduces polymorphism,
+and let-bound variables f are annotated with an instantiation site i when they
+are used in the program text. JNI functions δ are also polymorphic, and hence
+include an instantiation site. We discuss this further in Section 4.2.
+We list a few JNI functions as examples. The function FindClass(s) returns
+the Class object of the class named by string s. The function GetObjectClass(o)
+returns the Class of its argument o. The function GetFieldID(c, f , t) returns
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:35
+
+Fig. 16. JNI wrapper function from Figure 4 in formal language.
+
+a field identifier for the field named f of type t in class c, and similarly
+GetMethodID(c, m, t) returns a method identifier for the method named m
+of type t in class c. The function GetObjectField(o, fid) returns the object
+(i.e., nonprimitive) field identified by fid of object o, and lastly, the function
+CallObjectMethodn (o, m, x1 , . . . , xn ) invokes method m of object o with arguments x1 through xn and returns the object result. In the JNI, CallObjectMethod
+is a varargs function, and, in our formalism, we assume we have variations
+CallObjectMethodn for each possible arity n.
+4.1 Multilingual Types
+Like O-Saffire, J-Saffire uses a multilingual type language when performing
+type inference on glue code. In the JNI, the key type is jobject , which is the
+C type given to all Java objects, and data of this type can only be manipulated
+by passing it to JNI functions. Thus our strategy is to extend jobject with a
+representational type to model C’s view of Java objects. The JNI also uses field
+and method identifiers, which have C types jfieldID and jmethodID , respectively, and so J-Saffire needs to extend those types as well with information on
+which fields and methods they represent.
+Before we present our multilingual type language formally, consider again
+the example wrapper function my getObjectField from Section 2.2, shown in
+Figure 16 in our formal language grammar. Recall that this function takes two
+arguments, an object, and the name of one of its Object fields, and then returns
+that field. Notice that in order to assign this function a type, we need to specify
+that the value of the second argument names a field of the first argument; that
+field must be a java.lang.Object; and any other fields or methods of the object
+type are unconstrained. J-Saffire gives my getObjectField the following type:
+{ν; νfield : oret  ◦ φ; μ} jobject → str{νfield } → oret jobject
+where oret = {“java.lang.Object”;  f 1 ; · · · ; f n  ; m1 ; · · · ; mk } is a representational type describing instances of java.lang.Object. This representational types
+has three parts: the class name “java.lang.Object”, the field set  f 1 ; · · · ; f n , and
+the method set m1 ; · · · ; mk . These latter two sets come from the definition of
+Object in Java.
+The second parameter is a C string whose contents are represented by the
+type variable νfield . We use a variable because, when the function is created,
+the actual contents of the string are unknown (and in fact are likely to vary
+with different calls to the function). Such variables may be later unified with
+a constant string once the contents of the string becomes known, creating a
+singleton
+ type. Lastly,
+ the first parameter is a Java object with representational
+type {ν; ν f iel d : oret ◦ φ; μ}. In this type, the class name ν is an unconstrained
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:36
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 17. Java/C multilingual type language.
+
+variable; the field set must contain a field named νfield of type oret , but then may
+contain anything else, which is represented by variable φ; and the method set
+is unconstrained, as represented by the variable μ. In order to infer this type,
+J-Saffire also needs to track intermediate information about cls and fid as well.
+Grammar for Java/C Multilingual Types. Our formal multilingual type
+grammar is given in Figure 17. Our type language does not include integer or
+void types because our source language does not contain any values of these
+types. This simplifies the presentation of our system by restricting communication through the JNI to Java object types. Our implementation (Section 5.3)
+does handle primitives.
+The type language in Figure 17 has type variables α, singleton string types
+str{s}, and (possibly uncurried) function types. The type str{s} is our formalism
+for the C type char *. In this type, the string s may be either a type variable ν
+to be solved for, or a known constant “Str”. For example, in my getObjectField,
+the parameter field is given type str{νfield }, and the parameter obj has a field
+named νfield .
+The C types ct also include jobject, jfieldID, and jmethodID, extended to
+contain Java type information. The type jt jobject represents a Java object
+with Java type jt. The types ( f , o)jfieldID and (m, o)jmethodID represent intermediate JNI values for extracting field f or method m from object of type
+o. We include o so that we can check that this field identifier is used with
+an object of the correct type. For example, fid in my getObjectField has type
+(νfield : oret , oobj ), and thus can be used to extract a field named νfield of type oret
+from an instance of type oobj .
+Our grammar for Java type jt includes type variables ι, a representational
+type o for Java objects, and a class type jt JClass. Representational types o have
+the form {s; F ; M }, which represents an instance of the class named s with field
+set F and method set M . Our type checking system will implicitly assume that,
+if s is a known string in a representational type {s; F ; M }, then F and M match
+the field and method information from Java. In a representational type, a field
+set is a list of field typings s : jt, which means the field named s has Java
+type jt. Notice that s may be a variable or a known string. Similarly, a method
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:37
+
+Fig. 18. Sample JNI type signatures.
+
+set is a list of method typings s : [s ; sig], where s is the method name, s is the
+method descriptor (a string describing the method argument and return types),
+and sig is the method signature. Method signatures sig may be a variable ψ
+representing an unknown signature, or (jt1 × · · · jtn ) → jt0 , where jt1 . . . jtn are
+the argument types and jt0 is the return type. Our type checking system will
+implicitly assume that the method descriptor, if it is a known string, correctly
+describes its associated method signature.
+When performing inference, J-Saffire may discover the fields and methods of
+an object incrementally, and so we allow these sets to grow with the composition
+operator ◦. We say that a set is closed if it is composed with the empty set of
+methods ∅, and it is open if it is composed with a variable φ or μ. Since we never
+know just from C code whether we have accessed all the fields and methods of
+a class, field and method sets become closed only when the class name s is a
+known string. This is similar to O-Saffire in which sums  and products  may
+grow during inference.
+Returning to our last jt type, a class type jt JClass is the type J-Saffire gives
+to a Class object that represents the Java type jt. Recall that instances of Class
+are essential for using the JNI. For example, when J-Saffire infers a type for
+my getObjectField, the local variable cls, which holds the class of obj, is given
+the type oobj JClass jobject, where oobj is the representational type for obj.
+J-Saffire needs to know what classes instances of Class represent in order to
+determine types for fields and methods.
+Finally, we include universal polymorphic type schemes σ of the form ∀ 
+ϑ.ct.
+Here to reduce notation, we use ϑ to range over any of the variables in our type
+system (α, ν, ι, φ, ψ, or μ).
+Example JNI Function Types. Given this type grammar, we can precisely
+describe the types of the JNI functions. Figure 18 gives polymorphic type
+signatures for the functions mentioned in Figure 16. FindClass takes a string
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:38
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 19. Translation rules for Java types.
+
+ν and returns the class object for the class named ν. Note that, although the
+field and method sets of the resulting type are universally quantified, our type
+checking system requires that representational types are consistent with types
+from Java. Hence if ν is instantiated to a known string, then φ and μ will be
+constrained appropriately.
+GetObjectClass takes an instance object as a parameter and returns the
+class of that object. The function GetFieldID takes a class object and two strings
+describing a field (ν f ) and its type (ν2 ) and returns the jfieldID for the field ν f
+in that class. Note that the type of the class object and the object type embedded
+in the fieldID must be the same. Also, the object type o1 is open because it may
+have other fields in addition to ν f . Similarly, GetMethodID returns the methodID
+for the named method and type. The signature of the method must match ν2 ,
+the string passed as the second argument. GetObjectField takes an object and
+a jfieldID with matching types and extracts the contents of the field described
+by the jfieldID. CallObjectMethod is similar, calling the method described by
+the jmethodID.
+4.2 Type Checking Glue Code and Soundness
+Since our source language is close to lambda calculus, type checking for J-Saffire
+is fairly standard. The one catch is types of the form {s; F ; M } or [s; sig]. Recall
+that, in these types, s is a field descriptor (a class name, in our formalism) or a
+method descriptor, respectively. When s is a known string, these types only make
+sense if they correspond to the actual classes from Java. We formalize this by
+defining a function θ in Figure 19 that translates field and method descriptors
+into our multilingual type grammar, assuming we have all of the necessary
+class declarations. A field descriptor C is translated to a representational type
+with the appropriate field and method sets. Method descriptors, which contain
+parentheses to distinguish them from field descriptors, are translated into a
+method type with the corresponding signature. Note that we elide the details
+of separators between class names in method signatures.
+We say that {s; F ; M } or [s; sig] is well-formed if either s is a variable, or if
+s = “str” and either {s; F ; M } = θ(str) or [s; sig] = θ (str), respectively. In our
+type checking system, we implicitly assume that all types are well-formed.
+Figure 20 gives our type checking rules. Like our O-Saffire checking rules,
+we assume we have concrete multilingual type information for the program.
+The rules (VAR), (LAM), and (APP) are standard. In (STRING), string constants are
+given the corresponding singleton string type. Rule (LET) introduces HindleyMilner style universal types, which are instantiated by (INST). In (INST), we use t
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:39
+
+Fig. 20. Type checking rules.
+
+to range over the kinds of types variables may be instantiated to (ct, s, jt, F , sig,
+and M ), and we implicitly assume that type variables are always instantiated
+to the right kind. In the checking system, the index i on an occurrence of f
+is not used. Finally, JNI functions are typed using the (DELTA) rule. We write
+T (δ) for the type scheme for JNI function δ, for example, as shown in Figure 18.
+Since these functions are not curried, (DELTA) combines both (INST) and (APP) to
+type check the application of the JNI function.
+Soundness. We now sketch a proof of soundness for our type checking system. The first step is to extend our language so that we can represent the values
+returned by JNI functions. Figure 21(a) shows our source language with values
+v called out and with four new kinds of values. object (C) represents an instance
+of class C. Here we use a completely opaque representation of the Java object which is sufficient because these values may only be manipulated via JNI
+functions. class(C) represents an instance of java.lang.Class that is known to
+describe class C. fid(F, CF , C) represents a field identifier for a field named F
+of type CF inside of class C. Finally, mid(M , S M , C) represents a method identifier for the method with name M and method descriptor S M that resides inside
+class C.
+Figure 21(b) gives the type checking rules for these four new values. In all
+of the type rules, we use θ to return the corresponding representational type
+or method type for a given class name. (OBJ) and (CLASS) are straightforward.
+In (FID), we write f ∈ o to mean that the field typing f is present in object
+description o, and similarly for m ∈ o in (MID).
+We give an operational semantics for our language in Figure 22. Part (a) of
+this figure defines reduction contexts with the hole [] specifying which subexpression to evaluate next. Part (b) defines a reduction relation of the form
+R[e] → R[e ], where the expression R[e] evaluates to the expression R[e ], and
+we write →∗ for the reflexive, transitive closure of →.
+The rules (β) and (let) are standard. The remaining rules describe the behavior of JNI functions. Since Java objects are opaque in our system, our
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:40
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 21. Language and type rules with opaque Java values.
+
+Fig. 22. Operational semantics.
+
+operational semantics for JNI functions simply produce new opaque objects
+of the right type. The rule (δ-FC) converts a string into the corresponding Java
+class object, assuming the class exists in Java. The rule (δ-GOC) returns the
+class of an instance object. Rules (δ-GFID) and (δ-GMID) retrieve the field ID
+or method ID of a class member, creating the appropriate opaque object. These
+rules only apply if the field or method exists in the object’s class, which we
+test using θ . (Using θ is not necessary, but it is convenient because it already
+can process both field and method descriptors.) Rule (δ-GOF) extracts the field
+described by its second argument from its first argument. Notice that the field
+must exist in the class, and the class of the field identifier must match the
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:41
+
+object. Similarly, rule (δ-COM) invokes a Java method of arity n from the instance class. That method must exist in the class, and all the arguments must
+be of the right type (we do not permit subtyping). Note that, although instances
+of java.lang.Class are objects, and hence we could allow a class(C) to be used
+wherever an object ( java.lang.Class) is expected, our semantics forbids this for
+simplicity.
+Finally, we can show soundness by proving progress and preservation. We
+begin by presenting the usual substitution lemmas; we omit the proofs of these
+lemmas because they are completely standard.
+LEMMA 4.1 (SUBSTITUTION).
+e[x → e ] : ct.
+
+If
+
+[x → ct ]
+
+e : ct and
+
+LEMMA 4.2 (POLYMORPHIC SUBSTITUTION). If [ f → ∀ 
+β.ct ]
+e[ f → e ] : ct.
+e : ct and fv( ) ∩ β = ∅ then
+
+e : ct then
+e : ct and
+
+Given these lemmas, we can prove that types are preserved under reduction
+in the semantics. Note that, unlike our proof for O-Saffire, for J-Saffire, we
+prove progress and preservation separately.
+LEMMA 4.3 (PRESERVATION).
+
+If
+
+e : ct and e → e , then
+
+e : ct.
+
+PROOF SKETCH. By induction on the structure of e. If a subterm inside of e is
+reduced, then we apply induction. Otherwise we proceed by case analysis on
+the reduction. For (β), we use the substitution lemma, and, for (let), we use the
+polymorphic substitution lemma. Otherwise e = δ(v1 , . . . , vn ).
+If the reduction was (δ-FC), then we have e → class(C), and using the type
+of FindClass from Figure 18 with (DELTA), we have
+(DELTA)
+T (δ) = ∀ν, φ, μ.(str{ν}) → {ν; φ; μ} JClass jobject
+
+“C” : str{“C”}
+
+FindClassi (“C”) : {“C”; φ ; μ } JClass jobject
+
+for some φ and μ . By our assumption of well-formedness, {“C”; φ ; μ } = θ(C).
+And since by (CLASS) we have
+class(C) : θ (C) JClass jobject, we then
+have
+class(C) : {“C”; φ ; μ } JClass jobject, which is what we wanted to
+show.
+The other reduction steps are similar. For (δ-GOC), we again use (CLASS)
+to show that the class object produced by reduction has the same type as is
+returned by the JNI call. For (δ-GFID) and (δ-GMID), we use (FID) and (MID),
+respectively. Lastly, for (δ-GOF) and (δ-COM), we use (OBJ) to show that the
+object produced by reduction has the type we expect. There is surprisingly little
+to show for these last two cases; because we assume we have taken a reduction
+step, we need not check anything except the type of the retrieved field or method
+result.
+Next, we show that for any well typed expression e, one of the reduction rules
+can always be applied.
+LEMMA 4.4 (PROGRESS). For every closed expression e, if
+e is a value or there exists an e such that e → e .
+
+e : ct, then either
+
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+•
+
+18:42
+
+M. Furr and J. S. Foster
+
+PROOF SKETCH. By induction on the structure of e. If e is a value, then we
+are done. If e is an application e1 e2 , then we either apply induction or show
+that e1 must be a function based on its type, and hence we can take a step
+with (β). If e is a let, then we either use induction or take a step with (let).
+Otherwise e is of the form δ(e1 , . . . , en ). If some ei is not a value, we can apply
+induction. Otherwise, e is of the form δ(v1 , . . . , vn ), and we proceed by case
+analysis on the JNI function δ. We illustrate two of the cases which are all very
+similar.
+If δ = FindClass, then by assumption we have
+(DELTA)
+
+T (δ) = ∀ν, φ, μ.(str{ν}) → {ν; φ; μ} JClass jobject
+
+v : str{s}
+
+FindClassi (v) : {s; φ ; μ } JClass jobject
+for some φ and μ . Since v is a value, it must be of the form “C”, and thus
+s = “C” by (STRING). But then by our well-formedness assumption, {s; φ ; μ } =
+{“C”; φ ; μ } = θ (C), and hence C must be a valid Java class. But then we can
+take a step using (δ-FC).
+If δ = GetObjectField, then by assumption we have
+(DELTA)
+T (δ) = ∀νi , ν f , φi , μi . (o1 jobject × ( f , o1 )jfieldID) → o2 jobject
+o1 = {ν1 ;  f  ◦ φ1 ; μ1 }
+f = ν f : o2
+o2 = {ν2 ; φ2 ; μ2 }
+v1 : o1 jobject
+v2 : ( f , o1 )jfieldID
+GetObjectFieldi (v1 , v2 ) : o4
+
+Since the vi are values, we have v1 = object (C) and v2 = fid(F, CF , C ), for some
+C, F , CF , and C . By (OBJ), we have o1 = θ (C), and by (FID), we have o1 = θ (C ),
+and thus C = C . Then also (FID), we have “F” : θ(CF ) ∈ θ (C), and thus class C
+has a field F of type CF . Therefore we can take a step with (δ-GOF).
+Finally, we state our soundness theorem:
+THEOREM 4.5 (SOUNDNESS).
+v : ct.
+e →∗ v and
+PROOF.
+
+If
+
+e : ct, then there exists a value v such that
+
+The result follows directly from Lemma 4.3 and 4.4.
+
+Full proof details are available in a companion technical report [Furr and Foster
+2006a].
+4.3 Type Inference for the JNI
+Since our type system for the JNI is flow-insensitive, we use conventional
+notation to present our inference algorithm. Figure 23 shows our type inference rules. We perform type inference by applying these rules to our program
+and generating a set of constraints which are given in the hypotheses of the
+rules. We then solve the constraints to find a valid typing for the program, if
+any.
+We discuss the rules briefly. Rule (VAR) is the same as the checking rule. In
+rule (LAM), we create a fresh variable for the domain of the function type, and in
+rule (APP), we generate an equality constraint to ensure the function’s domain
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:43
+
+Fig. 23. Type rules modified for inference.
+
+type matches its actual argument type. Notice that, as was the case in the type
+checking system, we require equality of types and have no subsumption. Thus
+we could fail to unify two Java objects when one object is a subtype of the other.
+We did not find this to be a problem in practice, however (see Section 5.3). Rule
+(STRING) gives a singleton string type to the expression.
+In our type checking system for the JNI, we introduce polymorphism when
+typing the expression let f = e1 in e2 . To infer a type for this expression, we
+would normally first infer a type for e1 , then generalize its type to a type scheme
+
+∀ϑ.ct,
+which we would then bind to f while typing e2 . However, while this approach is possible to use for C, in our experience it is awkward in practice. C
+code is not structured as nested let blocks. Instead, function definitions in C
+are all at the top level and may call each other arbitrarily, assuming appropriate prototypes are supplied to satisfy the compiler’s declaration-before-use
+requirement. Using the standard approach to let-polymorphism, we would need
+to discover the dependencies between functions and then visit the functions in
+the program in the appropriate order.
+Instead, we take an approach based on semiunification [Henglein 1993;
+Fähndrich et al. 2000], which we think is a more elegant solution and is easier
+
+in practice. In rule (LET), we represent a polymorphic type as a pair (ct, ϑ),
+
+where ct is the base type and ϑ is the set of variables that may not be quanti→
+ represents the type scheme ∀−
+fied. For comparison, the pair (ct, ϑ)
+ϑ .ct, where
+ϑ = fv(ct) − ϑ. The key feature of this new version of (LET) is that, in practice,
+we need not know the full type of the expression e1 (whose type is generalized)3
+when we form this pair. We could initially pick its type to be a fresh variable
+which we then equate with the actual type of e1 later on during typing, and
+inference would still proceed correctly.
+ Since in pracIn rule (INST), we need to instantiate a polymorphic type (ct, ϑ).
+tice we may not know the type of ct yet, we generate instantiation constraints
+3 In practice, the only place we generalize a type is at function boundaries, and therefore implicitly
+
+enforce the value restriction required for soundness in the presence of mutation.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:44
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 24. Polymorphism example.
+
+relating the base type to this particular instance which occurs at instantiation
+site i. Instantiation constraints have the form a i b, where a and b range
+over ct, jt, etc. This constraint says that there must exist a substitution Si such
+that Si (a) = b. Thus in rule (INST), we generate a constraint ct i α to require that there is some substitution Si such that Si (ct) = α. We also need to
+ensure that nonquantifiable variables are not instantiated, which we enforce
+ This constrains the substitution
+with the self-instantiation constraint ϑ i ϑ.
+ Note that
+Si to rename every variable in ϑ to itself, that is, to not rename ϑ.
+two constraints a i b and c  j d do not interact if i = j .
+The last rule, (DELTA), simply combines (INST) and (APP) to apply a JNI function to its arguments at instantiation site i. Here we assume that T maps each
+JNI function to a plain type in which all variables are quantified, and hence we
+write its type as just (ct1 , . . . , ctn ) → ct instead of pairing it with ∅, and we do
+not generate a self-instantiation constraint.
+A full discussion of this style of polymorphic type inference is beyond the
+scope of this article and can be found elsewhere [Henglein 1993]. However,
+we illustrate the basic idea with the simple program shown in the left box in
+Figure 24. Note that we have numbered the instantiation sites, and we assume
+we have added pairs to the language for the sake of exposition. The program
+begins with the introduction of the lambda-bound variable y, which has type β
+as shown. The variable y is free in the scope of the enclosed let, and thus cannot
+be quantified. Therefore we assign f the type (α → α × β, {β}) with (LET), also
+as shown.
+Within the body of the let, we use (INST) and (APP) for each function application, generating the constraints shown in the middle box of the figure. At
+instantiation site 1, we generate the constraints α → α × β 1 str{“s”} → γ
+and β 1 β. (We’ve simplified away an extra equality constraint here.) Then
+at instantiation site 2, we require that this second instance of f instantiate to
+type γ → η, where η is a fresh variable, so that it takes as input the output of
+the first application of f .
+To solve these constraints, we need to find substitutions S1 and S2 for the
+instantiation sites and solve any implied equality constraints. We describe our
+formal algorithm for this later, and here we reason informally. The results are
+shown in the right box of the figure. First, we observe that instantiation 1
+replaces α with str{“s”} and β with itself, giving us S1 as shown. Then since
+S1 (α × β) = γ , we can conclude that γ has the form str{“s”} × β. Next we
+observe that instantiation 2 replaces α with γ , and thus it replaces α with
+str{“s”} × β. And as before, S2 (β) = β by the self-instantiation constraint. Then
+since S2 (α × β) = η, we have (str{“s”} × β) × β = η.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:45
+
+In our implementation, we do not keep track of the set f v( ) for functions.
+Since C does not have nested functions, we simply issue warnings at any uses
+of global variables of type jobject or global structures containing fields of
+type jobject. In general, we have found that programmers use few globals
+when interacting with the JNI. When encountering a global of type char *, our
+implementation does track their contents and therefore they cannot be used in
+JNI function calls as special strings. We also do not check for global variables
+of type jfieldID or jmethodID in our current implementation.
+Constraint Resolution. Our type inference rules generate unification constraints (rule (APP)) and instantiation constraints (rules (INST) and (DELTA)). To
+solve these constraints, we use a variant of Fähndrich et al.’s worklist algorithm
+for semi-unification [Fähndrich et al. 2000].
+To simplify the constraint resolution rules we present in the following, whenever we refer to field and method sets we always assume they have been flattened so that they are composed with either ∅ or a variable. Also, during the
+process of unification, unknown strings ν will be replaced by known constant
+strings str{“Str”}. As this happens, we need to ensure that our object types are
+still well-formed. In particular, if we ever form a type {“C”; F ; M }, we check
+that F and M are the correct field and method sets for class C, and if we form
+a method signature [“S M ”; sig], we ensure that sig matches method descriptor S M .
+To improve our error reporting, we also enforce a finer well-formedness condition on representational types whose class names are not known. In particular, we require that, in a field set, any two fields with the same name must
+have the same type.4 Formally, for a field f = s : jt, we define fname( f ) = s
+and ftype( f ) = jt. Then a field set  f 1 ; · · · ; f n  is well-formed if fname( f i ) =
+fname( f j ) ⇒ ftype( f i ) = ftype( f j ) for all i, j , where the = on fname is syntactic equality. In other words, “s” = “t” if s = t, and ν = ν if ν and ν are the
+same variable. Whenever we replace a ν by a constant string during constraint
+resolution, we recheck well-formedness and generate any implied equality constraints. Methods, however, unlike fields, may be overloaded in Java, and so we
+do not apply the above well-formedness condition to method sets.
+We express constraint solving in terms of rewrite rules, shown in Figure 25.
+Given a set of constraints C, we apply these rules exhaustively, replacing the
+left-hand side with the right-hand side until we reach a fixpoint. Technically,
+because we use semi-unification, this algorithm may not terminate, but we have
+not found a case of this in practice. The complete list of rewrite rules is long
+and mostly straightforward, and so Figure 25 contains only the interesting
+cases. The exhaustive set of rules may be found in our companion technical
+report [Furr and Foster 2006a].
+In Figure 25, the (Closure) rule unifies two terms b and c when they are both
+instantiations of the same variable a at the same instantiation site. This rule
+enforces the property that substitution Si must replace variable a consistently
+4 Although an overloaded field via inheritance is possible, their manipulation in C is not supported
+
+by our system and was not observed in our benchmarks.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:46
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 25. Selected constraint rewrite rules.
+
+[Henglein 1993]. The rule (Obj InEq) applies the usual semi-unification rule
+for constructed types. Since the substitution Si renames the left-hand side to
+yield the right-hand side in a constraint i , the right-hand side must have the
+same shape. Thus in (Obj Ineq), we unify jt with {ν; φ; μ}, where ν, φ, and μ
+are fresh variables, and then propagate the semi-unification constraint to the
+components.
+In (FieldSet InEq), we instantiate one field set to another. For each field
+typing f i in the field set on the left-hand side of the constraint, we make a new
+typing f i with free variables. Then we unify F with a new field set containing
+the f i composed with a fresh variable φ, and then propagate the instantiation
+constraint to produce F i φ and f i i f i for all i. If it turns out that this creates
+any duplicate field in the field set F , then our well-formedness condition will
+later unify them.
+(MethSet InEq) behaves similarly to (FieldSet InEq) except it creates fresh
+method signatures mi and propagates the constraints to them. Recall that we
+do not have a well-formedness condition on method names. To understand why,
+suppose an open method set x : ι → ι ◦ μ is unified with a closed method set
+x : Obj 1 → Obj 1 ; x : Obj 2 → Obj 2  ◦ ∅. Since the method x is overloaded, we
+do not know if ι should unify with Obj 1 or Obj 2 . Therefore, if this occurs during
+unification, J-Saffire emits a warning and removes the constraint. However,
+our unification algorithm does allow method sets with multiple copies of the
+same method signature to unify as long as they contain no free type variables.
+We could also unify return types of methods with otherwise equal signatures
+but do not do so in our current implementation.
+The last four rules handle strings. (Str Resolve) replaces a string variable by
+a constant, which triggers a well-formedness check on all types. In particular,
+for representational types {s; F ; M }, if s becomes a known constant, we unify F
+and M with the corresponding field and method sets and similarly for [s; sig].
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:47
+
+We also ensure that the same name appears at most once in a field set. (In
+practice, only those representational types and field sets that may be affected
+are verified.) (Str Sub) replaces one string variable by another, and again, we
+check well-formedness. (Str Eq) and (Str Neq) unify string constants.
+The remainder of the rewrite rules (not shown) either replace type variables
+with terms, match up field or method sets, or match up type constructors and
+propagate constraints recursively to the constructor parameters.
+Example. We illustrate our type inference system on the my getObjectField
+function from Figure 16. We begin by assigning each parameter a fresh type:
+obj : αobj
+
+field : αfield
+
+The second line of the function calls the GetObjectClass function. After looking up its type in the environment (shown in Figure 18 with quantified type
+variables ν, φ, and μ) and assigning its return type the fresh type αcl s , we add
+the following constraints for the function call using (DELTA):
+{ν; φ; μ} jobject 1 αobj
+{ν; φ; μ} JClass jobject 1 αcls
+In order for a substitution to map the type variables on the left-hand side of
+the constraint, the type on the right-hand side must have the same shape as
+the type on the left. Therefore, our constraint rewrite rules first unify αobj and
+αcl s with fresh types of the correct shape, and then propagate the instantiation
+constraints to the new types:
+αobj = {ν2 ; φ2 ; μ2 } jobject
+ν 1 ν2
+φ 1 φ2
+μ  1 μ2
+ν2 , φ2 , μ2 fresh
+
+αcl s = {ν3 ; φ3 ; μ3 } JClass jobject
+ν 1 ν3
+φ 1 φ 3
+μ 1 μ3
+ν3 , φ3 , μ3 fresh
+
+Then rule (Closure) in Figure 25 generates the constraints ν2 = ν3 , φ2 = φ3 ,
+and μ2 = μ3 to require that the substitution corresponding to this call is consistent. Next, my getObjectField calls GetFieldID, and after applying our type
+inference and constraint rewrite rules, we discover (among other things):
+α f iel d = str{νfield }
+φ2 = ν f iel d : {“java.lang.Object”; . . . } ◦ φ4
+
+νfield fresh
+φ4 fresh
+
+The last call to GetObjectField generates several new constraints, but they
+do not affect the types. Thus after my getObjectField has been analyzed, it is
+given the type
+{ν2 ; ν f iel d : {“java.lang.Object”; . . . } ◦ φ4 ; μ2 } jobject → str{νfield }
+→ {“java.lang.Object”; . . . } jobject
+In other words, this function accepts any object as the first parameter as long
+as it has a field with type java.lang.Object whose name is given by the second
+parameter exactly as intended.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:48
+
+•
+
+M. Furr and J. S. Foster
+
+5. IMPLEMENTATIONS
+Next we describe our implementations of O-Saffire and J-Saffire as well as the
+results of applying them to a variety of benchmarks. Section 6 compares and
+contrasts the two systems.
+5.1 O-Saffire
+Our implementation of O-Saffire consists of two separate tools, one for OCaml
+and one for C. The first tool uses the camlp4 preprocessor to analyze OCaml
+source programs, extract the type signatures of any foreign functions, and then
+apply the type translation function
+discussed in Section 3.4. Because ultimately C foreign functions will see the physical representations of OCaml
+types, O-Saffire resolves all types to a concrete form. In particular, type aliases
+are replaced by their base types, and opaque types are replaced by the concrete
+types they hide when available. If the concrete type is not available, the opaque
+type is assigned a fresh type variable, and O-Saffire simply checks to ensure
+it is used consistently. As each OCaml source file is analyzed, O-Saffire incrementally updates a central type repository with the newly extracted type information, beginning with a pregenerated repository from the standard OCaml
+library.
+The second tool, built using CIL [Necula et al. 2002], performs the bulk of
+the analysis. This part of O-Saffire takes as input the central type repository
+and a set of C source programs to which it applies the type inference algorithm from Section 3.4. In order to analyze constructs such as if unboxed ,
+O-Saffire uses syntactic pattern matching to identify tag and boxedness tests
+in the code. In particular, O-Saffire recognizes comparisons if ((e & 1) == 0)
+and its negation as tests for boxedness. O-Saffire also recognizes several patterns for checking the value of a primitive type or a tag, including if(e == n)
+and if (e-1) (a comparison to zero). Other patterns O-Saffire recognizes include tests if(Int val(e) == 0), if (e == Val unit), if (e == Val true),
+and if (e != Val int(0)). Programmers often use this last test to check for a
+nonempty list or a supplied option value. All of these patterns are also recognized when prefixed by the unary negation (!) operator.
+One feature of C that we have not fully discussed is the address-of operator.
+Our implementation models address-of in different ways, depending on the usage. Any local variable with an integer type (or local structure with a integer
+field) that has its address computed is given the type int{, 0, } everywhere.
+This conservatively models the fact that the variable may be updated arbitrarily through other aliases. It has been our experience that variables used for
+indexing into value types rarely have their address taken so this usually does
+not affect our analysis. Similarly, we produce a warning for any variable of type
+value whose address is taken (or any variable containing a field of type value )
+as well as for any global variable of type value .
+Recall that, in our formal system, we do not allow pointer arithmetic on
+C pointer types. In our implementation, we allow potentially unsafe pointer
+arithmetic for non-value types as our focus is on FFI safety, not general C type
+safety, which could be addressed with other techniques [Chandra and Reps
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:49
+
+1999; Necula et al. 2002]. We also treat function pointers conservatively. When
+encountering a call through a C function pointer, O-Saffire currently issues a
+warning and does not generate typing constraints on the parameters or return
+type.
+Sometimes it is useful to pass C data and pointers to OCaml. For example,
+glue code for a windowing library might want to return pointers representing
+windows or buttons to OCaml. There are two main ways to accomplish this. C
+pointers can be safely passed directly to OCaml because the OCaml garbage
+collector does not follow pointers to memory outside its own heap. Alternately,
+pointers can be passed in custom blocks that encapsulate C data and include
+pointers to routines for deallocation, comparison, serialization, and hashing,
+which will be used appropriately by the OCaml runtime. In either case, it is up
+to the programmer to ensure that such data is not treated as OCaml data or
+vice-versa.
+O-Saffire supports these behaviors with a very simple heuristic. If a value
+is cast directly to a C pointer type, our analysis unifies the type of the OCaml
+value with a custom type, and therefore ensures that the OCaml value is always
+used as a C pointer. However, we do not distinguish between two different C
+types so long as they are both pointers. Since a programmer can easily cast
+one pointer type to another arbitrarily in C, enforcing a stronger heuristic at
+the language boundary did not seem beneficial. On the other hand, O-Saffire
+issues a warning at a cast of a value type directly to a primitive type (such as
+an integer) since that is most likely an error in our experience. Our heuristic
+for other casts is to ignore all casts between C types that do not involve value .
+We model C structs in one of two ways. Any struct s stored on the C stack
+(i.e., a local or parameter) is expanded one level so that all of its fields are treated
+as local variables (e.g., s.f1, s.f2, etc). If an OCaml value is stored in or read
+from a heap-allocated struct, we emit a warning, which only occurred twice
+in our benchmarks. In general, we found that C struct types rarely contain
+OCaml data.
+In addition to the types we have described so far, OCaml also includes objects,
+polymorphic variants, and universally quantified types. O-Saffire treats object
+types in the same way as opaque types with no subtyping between different
+object types. We have not seen objects used in FFI C code. O-Saffire does not
+handle polymorphic variants, which are used in FFI code, and this leads to some
+false positives in our experiments. Unlike traditional sum types which use a
+sequentially numbered tag in the header of a structured block, polymorphic
+variants store a hash of their constructor name as the first element of the
+block. This is particularly difficult to handle because we have seen FFI code
+use binary search to select the proper tag for the block, and our analysis is not
+sophisticated enough to support this style of tag test.
+O-Saffire translates universally quantified type variables to the representational type (ψ, π + σ ), where ψ, π and σ are fresh variables with the constraint
+1 ≤ ψ. Since a polymorphic type could be either boxed or unboxed, this prevents
+a C function from using the polymorphic type directly as an integer or a boxed
+type without at least performing a boxedness test. Our current implementation
+also cannot infer universally quantified types for C helper functions that are
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:50
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 26. Experimental results.
+
+polymorphic in OCaml value parameters. Unlike JNI glue code, such OCaml
+glue functions appear to be rare in practice; we only saw 4 such functions in
+our benchmark suite. We could extend our implementation to use the same
+technique discussed in Section 4.3 to infer polymorphic signatures, but instead
+we take a heuristic approach. In O-Saffire, the programmer can annotate functions to indicate that calling them should yield no constraints between formal
+and actual arguments, and we added such annotations for the 4 polymorphic
+functions we found.
+Finally, a common technique for error handling in C glue code is to raise an
+OCaml exception, and when this occurs, the OCaml runtime pops the entire
+C function stack and returns control to OCaml. However, in order to throw an
+exception, the exception itself must be allocated on the OCaml heap. Thus it
+is safe for a function not to register its local references to data on the OCaml
+heap, and then allocate and throw an exception. To avoid false positives in this
+situation, our implementation tracks functions which never return and assigns
+them the effect nogc since all C references are no longer live when such a
+function is called.
+5.2 OCaml Experiments
+We ran O-Saffire on several programs that utilize the OCaml foreign function
+interface. The programs we looked at are actually glue libraries that provide
+an OCaml API for system and third-party libraries. All of the programs we
+analyzed were from a tested, released version, though we believe O-Saffire is
+also useful during development.
+Figure 26 gives a summary of our benchmarks and results. For each program, we list the lines of C code, OCaml code, and number of external OCaml
+function declarations. The fifth column gives the running time in seconds (fiverun average) for our C code analysis on an AMD Athlon 4600 processor with
+4GB of memory. Recall from Section 3.4 that we do not directly analyze OCaml
+function bodies. The cost of extracting OCaml types is negligible and therefore
+omitted. The running time only contains the time spent in our analysis, which
+begins once CIL has constructed the AST of the program. All of the running
+times are very fast. The slowest benchmark is lablgtk, which takes significantly
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:51
+
+more time than the others. We believe this is due to the large number of global
+variables pulled in to the code via system headers which slows down operations
+on type environments.
+The next three columns list the number of errors found, the number of warnings for questionable programming practice, and the number of false positives,
+that is, warnings for code that appears to be correct. The last column shows the
+number of places where the implementation warned that it did not have precise
+flow-sensitive information (see the following). The total number of warnings issued by O-Saffire is the sum of these four columns.
+We found 24 outright errors in the benchmarks. One source of errors was forgetting to register C references to the OCaml heap before invoking the OCaml
+runtime. This accounts for one error in each of ftplib, lablgl, and lablgtk. Similarly, the one error in each of ocaml-mad and ocaml-vorbis was registering a
+local parameter with the garbage collector but then forgetting to release it, thus
+possibly leaking memory or causing subtle memory corruption.
+The 19 remaining errors are type mismatches between the C code and the
+OCaml code. For instance, 5 of the lablgtk errors and all ocaml-glpk and ocamlssl errors were due to using Val int instead of Int val or vice-versa. Another
+error was due to one FFI function mistreating an optional argument as a regular
+argument. In particular, the function directly accessed the option block as if it
+were the contents of the option type rather than the option type itself. Thus,
+the C code will most likely violate type safety.
+Another lablgtk error was due to a C pointer of type t being initialized as
+the value (t*)Val unit which is unsafe—recall that Val Unit is represented as
+the OCaml integer 0, which is stored with a tag in memory as the value 1. This
+mistake is particularly dangerous because on one program path, the variable
+is passed to a gtk library function that expects either a valid pointer or NULL,
+but Val Unit is neither of those. The remaining two gtk errors were due to a
+type mismatch between OCaml and the C. The OCaml source code contained
+a declaration type t = {len: int}, defining the type t to be a record with a single
+element. However, the C code manipulated data with this type as if it had
+a second field containing a C pointer which it does not. The remaining lablgl
+errors were similar cases in which data was described with one shape in OCaml
+and manipulated with a different shape in C.
+In addition to the 24 errors, O-Saffire reported 22 warnings corresponding
+to questionable coding practices. A common mistake was declaring the last
+parameter in an OCaml signature as type unit even though the corresponding
+C function omits that parameter in its declaration:
+OCaml : external f : int → unit → unit = “f”
+C : value f(value x);
+
+While this does not usually cause problems on most systems, it is not good
+practice since the trailing unit parameter is placed on the stack. The warnings
+reported for ftplib, ocaml-glpk, ocaml-ssl, lablgl, and lablgtk were all due to this
+case.
+The warning in gz is an interesting abuse of the OCaml type system. The gz
+program contains an FFI function to seek (set the file position) on file streams,
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:52
+
+•
+
+M. Furr and J. S. Foster
+
+which either have type input channel or output channel. However, instead of
+taking a sum type as a parameter to allow both kinds of arguments, the function
+is declared with a polymorphic type as its parameter.
+OCaml : external seek : int → ’ a → unit = “seek”
+C : value seek(value pos, value chan) {
+FILE *strm = Field(chan,0);
+fseek(strm,...);
+}
+
+Clearly using chan in this way is very dangerous because OCaml will allow any
+argument to be passed to this function, including unboxed integers. In this case,
+however, only the right types are passed to the function, and it is encapsulated
+so no other code can access it, and therefore we classify this as questionable
+programming practice rather than an error.
+O-Saffire also reported a number of false positives, that is, warnings for
+code that seems correct. One source of false positives is polymorphic variants
+which we do not handle. The other main source of false positives is due to
+pointer arithmetic disguised as integer arithmetic. Recall that the type value
+is actually a typedef for long. Therefore if v is an OCaml value that has been
+unified with a C pointer type, then both ((t∗)v + 1) and (t∗)(v + sizeof(t)) are
+equivalent. However, our system will not type check the second case because
+direct arithmetic is being performed on a value type.
+Finally, in several of the benchmarks, there are a number of places where
+O-Saffire issued a warning because it does not have precise enough information
+to compute a type. For instance, this may occur when computing the type of
+e1 + p e2 if e2 has the type int{, 0, } since the analysis cannot determine the
+new offset. Fifty-four of the imprecision messages occurred when the type of
+an expression included B, I, or T as  when a more precise type was needed
+during inference. We also classify as imprecision warnings those that are for
+occurrences of global value types, uses of function pointers, and occurrences
+of C struct types containing value types stored in the heap. However, these
+cases occurred only 10, 8, and 2 times, respectively. One interesting direction for
+future work would be eliminating these warnings and instead adding runtime
+checks to the C code.
+We have reported the O-Saffire results to the authors of the programs in
+our benchmark suite and confirmed that all of the errors reported were in fact
+previously unknown bugs.
+5.3 J-Saffire
+Similarly to O-Saffire, our implementation of J-Saffire is composed of two tools.
+The first tool is a lightweight Java compiler wrapper that intercepts calls to
+javac and records the class path so that the second tool can retrieve class files
+automatically. The wrapper itself does not perform any code analysis. Note
+that this is different from O-Saffire, which could eagerly translate OCaml types
+because only types occurring in external declarations could be used in C. The
+JNI, however, allows C code to look up Java classes dynamically via FindClass.
+Thus the second tool in J-Saffire translates Java types and applies our type
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:53
+
+inference algorithm to C code, issuing warnings whenever it finds a type error.
+This part of J-Saffire uses CIL to parse C source code and the OCaml JavaLib
+[Cannasse 2004] to extract Java type information from compiled class files.
+In addition to the type jobject, the JNI contains several primitive types,
+including void and int, which we did not model in our formal system. To
+model these additional types, our implementation has slightly richer handling
+of field and method descriptors. In the JNI, these descriptors may include class
+names, which we included in our formalism, or strings such as I and V to represent primitives int and void. Thus in our implementation, we introduce a
+new type constructor JTStr{ν}, which is a place holder for the jt type described
+by ν. When ν is unified with a constant string, the type JTStr{ν} is immediately
+replaced with the concrete type it describes. This was not necessary in our formalism because we could use a representational type {ν; φ; μ} instead but that
+type would only represent an object and not a primitive.
+Another type that we omitted from our formal system is Java arrays. In Java,
+arrays are a subtype of Object, and so we model them in our implementation
+as a Java class with a unique name. We represent the array contents as a field
+in this object so that its type is available when the array is dereferenced.
+The JNI also contains a number of typedefs (aliases) for more specific object
+types such as jstring for Java Strings. These are all aliases of jobject, and so
+their use is not required by the JNI, and they do not result in any more checking
+by the C compiler. J-Saffire does not require their use either, but, since they
+are a form of documentation, we enforce their intended meaning, for instance,
+values of type jstring are assigned a type corresponding to String. We found
+14 examples in our benchmarks where programmers used the wrong alias. The
+JNI also defines types jvoid and jint, representing Java voids and integers, as
+aliases of the C types void and int, respectively. J-Saffire does not distinguish
+between the C name and its j-prefixed counterpart. Our implementation also
+forbids casting between jobject (or one of its typedefs) to any other C type and
+produces a warning if this occurs.
+Rather than being called directly, JNI functions are actually stored in
+a table that is passed as an extra argument (typically named env) to every C function called from Java, and this table is in turn passed to every
+JNI function. For example, the FindClass function is actually called with
+(*env)->FindClass(env,...). J-Saffire extracts FFI function names via syntactic pattern matching, and we assume that the table is the same everywhere.
+J-Saffire ignores calls to function pointers that are not part of the JNI and
+issues a warning whenever it encounters one.
+The JNI functions for invoking Java methods must take a variable number of arguments since they may be used to invoke methods with any number
+of parameters. J-Saffire handles the commonly used interface, which is JNI
+functions declared to be varargs using the ... convention in C. However, the
+JNI provides two other calling mechanisms that we do not model; passing arguments as an array and passing arguments using the special va list structure.
+We issue warnings if either is used.
+Although our formal type system is flow-insensitive, J-Saffire treats the
+types of local variables flow-sensitively. Each assignment updates the type of a
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:54
+
+•
+
+M. Furr and J. S. Foster
+
+Fig. 27. Experimental results.
+
+variable in the environment, and we add a unification constraint to variables of the same name at join points in the control flow graph similar to
+O-Saffire.
+Lastly, J-Saffire models strings in a very simple way to match how they are
+used in practice in C glue code. We currently ignore string operations like strcat
+or destructive updates via array operations. We also assume that strings are
+always initialized before they are used since most compilers produce a warning
+when this is not the case.
+5.4 JNI Experiments
+We ran J-Saffire on a suite of 12 benchmarks that use the JNI. Figure 27 shows
+our results. The first 7 programs are taken from the Java-Gnome project [JavaGnome Developers 2005] and the remaining programs are unrelated. The last
+program is a development Java 1.6 compiler, code-named Mustang (we used
+build 61). All benchmarks except pgpjava and Mustang are glue code libraries
+that connect Java to an external C library. For each program, Figure 27 lists
+the number of lines of C code and Java code and the number of native methods.
+Next we list the analysis time in seconds (average of 5 runs) and the number of
+messages reported by J-Saffire, manually divided into the same four categories
+as the O-Saffire experiments. The running time includes the C code analysis
+(including extracting Java types from class files) but not the parsing of C code
+or the compilation time. The measurements were performed on an AMD Athlon
+4600 processor with 4GB of RAM. In a prior conference version [Furr and Foster
+2006b], we reported the number of messages for Mustang to be much lower. We
+have since discovered that we had not reported the imprecision messages for
+this benchmark and have also fixed a few bugs in the implementation which
+have changed some of our results.
+J-Saffire reported 156 errors which are programming mistakes that may
+cause a program to crash or to emit an unexpected exception. Surprisingly,
+the most common error was declaring a C function with the wrong arity, which
+accounted for 68 errors (30 in libgtk and 38 in libgnome). All C functions
+called from Java must start with one parameter for the JNI environment and
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:55
+
+a second parameter for the invoking object or class. In many cases, the second
+parameter was omitted in the call, and hence any subsequent arguments would
+be retrieved from the wrong stack location which could easily cause a program
+crash.
+Fifty-six of the errors were due to mistakes made during a software rewrite.
+Programs that use the JNI typically use one of two techniques to pass C pointers
+(e.g., GUI window objects) through Java: they either pass the pointer directly
+as an integer or they embed the pointer as a private integer field inside a Java
+object. Several of the libraries in the Java-Gnome project appear to be switching
+from the integer technique to the object technique, which requires changing
+Java declarations in parallel with C declarations, an error-prone process. JSaffire detected many cases when a Java native method specified an Object
+parameter but the corresponding C function specified an integer parameter
+or vice-versa. This accounted for 4 errors in libgnome, 25 in libgtk, and 27 in
+libgtkhtml.
+Type mismatches accounted for 18 of the remaining errors. Six errors occurred because a native Java method was declared with a String argument,
+but the C code took a byte array argument. In general, Java strings must be
+translated to C strings using special JNI functions, and hence this is a type
+error. Another type error occurred because one C function passed a (nonarray) Java object to another C function expecting a Java array. Since both of
+these are represented with the type jobject in C, the C compiler did not
+catch this error. The one error in Mustang occurred when the C source code
+did not properly distinguish between the types int and long in a C function
+signature. If used on a big-endian 64-bit machine, the C function would access only the higher 32 bits of the value on the stack, creating a runtime error
+[Furr and Foster 2005b].
+Finally, 14 errors were due to incorrect namings. 11 of these errors (9 in jnetfilter and 2 in libgtk) were caused by calls to FindClass with an incorrect string.
+Ironically, all 9 jnetfilter errors occurred in code that was supposed to construct
+a Java exception to throw, but, since the string did not properly identify the
+exception class, the JVM would throw a ClassNotFound exception instead. The
+remaining 3 errors were due to giving incorrect names to C functions corresponding to Java native methods. As mentioned in Section 2.2, such functions
+must be given long names following a particular naming scheme, and it is easy
+to get this wrong.
+Most of the errors we found are easy to trigger with a small amount of code. In
+cases such as incorrectly-named functions, errors would likely be immediately
+apparent as soon as the native method is called. Clearly, many of the errors are
+in code that has not been tested very much, most likely the parts of libraries
+that have not yet been used by Java programmers.
+J-Saffire also produced 124 warnings, which are suspicious programming
+practices that do not actually cause runtime errors. One warning arose
+when a programmer called the function FindClass with a field descriptor
+of the form Ljava/lang/String; rather than a fully qualified class name
+java/lang/String. Technically this is an error [Liang 1999], but the Sun JVM
+we tested allows both versions so we only consider this a warning.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:56
+
+•
+
+M. Furr and J. S. Foster
+
+Thirteen of the warnings were due to using an inappropriate type alias for
+a JNI type such as declaring an arbitrary object with the type jstring. Since
+these aliases are just typedefs for jobject, their misuse will not cause any ill
+effects, but this is a poor practice.
+Finally, 110 warnings were due to the declaration of C functions that appear
+to implement a specific native method (because they have specially formatted
+names) but do not correspond to any native Java method. In many cases, there
+was a native method in the Java code, but it had been commented out or moved
+without deleting the C code. This will not cause any runtime errors, but it seems
+helpful to notify the programmer about this dead code.
+J-Saffire also produced 140 false positives, which are warnings about correct code. Twenty-seven of the Mustang false positives, 34 of the libgtk false
+positives, and all of the false positives from the rest of the benchmarks were
+due to subtyping inside of C code, which our analysis does not model precisely
+because it uses unification. The remaining 2 false positives in libgtk and 31 of
+the Mustang messages occurred when an object of type jt JClass unified with
+an instance of java.lang.Class. This is safe in the JNI, but, since we use a richer
+representation of classes in J-Saffire, these two types are incompatible in our
+system. Of the remaining false positives (all in Mustang), 32 occurred because
+the type of Java object returned by a function was selected using a switch statement that tested the contents of a string. These occurred in internal functions
+of Mustang that directly manipulate Java objects so it is no surprise that our
+analysis was unable to handle this style of code.
+Finally, J-Saffire emitted 2642 imprecision warnings, which occurred when
+the analysis was unable to analyze a particular program point. The vast majority of these cases were in Mustang. Thirty-six of the imprecision warnings (of
+which 14 are from Mustang) were due to unification failures with partially specified methods that could not be resolved. There were 707 messages (of which
+701 were from Mustang) that were due to code using parts of the JNI API that
+our analysis does not model, such as using an alternative calling convention
+of passing method arguments packed in an array. The remaining messages all
+came from Mustang; 115 of these were due to expressions that our analysis was
+unable to handle such as directly manipulating the jobject struct type, which
+is assumed to be opaque in our system. The other 1784 messages were due to
+the use of function pointers which J-Saffire does not model. The Java compiler
+appears to be atypical in the style of JNI code it uses since the other benchmarks
+reported few if any such warnings (which is not surprising). Therefore, we did
+not investigate adding support for these features in our initial implementation,
+but this may be worth exploring in a future version.
+We have reported the results to the authors of the programs in our benchmark
+suite for J-Saffire and confirmed that all of the errors reported were in fact
+previously unknown bugs.
+6. DISCUSSION AND FUTURE WORK
+We have presented two type inference systems for checking type safety of programs that use the OCaml FFI and the JNI. Our inference systems rely on
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:57
+
+two key ideas. The first is to refine the types given to high-level data in C glue
+code. Instead of the single conflated type assigned by the FFI, our analyses use
+multilingual representational types that model C’s view of OCaml and Java
+data. The other key idea of our analyses is to use singleton types to track values through C glue code in order to determine how high-level data is being
+accessed by the glue code.
+The need for value tracking is a fundamental part of FFI analysis because
+it allows us to model FFI operations precisely. In the high-level language, operations like pattern matching and field access are distinguished syntactically
+using constructs that contain non-first-class identifiers. For example, in Java,
+a field access is written e. f , where e is an arbitrary expression but f is an
+identifier for a field. C glue code cannot simply use C’s corresponding field access operator for Java data because the C compiler does not have object layout
+information. Thus instead in the JNI, object fields are accessed via a series of
+function calls in which the field name is passed as a string. This makes field
+names first class in C glue code which means that, in order to determine what
+fields are accessed by a JNI operation, we need to track string values. We similarly needed to track integer values in glue code for the OCaml FFI in order to
+track manipulations of sum and product types.
+We found that we were able to determine string and integer values with
+sufficient precision using fairly simple analyses—a flow-insensitive, contextsensitive analysis for strings in the JNI and a flow-sensitive, context-insensitive
+analysis for integers and offsets in the OCaml FFI. We suspect these analyses
+were sufficient because glue code seems complicated on the surface, and, since
+programmers are naturally worried about making mistakes in this code, they
+use the FFI in a simple way.
+Despite this, it is not surprising that programmers still make type errors
+in glue code. In both FFIs, type violations can succeed silently. This is almost
+always the case in the OCaml FFI, while in the JNI some kinds of type errors
+result in runtime exceptions. Thus programmers are left to rely on testing
+to find bugs which can cover only a limited number of executions. Another
+approach programmers could take is to wrap high-level data in C types and
+use C’s type system to enforce type safety. Although this would be possible
+(e.g., making one C struct for each kind of high-level data), we did not find
+any code that tried this, perhaps because it may be too complicated given the
+perceived benefit, and it would require updating each time a type signature
+changed.
+We also found that, although in many ways the OCaml FFI and the JNI are
+similar, their different design decisions resulted in different kinds of mistakes
+by programmers. In particular, in the OCaml FFI, programmers need to remember to explicitly register pointers to the OCaml heap, while the JNI automatically registers such pointers. As a result OCaml programs can introduce bugs
+by forgetting to register pointers, although they can also reduce overhead by
+not bothering to register pointers that will be dead before the garbage collector
+is invoked.
+Aside from these fundamental design choices, even seemingly trivial FFI
+design decisions have consequences. For example, the poor choice of names for
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:58
+
+•
+
+M. Furr and J. S. Foster
+
+the OCaml FFI macros Val int and Int val (do you remember which is which?)
+leads to mistakes, whereas in the JNI there is no such confusion because C
+and Java integers have the same representation. On the other hand, the JNI’s
+baroque naming convention for native functions results in many errors, whereas
+we found no cases where the OCaml FFI programmer mismatched function
+names between C and OCaml. In general, writing programs that use an FFI
+is just like any other software engineering task: if the programmer has an
+opportunity to make a mistake because of something slightly complicated or
+confusing, he will make that mistake at times.
+6.1 Future Improvements to O-Saffire and J-Saffire
+There are several aspects of the OCaml and Java FFIs that our systems do not
+currently handle. Both FFIs include array types that can be accessed by C code,
+but our analyses do not perform bounds checks. One approach to this problem
+is inserting dynamic checks at runtime [Tan et al. 2006]. In our experiments,
+we found a number of false positives in O-Saffire due to polymorphic variants
+and, in J-Saffire, due to the lack of subtyping on jobjects. We believe that both
+of these could be addressed with more sophisticated analyses.
+Our analyses also do not model control flow via exceptions. In the OCaml
+FFI, an exception unwinds both the OCaml and the C stack to the point of the
+closest handler. Thus the C programmer must be careful to free any C resources
+in use when an exception is raised. In the JNI, exceptions unwind only the Java
+stack up to the last native method or the last handler, whichever comes first.
+Thus JNI glue code must be careful to always check for exceptions after calling
+almost any JNI function. We leave enforcement of these requirements to future
+work.
+Finally, our analyses also do not track foreign data stored in global C variables. In both OCaml and Java, if a foreign data reference is stored in a global,
+the glue code must register that reference as a global root to the garbage collector. Similarly, when the global variable is overwritten or becomes dead, the
+programmer must explicitly remove the global root. Currently O-Saffire and
+J-Saffire simply issue warnings when they see global variables that may hold
+foreign data and do not attempt to track the contents of the global. To verify
+that global references are handled correctly would likely require a new global
+analysis, including constructing a multilingual call graph to track the lifetimes
+of objects through the entire program.
+6.2 Future Work for Other FFIs
+We believe that our basic approach can also be applied to other FFIs. One
+interesting target is the Haskell FFI [Jones 2001], which is somewhat different
+than the OCaml or Java FFI. In the Haskell FFI, all glue code is written in
+Haskell rather than C. The programmer imports foreign (typically C) functions
+into the Haskell namespace, giving them Haskell type signatures. Assuming
+these are correctly specified, Haskell’s type system will then enforce type safety
+at native calls. However, just as manipulating high-level types in C code is
+cumbersome in the OCaml FFI and the JNI, manipulating C types in Haskell
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:59
+
+is also messy and error-prone. For instance, to access a field of a C struct, the
+programmer must use the low-level, type-unsafe function peekByteOff, which
+extracts a field at a given numeric offset. While an FFI preprocessor can help
+automate many of these low-level calls, we believe our approach could also
+ensure that Haskell accesses C data safely.
+Another possible target is dynamically typed languages such as Python,
+which has an FFI to C. To analyze such a program, we would most likely need to
+use a soft typing system [Wright and Cartwright 1994] to infer types for Python
+data. One challenge for Python is that it uses reference counting for memory
+management, and thus C glue code must explicitly increment and decrement
+counts for references to Python data. As this is easy to do incorrectly, we suspect
+an analysis to look for these kind of bugs would find many mistakes.
+Finally, another kind of code that has the same flavor as FFIs is code that
+uses reflection. Reflection APIs typically treat data as foreign until its type
+has been examined at which point it can be cast to a native type. For example,
+Java’s reflection API looks very similar to the JNI except that objects accessed
+by reflection are instances of Object rather than the completely opaque type
+jobject. In Java’s reflection API, class, field and method names are looked up
+using strings, intermediate field values are stored in a nonparameterized Field
+class, and result types must be explicitly downcast from Object to the correct
+type. We believe that our singleton type system could be used to track strings
+through Java reflective code, and we could then statically ensure that many
+uses of reflection are type safe. We leave this as an open problem for future
+work.
+7. RELATED WORK
+Most languages include a foreign function interface, typically to C, since it
+runs on many platforms. For languages whose semantics and runtime systems
+are close to C, foreign function interfaces can be fairly straightforward. For
+languages that are further from C, FFIs are more complicated, and there are
+many interesting design points with different trade-offs [Blume 2001; Finne
+et al. 1999; Huelsbergen 1996; Leroy 2004; Liang 1999; Jones 2001]. For example, Blume [2001] proposes a system allowing arbitrary C data types to be
+accessed by ML. Fisher et al. [2001] have developed a framework that supports
+exploration of many different foreign interface policies that free the programmer from having to write glue code to translate between data representations.
+While various interfaces allow more or less code to be written natively (and
+there is a general trend towards more native code rather than glue code), the
+problem of validating usage of the interface on the foreign language side still
+remains.
+In work concurrent with ours, Tan et al. [2006] present a system that inserts
+dynamic checks into C glue code to ensure that the JNI is used safely. Because
+the checks are performed at runtime, their system can only verify type and
+memory safety of particular program executions. However, they are also able
+to check for more kinds of errors than our static system, such as out of bounds
+array accesses.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:60
+
+•
+
+M. Furr and J. S. Foster
+
+Our technique of tracking pointer offsets for the OCaml-to-C FFI bears some
+resemblance to systems that use physical type checking for C [Chandra and
+Reps 1999; Necula et al. 2002] in that both must be concerned with detailed
+memory representations. However, our system is considerably simpler than
+full-fledged physical type checking systems because OCaml data given type
+value is typically only used in restricted ways.
+Our string-tracking mechanism for code that uses the JNI is relatively
+simple, supporting polymorphism but treating strings themselves as opaque.
+Recently several researchers have developed more sophisticated techniques to
+track strings in programs [Christensen et al. 2003; DeLine and Fähndrich 2004;
+Gould et al. 2004; Thiemann 2005]. These systems include support for modeling
+string manipulation routines because one of their goals is to check that dynamically generated SQL queries are well-formed. For purposes of checking clients
+of the JNI, we have found that our simple tracking of strings as constants is
+sufficient.
+Nishimura [1998] presents an object calculus that can statically infer kinded
+types for first-class method names which is similar to our inference of Java
+object types for the JNI. Nishimura’s system has similar restrictions to ours
+such as not supporting inheritance or overloaded methods. Our work differs in
+that we are typing C code and must analyze the value of C strings instead of
+working with a pure object calculus, and we have implemented our system and
+applied it to a number of benchmarks.
+Trifonov and Shao [1999] use effects to reason about the safety of interfacing multiple safe languages with different runtime resource requirements
+in the same address space. Their focus is on ensuring that code fragments in
+the various languages have access to necessary resources while preserving the
+languages’ semantics, which differs from our goal of checking types and GC
+properties in FFIs.
+Matthews and Findler [2007] study the semantics of mixing the typed and
+untyped lambda calculus to better reason about their interaction. They focus
+on high-level properties such as ensuring soundness of the typed language in
+the presence of foreign values, while our focus is on detecting errors in low-level
+glue code.
+There are a number of alternatives to using FFIs directly. One technique
+is to use automatic interface generators to produce glue code. SWIG [Beazley
+1996] generates glue code based on an interface specification file. This has
+the advantage of eliminating the need for custom glue code (and thus eliminating safety violations), but it exposes all of the low-level types to the highlevel language, creating a possibly awkward interface. Exu [Bubba et al. 2001]
+provides programmers with a lightweight system for automatically generating JNI-to-C++ glue code for the common cases. Mockingbird [Auerbach
+et al. 1999] is a system for automatically finding matchings between two
+types written in different languages and generating the appropriate glue
+code. Our benchmark suite contained custom glue code that was generated by
+hand.
+In addition to the JNI, there has been significant work on other approaches
+to object-oriented language interoperation, such as COM [Gray et al. 1998],
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:61
+
+SOM [Hamilton 1996] and CORBA [Object Management Group 2004]. Barrett
+[1998] proposes the PolySPIN system as an alternative to CORBA. All of these
+systems check for errors mainly at runtime, though, in some cases, interface
+generators can be used to provide some compile-time checking. Grechanik et al.
+[2004] present a framework called ROOF that allows many different languages
+to interact using a common syntax. This system includes both runtime and
+static type checking for code that uses ROOF. It is unclear whether ROOF
+supports polymorphism and whether it can infer types for glue code in isolation.
+Another approach to avoiding foreign function interfaces is to compile all programs to a common intermediate representations. For example, the Microsoft
+common-language runtime (CLR) [Hamilton 2003; Meijer et al. 2001] provides
+interoperation by being the target of compilers for different languages, and the
+CLR includes a strong static type system. While this solution avoids some of
+the difficulties that can arise with FFIs, it does not solve the issue of interfacing
+with programs in non-CLR languages or with unmanaged (unsafe) CLR code.
+8. CONCLUSION
+We have presented O-Saffire and J-Saffire, a pair of multilingual type inference
+systems for checking the type safety of programs that use the OCaml-to-C FFI
+and the JNI, respectively. Both systems focus their analysis efforts on C glue
+code, ensuring that it obeys the high-level language types. Since these FFIs
+conflate almost all high-level types to a single C type to perform inference, we
+use extended multilingual types that embed the high-level types into C types.
+O-Saffire and J-Saffire use representational types to capture C’s view of highlevel data. In O-Saffire, our representational types model a union of unboxed
+and boxed data, which covers integers, updatable references, data types, and
+the unit type. Then during type inference we use an intraprocedural dataflow
+analysis algorithm to track the currently known information about a representational type, which allows us to analyze the C code equivalent of OCaml pattern
+matching. In J-Saffire, representational types model an object as an instance
+of a class with a given name, which may be a string variable, and with a subset
+of its fields and methods, the names and types of which could also be unknown
+string variables. Since strings tend to be used fairly simply in JNI glue code,
+J-Saffire uses unification to track strings but includes a polymorphic inference
+component to model wrapper functions precisely even allowing functions to be
+polymorphic in the values of string arguments. O-Saffire also uses effects to
+track garbage collection information and ensure that C pointers to the OCaml
+heap are registered with the garbage collector. We applied our implementations
+of O-Saffire and J-Saffire to a number of benchmarks, finding many errors and
+suspicious coding practices. Our results suggest that our static checking system
+can be an important part of ensuring that foreign function interfaces are used
+correctly.
+ACKNOWLEDGMENTS
+
+We would like to thank the anonymous reviewers for their helpful comments.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+18:62
+
+•
+
+M. Furr and J. S. Foster
+
+REFERENCES
+AUERBACH, J., BARTON, C., CHU-CARROLL, M., AND RAGHAVACHARI, M. 1999. Mockingbird: Flexible
+stub compilation from paris of declarations. In Proceedings of the 19th International Conference
+on Distributed Computing Systems. Austin, TX.
+BARRETT, D. J. 1998. Polylingual systems: An approach to seamless interoperability. Ph.D. thesis,
+University of Massachusetts, Amherst, MA.
+BEAZLEY, D. M. 1996. SWIG: An easy to use tool for integrating scripting languages with C and
+C++. USENIX 4th Annual Tcl/Tk Workshop.
+BLUME, M. 2001. No-longer-foreign: Teaching an ML compiler to speak C “natively”. In Proceedings of the 1st International Workshop on Multilanguage Infrastructure and Interoperability
+(BABEL’01). Firenze, Italy.
+BUBBA, J. F., KAPLAN, A., AND WILEDEN, J. C. 2001. The Exu approach to safe, transparent and
+lightweight interoperability. In Proceedings of the 25th International Computer Software and
+Applications Conference (COMPSAC’01). Chicago, IL.
+CANNASSE, N. 2004. Ocaml javalib. http://team.motion-twin.com/ncannasse/javaLib/.
+CHANDRA, S. AND REPS, T. W. 1999. Physical type checking for C. In Proceedings of the ACM SIGPLAN/SIGSOFT Workshop on Program Analysis for Software Tools and Engineering. Toulouse,
+France, 66–75.
+CHRISTENSEN, A. S., MøLLER, A., AND SCHWARTZBACH, M. I. 2003. Precise analysis of string expressions. In Proceedings of the 10th International Symposium on Static Analysis. San Diego, CA.
+DELINE, R. AND FÄHNDRICH, M. 2004. The Fugue protocol checker: Is your software baroque? Tech.
+rep. MSR-TR-2004-07, Microsoft Research.
+FÄHNDRICH, M., REHOF, J., AND DAS, M. 2000. Scalable context-sensitive flow analysis using instantiation constraints. In Proceedings of the ACM Conference on Programming Language Design and
+Implementation. Vancouver B.C., Canada.
+FELLEISEN, M. AND HIEB, R. 1992. The revised report on the syntactic theories of sequential control
+and state. Theor. Comput. Sci. 103, 2, 235–271.
+FINNE, S., LEIJEN, D., MEIJER, E., AND JONES, S. P. 1999. Calling hell from heaven and heaven
+from hell. In Proceedings of the 4th ACM SIGPLAN International Conference on Functional
+Programming. Paris, France, 114–125.
+FISHER, K., PUCELLA, R., AND REPPY, J. 2001. A framework for interoperability. In Proceedings of
+the 1st International Workshop on Multilanguage Infrastructure and Interoperability (BABEL’01).
+Firenze, Italy.
+FURR, M. AND FOSTER, J. S. 2005a. Checking type safety of foreign function calls. In Proceedings of
+the ACM Conference on Programming Language Design and Implementation. Chicago, IL. 62–72.
+FURR, M. AND FOSTER, J. S. 2005b. Java SE 6 ”Mustang” bug 6362203. http://bugs.sun.com/
+bugdatabase/view_bug.do?bug_id=6362203.
+FURR, M. AND FOSTER, J. S. 2006a. Checking type safety of foreign function calls. Tech. rep. CSTR-4845, Computer Science Department, University of Maryland.
+FURR, M. AND FOSTER, J. S. 2006b. Polymorphic type inference for the JNI. In Proceedings of the
+15th European Symposium on Programming. Vienna, Austria. To appear.
+GOULD, C., SU, Z., AND DEVANBU, P. 2004. Static Checking of Dynamically Generated Queries in
+Database Applications. In Proceedings of the 26th International Conference on Software Engineering (ICSE’04). Edinburgh, 645–654.
+GRAY, D. N., HOTCHKISS, J., LAFORGE, S., SHALIT, A., AND WEINBERG, T. 1998. Modern languages and
+Microsoft’s component object model. Comm. ACM 41, 5, 55–65.
+GRECHANIK, M., BATORY, D., AND PERRY, D. E. 2004. Design of large-scale polylingual systems. In
+Proceedings of the 26th International Conference on Software Engineering (ICSE’04). Scot and.
+357–366.
+HAMILTON, J. 1996. Interlanguage object sharing with SOM. In Proceedings of the Usenix Annual
+Technical Conference. San Diego, CA.
+HAMILTON, J. 2003. Language integration in the common language runtime. ACM SIGPLAN
+Notices 38, 2, 19–28.
+HENGLEIN, F. 1993. Type inference with polymorphic recursion. ACM Trans. Program. Lang.
+Syst. 15, 2, 253–289.
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+Checking Type Safety of Foreign Function Calls
+
+•
+
+18:63
+
+HUELSBERGEN, L. 1996. A portable C interface for standard ML of New Jersey. http://www.smlnj.
+org//doc/SMLNJ-C/smlnj-c.ps.
+JAVA-GNOME DEVELOPERS. 2005. Java bindings for the gnome and gtk libraries. http://
+java-gnome.sourceforge.net.
+JONES, S. P. 2001. Tackling the awkward squad: Monadic input/output, concurrency, exceptions,
+and foreign-language calls in Haskell. In Engineernig Theories of Software Construction, T. Hoare,
+M. Broy, and R. Steinbruggen, Eds. IOS Press, 47–96.
+LEROY, X. 2004. The Objective Caml system. Release 3.08, http://caml.inria.fr/distrib/
+ocaml-3.08/ocaml-3.08-refman.pdf.
+LIANG, S. 1999. The Java Native Interface: Programmer’s Guide and Specification. AddisonWesley.
+LINDHOLM, T. AND YELLIN, F. 1997. The Java Virtual Machine Specification. Addison-Wesley.
+MATTHEWS, J. AND FINDLER, R. B. 2007. Operational semantics for multi-language programs. In
+Proceedings of the 34th Annual ACM Symposium on Principles of Programming Languages. Nice,
+France, 3–10.
+MEIJER, E., PERRY, N., AND VAN YZENDOORN, A. 2001. Scripting .NET using Mondrian. In Proceedings of the 15th European Conference on Object-Oriented Programming (ECOOP’01). Budapest,
+Hungary.
+NECULA, G., MCPEAK, S., RAHUL, S. P., AND WEIMER, W. 2002. CIL: Intermediate language and
+tools for analysis and transformation of C programs. In Proceedings of the 11th International
+Conference on Computer Construction. Grenoble, France.
+NECULA, G., MCPEAK, S., AND WEIMER, W. 2002. CCured: Type-safe retrofitting of legacy code.
+In Proceedings of the 29th Annual ACM Symposium on Principles of Programming Languages.
+Portland, OR. 128–139.
+NISHIMURA, S. 1998. Static typing for dynamic messages. In Proceedings of the 25th Annual ACM
+Symposium on Principles of Programming Languages. San Diego, CA.
+Object Management Group 2004. Common object request broker architecture: Core specification,
+Version 3.0.3. Object Management Group.
+RÉMY, D. 1989. Typechecking records and variants in a natural extension of ML. In Proceedings of
+the 16th Annual ACM Symposium on Principles of Programming Languages. Austin, TX. 77–88.
+TAN, G., APPEL, A. W., CHAKRADHAR, S., RAGHUNATHAN, A., RAVI, S., AND WANG, D. 2006. Safe java
+native interface. In Proceedings of the IEEE International Symposium on Secure Software Engineering. Arlington, VA.
+THIEMANN, P. 2005. Grammar-based analysis of string expressions. In Proceedings of the ACM
+SIGPLAN International Workshop on Types in Language Design and Implementation. Long
+Beach, CA.
+TRIFONOV, V. AND SHAO, Z. 1999. Safe and principled language interoperation. In Proceedings of
+the 8th European Symposium on Programming. D. Swierstra, Ed. Lecture Notes in Computer
+Science, vol. 1576. Springer-Verlag, Berlin, Germany, 128–146.
+WRIGHT, A. K. AND CARTWRIGHT, R. 1994. A practical soft type system for scheme. In Proceedings
+of the Conference on Lisp and Functional Programming. 250–262.
+Received July 2006; revised December 2006; accepted July 2007
+
+ACM Transactions on Programming Languages and Systems, Vol. 30, No. 4, Article 18, Publication date: July 2008.
+
+

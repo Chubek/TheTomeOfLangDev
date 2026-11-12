@@ -1,0 +1,1993 @@
+Meta Optimization:
+Improving Compiler Heuristics with Machine Learning
+Mark Stephenson and
+Saman Amarasinghe
+Massachusetts Institute of Technology
+Laboratory for Computer Science
+Cambridge, MA 02139
+
+Martin Martin and Una-May O’Reilly
+Massachusetts Institute of Technology
+Artificial Intelligence Laboratory
+Cambridge, MA 02139
+{mcm, unamay}@ai.mit.edu
+
+{mstephen, saman}@cag.lcs.mit.edu
+
+ABSTRACT
+
+1. INTRODUCTION
+
+Compiler writers have crafted many heuristics over the years
+to approximately solve NP-hard problems eﬃciently. Finding a heuristic that performs well on a broad range of applications is a tedious and diﬃcult process. This paper introduces Meta Optimization, a methodology for automatically ﬁne-tuning compiler heuristics. Meta Optimization
+uses machine-learning techniques to automatically search
+the space of compiler heuristics. Our techniques reduce compiler design complexity by relieving compiler writers of the
+tedium of heuristic tuning. Our machine-learning system
+uses an evolutionary algorithm to automatically ﬁnd eﬀective compiler heuristics. We present promising experimental
+results. In one mode of operation Meta Optimization creates
+application-speciﬁc heuristics which often result in impressive speedups. For hyperblock formation, one optimization
+we present in this paper, we obtain an average speedup of
+23% (up to 73%) for the applications in our suite. Furthermore, by evolving a compiler’s heuristic over several benchmarks, we can create eﬀective, general-purpose heuristics.
+The best general-purpose heuristic our system found for hyperblock formation improved performance by an average of
+25% on our training set, and 9% on a completely unrelated
+test set. We demonstrate the eﬃcacy of our techniques on
+three diﬀerent optimizations in this paper: hyperblock formation, register allocation, and data prefetching.
+
+Compiler writers have a diﬃcult task. They are expected
+to create eﬀective and inexpensive solutions to NP-hard
+problems such as register allocation and instruction scheduling. Their solutions are expected to interact well with other
+optimizations that the compiler performs. Because some
+optimizations have competing and conﬂicting goals, adverse
+interactions are inevitable. Getting all of the compiler passes
+to mesh nicely is a daunting task.
+The advent of intractably complex computer architectures
+also complicates the compiler writer’s task. Since it is impossible to create a simple model that captures the intricacies of modern architectures and compilers, compiler writers
+rely on inaccurate abstractions. Such models are based upon
+many assumptions, and thus may not even properly simulate
+ﬁrst-order eﬀects.
+Because compilers cannot aﬀord to optimally solve NPhard problems, compiler writers devise clever heuristics that
+quickly ﬁnd good approximate solutions for a large class of
+applications. Unfortunately, heuristics rely on a fair amount
+of tweaking to achieve suitable performance. Trial-and-error
+experimentation can help an engineer optimize the heuristic for a given compiler and architecture. For instance, one
+might be able to use iterative experimentation to ﬁgure out
+how much to unroll loops for a given architecture (i.e., without thrashing the instruction cache or incurring too much
+register pressure).
+After studying several compiler optimizations, we found
+that many heuristics have a focal point. A single priority
+or cost function often dictates the eﬃcacy of a heuristic.
+A priority function— a function of the factors that aﬀect
+a given problem— measures the relative importance of the
+diﬀerent options available to a compiler algorithm.
+Take register allocation for example. When a graph coloring register allocator cannot successfully color an interference graph, it spills a variable to memory and removes it
+from the graph. The allocator then attempts to color the
+reduced graph. When a graph is not colorable, choosing an
+appropriate variable to spill is crucial. For many allocators,
+this decision is bestowed upon a single priority function.
+Based on relevant data (e.g., number of references, depth in
+loop nest, etc.), the function assigns weights to all uncolored
+variables and thereby determines which variable to spill.
+Fine-tuning priority functions to achieve suitable performance is a tedious process. Currently, compiler writers manually experiment with diﬀerent priority functions. For in-
+
+Categories and Subject Descriptors
+D.1.2 [Programming Techniques]: Automatic Programming; D.2.2 [Software Engineering]: Design Tools and
+Techniques; I.2.6 [Artificial Intelligence]: Learning
+
+General Terms
+Design, Algorithms, Performance
+
+Keywords
+Machine Learning, Priority Functions, Genetic Programming, Compiler Heuristics
+
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for profit or commercial advantage and that copies
+bear this notice and the full citation on the first page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior specific
+permission and/or a fee.
+PLDI’03, June 9–11, 2003, San Diego, California, USA.
+Copyright 2003 ACM 1-58113-662-5/03/0006 ...$5.00.
+
+stance, Bernstein et al. manually identiﬁed three priority
+functions for choosing spill variables [3]. By applying the
+three functions to a suite of benchmarks, they found that a
+register allocator’s eﬀectiveness is highly dependent on the
+priority function the compiler uses.
+The importance of priority functions is a key insight that
+motivates Meta Optimization, a method by which a machinelearning algorithm automatically searches the priority function solution space. More speciﬁcally, we use a learning algorithm that iteratively searches for priority functions that
+improve the execution time of compiled applications.
+Our system can be used to cater a priority function to
+a speciﬁc input program. This mode of operation is essentially an advanced form of feedback directed optimization.
+More importantly, it can be used to ﬁnd a general-purpose
+function that works well for a broad range of applications.
+In this mode of operation, Meta Optimization can perform
+the tedious work that is currently performed by engineers.
+For each of the three case studies we describe in this paper,
+we were able to at least match the performance of humangenerated priority functions. In some cases we achieved considerable speedups.
+While many researchers have used machine-learning techniques and exhaustive search algorithms to improve an application, none have used learning to search for priority functions. Because Meta Optimization improves the eﬀectiveness of the compiler itself, in theory, we need only apply the
+process once (rather than on a per-application basis).
+The remainder of this paper is organized as follows. The
+next section introduces priority functions. Section 3 describes genetic programming, a machine-learning technique
+that is well suited to our problem. Section 4 discusses our
+methodology. We apply our technique to three separate case
+studies in Section 5, Section 6, and Section 7. Results of our
+experiments are included in the case study sections. Section 8 discusses related work, and ﬁnally Section 9 concludes.
+
+2.
+
+PRIORITY FUNCTIONS
+
+This section is intended to give the reader a feel for the
+utility and ubiquity of priority functions. Put simply, priority functions prioritize the options available to a compiler
+algorithm.
+For example, in list scheduling, a priority function assigns
+a weight to each instruction in the scheduler’s dependence
+graph, dictating the order in which to schedule instructions.
+A common and eﬀective heuristic assigns priorities using
+latency-weighted depths [10]. Essentially, this is the instruction’s depth in the dependence graph, taking into account
+the latency of instructions on all paths to the root nodes:
+
+
+P (i) =
+
+latency(i)
+latency(i) + P (j)
+i depends on j
+max
+
+:
+:
+
+if i is independent.
+otherwise.
+
+The list scheduler proceeds by scheduling ready instructions
+in priority order. In other words, if two instructions are
+ready to be scheduled, the algorithm will favor the instruction with the higher priority. The scheduling algorithm
+hinges upon the priority function. Apart from enforcing the
+legality of the schedule, the scheduler entirely relies on the
+priority function to make all of its decisions.
+This description of list scheduling is a simpliﬁcation. Production compilers use sophisticated priority functions that
+
+account for many competing factors (e.g., how a given schedule may aﬀect register allocation).
+The remainder of the section lists a few other priority
+functions that are amenable to the techniques we discuss in
+this paper. We will explore three of the following priority
+functions in detail later in the paper.
+• Clustered scheduling: Özer et al. describe an approach to scheduling for architectures with clustered
+register ﬁles [20]. They note that the choice of priority
+function has a “strong eﬀect on the schedule.” They
+also investigate ﬁve diﬀerent priority functions [20].
+• Hyperblock formation: Later in this paper we use
+the formation of predicated hyperblocks as a case study.
+• Meld scheduling: Abraham et al. rely on a priority
+function to schedule across region boundaries [1]. The
+priority function is used to sort regions by the order in
+which they should be visited.
+• Modulo scheduling: In [22], Rau states that “there
+is a limitless number of priority functions” that can
+be devised for modulo scheduling. Rau describes the
+tradeoﬀs involved when considering scheduling priorities.
+• Data Prefetching: Later in this paper we investigate
+a priority function that determines whether or not to
+prefetch an address.
+• Register allocation: Many register allocation algorithms use cost functions to determine which variables
+to spill if spilling is required. We use register allocation
+as a case study later in the paper.
+This is not an exhaustive list of applications. Many important compiler optimizations employ cost functions of the
+sort mentioned above. The next section introduces genetic
+programming, which we use to automatically ﬁnd eﬀective
+priority functions.
+
+3. GENETIC PROGRAMMING
+Of the many available machine-learning techniques, we
+chose to employ genetic programming (GP) because its attributes best ﬁt the needs of our application. The following
+list highlights the suitability of GP to our problem:
+• GP is especially appropriate when the relationships
+among relevant variables are poorly understood [13].
+Such is the case with compiler heuristics, which often
+feature uncertain tradeoﬀs. Today’s complex systems
+also introduce uncertainty.
+• GP is capable of searching high-dimensional spaces.
+Many other learning algorithms are not as scalable.
+• GP is a distributed algorithm. With the cost of computing power at an all-time low, it is now economically
+feasible to dedicate a cluster of machines to searching
+a solution space.
+• GP solutions are human readable. The ‘genomes’ on
+which GP operates are parse trees which can easily
+be converted to free-form arithmetic equations. Other
+machine-learning representations, such as neural networks, are not as comprehensible.
+
+(a)
+
+(b)
+
+(c)
+
++
+
+(d)
+
+-
+
+exec_ratio
+
+*
+
+num_ops
+
+4.0
+
+total_ops
+
+-
+
+*
+
+/
+
+2.3
+
+predictability
+
+*
+
+4.1
+
+total_ops
+
++
+
+exec_ratio
+
+exec_ratio
+
+2.3
+
+num_branches
+
++
+
+1.2
+
+Figure 1: GP Genomes. Part (a) and (b) show examples of GP genomes. Part (c) provides an example of a random
+crossover of the genomes in (a) and (b). Part (d) shows a mutation of the genome in part (a).
+
+Create initial population
+gens = 0
+
+Compile and run each expression
+
+gens < LIMIT?
+No
+Probabilistically select expressions
+
+Yes
+End
+
+Crossover and mutation
+gens = gens + 1
+
+Figure 2: Flow of genetic programming. Genetic programming (GP) initially creates a population of expressions. Each expression is then assigned a ﬁtness, which
+is a measure of how well it satisﬁes the end goal. In
+our case, ﬁtness is proportional to the execution time of
+the compiled application(s). Until some user-deﬁned cap
+on the number of generations is reached, the algorithm
+probabilistically chooses the best expressions for mating and continues. To guard against stagnation, some
+expressions undergo mutation.
+
+Like other evolutionary algorithms, GP is loosely patterned on Darwinian evolution. GP maintains a population of parse trees [13]. In our case, each parse tree is an
+expression that represents a priority function. As with natural selection, expressions are chosen for reproduction (called
+crossover) according to their level of ﬁtness. Expressions
+that best solve the problem are most likely to have progeny.
+The algorithm also randomly mutates some expressions to
+innovate a possibly stagnant population.
+Figure 2 shows the general ﬂow of genetic programming in
+the context of our system. The algorithm begins by creating a population of initial expressions. The baseline heuristic over which we try to improve is included in the initial
+population; the remainder of the initial expressions are randomly generated. The algorithm then determines each ex-
+
+pression’s level of ﬁtness. In our case, compilers that produce the fastest code are ﬁttest. Once the algorithm reaches
+a user-deﬁned limit on the number of generations, the process stops; otherwise, the algorithm proceeds by probabilistically choosing the best expressions for mating. Some of the
+oﬀspring undergo mutation, and the algorithm continues.
+Unlike other evolutionary algorithms, which use ﬁxedlength binary genomes, GP’s expressions are variable in
+length and free-form. Figure 1 provides several examples
+of genetic programming genomes (expressions). Variablelength genomes do not artiﬁcially constrain evolution by
+setting a maximum genome size. However, without special
+consideration, genomes grow exponentially during crossover
+and mutation.
+Our system rewards parsimony by selecting the smaller
+of two otherwise equally ﬁt expressions [13]. Parsimonious
+expressions are aligned with our philosophy of using GP as
+a tool for compiler writers and architects to identify important heuristic features and the relationships among them.
+Without enforcing parsimony, expressions quickly become
+unintelligible.
+In Figure 1, part (c) provides an example of crossover,
+the method by which two expressions reproduce. Here the
+two expressions in (a) and (b) produce oﬀspring. Crossover
+works by selecting a random node in each parent, and then
+swapping the subtrees rooted at those nodes1 . In theory,
+crossover works by propagating ‘good’ subexpressions. Good
+subexpressions increase an expression’s ﬁtness.
+Because GP favors ﬁt expressions, expressions with favorable building blocks are more likely selected for crossover,
+further disseminating the blocks. Our system uses tournament selection to choose expressions for crossover. Tournament selection chooses N expressions at random from the
+population and selects the one with the highest ﬁtness [13].
+N is referred to as the tournament size. Small values of
+N reduce selection pressure; expressions are only compared
+against the other N − 1 expressions in the tournament.
+Finally, part (d) shows a mutated version of the expression
+in (a). Here, a randomly generated expression supplants a
+randomly chosen node in the expression. For details on the
+mutation operators we implemented, see [2].
+1
+
+Selection algorithms must use caution when selecting random tree nodes. If
+we consider a full binary tree, then leaf nodes comprise over 50% of the tree.
+Thus, a naive selection algorithm will choose leaf nodes over half of the time.
+We employ depth-fair crossover, which equally weighs each level of the tree [12].
+
+Real-Valued Function
+Real1 + Real2
+Real1 − Real2
+Real1 · Real2
+Real1 /Real2 : if Real2 = 0
+0 : if Real2 = 0
+√
+Real1
+Real1 : ifBool1
+Real2 : if notBool1
+Real1 · Real2 : ifBool1
+Real2 : if notBool1
+Returns real constant K
+Returns real value of arg from environment
+
+Representation
+(add Real1 Real2 )
+(sub Real1 Real2 )
+(mul Real1 Real2 )
+
+Boolean-Valued Function
+Bool1 and Bool2
+Bool1 or Bool2
+not Bool1
+Real1 < Real2
+Real1 > Real2
+Real1 = Real2
+Returns Boolean constant
+Returns Boolean value of arg
+from environment
+
+Representation
+(and Bool1 Bool2 )
+(or Bool1 Bool2 )
+(not Bool1 )
+(lt Real1 Real2 )
+(gt Real1 Real2 )
+(eq Real1 Real2 )
+(bconst {true, f alse})
+(barg arg)
+
+
+
+
+
+(sqrt Real1 )
+
+Parameter
+Population size
+Number of generations
+Generational replacement
+Mutation rate
+Tournament size
+Elitism
+
+(tern Bool1 Real1 Real2 )
+
+Fitness
+
+(div Real1 Real2 )
+
+(cmul Bool1 Real1 Real2 )
+(rconst K)
+(rarg arg)
+
+Table 1: GP primitives. Our GP system uses the primitives and syntax shown in this table. The top segment
+represents the real-valued functions, which all return a
+real value. Likewise, the functions in the bottom segment all return a Boolean value.
+
+To ﬁnd general-purpose expressions (i.e., expressions that
+work well for a broad range of input programs), the learning
+algorithm learns from a set of ‘training’ programs. To train
+on multiple input programs, we use the technique described
+by Gathercole in [9]. The technique—called dynamic subset
+selection (DSS)— trains on subsets of the training programs,
+concentrating more eﬀort on programs that perform poorly
+compared to the baseline heuristics. DSS reduces the number of ﬁtness evaluations that need to be performed in order
+to achieve a suitable solution. Because our system must
+compile and run benchmarks to test an expression’s level of
+ﬁtness, ﬁtness evaluations for our problem are costly.
+The next section describes the methodology that we use
+throughout the remainder of the paper.
+
+4.
+
+Setting
+400 expressions
+50 generations
+22 expressions
+5%
+7
+Best expression is guaranteed survival.
+Average speedup over the baseline
+on the suite of benchmarks.
+
+METHODOLOGY
+
+Compiler priority functions are often based on assumptions that may not be valid across application and architectural variations. In other words, who knows on what set of
+benchmarks, and for what target architecture the priority
+functions were designed? It could be the case that a priority function was designed for completely orthogonal circumstances than those under which you use your compiler.
+Our system uses genetic programming to automatically
+search for eﬀective priority functions. Though it may be
+possible to ‘evolve’ the underlying algorithm, we restrict ourselves to priority functions. This drastically reduces search
+space size, and the underlying algorithm ensures optimization legality. Furthermore, this technique is still very powerful; even small changes to the priority function can drastically improve (or diminish) performance.
+We optimize a given priority function by wrapping the
+iterative framework of Figure 2 around the compiler and architecture. We replace the priority function that we wish
+
+Table 2: GP parameters. This table shows the GP parameters we used to collect the results in this section.
+
+to optimize with an expression parser and evaluator. This
+allows us to compile the benchmarks in our ‘training’ suite
+using the expressions— which are priority functions— in the
+population. The expressions that create the fastest executables for the applications in the training suite are favored for
+crossover.
+Our system uses total execution time to assign ﬁtnesses.
+This approach focuses on frequently executed procedures,
+and therefore, may slowly converge upon general-purpose
+solutions. However, when one wants to specialize a compiler
+for a given input program, this evaluation of ﬁtness works
+extremely well.
+Table 1 shows the GP expression primitives that our system uses. Careful selection of GP primitives is essential. We
+want to give the system enough ﬂexibility to potentially ﬁnd
+unexpected results. However, the more leeway we give GP,
+the longer it will take to converge upon a general solution.
+Our system creates an initial population that consists of
+399 randomly generated expressions; it randomly ‘grows’
+expressions of varying heights using the primitives in Table 1
+and features extracted by the compiler writer. Features are
+measurable program characteristics that the compiler writer
+thinks may be important for forming good priority functions
+(e.g., latency-weighted depth for list scheduling).
+In addition to the randomly generated expressions, we
+seed the initial population with the compiler writer’s best
+guess. In other words, we include the priority function
+distributed with the compiler. For two of the three optimizations presented in this paper, we found that the seed is
+quickly obscured and weeded out of the population as more
+favorable expressions emerge. In fact, for hyperblock selection and data prefetching, which we discuss later, the seed
+had no impact on the ﬁnal solution. These results suggest
+that one could use Meta Optimization to construct priority
+functions from scratch rather than trying to improve upon
+preexisting functions. In this way, our tool can reduce the
+complexity of compiler design by sparing the engineer from
+perfunctory algorithm tweaking.
+Table 2 summarizes the parameters that we use to collect results. We chose the parameters in the table after a
+moderate amount of experimentation. We give our GP system 50 generations to ﬁnd a solution. For the benchmarks
+that we surveyed, the time required to run for 50 generations is about one day per benchmark in the training set2 .
+Our system memoizes benchmark ﬁtnesses because ﬁtness
+evaluations are so costly.
+After every generation the system randomly replaces 22%
+of the population with new expressions created via the crossover
+2
+
+We ran on 15 to 20 machines in parallel for the experiments in Section 5 and
+Section 6, and we used 5 machines for the experiments in Section 7.
+
+branch ...
+
+buf = *inp
+inp = inp + 1
+t = buf >> 4
+d = t & 0xf
+
+d - buf & 0x1
+
+(a)
+
+cmp p2,p3 ...
+(p2) d = buf & 0x1
+(p3) buf = *inp
+(p3) inp = inp + 1
+(p3) t = buf >> 4
+(p3) d = t & 0xf
+(b)
+
+Figure 3: Control ﬂow v. predicated execution. Part (a)
+shows a segment of control-ﬂow that demonstrates a simple if-then-else statement. As is typical with multimedia and integer applications, there are few instructions
+per basic block in the example. Part (b) is the corresponding predicated hyperblock. If-conversion merges
+disjoint paths of control by creating predicated hyperblocks. Choosing which paths to merge is a balancing
+act. In this example, branching may be more eﬃcient
+than predicating if p3 is rarely true.
+
+operation presented in Section 3. Only the best expression is
+guaranteed survival. Typically, GP practitioners use much
+higher replacement rates. However, since we use dynamic
+subset selection, only a subset of benchmarks is evaluated
+in a generation. Thus, we need a lower replacement rate
+in order to increase the likelihood that a given expression
+will be tested on more than one subset of benchmarks. The
+mutation operator, which is discussed in the same section,
+mutates roughly 5% of the new expressions. Finally, we use
+a tournament size of 7 when selecting the ﬁttest expressions.
+This setting causes moderate selection pressure.
+The following three sections build upon the methodology
+described in this section by presenting individual case studies. Results for each of the case studies are included in their
+respective sections.
+
+5.
+
+CASE STUDY I: HYPERBLOCK
+FORMATION
+
+This section describes the operation of our system in the
+context of a speciﬁc compiler optimization: hyperblock formation. Here we introduce the optimization, and then we
+discuss factors that might be important when creating a priority function for it. We conclude the section by presenting
+experimental results for hyperblock formation.
+Architects have proposed two noteworthy methods for decreasing the costs associated with control transfers3 : improved branch prediction, and predication. Improved branch
+prediction algorithms would obviously increase processor utilization. Unfortunately, some branches are inherently unpredictable, and hence, even the most sophisticated algorithm
+would fail. For such branches, predication may be a fruitful
+alternative.
+3
+
+r 4 architecture features 20 pipeline stages. It squashes up to
+The Pentium
+126 in-flight instructions when it mispredicts.
+
+Rather than relying on branch prediction, predication allows a multiple-issue processor to simultaneously execute the
+taken and fall-through paths of control ﬂow. The processor
+nulliﬁes all instructions in the incorrect path. In this model,
+a predicate operand guards the execution of every instruction. If the value of the operand is true, then the instruction
+executes normally. If however, the operand is false, the processor nulliﬁes the instruction, preventing it from modifying
+processor state.
+Figure 3 highlights the diﬀerence between control-ﬂow
+and predicated execution. Part (a) shows a segment of
+control-ﬂow. Using a process dubbed if-conversion, the IMPACT predicating compiler merges disjoint paths of execution into a predicated hyperblock. A hyperblock is a predicated single-entry, multiple-exit region. Part (b) shows the
+hyperblock corresponding to the control-ﬂow in part (a).
+Here, p2 and p3 are mutually exclusive predicates that are
+set according to the branch condition in part (a).
+Though predication eﬀectively exposes ILP, simply predicating everything will diminish performance by saturating
+machine resources with useless instructions. However, an
+appropriate balance of predication and branching can drastically improve performance.
+
+5.1 Feature Extraction
+In the following list we give a brief overview of several criteria that are useful to consider when forming hyperblocks.
+Such criteria are often referred to as features. In the list,
+a path refers to a path of control ﬂow (i.e., a sequence of
+basic blocks that are connected by edges in the control ﬂow
+graph):
+• Path predictability: Predictable branches incur no
+misprediction penalties, and thus, should probably remain unpredicated. Combining multiple paths of execution into a single predicated region uses precious
+machine resources [15]. In this case, using machine
+resources to parallelize individual paths is typically
+wiser.
+• Path frequency: Infrequently executed paths are
+probably not worth predicating. Including the path
+in a hyperblock would consume resources, and could
+negatively aﬀect performance.
+• Path ILP: If a path’s level of parallelism is low, it may
+be worthwhile to predicate the path. In other words, if
+a path does not fully use machine resources, combining
+it with another sequential path probably will not diminish performance. Because predicated instructions
+do not need to know the value of their guarding predicate until late in the pipeline, a processor can sustain
+high levels of ILP.
+• Number of instructions in path: Long paths use
+up machine resources, and if predicated, will likely
+slow execution. This is especially true when long paths
+are combined with short paths. Since every instruction in a hyperblock executes, long paths eﬀectively
+delay the time to completion of short paths. The cost
+of misprediction is relatively high for short paths. If
+the processor mispredicts on a short path, the processor has to nullify all the instructions in the path,
+and the subsequent control-independent instructions
+fetched before the branch condition resolves.
+
+• Number of branches in path: Paths of control
+through several branches have a greater chance of mispredicting. Therefore, it may be worthwhile to predicate such paths. On the other hand, including several
+such paths may produce large hyperblocks that saturate resources.
+• Compiler optimization considerations: Paths that
+contain hazard conditions (i.e., pointer dereferences
+and procedure calls) limit the eﬀectiveness of many
+compiler optimizations. In the presence of hazards, a
+compiler must make conservative assumptions. The
+code in Figure 3(a) could beneﬁt from predication.
+Without architectural support, the load from *inp cannot be hoisted above the branch. The program will
+behave unexpectedly if the load is not supposed to execute and it accesses protected memory. By removing
+branches from the instruction stream, predication affords the scheduler freer code motion opportunities.
+For instance, the predicated hyperblock in Figure 3(b)
+allows the scheduler to rearrange memory operations
+without control-ﬂow concerns.
+• Machine-specific considerations: A heuristic should
+account for machine characteristics. For instance, the
+branch delay penalty is a decisive factor.
+Clearly, there is much to consider when designing a heuristic for hyperblock selection. Many of the above considerations make sense on their own, but when they are put together, contradictions arise. Finding the right mix of criteria
+to construct an eﬀective priority function is nontrivial. That
+is why we believe automating the decision process is crucial.
+
+5.2 Trimaran’s Heuristic
+We now discuss the heuristic employed by Trimaran’s IMPACT compiler for creating predicated hyperblocks [15, 16].
+The IMPACT compiler begins by transforming the code
+so that it is more amenable to hyperblock formation [15].
+IMPACT’s algorithm then identiﬁes acyclic paths of control that are suitable for hyperblock inclusion. Park and
+Schlansker detail this portion of the algorithm in [21]. A priority function— which is the critical calculation in the predication decision process— assigns a value to each of the paths
+based on characteristics such as the ones just described [15].
+Some of these characteristics come from runtime proﬁling.
+IMPACT uses the priority function shown below:
+
+
+hi =
+
+0.25
+1
+
+:
+:
+
+if pathi contains a hazard.
+if pathi is hazard free.
+
+d ratioi =
+
+dep heighti
+maxj=1→N dep heightj
+
+o ratioi =
+
+num opsi
+maxj=1→N num opsj
+
+priorityi = exec ratioi · hi · (2.1 − d ratioi − o ratioi ) (1)
+The heuristic applies the above equation to all paths in a
+predicatable region. Based on a runtime proﬁle, exec ratio
+is the probability that the path is executed. The priority function also penalizes paths that contain hazards (e.g.,
+
+Feature
+Registers
+
+Integer units
+
+Floating-point units
+
+Memory units
+
+Branch unit
+Branch prediction
+
+Description
+64 general-purpose registers, 64 ﬂoatingpoint registers, and 256 predicate
+registers.
+4 fully-pipelined units with 1-cycle latencies, except for multiply instructions,
+which require 3 cycles, and divide instructions, which require 8.
+2 fully-pipelined units with 3-cycle latencies, except for divide instructions, which
+require 8 cycles.
+2 memory units. L1 cache accesses take
+2 cycles, L2 accesses take 7 cycles, and
+L3 accesses require 35 cycles. Stores are
+buﬀered, and thus require 1 cycle.
+1 branch unit.
+2-bit branch predictor with a 5-cycle
+branch misprediction penalty.
+
+Table 3: Architectural characteristics. This table describes the EPIC architecture over which we evolved.
+This model approximates the Intel Itanium architecture.
+
+pointer dereferences and procedure calls). Such paths may
+constrain aggressive compiler optimizations. To avoid large
+hyperblocks, the heuristic is careful not to choose paths that
+have a large dependence height (dep height) with respect
+to the maximum dependence height. Similarly it penalizes
+paths that contain too many instructions (num ops).
+IMPACT’s algorithm then merges the paths with the highest priorities into a predicated hyperblock. The algorithm
+stops merging paths when it has consumed the target architecture’s estimated resources.
+
+5.3 Experimental Setup
+This section discusses the experimental results for optimizing Trimaran’s hyperblock selection priority function.
+Trimaran is an integrated compiler and simulator for a parameterized EPIC architecture. Table 3 details the speciﬁc
+architecture over which we evolved. This model resembles
+ architecture.
+Intel’s Itanium r
+We modiﬁed Trimaran’s IMPACT compiler by replacing
+its hyperblock formation priority function (Equation 1) with
+our GP expression parser and evaluator. This allows IMPACT to read an expression and evaluate it based on the
+values of human-selected features that might be important
+for creating eﬀective priority functions. Table 4 describes
+these features.
+The hyperblock formation algorithm passes the features
+in the table as parameters to the expression evaluator. For
+instance, if an expression contains a reference to dep height,
+the path’s dependence height will be used when the expression is evaluated. Most of the characteristics in Table 4
+were already available in IMPACT. Equation 1 has a local
+scope. To provide some global information, we also extract
+the minimum, maximum, mean, and standard deviation of
+all path-speciﬁc characteristics in the table.
+We added a 2-bit dynamic branch predictor to the simulator and we modiﬁed the compiler’s proﬁler to extract
+branch predictability statistics. Lastly, we enabled the following compiler optimizations: function inlining, loop unrolling, backedge coalescing, acyclic global scheduling [6],
+modulo scheduling [25], hyperblock formation, register allocation, machine-speciﬁc peephole optimization, and several
+classic optimizations.
+
+Feature
+dep height
+num ops
+exec ratio
+
+num branches
+predictability
+
+predict product
+avg ops executed
+unsaf e JSR
+
+saf e JSR
+
+mem hazard
+
+max dep height
+total ops
+num paths
+
+Description
+The maximum instruction dependence
+height over all instructions in path.
+The total number of instructions in the
+path.
+How frequently this path is executed compared to other paths considered (from
+proﬁle).
+The total number of branches in the path.
+Average path predictability obtained by
+simulating a branch predictor (from proﬁle).
+Product of branch predictabilities in the
+path (from proﬁle).
+The average number of instructions executed in the path (from proﬁle).
+If the path contains a subroutine call that
+may have side-eﬀects, it returns true; otherwise it returns f alse.
+If the path contains a side-eﬀect free subroutine call, it returns true; otherwise it
+returns f alse.
+If the path contains an unresolvable memory access, it returns true; otherwise it
+returns f alse.
+The maximum dependence height over all
+paths considered for hyperblock inclusion.
+The sum of all instructions in paths considered for hyperblock inclusion.
+Number of paths considered for hyperblock inclusion.
+
+Table 4: Hyperblock selection features. The compiler
+writer chooses interesting attributes, and the system
+evolves a priority function based on them. We rely on
+proﬁle information to extract some of these parameters.
+We also include the min, mean, max, and standard deviation of path characteristics. This provides some global
+information to the greedy local heuristic.
+
+5.4 Experimental Results
+We use the familiar benchmarks in Table 5 to test our system. All of the Trimaran certiﬁed benchmarks are included
+in the table4 [24]. Our suite also includes many of the Mediabench benchmarks [14]. The build process for ghostscript
+proved too diﬃcult to compile. We also exclude the remainder of the Mediabench applications because the Trimaran
+system does not compile them correctly5 .
+We begin by presenting results for application-specialized
+heuristics. Following this, we show that it is possible to use
+Meta Optimization to create general-purpose heuristics.
+
+5.4.1 Specialized Priority Functions
+Specialized heuristics are created by optimizing a priority function for a given application. In other words, we
+train the priority function on a single benchmark. Figure 4
+shows that Meta Optimization is extremely eﬀective on a
+per-benchmark basis. The dark bar shows the speedup (over
+Trimaran’s baseline heuristic) of each benchmark when run
+with the same data on which it was trained. The light bar
+shows the speedup attained when the benchmark processes
+a data set that was not used to train the priority function.
+We call this the novel data set.
+
+Benchmark
+codrle4
+decodrle4
+huﬀ enc
+huﬀ dec
+djpeg
+g721encode
+g721decode
+mpeg2dec
+rasta
+rawcaudio
+rawdaudio
+toast
+unepic
+085.cc1
+052.alvinn
+
+Suite
+See [4]
+
+Description
+RLE type 4 encoder/decoder.
+
+See [4]
+
+A Huﬀman encoder/decoder.
+
+Mediabench
+Mediabench
+
+Lossy still image decompressor.
+CCITT voice
+compressor/decompressor.
+Lossy video decompressor.
+Speech recognition application.
+Adaptive diﬀerential pulse code
+modulation audio encoder/decoder.
+Speech transcoder.
+Experimental image decompressor.
+gcc C compiler.
+Single-precision neural network
+training.
+A neural network-based image
+recognition algorithm.
+Part of a 3-D graphics library
+similar to OpenGL.
+In-memory ﬁle compressor and
+decompressor.
+Creates a truth table from a logical
+representation of a Boolean equation.
+JPEG compressor and
+decompressor.
+Lisp interpreter.
+Processor simulator.
+An object oriented database.
+
+Mediabench
+Mediabench
+Mediabench
+Mediabench
+Mediabench
+SPEC92
+SPEC92
+
+179.art
+
+SPEC2000
+
+osdemo
+mipmap
+129.compress
+
+Mediabench
+Mediabench
+SPEC95
+
+023.eqntott
+
+SPEC92
+
+132.ijpeg
+
+SPEC95
+
+130.li
+124.m88ksim
+147.vortex
+
+SPEC95
+SPEC95
+SPEC95
+
+Table 5: Benchmarks used. The set includes applications from the SpecInt, SpecFP, and Mediabench benchmark suites, as well as a few miscellaneous programs.
+
+Intuitively, in most cases the training input data achieves
+a better speedup. Because Meta Optimization is performancedriven, it selects priority functions that excel on the training
+input data. The alternate input data likely exercises different paths of control ﬂow—paths which may have been
+unused during training. Nonetheless, in every case, the
+application-speciﬁc priority function outperforms the baseline.
+Figure 5 shows ﬁtness improvements over generations. In
+many cases, Meta Optimization ﬁnds a superior priority
+function quickly, and ﬁnds only marginal improvements as
+the evolution continues. In fact, the baseline priority function is quickly obscured by GP-generated expressions. Often, the initial population contains at least one expression
+that outperforms the baseline. This means that by simply
+creating and testing 399 random expressions, we were able
+to ﬁnd a priority function that outperformed Trimaran’s for
+the given benchmark.
+Once GP has discovered a decent solution, the search
+space and operator dynamics are such that most oﬀspring
+will be worse, some will be equal and very few turn out to be
+better. This seems indicative of a steep hill in the solution
+space. In addition, multiple reruns using diﬀerent initialization seeds reveal minuscule diﬀerences in performance. It
+might be a space in which there are many possible solutions
+associated with a given ﬁtness.
+
+5.4.2 General-Purpose Priority Functions
+
+Due to preexisting bugs in Trimaran, we could not get 134.perl to execute
+correctly, though [24] certified it.
+
+We divided the benchmarks in Table 5 into two sets6 : a
+training set, and a test set. Instead of creating a priority
+
+We exclude cjpeg, the complement of djpeg, because it does not execute properly when compiled with some priority functions. Our system can also be used
+to uncover bugs!
+
+We chose to train mostly on Mediabench applications because they compile and
+run faster than the Spec benchmarks.
+
+4
+5
+
+6
+
+3.5
+Train data set
+
+Novel data set
+
+3.0
+
+2.5
+
+2.5
+
+Figure 4: Hyperblock specialization. This graph shows
+speedups obtained by training on a per-benchmarks basis. The dark colored bars are executions using the same
+data set on which the specialized priority function was
+trained. The light colored bars are executions that use
+an alternate, or novel data set.
+
+huff_dec
+
+huff_enc
+
+129.compress
+
+124.m88ksim
+
+mpeg2dec
+
+toast
+
+rawcaudio
+
+decodrle4
+
+Average
+
+mpeg2dec
+
+rawdaudio
+
+rawcaudio
+
+g721decode
+
+129.compress
+
+toast
+
+0.0
+huff_enc
+
+0
+huff_dec
+
+0.5
+
+g721encode
+
+0.5
+
+rawdaudio
+
+1.0
+
+g721encode
+
+1
+
+1.5
+
+g721decode
+
+1.54
+
+1.5
+
+2.0
+
+codrle4
+
+2
+
+Novel data set
+
+1.44
+1.25
+
+Speedup
+
+3
+
+1.23
+
+Speedup
+
+Train data set
+
+Average
+
+3.5
+
+Figure 6: Training on multiple benchmarks.
+
+A single priority function was obtained by training over all
+the benchmarks in this graph. The dark bars represent
+speedups obtained by running the given benchmark on
+the same data that was used to train the priority function. The light bars correspond to a novel data set.
+
+3.5
+
+refers to this as cross validation. Since the benchmarks in
+the test set are not related to the benchmarks in the training
+set, this is a measure of the priority function’s generality.
+The results of the cross validation are shown in Figure 7.
+This experiment applies the best priority function on the
+training set to the benchmarks in the test set. The average speedup on the test set is 9%. In three cases (unepic, 023.eqntott, and 085.cc1) Trimaran’s baseline heuristic marginally outperforms the GP-generated priority function. For the remaining benchmarks, the heuristic our system found is better.
+
+129.compress
+g721decode
+mpeg2dec
+rawcaudio
+rawdaudio
+toast
+huff_enc
+huff_dec
+
+3
+
+Speedup
+
+2.5
+
+2
+
+1.5
+
+5.4.3 The Best Priority Function
+
+1
+0
+
+5
+
+10
+
+15
+
+20
+
+25
+
+30
+
+35
+
+40
+
+45
+
+50
+
+Generation
+
+Figure 5: Hyperblock formation evolution. This ﬁgure
+graphs the best ﬁtness over generations. For this problem, Meta Optimization quickly ﬁnds a priority function
+that outperforms Trimaran’s baseline heuristic.
+
+function for each benchmark, in this section we aim to ﬁnd
+one priority function that works well for all the benchmarks
+in the training set. To this end, we evolve over the training
+set using dynamic subset selection [9].
+Figure 6 shows the results of applying the single best priority function to the benchmarks in the training set. The
+dark bar associated with each benchmark is the speedup
+over Trimaran’s base heuristic when the training input data
+is used. This data set yields a 44% improvement. The light
+bar shows results when novel input data is used. The overall
+improvement for this set is 25%.
+It is interesting that, on average, the general-purpose priority function outperforms the application-speciﬁc priority
+function on the novel data set. The general-purpose solution
+is less susceptible to variations in input data because it was
+trained to be more general.
+We then apply the resulting priority function to the benchmarks in the test set. The machine-learning community
+
+Figure 8 shows the best general-purpose priority function
+our system found for hyperblock selection. Because parsimony pressure favors small expressions, most of our system’s solutions are readable. Nevertheless, the expressions
+presented in this paper have been hand simpliﬁed for ease
+of discussion.
+Notice that some parts of the expression have no impact on the overall result. For instance, removing the subexpression on line 2 will not aﬀect the heuristic; the value
+is invariant to a scheduling region since the mean execution
+ratio is the same for all paths in the region. Such ‘useless’ expressions are called introns. It turns out that introns
+are actually quite useful for preserving good building blocks
+during crossover and mutation [13].
+The conditional multiply statement on line 4 does have a
+direct eﬀect on the priority function: it favors paths that do
+not have pointer dereferences (because the sub-expression
+in line 5 will always be greater than one). Pointers inhibit
+the eﬀectiveness of the scheduler and other compiler optimizations, and thus dereferences should be penalized. The
+IMPACT group came to the exact same conclusion, though
+the extent to which they penalize dereferences diﬀers [15].
+The sub-expression on line 8 favors ‘bushy’ parallel paths,
+where there are numerous independent operations. This result is somewhat counterintuitive since highly parallel paths
+will quickly saturate machine resources. In addition, paths
+
+1.6
+1.4
+
+1.09
+
+Speedup
+
+1.2
+1.0
+0.8
+0.6
+0.4
+0.2
+Average
+
+mipmap
+
+osdemo
+
+130.li
+
+art
+
+085.cc1
+
+147.vortex
+
+052.alvinn
+
+132.ijpeg
+
+023.eqntott
+
+rasta
+
+djpeg
+
+unepic
+
+0.0
+
+Figure 7: Cross validation of the general-purpose priority function. The best priority function found by training
+on the benchmarks in Figure 6 is applied to the benchmarks in this graph.
+(1) (add
+(2) (sub (mul exec ratio mean 0.8720) 0.9400)
+(3) (mul 0.4762
+(4)
+(cmul (not mem hazard)
+(5)
+(mul 0.6727 num paths)
+(6)
+(mul 1.1609
+(7)
+(add
+(8)
+(sub
+(9)
+(mul
+(10)
+(div num ops dep height) 10.8240)
+(11)
+exec ratio )
+(12)
+(sub (mul (cmul has unsafe jsr
+(13)
+predict product mean
+(14)
+0.9838)
+(15)
+(sub 1.1039 num ops max ))
+(16)
+(sub (mul dep height mean
+(17)
+num branches max )
+(18)
+num paths )))))))
+
+variables to spill when spilling is required. For instance in
+priority-based coloring register allocation, the priority function is an estimate of the relative beneﬁts of storing a given
+variable in a register [7].
+Priority-based coloring ﬁrst associates a live range with
+every variable. A live range is the composition of code
+segments (basic blocks), through which the associated variable’s value must be preserved. The algorithm then prioritizes each live range based on the estimated execution
+savings of register allocating the associated variable:
+savingsi = wi · (LDsave · usesi + ST save · def si )
+
+
+
+(2)
+
+i∈lr savingsi
+
+(3)
+N
+Equation 2 is used to compute the savings of each code
+segment. LDsave and ST save are estimates of the execution time saved by keeping the associated variable in a register for references and deﬁnitions respectively. usesi and
+def si represent the number of uses and deﬁnitions of a variable in block i. wi is the estimated execution frequency for
+the block.
+Equation 3 sums the savings over the N blocks that compose the live range. Thus, this priority function represents
+the savings incurred by accessing a register instead of resorting to main memory.
+The algorithm then tries to assign registers to live ranges
+in priority order. Please see [7] for a complete description
+of the algorithm. For our purposes, the important thing to
+note is that the success of the algorithm depends on the
+priority function.
+The priority function described above is intuitive— it assigns weights to live ranges based on the estimated execution
+savings of register allocating them. Nevertheless, our system
+ﬁnds functions that improve the heuristic by up to 11%.
+priority(lr) =
+
+Figure 8: The best priority function our system found
+
+6.1 Experimental Results
+
+for hyperblock scheduling.
+
+We collected these results using the same experimental
+setup that we used for hyperblock selection. We use Trimaran and we target the architecture described in Table 3.
+However, to more eﬀectively stress the register allocator, we
+only use 32 general-purpose registers and 32 ﬂoating-point
+registers.
+We modiﬁed Trimaran’s Elcor register allocator by replacing its priority function (Equation 2) with an expression parser and evaluator. The register allocation heuristic
+described above essentially works at the basic block level.
+Equation 3 simply sums and normalizes the priorities of the
+individual basic blocks. For this reason, we stay within the
+algorithm’s framework and leave Equation 3 intact.
+For a more detailed description of our experiments with
+register allocation, including the features we extracted to
+perform them, please see [23].
+
+with higher exec ratio’s are slightly penalized, which also
+deﬁes intuition.
+The conditional multiply expression on line 12 penalizes
+paths with unsafe calls (i.e., calls to subroutines that may
+have side eﬀects). Once again this agrees with the IMPACT
+group’s reasoning [15].
+Because Trimaran is such a large and complicated system, it is diﬃcult to know exactly why the priority function
+in Figure 8 works well. This is exactly the point of using a methodology like Meta Optimization. The bountiful
+complexities of compilers and systems are diﬃcult to understand. Also worthy of notice is the fact that we get such
+good speedups, particularly on the training set, by changing
+such a small portion of the compiler.
+The next section presents another case study, which we
+also test on Trimaran.
+
+6.
+
+CASE STUDY II:
+REGISTER ALLOCATION
+
+The importance of register allocation is well-known, so we
+will not motivate the optimization here. Many register allocation algorithms use cost functions to determine which
+
+6.1.1 Specialized Priority Functions
+These results indicate that Meta Optimization works well,
+even for well-studied heuristics. Figure 9 shows speedups
+obtained by specializing Trimaran’s register allocator for a
+given application. The dark bar associated with each application represents the speedup obtained by using the same
+input data that was used to specialize the heuristic. The
+light bar shows the speedup when the benchmark processes
+a novel data set.
+
+1.15
+
+1.2
+Training data set
+
+Novel data set
+
+Train data set
+
+1
+
+1.03
+
+Speedup
+
+1.08
+
+1.06
+
+1.05
+
+1.03
+
+1.05
+
+1.1
+Speedup
+
+Novel data set
+
+1.1
+
+1.15
+
+0.95
+
+1
+
+0.9
+
+0.95
+
+Figure 9: Register allocation specialization.
+This
+graph shows speedups obtained by training on a perbenchmarks basis. The dark colored bars are executions
+using the same data set on which the specialized priority function was trained. The light colored bars are
+executions that use a novel data set.
+1.15
+
+Average
+
+mpeg2dec
+
+rawdaudio
+
+rawcaudio
+
+huff_dec
+
+huff_enc
+
+g721encode
+
+129.compress
+
+Average
+
+g721decode
+
+huff_dec
+
+huff_enc
+
+129.compress
+
+rawcaudio
+
+mpeg2dec
+
+g721decode
+
+0.85
+0.9
+
+Figure 11: Training a register allocation priority function on multiple benchmarks. Our DSS evolution trained
+on all the benchmarks in this ﬁgure. The single best priority function was applied to all the benchmarks. The
+dark bars represent speedups obtained by running the
+given benchmark on the same data that was used to
+train the priority function. The light bars correspond
+to an alternate data set.
+1.08
+
+1.125
+
+1.06
+mpeg2dec
+rawcaudio
+g721decode
+129.compress
+huff_enc
+huff_dec
+
+1.02
+
+1.02
+
+1.075
+
+1.04
+Speedup
+
+Speedup
+
+1.1
+
+1
+1.05
+
+0.98
+
+1.025
+
+5
+
+10
+
+15
+
+20
+
+25
+
+30
+
+35
+
+40
+
+45
+
+50
+
+Average
+
+130.li
+
+085.cc1
+
+147.vortex
+
+132.ijpeg
+
+djpeg
+
+unepic
+
+023.eqntott
+
+0
+
+124.m88ksim
+
+1
+
+codrle4
+
+decodrle4
+
+0.96
+
+Generation
+
+Figure 10: Register allocation evolution. This ﬁgure
+graphs ﬁtness over generations. Unlike the hyperblock
+selection evolution, these ﬁtnesses improve gradually.
+
+Once again, it makes sense that the training input data
+outperforms the alternate input data. In the case of register allocation however, we see that the disparity between
+speedups on training and novel data is less pronounced than
+it is with hyperblock selection. This is likely because hyperblock selection is extremely data-driven. An examination of
+the general-purpose hyperblock formation heuristic reveals
+two dynamic factors (exec ratio and predict product mean)
+that are critical components in the hyperblock decision process.
+Figure 10 graphs ﬁtness improvements over generations.
+It is interesting to contrast this graph with Figure 5. The
+fairly constant improvement in ﬁtness over several generations seems to suggest that this problem is harder to optimize than hyperblock selection. Additionally, unlike the
+hyperblock selection algorithm, the baseline heuristic typically remained in the population for several generations.
+
+Figure 12: Cross validation of the general-purpose register allocation priority function. The best priority function found by the DSS run is applied to the benchmarks
+in this graph. Results from two target architectures are
+shown.
+
+6.1.2 General-Purpose Priority Functions
+Just as we did in Section 5.4.2, we divide our benchmarks
+into a training set and a test set7 . The benchmarks in Figure 11 show the training set for this experiment. The ﬁgure
+also shows the results of applying the best priority function
+(from our DSS run) to all the benchmarks in the set. The
+dark bar associated with each benchmark is the speedup
+over Trimaran’s baseline heuristic when using the training
+input data. The average for this data set is 3%. On a novel
+data set we attain an average speedup of 3%, which indicates
+that register allocation is not as susceptible to variations in
+input data.
+Figure 12 shows the cross validation results for this ex7
+
+This experiment uses smaller test and training sets due to preexisting bugs in
+Trimaran. It does not correctly compile several of our benchmarks when targeting a machine with 32 registers.
+
+3.00
+
+2.4
+
+Novel data
+2.2
+
+2.00
+
+2
+
+1.50
+
+1.00
+
+Speedup
+
+2.50
+
+1.35
+1.40
+
+Speedup
+
+Training data
+
+103.su2cor
+102.swim
+034.mdljdp2
+093.nasa7
+125.turb3d
+146.wave5
+015.doduc
+101.tomcatv
+107.mgrid
+141.apsi
+
+1.8
+
+1.6
+
+1.4
+
+0.50
+
+1.2
+
+Average
+
+141.apsi
+
+107.mgrid
+
+034.mdljdp2
+
+015.doduc
+
+093.nasa7
+
+146.wave5
+
+125.turb3d
+
+103.su2cor
+
+102.swim
+
+101.tomcatv
+
+0.00
+
+Figure 13: Prefetching specialization. This graph shows
+speedups obtained by training on a per-benchmarks basis. The dark colored bars are executions using the same
+data set on which the specialized priority function was
+trained. The light colored bars are executions that use
+a novel data set.
+
+periment. The ﬁgure shows the speedups (over Trimaran’s
+baseline) achieved by applying the single best priority function to a set of benchmarks that were not in the training set.
+The learned priority function outperforms the baseline for
+all benchmarks except decodrle4 and 132.ijpeg. Although
+the overall speedup on the cross validation set is only 3%,
+this is an exciting result. Register allocation is well-studied
+optimization which our technique is able to improve.
+
+7.
+
+CASE STUDY III:
+DATA PREFETCHING
+
+This section describes another memory hierarchy optimization. Data prefetching is an optimization aimed at reducing the costs of long-latency memory accesses. By moving data from main memory into cache before it is accessed,
+prefetching can eﬀectively reduce memory latencies.
+However, prefetching can degrade performance in many
+cases. For instance, aggressive prefetching may evict useful
+data from the cache before it is needed. In addition, adding
+unnecessary prefetch instructions may hinder instruction cache performance and saturate memory queues.
+The Open Research Compiler (ORC) [19] uses an extension of Mowry’s algorithm [18] to insert prefetch instructions. ORC uses a priority function that assigns a Boolean
+conﬁdence to prefetching a given address. Subsequent passes
+use this value to determine whether or not to prefetch the
+address. Currently, the priority function is simply based
+upon how well the compiler can estimate loop trip counts.
+
+7.1 Experimental Setup
+This case study is diﬀerent from those already presented
+in two important ways. First, we collected the results of this
+section in the context of a real machine: we use the Open
+Research Compiler, and we target an Itanium I architecture.
+Just as with the previous two case studies, the ﬁtness of an
+expression is the speedup over the baseline priority function.
+However, unlike simulated execution which is perfectly reproducible, real environments are inherently noisy. Even on
+an unloaded system, back-to-back runs of a program may
+vary.
+
+1
+0
+
+5
+
+10
+
+15
+
+20
+
+25
+
+30
+
+35
+
+40
+
+45
+
+50
+
+Generation
+
+Figure 14: Prefetching evolution. This ﬁgure graphs ﬁtness over generations. The baseline expression is quickly
+weeded out of the population.
+
+Fortunately, GP can handle noisy environments, as long
+as the level of noise is smaller than attainable speedups using our technique. For the Itanium processor, this is indeed the case. Since it is a single threaded, statically scheduled processor, our measurements are fairly consistent; variations due to noise are well within the range of our attained
+speedups.
+Another major divergence from the methodology employed
+in the last two case studies is the format of the priority function that we aim to optimize. Whereas the priority functions
+for register allocation and hyperblock formation are realvalued, the prefetching priority function is Boolean-valued.
+This case study emphasizes GP’s ﬂexibility.
+As the ORC website recommends, we compile all benchmarks with -O3 optimizations enabled, and we use proﬁledriven feedback. For additional details such as the features
+we extracted for this optimization, please see [23].
+
+7.2 Experimental Results
+Prefetching is known to be an eﬀective technique for ﬂoating point benchmarks, and for this reason we train on various
+SPECFP benchmarks in this case study.
+
+7.2.1 Specialized Priority Functions
+Figure 13 shows the results of the ten diﬀerent applicationspecialized priority functions. Closer examination of the GP
+solutions reveals that ORC overzealously prefetches and that
+by simply taming the compiler’s aggressiveness, one can substantially improve performance (on this set of benchmarks).
+The GP solutions rarely prefetched. In fact, shutting oﬀ
+prefetching altogether achieves gains within 7% of the specialized priority functions.
+Figure 14 graphs ﬁtness over generation for the applicationspeciﬁc experiments. Just as with hyperblock selection,
+the baseline priority function has no impact on the ﬁnal
+solutions— it is quickly obscured by superior expressions.
+As is the case with hyperblock selection, it appears that in
+many cases, GP solutions get ‘stuck’ in a local minimum in
+the solution space; the ﬁtnesses stop improving early in the
+evolution. One plausible explanation for this is our use of
+parsimony pressure in the selection process. For applicationspeciﬁc evolutions, it is often the case that very small expressions work well. While these small expressions are eﬀective,
+
+3.0
+
+1.6
+
+Train data set
+
+Novel data set
+
+1.4
+
+2.5
+
+1.0
+
+1
+
+1.01
+
+Speedup
+
+1.5
+1.31
+1.36
+
+Speedup
+
+1.2
+
+2.0
+0.8
+0.6
+0.4
+
+0.5
+
+0.2
+
+Figure 15: Training a prefetching priority function on
+multiple benchmarks. Our DSS evolution trained on all
+the benchmarks in this ﬁgure. The single best priority
+function was applied to all the benchmarks. The dark
+bars represent speedups obtained by running the given
+benchmark on the same data that was used to train the
+priority function. The light bars correspond to an alternate data set.
+they limit the genetic material available to the crossover
+operator. Furthermore, since we always keep the best expression, the population soon becomes inbred with copies of
+the top expression. Future work will explore the impact of
+parsimony pressure and elitism.
+
+7.2.2 General-Purpose Priority Functions
+The performance of the best DSS-generated prefetching
+priority function is shown in Figure 15. The priority function
+was trained on the same benchmarks in the ﬁgure, which
+are a combination of SPEC92 and SPEC95 ﬂoating point
+benchmarks. Data prefetching, like hyperblock selection, is
+extremely data-driven. By applying the same input data
+that we used to train the priority function we achieve a
+31% speedup. Somewhat surprisingly, the novel input data
+set achieves a better speedup of 36%. Because the priority
+function learned to prefetch infrequently, it is simply the
+case that the novel data set is more sensitive to prefetching
+than the training data set is.
+Figure 16 shows the cross validation results for this optimization, and prompts us to mention a caveat of our technique. GP’s ability to identify good general-purpose solutions is based on the benchmarks over which they are
+evolved. For the SPEC92 and SPEC95 benchmarks that
+were used to train our general-purpose heuristic, aggressive
+prefetching was debilitating. However, for a couple of benchmarks in the SPEC2000 ﬂoating point set, we see that aggressive prefetching is desirable. Thus, unless designers can
+assert that the training set provides adequate problem coverage, they cannot completely trust GP-generated solutions.
+
+8.
+
+RELATED WORK
+
+Many researchers have applied machine-learning methods
+to compilation, and therefore, only the most relevant works
+are cited here.
+Calder et al. used supervised learning techniques to ﬁnetune static branch prediction heuristics [5]. They employ
+
+Average
+
+191.fma3d
+
+301.apsi
+
+200.sixtrack
+
+189.lucas
+
+188.ammp
+
+187.facerec
+
+183.equake
+
+173.applu
+
+178.galgel
+
+172.mgrid
+
+168.wupwise
+
+171.swim
+
+0
+
+Average
+
+141.apsi
+
+107.mgrid
+
+034.mdljdp2
+
+015.doduc
+
+093.nasa7
+
+146.wave5
+
+125.turb3d
+
+103.su2cor
+
+102.swim
+
+101.tomcatv
+
+0.0
+
+Figure 16:
+
+Cross validation of the general-purpose
+prefetching priority function on SPEC2000. The best
+priority function found by the DSS run is applied to the
+benchmarks in this graph. Results from two target architectures are shown.
+
+neural networks and decision trees to search for eﬀective
+static branch prediction heuristics. While our methodology
+is similar, our work diﬀers in several important ways. Most
+importantly, we use unsupervised learning, while they use
+supervised learning.
+Unsupervised learning is used to capture inherent organization in data, and thus, only input data is required for
+training. Supervised learning attempts to match training
+inputs with known outcomes, called labels. This means that
+their learning techniques rely on knowing the optimal outcome, while ours does not8 . In their case determining the optimal outcome is trivial— they simply run the benchmarks
+in their training set and note the direction that each branch
+favors. In this sense, their method is simply a classiﬁer:
+classify the data into two groups, either taken or not-taken.
+Priority functions cannot be classiﬁed in this way, and thus
+they demand an unsupervised method such as ours.
+We also diﬀer in the end goal of our learning techniques.
+They use misprediction rates to guide the learning process.
+While this is a perfectly valid choice, it does not necessarily
+reﬂect the bottom line: execution time.
+Monsifrot et al. use a classiﬁer based on decision tree
+learning to determine which loops to unroll [17]. Like [5],
+this supervised methodology relies on extracting labels, which
+is not only diﬃcult, in many cases it is simply not feasible.
+Cooper et al. use genetic algorithms to solve compilation
+phase ordering problems [8]. Their technique is quite effective. However, like other related work, they evolve the
+application, not the compiler9 . Thus, their compiler iteratively evolves every program it compiles. By evolving compiler heuristics, and not the applications themselves, we need
+only apply our process once as shown in Section 5.4.2.
+The COGEN(t) compiler creatively uses genetic algorithms
+to map code to irregular DSPs [11]. This compiler, though
+interesting, also evolves on a per-application basis. Nonetheless, the compile-once nature of DSP applications may warrant the long, iterative compilation process.
+8
+
+This is a strict requirement both for decision trees and the gradient descent
+method they use to train their neural network.
+
+9
+
+However, they were able to manually construct a general-purpose sequence using information gleaned from their application-specific evolutions.
+
+9.
+
+CONCLUSION
+
+Compiler developers have always had to contend with
+complex phenomenon that are not easy modeled. For example, it has never been possible to create a useful model
+for all the input programs the compiler has to optimize.
+However until recently, most architectures— the target of
+compiler optimizations— were simple and analyzable. This
+is no longer the case. A complex compiler with multiple interdependent optimization passes exacerbates the problem.
+In many instances, end-to-end performance can only be evaluated empirically.
+Optimally solving NP-hard problems is not practical even
+when simple analytical models exist. Thus, heuristics play
+a major role in modern compilers. Borrowing techniques
+from the machine-learning community, we created a general framework for developing compiler heuristics. We advocate a machine-learning based methodology for automatically learning eﬀective compiler heuristics.
+The techniques presented in this paper show promise, but
+they are still in their infancy. For many applications our
+techniques found excellent application-speciﬁc priority functions. However, the disparity in some cases between the
+application-speciﬁc performance and the general-purpose performance tells us that our techniques can be improved.
+We also note disparities between the performance of training set applications and the cross validation performance. In
+some cases our solutions overfit the training set. If compiler
+developers use our technique but only train using benchmarks on which their compiler will be judged, the generality
+of their compiler may actually be reduced.
+Our ﬂedgling research has a few shortcomings that future
+work will address. For instance, the success of any learning algorithm hinges on selecting the right features. We will
+explore techniques that aid in extracting features that best
+reﬂect program variability. While genetic programming is
+well-suited to our application, it too has shortcomings. The
+overriding goal of our research is to free humans from tedious parameter tweaking. Unfortunately, GP’s success is
+dependent on parameters such as population size and mutation rate, and ﬁnding an adequate solution relies on some
+experimentation (which fortunately can be performed with
+a minimal amount of user interaction). Future work will
+experiment with diﬀerent learning techniques.
+We believe the beneﬁts of using a system like ours far outweighs the drawbacks. While our techniques do not always
+achieve large speedups, they do reduce design complexity
+considerably. Compiler writers are forced to spend a large
+portion of their time designing heuristics. The results presented in this paper lead us to believe that machine-learning
+techniques can optimize heuristics at least as well human designers. We believe that automatic heuristic tuning based on
+empirical evaluation will become prevalent, and that designers will intentionally expose algorithm policies to facilitate
+machine-learning optimization.
+A toolset that can be used to evolve compiler heuristics
+will be available at:
+http://www.cag.lcs.mit.edu/metaopt
+
+10. ACKNOWLEDGMENTS
+We would like to thank the PLDI reviewers for their insightful comments. In general we thank everyone who helped
+us with this paper, especially Kristen Grauman, Michael
+Gordon, Sam Larsen, William Thies, Derek Bruening, and
+Vladimir Kiriansky. Finally, thanks to Michael Smith and
+Glenn Holloway at Harvard University for lending us their
+Itanium machines in our hour of need. This work is funded
+by DARPA, NSF, and the Oxygen Alliance.
+
+11. REFERENCES
+[1] S. G. Abraham, V. Kathail, and B. L. Deitrich. Meld
+Scheduling: Relaxing Scheduling Constaints Across
+Region Boundaries. In Proceedings of the 29th Annual
+International Symposium on Microarchitecture
+(MICRO-29), pages 308–321, 1996.
+[2] W. Banzhaf, P. Nordin, R. Keller, and F. Francone.
+Genetic Programming : An Introduction : On the
+Automatic Evolution of Computer Programs and Its
+Applications. Morgan Kaufmann, 1998.
+[3] D. Bernstein, D. Goldin, and M. G. et. al. Spill Code
+Minimization Techniques for Optimizing Compilers. In
+Proceedings of the SIGPLAN ’89 Conference on
+Programming Language Design and Implementation,
+pages 258–263, 1989.
+[4] D. Bourgin. Losslessy compression schemes.
+http://hpux.u-aizu.ac.jp/hppd/hpux/Languages/codecs-1.0/.
+[5] B. Calder, D. G. ad Michael Jones, D. Lindsay,
+J. Martin, M. Mozer, and B. Zorn. Evidence-Based
+Static Branch Prediction Using Machine Learning. In
+ACM Transactions on Programming Languages and
+Systems (ToPLaS-19), volume 19, 1997.
+[6] P. Chang, D. Lavery, S. Mahlke, W. Chen, and
+W. Hwu. The Importance of Prepass Code Scheduling
+for Superscalar and Superpipelined processors. In
+IEEE Transactions on Computers, volume 44, pages
+353–370, March 1995.
+[7] F. C. Chow and J. L. Hennessey. The Priority-Based
+Coloring Approch to Register Allocation. In ACM
+Transactions on Programming Languages and Systems
+(ToPLaS-12), pages 501–536, 1990.
+[8] K. Cooper, P. Scheilke, and D. Subramanian.
+Optimizing for Reduced Code Space using Genetic
+Algorithms. In Languages, Compilers, Tools for
+Embedded Systems, pages 1–9, 1999.
+[9] C. Gathercole. An Investigation of Supervised
+Learning in Genetic Programming. PhD thesis,
+University of Edinburgh, 1998.
+[10] P. B. Gibbons and S. S. Muchnick. Eﬃcient
+Instruction Scheduling for a Pipelined Architecture. In
+Proceedings of the ACM Symposium on Compiler
+Construction, volume 21, pages 11–16, 1986.
+[11] G. W. Grewal and C. T. Wilson. Mappping Reference
+Code to Irregular DSPs with the Retargetable,
+Optimizing Compiler COGEN(T). In International
+Symposium on Microarchitecture, volume 34, pages
+192–202, 2001
+
+.
+[12] M. Kessler and T. Haynes. Depth-Fair Crossover in
+Genetic Programming. In Proceedings of the ACM
+Symposium on Applied Computing, pages 319–323,
+February 1999.
+[13] J. Koza. Genetic Programming: On the Programming
+of Computers by Means of Natural Selection. The MIT
+Press, 1992.
+[14] C. Lee, M. Potkonjak, and W. H. Mangione-Smith.
+MediaBench: a tool for evaluating and synthesizing
+multimedia and communication systems. In
+International Symposium on Microarchitecture,
+volume 30, pages 330–335, 1997.
+[15] S. A. Mahlke. Exploiting instruction level parallelism
+in the presence of branches. PhD thesis, University of
+Illinois at Urbana-Champaign, Department of
+Electrical and Computer Engineering, 1996.
+[16] S. A. Mahlke, D. Lin, W. Chen, R. Hank, and
+R. Bringmann. Eﬀective Compiler Support for
+Predicated Execution Using the Hyperblock. In
+International Symposium on Microarchitecture,
+volume 25, pages 45–54, 1992.
+[17] A. Monsifrot, F. Bodin, and R. Quiniou. A Machine
+Learning Approach to Automatic Production of
+Compiler Heuristics. In Artificial Intelligence:
+Methodology, Systems, Applications, pages 41–50,
+2002.
+[18] T. C. Mowry. Tolerating Latency through
+Software-Controlled Data Prefetching. PhD thesis,
+Stanford University, Department of Electrical
+Engineering, 1994
+
+.
+[19] Open Research Compiler.
+http://ipf-orc.sourceforge.net.
+[20] E. Ozer, S. Banerjia, and T. Conte. Uniﬁed Assign
+and Schedule: A New Approach to Scheduling for
+Clustered Register Filee Microarchitectures. In
+Proceedings of the 27th Annual International
+Symposium on Microarchitecture (MICRO-24), pages
+308–315, 1998.
+[21] J. C. H. Park and M. S. Schlansker. On Predicated
+Execution. Technical Report HPL-91-58, Hewlett
+Packard Laboratories, 1991.
+[22] B. R. Rau. Iterative Modulo Scheduling: An
+Algorithm for Software Pipelining Loops. In
+Proceedings of the 27th Annual International
+Symposium on Microarchitecture (MICRO-24),
+November 1994.
+[23] M. Stephenson, S. Amarasinghe, U.-M. O’Reilly, and
+M. Martin. Compiler Heuristic Design with Machine
+Learning. Technical Report TR-893, Massachusetts
+Institute of Technology, 2003.
+[24] Trimaran. http://www.trimaran.org.
+[25] N. Warter. Modulo Scheduling with Isomorphic
+Control Transformations. PhD thesis, University of
+Illinois at Urbana-Champaign, Department of
+Electrical and Computer Engineering, 1993.
+
+

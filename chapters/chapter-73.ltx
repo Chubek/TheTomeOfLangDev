@@ -1,0 +1,541 @@
+%%
+%% chapter-73.ltx — Local and Peephole Optimization
+%%
+
+\section{Introduction}\label{sec:local-peephole-intro}
+
+Local and peephole optimizations are the simplest and most widely applied class of compiler optimizations. They examine a small window of code---a single instruction, a basic block, or a short sequence of instructions---and apply local transformations that improve the code without requiring global program analysis. Despite their limited scope, these optimizations can yield significant performance improvements, often accounting for 10--30\% of the total speedup achieved by a compiler.
+
+The term ``peephole optimization'' was coined by Tesler and Enea~\cite{tesler1968improving} in 1968 to describe a technique that examines the generated code through a small ``peephole'' and replaces instruction sequences with more efficient equivalents. Modern compilers apply thousands of peephole rules, many of them machine-specific.
+
+\section{Constant Folding and Propagation}\label{sec:constant-folding}
+
+\subsection{Constant Folding}\label{sec:constant-folding-detail}
+
+\emph{Constant folding} evaluates expressions involving only constants at compile time, replacing the expression with its computed value.
+
+\begin{definition}[Constant Folding]\label{def:constant-folding}
+\textbf{Constant folding} replaces an expression $e_1 \mathbin{\text{op}} e_2$ with the value $v_1 \mathbin{\text{op}} v_2$ when both $e_1$ and $e_2$ are compile-time constants with values $v_1$ and $v_2$.
+\end{definition}
+
+\begin{example}[Constant Folding]\label{ex:const-fold}
+\begin{verbatim}
+  x = 3 + 4;         →  x = 7;
+  y = 2 * 3.14;      →  y = 6.28;
+  z = "hello" + " world";  →  z = "hello world";
+  a = 10 > 5;        →  a = true;
+\end{verbatim}
+\end{example}
+
+\subsection{Constant Propagation}\label{sec:constant-prop-detail}
+
+\emph{Constant propagation} replaces uses of a variable with its known constant value.
+
+\begin{definition}[Constant Propagation]\label{def:constant-prop}
+\textbf{Constant propagation} replaces a use of variable $x$ with the constant $c$ if $x$ is known to have value $c$ at that program point.
+\end{definition}
+
+\begin{example}[Constant Propagation]\label{ex:const-prop}
+\begin{verbatim}
+  x = 5;
+  y = x + 3;    →  y = 5 + 3;  →  y = 8;
+  z = x * 2;    →  z = 5 * 2;  →  z = 10;
+\end{verbatim}
+\end{example}
+
+\subsection{Implementation}\label{sec:const-impl}
+
+Constant folding and propagation are typically implemented as a single pass:
+\begin{enumerate}
+  \item Maintain a mapping from variables to their known constant values.
+  \item For each assignment $x = e$:
+    \begin{itemize}
+      \item If $e$ is a constant expression (all operands are constants), fold it and record $x \mapsto v$.
+      \item Otherwise, record $x \mapsto \top$ (unknown).
+    \end{itemize}
+  \item For each use of $x$: if $x \mapsto c$, replace with $c$.
+  \item At control-flow merge points: if $x$ has different values on different paths, set $x \mapsto \top$.
+\end{enumerate}
+
+\section{Algebraic Simplification}\label{sec:algebraic-simplification}
+
+\emph{Algebraic simplification} applies algebraic identities to reduce expressions.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Pattern} & \textbf{Replacement} \\
+\hline
+$x + 0$ & $x$ \\
+$x - 0$ & $x$ \\
+$x \times 1$ & $x$ \\
+$x \times 0$ & $0$ \\
+$x / 1$ & $x$ \\
+$x \mathbin{\&} 0$ & $0$ \\
+$x \mathbin{|} 0$ & $x$ \\
+$x \wedge x$ & $0$ \\
+$x \mathbin{|} x$ & $x$ \\
+$x \mathbin{\&} x$ & $x$ \\
+$\neg(\neg x)$ & $x$ \\
+$x - x$ & $0$ \\
+\hline
+\end{tabular}
+\caption{Common algebraic simplification rules.}
+\label{tab:algebraic-rules}
+\end{table}
+
+\subsection{Strength Reduction}\label{sec:strength-reduction}
+
+\emph{Strength reduction} replaces expensive operations with cheaper equivalents.
+
+\begin{definition}[Strength Reduction]\label{def:strength-reduction}
+\textbf{Strength reduction} replaces an operation with a computationally cheaper operation that produces the same result.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Expensive} & \textbf{Cheaper} \\
+\hline
+$x^2$ & $x \times x$ \\
+$x / 2$ & $x \gg 1$ (for unsigned $x$) \\
+$x \times 2^k$ & $x \ll k$ \\
+$x \bmod 2^k$ & $x \mathbin{\&} (2^k - 1)$ \\
+$x \times c$ (constant $c$) & Shift-and-add sequence \\
+\hline
+\end{tabular}
+\caption{Common strength reduction transformations.}
+\label{tab:strength-reduction}
+\end{table}
+
+\begin{example}[Strength Reduction for Multiplication]\label{ex:sr-mul}
+Multiplication by a constant can be replaced by shifts and adds:
+\begin{verbatim}
+  x * 10  →  (x << 3) + (x << 1)    // 8x + 2x = 10x
+  x * 7   →  (x << 3) - x            // 8x - x = 7x
+  x * 15  →  (x << 4) - x            // 16x - x = 15x
+\end{verbatim}
+\end{example}
+
+\section{Peephole Optimization Patterns}\label{sec:peephole-patterns}
+
+Peephole optimization examines a sliding window of instructions and applies local replacement rules.
+
+\subsection{Redundant Load/Store Elimination}\label{sec:redundant-load-store}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Before} & \textbf{After} \\
+\hline
+\texttt{store R1, [M]} / \texttt{load R2, [M]} & \texttt{store R1, [M]} / \texttt{mov R2, R1} \\
+\texttt{load R1, [M]} / \texttt{store R1, [M]} & \texttt{load R1, [M]} \\
+\texttt{push X} / \texttt{pop X} & (deleted) \\
+\texttt{mov R1, R2} / \texttt{mov R2, R1} & \texttt{mov R1, R2} \\
+\hline
+\end{tabular}
+\caption{Redundant load/store elimination patterns.}
+\label{tab:redundant-load-store}
+\end{table}
+
+\subsection{Branch Optimization}\label{sec:branch-optimization}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Before} & \textbf{After} \\
+\hline
+\texttt{jmp L1} / \texttt{L1:} \ldots & \ldots (unconditional jump to next instruction) \\
+\texttt{jmp L1} / \texttt{jmp L2} & \texttt{jmp L2} (jump chaining) \\
+\texttt{branch cond, L1} / \texttt{L1: jmp L2} & \texttt{branch cond, L2} (branch shortening) \\
+\texttt{cmp R1, R1} / \texttt{branch eq, L} & \texttt{jmp L} (unconditional branch) \\
+\hline
+\end{tabular}
+\caption{Branch optimization patterns.}
+\label{tab:branch-optimization}
+\end{table}
+
+\subsection{Arithmetic Simplification}\label{sec:arithmetic-peephole}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Before} & \textbf{After} \\
+\hline
+\texttt{add R1, R1, 0} & \ldots (delete) \\
+\texttt{mul R1, R1, 1} & \ldots (delete) \\
+\texttt{mul R1, R1, 0} & \texttt{mov R1, 0} \\
+\texttt{add R1, R2, R2} & \texttt{shl R1, R2, 1} \\
+\texttt{sub R1, R2, R2} & \texttt{mov R1, 0} \\
+\hline
+\end{tabular}
+\caption{Arithmetic peephole patterns.}
+\label{tab:arithmetic-peephole}
+\end{table}
+
+\section{Redundant Instruction Elimination}\label{sec:redundant-elimination}
+
+\subsection{Dead Code Elimination (Local)}\label{sec:local-dce}
+
+Local dead code elimination removes instructions whose results are never used within the same basic block.
+
+\begin{definition}[Local Dead Code]\label{def:local-dead}
+An instruction $s$ is \textbf{locally dead} if its result is not used by any subsequent instruction in the same basic block.
+\end{definition}
+
+\begin{example}[Local Dead Code]\label{ex:local-dead}
+\begin{verbatim}
+  x = a + b;    // dead if x is not used later in this block
+  y = c * d;    // y is used below
+  z = y + 1;
+\end{verbatim}
+\end{example}
+
+\subsection{Move Elimination}\label{sec:move-elimination}
+
+\emph{Move elimination} (or \emph{copy elimination}) removes redundant copy/move instructions.
+
+\begin{definition}[Move Elimination]\label{def:move-elim}
+A move instruction $\texttt{mov R1, R2}$ can be eliminated if:
+\begin{itemize}
+  \item $\texttt{R1}$ and $\texttt{R2}$ already contain the same value, or
+  \item $\texttt{R1}$ is not used before being redefined.
+\end{itemize}
+\end{definition}
+
+\section{Machine-Specific Peephole Rules}\label{sec:machine-specific}
+
+Machine-specific peephole rules exploit the features of a particular target architecture.
+
+\subsection{x86-Specific Rules}\label{sec:x86-rules}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Before} & \textbf{After} \\
+\hline
+\texttt{mov eax, 0} & \texttt{xor eax, eax} (shorter encoding) \\
+\texttt{mov eax, -1} & \texttt{or eax, -1} or \texttt{mov eax, 0xFFFFFFFF} \\
+\texttt{lea eax, [ebx + ecx]} & (keep: lea is efficient for address computation) \\
+\texttt{test eax, eax} / \texttt{jz L} & (keep: test is the idiomatic zero-check) \\
+\hline
+\end{tabular}
+\caption{x86-specific peephole rules.}
+\label{tab:x86-rules}
+\end{table}
+
+\subsection{ARM-Specific Rules}\label{sec:arm-rules}
+
+ARM's conditional execution feature enables unique peephole optimizations:
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Before} & \textbf{After} \\
+\hline
+\texttt{cmp R1, R2} / \texttt{bne L} / \texttt{mov R3, R4} / \texttt{L:} \ldots & \texttt{cmp R1, R2} / \texttt{movne R3, R4} \\
+\texttt{mov R1, R2} / \texttt{mov R1, R3} & \texttt{mov R1, R3} (first move is dead) \\
+\hline
+\end{tabular}
+\caption{ARM-specific peephole rules.}
+\label{tab:arm-rules}
+\end{table}
+
+\subsection{Implementation Architecture}\label{sec:peephole-arch}
+
+Modern compilers organize peephole optimizations as a collection of \emph{pattern-action} rules:
+
+\begin{definition}[Peephole Rule]\label{def:peephole-rule}
+A \textbf{peephole rule} consists of:
+\begin{itemize}
+  \item A \textbf{pattern}: a sequence of instructions (possibly with wildcards).
+  \item A \textbf{guard}: a condition that must hold for the rule to apply.
+  \item A \textbf{replacement}: the instruction sequence to substitute.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Peephole Optimization Engine}
+\label{alg:peephole}
+\begin{algorithmic}[1]
+\Require Instruction sequence $I$, rule set $R$
+\Ensure Optimized instruction sequence
+\State $changed \gets \text{true}$
+\While{$changed$}
+  \State $changed \gets \text{false}$
+  \For{each window $W$ of instructions in $I$}
+    \For{each rule $r \in R$}
+      \If{$W$ matches pattern of $r$ and guard of $r$ holds}
+        \State Replace $W$ with replacement of $r$
+        \State $changed \gets \text{true}$
+      \EndIf
+    \EndFor
+  \EndFor
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\begin{historical}
+Peephole optimization was introduced by Tesler and Enea in 1968~\cite{tesler1968improving} as a technique for improving the quality of generated code. The idea was to examine the output of the code generator through a small ``peephole'' and replace inefficient instruction sequences with better ones. Modern compilers like GCC and LLVM apply thousands of peephole rules, many of them generated automatically from machine descriptions. The concept has evolved to include not just instruction-level patterns but also basic-block-level and even function-level transformations.
+\end{historical}
+
+\section{Combining Local Optimizations}\label{sec:combining-local}
+
+In practice, local and peephole optimizations are applied iteratively until no more transformations are possible. The order of application can affect the final result:
+
+\begin{algorithm}[H]
+\caption{Iterative Local Optimization}
+\label{alg:iterative-local}
+\begin{algorithmic}[1]
+\Require Function $F$
+\Ensure Optimized function
+\State $\mathit{changed} \gets \text{true}$
+\While{$\mathit{changed}$}
+  \State $\mathit{changed} \gets \text{false}$
+  \ForAll{basic blocks $B$ in $F$}
+    \State Apply constant folding in $B$
+    \State Apply algebraic simplification in $B$
+    \State Apply strength reduction in $B$
+    \State Apply peephole rules in $B$
+    \State Apply dead code elimination in $B$
+    \If{any transformation was applied}
+      \State $\mathit{changed} \gets \text{true}$
+    \EndIf
+  \EndFor
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Interaction Between Optimizations}\label{sec:local-interaction}
+
+Local optimizations interact in important ways:
+\begin{itemize}
+  \item Constant folding can expose dead code (if a branch condition becomes constant).
+  \item Strength reduction can expose common subexpressions.
+  \item Dead code elimination can expose new constant propagation opportunities.
+  \item Algebraic simplification can enable further constant folding.
+\end{itemize}
+
+\section{Machine Description for Peephole Optimization}\label{sec:machine-desc}
+
+Modern compilers use machine descriptions to specify peephole rules declaratively:
+
+\begin{definition}[Peephole Pattern Specification]\label{def:peephole-spec}
+A \textbf{peephole pattern specification} defines rules in a declarative format:
+\begin{verbatim}
+  (define_peephole
+    (set (reg:SI R1) (plus:SI (reg:SI R2) (const_int 0)))
+    (set (reg:SI R1) (reg:SI R2))
+    "add with 0 is a move")
+\end{verbatim}
+\end{definition}
+
+\section{Summary}\label{sec:local-peephole-summary}
+
+Local and peephole optimizations are the workhorses of compiler optimization. They are simple to implement, fast to execute, and effective at eliminating common inefficiencies in generated code. Constant folding and propagation eliminate compile-time-computable expressions. Algebraic simplification and strength reduction replace expensive operations with cheaper equivalents. Peephole patterns eliminate redundant instructions, optimize branches, and exploit machine-specific features. Local optimizations interact and should be applied iteratively. Modern compilers use machine descriptions to specify peephole rules declaratively. Despite their limited scope, these optimizations are essential for producing efficient code.
+
+\section{Machine-Specific Peephole Rules}\label{sec:machine-peephole}
+
+Machine-specific peephole rules exploit the features and idiosyncrasies of the target architecture to produce tighter, faster code.
+
+\subsection{x86-Specific Peephole Rules}\label{sec:x86-peephole}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lll}
+\hline
+\textbf{Pattern} & \textbf{Replacement} & \textbf{Reason} \\
+\hline
+\texttt{mov eax, 0} & \texttt{xor eax, eax} & Shorter encoding (2 vs 5 bytes) \\
+\texttt{add eax, 0} & \emph{delete} & No-op \\
+\texttt{mul eax, 1} & \emph{delete} & Identity \\
+\texttt{mul eax, 2} & \texttt{shl eax, 1} & Shift faster than multiply \\
+\texttt{mul eax, 4} & \texttt{shl eax, 2} & Shift faster than multiply \\
+\texttt{div eax, 2} & \texttt{sar eax, 1} & Shift faster than divide \\
+\texttt{cmp eax, 0} & \texttt{test eax, eax} & Shorter encoding \\
+\texttt{mov [mem], reg; mov reg, [mem]} & \texttt{mov [mem], reg} & Redundant reload \\
+\hline
+\end{tabular}
+\caption{Common x86 peephole optimization rules.}
+\label{tab:x86-peephole}
+\end{table}
+
+\subsection{ARM-Specific Peephole Rules}\label{sec:arm-peephole}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lll}
+\hline
+\textbf{Pattern} & \textbf{Replacement} & \textbf{Reason} \\
+\hline
+\texttt{MOV r0, \#0} & \texttt{EOR r0, r0, r0} & May be shorter \\
+\texttt{ADD r0, r1, r2; CMP r0, \#0} & \texttt{ADDS r0, r1, r2} & Flag-setting variant \\
+\texttt{LDR r0, [r1, \#0]} & \texttt{LDR r0, [r1]} & Shorter encoding \\
+\texttt{MOV r0, r1; MOV r1, r0} & \texttt{MOV r0, r1} & Redundant copy \\
+\hline
+\end{tabular}
+\caption{Common ARM peephole optimization rules.}
+\label{tab:arm-peephole}
+\end{table}
+
+\subsection{Address Computation Peephole Rules}\label{sec:addr-peephole}
+
+Modern processors support complex addressing modes that can fold multiple operations into a single memory access:
+
+\begin{definition}[Address Mode Folding]\label{def:addr-folding}
+\textbf{Address mode folding} combines address computation instructions into the addressing mode of a load or store instruction. For example, on x86-64:
+\[
+\texttt{lea rax, [rbx + rcx*4 + 8]} \text{; } \texttt{mov rdx, [rax]} \implies \texttt{mov rdx, [rbx + rcx*4 + 8]}
+\]
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Address Mode Folding}
+\label{alg:addr-folding}
+\begin{algorithmic}[1]
+\Require Instruction sequence with address computation followed by load/store
+\Ensure Optimized instruction sequence
+\ForAll{load/store instructions $m$ with base address $a$}
+  \State Trace definition chain of $a$ backward
+  \If{$a$ is computed by \texttt{add}/\texttt{lea} from base + index*scale + offset}
+    \If{target supports this addressing mode}
+      \State Replace $m$ with single instruction using complex addressing mode
+      \State Delete address computation instructions
+    \EndIf
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Branch Optimization Peephole Rules}\label{sec:branch-peephole}
+
+\subsection{Branch Shortening}\label{sec:branch-shortening}
+
+\begin{definition}[Branch Shortening]\label{def:branch-shortening}
+\textbf{Branch shortening} replaces long conditional branches with short branches when the target is within the short branch range. This saves code space and may improve instruction fetch performance.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Branch Shortening}
+\label{alg:branch-shortening}
+\begin{algorithmic}[1]
+\Require Instruction sequence with branches, target offsets
+\Ensure Optimized branch instructions
+\State Compute initial layout and branch offsets
+\Repeat
+  \State changed $\gets$ false
+  \ForAll{conditional branches $b$}
+    \If{$b$ is long-form and target is within short range}
+      \State Replace $b$ with short-form branch
+      \State changed $\gets$ true
+      \State Recompute offsets (code shrinks)
+    \EndIf
+  \EndFor
+\Until{$\neg$ changed}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Branch Elimination}\label{sec:branch-elimination}
+
+\begin{verbatim}
+  // Pattern: conditional branch to next instruction
+  CMP r1, r2
+  JE  L1       ; branch to next instruction
+  L1: ...
+  
+  // Optimized: remove the branch
+  CMP r1, r2
+  L1: ...
+\end{verbatim}
+
+\subsection{Branch Inversion for Fall-Through}\label{sec:branch-inversion}
+
+\begin{definition}[Branch Inversion]\label{def:branch-inversion}
+\textbf{Branch inversion} swaps the taken and not-taken targets of a conditional branch when the not-taken path is more likely. This exploits the processor's branch prediction heuristic that predicts forward branches as not taken.
+\end{definition}
+
+\section{Sequence Optimization Peephole Rules}\label{sec:sequence-peephole}
+
+\subsection{Redundant Load/Store Elimination}\label{sec:redundant-load-store}
+
+\begin{verbatim}
+  // Pattern: store followed by load of same address
+  MOV [rbx], rax    ; store rax to [rbx]
+  MOV rcx, [rbx]    ; load from [rbx] into rcx
+  
+  // Optimized: replace load with register copy
+  MOV [rbx], rax
+  MOV rcx, rax      ; rcx already has the value
+\end{verbatim}
+
+\subsection{Instruction Combination}\label{sec:instruction-combine}
+
+\begin{definition}[Instruction Combination]\label{def:instruction-combine}
+\textbf{Instruction combination} merges multiple instructions into a single instruction that performs the same computation. Examples include:
+\begin{itemize}
+  \item Combining \texttt{add} + \texttt{mov} into a single \texttt{lea}
+  \item Combining \texttt{shift} + \texttt{add} into \texttt{lea} with scale
+  \item Combining \texttt{load} + \texttt{sign-extend} into \texttt{movsx}
+\end{itemize}
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lll}
+\hline
+\textbf{Instruction Sequence} & \textbf{Combined} & \textbf{Savings} \\
+\hline
+\texttt{mov rax, [mem]; movsx rax, eax} & \texttt{movsxd rax, [mem]} & 1 instruction \\
+\texttt{shl rax, 2; add rax, rbx} & \texttt{lea rax, [rbx + rax*4]} & 1 instruction \\
+\texttt{mov rax, imm32} & \texttt{mov eax, imm32} & 1 byte (zero-extends) \\
+\texttt{nop; nop; nop} & \texttt{nop (3-byte)} & 0 bytes, 1 instruction \\
+\hline
+\end{tabular}
+\caption{Instruction combination examples.}
+\label{tab:instruction-combine}
+\end{table}
+
+\section{Peephole Optimization Frameworks}\label{sec:peephole-frameworks}
+
+\subsection{DAG-Based Pattern Matching}\label{sec:dag-pattern}
+
+\begin{definition}[DAG Pattern Matching]\label{def:dag-pattern}
+\textbf{DAG pattern matching} represents both the instruction sequence and the peephole rules as directed acyclic graphs. Pattern matching is performed by tree/DAG matching algorithms that find subgraph isomorphisms.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{DAG-Based Peephole Optimization}
+\label{alg:dag-peephole}
+\begin{algorithmic}[1]
+\Require Instruction DAG $D$, pattern rules $R$
+\Ensure Optimized instruction DAG
+\ForAll{rules $r \in R$}
+  \State Find all matches of $r.pattern$ in $D$
+  \ForAll{matches $m$}
+    \State Compute cost difference: $\Delta = cost(r.pattern) - cost(r.replacement)$
+    \If{$\Delta > 0$}
+      \State Replace matched subgraph with $r.replacement$
+    \EndIf
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Combinatorial Peephole Optimization}\label{sec:combinatorial-peephole}
+
+When peephole rules interact (one rule creates a pattern for another), the optimization problem becomes combinatorial:
+
+\begin{definition}[Combinatorial Peephole]\label{def:combinatorial-peephole}
+\textbf{Combinatorial peephole optimization} considers all possible orderings of rule applications and selects the sequence that produces the minimum-cost code. This is equivalent to finding the shortest derivation in a term rewriting system.
+\end{definition}
+
+\begin{theorem}[Peephole Termination]\label{thm:peephole-termination}
+If all peephole rules are \emph{cost-reducing} (each replacement produces code with equal or lower cost), and the set of possible code sequences is finite (bounded by code size), then repeated application of peephole rules terminates.
+\end{theorem}

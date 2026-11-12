@@ -1,0 +1,406 @@
+%%
+%% chapter-64.ltx — Forward and Backward Dataflow Analyses
+%%
+
+\section{Introduction}\label{sec:forward-backward-intro}
+
+The dataflow analysis framework developed in Chapter~\ref{sec:dataflow-intro} is a general schema that can be instantiated in many ways. The direction of information flow---forward from entry to exit, or backward from exit to entry---and the choice of lattice and transfer functions determine the specific analysis obtained. In this chapter, we develop the five classical dataflow analyses in full detail: reaching definitions, available expressions, and constant propagation as forward analyses; live variables and very busy expressions as backward analyses. For each, we present the lattice, the transfer functions, the dataflow equations, and a worked example. We conclude with implementation patterns that apply across all analyses.
+
+\section{Reaching Definitions (Forward)}\label{sec:reaching-definitions}
+
+\subsection{Motivation and Definition}\label{sec:rd-motivation}
+
+A \emph{definition} of a variable $x$ is a statement that assigns a value to $x$. A definition $d$ \emph{reaches} a program point $p$ if there exists a path from the point immediately after $d$ to $p$ along which $d$ is not \emph{killed} (i.e., $x$ is not re-assigned).
+
+\begin{definition}[Reaching Definitions]\label{def:reaching-defs}
+A definition $d$ of variable $x$ \textbf{reaches} program point $p$ if there exists a path from the point immediately following $d$ to $p$ such that $x$ is not redefined along that path.
+\end{definition}
+
+Reaching definitions are fundamental to many compiler optimizations, including constant propagation, common subexpression elimination, and partial redundancy elimination.
+
+\subsection{Lattice and Transfer Functions}\label{sec:rd-lattice}
+
+The lattice for reaching definitions is the powerset lattice of all definitions in the program:
+
+\begin{definition}[Reaching Definitions Lattice]\label{def:rd-lattice}
+Let $\mathit{Defs}$ be the set of all definitions in the program. The lattice is $(2^{\mathit{Defs}}, \subseteq)$ with:
+\begin{itemize}
+  \item Meet: $\sqcap = \cap$ (set intersection)
+  \item Join: $\sqcup = \cup$ (set union)
+  \item Top: $\top = \mathit{Defs}$ (all definitions reach---most conservative)
+  \item Bottom: $\bot = \emptyset$ (no definitions reach---most optimistic)
+\end{itemize}
+\end{definition}
+
+For a forward may-analysis like reaching definitions, we use the \emph{join} ($\cup$) at merge points and initialize all nodes to $\bot = \emptyset$.
+
+\begin{definition}[Transfer Functions for Reaching Definitions]\label{def:rd-transfer}
+For a basic block $B$:
+\begin{align}
+  \mathit{gen}(B) &= \{d \mid d \text{ is a definition in } B \text{ of some variable } x, \text{ and } d \text{ is the last definition of } x \text{ in } B\} \\
+  \mathit{kill}(B) &= \{d \mid d \text{ is a definition of some variable } x \text{ that is defined in } B, \text{ but } d \notin \mathit{gen}(B)\} \\
+  f_B(S) &= \mathit{gen}(B) \cup (S \setminus \mathit{kill}(B))
+\end{align}
+\end{definition}
+
+\subsection{Dataflow Equations}\label{sec:rd-equations}
+
+\begin{definition}[Reaching Definitions Equations]\label{def:rd-equations}
+\begin{align}
+  \mathit{IN}[B] &= \bigcup_{P \in \mathit{pred}(B)} \mathit{OUT}[P] \\
+  \mathit{OUT}[B] &= \mathit{gen}(B) \cup (\mathit{IN}[B] \setminus \mathit{kill}(B))
+\end{align}
+\end{definition}
+
+\subsection{Worked Example}\label{sec:rd-example}
+
+\begin{example}[Reaching Definitions Computation]\label{ex:rd}
+Consider the following program:
+\begin{verbatim}
+  B1: d1: x = 5
+  B2: d2: y = x + 1
+  B3: d3: x = 3     |     d4: z = y * 2
+  B5: d5: w = x + z
+\end{verbatim}
+
+The gen and kill sets are:
+\begin{itemize}
+  \item $\mathit{gen}(B_1) = \{d_1\}$, $\mathit{kill}(B_1) = \emptyset$
+  \item $\mathit{gen}(B_2) = \{d_2\}$, $\mathit{kill}(B_2) = \emptyset$
+  \item $\mathit{gen}(B_3) = \{d_3\}$, $\mathit{kill}(B_3) = \{d_1\}$
+  \item $\mathit{gen}(B_4) = \{d_4\}$, $\mathit{kill}(B_4) = \emptyset$
+  \item $\mathit{gen}(B_5) = \{d_5\}$, $\mathit{kill}(B_5) = \{d_3\}$
+\end{itemize}
+
+Iterating the equations yields:
+\begin{itemize}
+  \item $\mathit{OUT}[B_1] = \{d_1\}$
+  \item $\mathit{OUT}[B_2] = \{d_1, d_2\}$
+  \item $\mathit{OUT}[B_3] = \{d_2, d_3\}$ (since $d_1$ is killed)
+  \item $\mathit{OUT}[B_4] = \{d_1, d_2, d_4\}$
+  \item $\mathit{OUT}[B_5] = \{d_2, d_4, d_5\}$ (since $d_3$ is killed)
+\end{itemize}
+\end{example}
+
+\section{Available Expressions (Forward)}\label{sec:available-expressions}
+
+\subsection{Motivation and Definition}\label{sec:ae-motivation}
+
+An expression $e$ is \emph{available} at program point $p$ if every path from the entry to $p$ evaluates $e$ before reaching $p$, and no path re-evaluates any operand of $e$ between the last evaluation and $p$. Available expressions enable \emph{common subexpression elimination}: if $e$ is available at $p$, we can reuse a previously computed value of $e$ instead of recomputing it.
+
+\begin{definition}[Available Expressions]\label{def:avail-expr}
+An expression $x \mathbin{\text{op}} y$ is \textbf{available} at point $p$ if on every path from the entry to $p$, the expression is evaluated and neither $x$ nor $y$ is subsequently modified before $p$.
+\end{definition}
+
+\subsection{Lattice and Transfer Functions}\label{sec:ae-lattice}
+
+\begin{definition}[Available Expressions Lattice]\label{def:ae-lattice}
+Let $\mathit{Exprs}$ be the set of all expressions in the program. The lattice is $(2^{\mathit{Exprs}}, \supseteq)$ (note: reverse subset ordering!) with:
+\begin{itemize}
+  \item Meet: $\sqcap = \cap$ (set intersection)
+  \item Join: $\sqcup = \cup$ (set union)
+  \item Top: $\top = \mathit{Exprs}$ (all expressions available---initial assumption)
+  \item Bottom: $\bot = \emptyset$ (no expressions available)
+\end{itemize}
+\end{definition}
+
+This is a forward must-analysis: an expression is available only if it is available on \emph{all} paths.
+
+\begin{definition}[Transfer Functions for Available Expressions]\label{def:ae-transfer}
+For a basic block $B$:
+\begin{align}
+  \mathit{e\_gen}(B) &= \{e \mid e \text{ is evaluated in } B \text{ and no operand of } e \text{ is killed later in } B\} \\
+  \mathit{e\_kill}(B) &= \{e \mid \text{some operand of } e \text{ is modified in } B\} \\
+  f_B(S) &= \mathit{e\_gen}(B) \cup (S \setminus \mathit{e\_kill}(B))
+\end{align}
+\end{definition}
+
+\subsection{Dataflow Equations}\label{sec:ae-equations}
+
+\begin{definition}[Available Expressions Equations]\label{def:ae-equations}
+\begin{align}
+  \mathit{OUT}[B] &= \mathit{e\_gen}(B) \cup (\mathit{IN}[B] \setminus \mathit{e\_kill}(B)) \\
+  \mathit{IN}[B] &= \begin{cases} \emptyset & \text{if } B = B_0 \text{ (entry)} \\ \bigcap_{P \in \mathit{pred}(B)} \mathit{OUT}[P] & \text{otherwise} \end{cases}
+\end{align}
+\end{definition}
+
+Note the initialization: $\mathit{IN}[B_0] = \emptyset$ (no expressions available at entry) and $\mathit{IN}[B] = \mathit{Exprs}$ for all other blocks (optimistic initialization for a must-analysis).
+
+\subsection{Worked Example}\label{sec:ae-example}
+
+\begin{example}[Available Expressions]\label{ex:ae}
+Consider:
+\begin{verbatim}
+  B1: a = b + c
+  B2: d = b + c    (if we know b,c unchanged)
+  B3: b = a        (kills b+c)
+\end{verbatim}
+At entry to $B_2$, the expression $b + c$ is available (it was computed in $B_1$ and neither $b$ nor $c$ was modified). Thus $B_2$ can be optimized to $d = a$. At entry to $B_3$, $b + c$ is no longer available because $B_3$ modifies $b$.
+\end{example}
+
+\section{Live Variables (Backward)}\label{sec:live-variables}
+
+\subsection{Motivation and Definition}\label{sec:lv-motivation}
+
+A variable $x$ is \emph{live} at program point $p$ if there exists a path from $p$ to a use of $x$ along which $x$ is not redefined. Live variable analysis is essential for register allocation (a dead variable's register can be reused) and dead code elimination.
+
+\begin{definition}[Live Variables]\label{def:live-vars}
+A variable $x$ is \textbf{live} at point $p$ if there exists a path from $p$ to a use of $x$ along which $x$ is not redefined. Otherwise, $x$ is \textbf{dead} at $p$.
+\end{definition}
+
+\subsection{Lattice and Transfer Functions}\label{sec:lv-lattice}
+
+\begin{definition}[Live Variables Lattice]\label{def:lv-lattice}
+Let $\mathit{Vars}$ be the set of all program variables. The lattice is $(2^{\mathit{Vars}}, \subseteq)$ with:
+\begin{itemize}
+  \item Join: $\sqcup = \cup$ (set union)
+  \item Top: $\top = \mathit{Vars}$
+  \item Bottom: $\bot = \emptyset$
+\end{itemize}
+\end{definition}
+
+This is a backward may-analysis: a variable is live if it \emph{might} be used before being redefined on some path.
+
+\begin{definition}[Transfer Functions for Live Variables]\label{def:lv-transfer}
+For a basic block $B$:
+\begin{align}
+  \mathit{use}(B) &= \{x \mid x \text{ is used in } B \text{ before any definition of } x\} \\
+  \mathit{def}(B) &= \{x \mid x \text{ is defined in } B \text{ before any use of } x\} \\
+  f_B(S) &= \mathit{use}(B) \cup (S \setminus \mathit{def}(B))
+\end{align}
+\end{definition}
+
+\subsection{Dataflow Equations}\label{sec:lv-equations}
+
+\begin{definition}[Live Variables Equations]\label{def:lv-equations}
+\begin{align}
+  \mathit{OUT}[B] &= \bigcup_{S \in \mathit{succ}(B)} \mathit{IN}[S] \\
+  \mathit{IN}[B] &= \mathit{use}(B) \cup (\mathit{OUT}[B] \setminus \mathit{def}(B))
+\end{align}
+\end{definition}
+
+Note the reversal of direction: information flows from successors to predecessors, and we compute $\mathit{IN}$ from $\mathit{OUT}$.
+
+\subsection{Worked Example}\label{sec:lv-example}
+
+\begin{example}[Live Variables]\label{ex:lv}
+Consider:
+\begin{verbatim}
+  B1: x = input()
+      y = input()
+  B2: if x > 0 then
+  B3:   z = x + y
+  B4: else
+  B5:   z = y * 2
+  B6: endif
+      print z
+\end{verbatim}
+Working backward from $B_6$:
+\begin{itemize}
+  \item $\mathit{IN}[B_6] = \{z\}$ (z is used in print)
+  \item $\mathit{OUT}[B_3] = \{z\}$, $\mathit{IN}[B_3] = \{x, y\}$ (x and y are used, z is defined)
+  \item $\mathit{OUT}[B_5] = \{z\}$, $\mathit{IN}[B_5] = \{y\}$ (y is used, z is defined)
+  \item $\mathit{OUT}[B_2] = \mathit{IN}[B_3] \cup \mathit{IN}[B_5] = \{x, y\}$
+  \item $\mathit{IN}[B_1] = \emptyset$ (x and y are both defined in B1)
+\end{itemize}
+\end{example}
+
+\section{Very Busy Expressions (Backward)}\label{sec:very-busy}
+
+\subsection{Motivation and Definition}\label{sec:vb-motivation}
+
+An expression is \emph{very busy} at a point if it is guaranteed to be evaluated before any of its operands are modified, on every path forward from that point. This analysis enables \emph{code hoisting}: moving a computation to an earlier point where it is very busy.
+
+\begin{definition}[Very Busy Expressions]\label{def:very-busy}
+An expression $e$ is \textbf{very busy} at point $p$ if on every path from $p$, $e$ is evaluated before any operand of $e$ is redefined.
+\end{definition}
+
+\subsection{Lattice and Transfer Functions}\label{sec:vb-lattice}
+
+\begin{definition}[Very Busy Expressions Lattice]\label{def:vb-lattice}
+The lattice is $(2^{\mathit{Exprs}}, \supseteq)$ with meet $= \cap$. This is a backward must-analysis.
+\end{definition}
+
+\begin{definition}[Transfer Functions for Very Busy Expressions]\label{def:vb-transfer}
+\begin{align}
+  \mathit{vb\_gen}(B) &= \{e \mid e \text{ is evaluated in } B \text{ before any operand of } e \text{ is defined}\} \\
+  \mathit{vb\_kill}(B) &= \{e \mid \text{some operand of } e \text{ is defined in } B \text{ before } e \text{ is evaluated}\} \\
+  f_B(S) &= \mathit{vb\_gen}(B) \cup (S \setminus \mathit{vb\_kill}(B))
+\end{align}
+\end{definition}
+
+\subsection{Dataflow Equations}\label{sec:vb-equations}
+
+\begin{definition}[Very Busy Expressions Equations]\label{def:vb-equations}
+\begin{align}
+  \mathit{OUT}[B] &= \begin{cases} \emptyset & \text{if } B = B_\mathit{exit} \\ \bigcap_{S \in \mathit{succ}(B)} \mathit{IN}[S] & \text{otherwise} \end{cases} \\
+  \mathit{IN}[B] &= \mathit{vb\_gen}(B) \cup (\mathit{OUT}[B] \setminus \mathit{vb\_kill}(B))
+\end{align}
+\end{definition}
+
+\section{Constant Propagation (Forward)}\label{sec:constant-propagation}
+
+\subsection{Motivation}\label{sec:cp-motivation}
+
+Constant propagation determines which variables have constant values at each program point. Unlike the set-based analyses above, constant propagation requires a lattice that can express ``this variable is definitely the constant 5,'' ``this variable might be different constants on different paths,'' and ``this variable's value is unknown.''
+
+\subsection{The Constant Lattice}\label{sec:cp-lattice}
+
+\begin{definition}[Constant Lattice]\label{def:const-lattice}
+For a single variable, the \textbf{constant lattice} is:
+\[
+\mathcal{L}_c = \{\bot\} \cup \{c \mid c \in \mathbb{Z}\} \cup \{\top\}
+\]
+with the ordering:
+\begin{itemize}
+  \item $\bot \sqsubseteq c$ for all constants $c$ (no information --- variable not yet assigned)
+  \item $c \sqsubseteq \top$ for all constants $c$ (conflicting information --- variable has different values on different paths)
+  \item Constants are incomparable with each other
+\end{itemize}
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm,
+  latnode/.style={circle, draw=TomeInk, fill=TomeBg, minimum size=0.8cm, align=center}
+]
+  \node[latnode] (top) {$\top$};
+  \node[latnode, below left=of top] (c1) {$5$};
+  \node[latnode, below=of top] (c2) {$3$};
+  \node[latnode, below right=of top] (c3) {$7$};
+  \node[latnode, below=2.0cm of top] (bot) {$\bot$};
+  
+  \node at (c1 -| top) [right=0.3cm of top, font=\small, color=TomeRule] {$\cdots$};
+  
+  \draw[->, thick, color=TomeInk] (bot) -- (c1);
+  \draw[->, thick, color=TomeInk] (bot) -- (c2);
+  \draw[->, thick, color=TomeInk] (bot) -- (c3);
+  \draw[->, thick, color=TomeInk] (c1) -- (top);
+  \draw[->, thick, color=TomeInk] (c2) -- (top);
+  \draw[->, thick, color=TomeInk] (c3) -- (top);
+\end{tikzpicture}
+\caption{The constant lattice for a single variable.}
+\label{fig:const-lattice}
+\end{figure}
+
+For the full program, the lattice is the Cartesian product $\mathcal{L}_c^{|\mathit{Vars}|}$, ordered pointwise.
+
+\subsection{Transfer Functions}\label{sec:cp-transfer}
+
+\begin{definition}[Constant Propagation Transfer Functions]\label{def:cp-transfer}
+For a statement $s$:
+\begin{itemize}
+  \item $x = c$ (constant assignment): $\sigma[x \mapsto c]$, all other variables unchanged.
+  \item $x = y \mathbin{\text{op}} z$: 
+    \[
+    \sigma[x \mapsto \begin{cases}
+      \sigma(y) \mathbin{\text{op}} \sigma(z) & \text{if } \sigma(y), \sigma(z) \in \mathbb{Z} \\
+      \top & \text{if } \sigma(y) = \top \text{ or } \sigma(z) = \top \\
+      \bot & \text{if } \sigma(y) = \bot \text{ or } \sigma(z) = \bot
+    \end{cases}]
+    \]
+  \item $x = \mathit{input}()$: $\sigma[x \mapsto \top]$
+\end{itemize}
+\end{definition}
+
+\subsection{The Meet Operator}\label{sec:cp-meet}
+
+The meet operator for the constant lattice is:
+\[
+c_1 \sqcap c_2 = \begin{cases}
+  c_1 & \text{if } c_1 = c_2 \\
+  \top & \text{if } c_1 \neq c_2 \text{ and both are constants} \\
+  c_1 & \text{if } c_2 = \bot \\
+  c_2 & \text{if } c_1 = \bot \\
+  \top & \text{if either is } \top
+\end{cases}
+\]
+
+\begin{insight}
+Constant propagation is the canonical example of a non-distributive analysis. The transfer function for $x = y + z$ does not distribute over the meet: if path 1 gives $(y=3, z=4)$ and path 2 gives $(y=5, z=2)$, the meet gives $(y=\top, z=\top)$, and the transfer function yields $x = \top$. But the MOP solution would compute $x = 7$ on path 1 and $x = 7$ on path 2, yielding $x = 7$. The MFP solution loses precision because it first merges the values of $y$ and $z$ and then applies the transfer function.
+\end{insight}
+
+\subsection{Kildall's Method}\label{sec:kildall}
+
+Kildall's method~\cite{kildall1973unified} was the first to recognize that constant propagation could be formulated as a dataflow analysis over the constant lattice. The algorithm maintains a mapping from variables to lattice values at each program point and iterates until a fixedpoint is reached.
+
+\section{Implementation Patterns}\label{sec:implementation-patterns}
+
+\subsection{Generic Dataflow Engine}\label{sec:generic-engine}
+
+All the analyses described above share a common structure. A well-designed compiler implements a \emph{generic dataflow engine} that is parameterized by:
+
+\begin{itemize}
+  \item The lattice (type of dataflow facts, meet/join operators, top/bottom elements)
+  \item The direction (forward or backward)
+  \item The transfer function (gen/kill sets or more complex functions)
+  \item The combination rule (meet or join at merge points)
+\end{itemize}
+
+\begin{algorithm}[H]
+\caption{Generic Dataflow Framework}
+\label{alg:generic-df}
+\begin{algorithmic}[1]
+\Require Direction $d \in \{\text{forward}, \text{backward}\}$
+\Require Lattice $(\mathcal{L}, \sqcap, \sqcup, \top, \bot)$
+\Require Transfer functions $\{f_n\}_{n \in N}$
+\Require Combination operator $\bigotimes \in \{\sqcap, \sqcup\}$
+\State Initialize boundary conditions
+\State Initialize all other values to $\top$ (for must) or $\bot$ (for may)
+\State $\mathit{worklist} \gets$ all nodes in appropriate order
+\While{$\mathit{worklist} \neq \emptyset$}
+  \State $n \gets$ dequeue from $\mathit{worklist}$
+  \State $\mathit{new\_in} \gets \bigotimes_{m \in \mathit{neighbors}(n)} \mathit{out}[m]$
+  \State $\mathit{new\_out} \gets f_n(\mathit{new\_in})$
+  \If{$\mathit{new\_out} \neq \mathit{out}[n]$}
+    \State $\mathit{out}[n] \gets \mathit{new\_out}$
+    \ForAll{$s \in \mathit{successors\_or\_predecessors}(n)$}
+      \State Enqueue $s$ if not already in $\mathit{worklist}$
+    \EndFor
+  \EndIf
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Bit-Vector Implementation}\label{sec:bitvector}
+
+For set-based analyses (reaching definitions, available expressions, live variables), the lattice elements are sets, and the most efficient representation is a \emph{bit vector}. Each element of the universal set is assigned an index, and membership is represented by a single bit.
+
+\begin{itemize}
+  \item Union $\cup$ becomes bitwise OR
+  \item Intersection $\cap$ becomes bitwise AND
+  \item Set difference $\setminus$ becomes bitwise AND-NOT
+  \item Membership test becomes a bit test
+\end{itemize}
+
+This representation is extremely efficient: a set of $n$ elements requires $\lceil n / w \rceil$ words (where $w$ is the machine word size), and all operations are performed in parallel at the hardware level.
+
+\subsection{Sparse Evaluation}\label{sec:sparse-eval}
+
+For many analyses, most program points have the same dataflow value. \emph{Sparse evaluation} exploits this by computing dataflow information only at points where it changes---typically the $\phi$-nodes in SSA form. This can dramatically reduce the cost of dataflow analysis for large programs.
+
+\begin{definition}[Sparse Problem]\label{def:sparse-problem}
+A dataflow problem is \textbf{sparse} if the transfer function for most nodes is the identity function: $f_n(x) = x$. Only at a small number of \emph{interesting} nodes does the transfer function produce a different value.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcccc}
+\hline
+\textbf{Analysis} & \textbf{Direction} & \textbf{Type} & \textbf{Lattice} & \textbf{Distributive?} \\
+\hline
+Reaching Definitions & Forward & May & Powerset & Yes \\
+Available Expressions & Forward & Must & Powerset & Yes \\
+Live Variables & Backward & May & Powerset & Yes \\
+Very Busy Expressions & Backward & Must & Powerset & Yes \\
+Constant Propagation & Forward & May & Product & No \\
+\hline
+\end{tabular}
+\caption{Summary of classical dataflow analyses.}
+\label{tab:df-summary}
+\end{table}
+
+\section{Summary}\label{sec:forward-backward-summary}
+
+The classical dataflow analyses---reaching definitions, available expressions, live variables, very busy expressions, and constant propagation---demonstrate the power and versatility of the dataflow framework. They differ in direction (forward or backward), combination type (may or must), and lattice structure (powerset or product), but all share the same underlying algorithmic structure. The key theoretical result is that for distributive analyses, the practical iterative algorithm computes the ideal MOP solution exactly. For non-distributive analyses like constant propagation, the MFP solution is a sound but potentially imprecise approximation---a limitation that motivates the more sophisticated techniques of abstract interpretation developed in later chapters.

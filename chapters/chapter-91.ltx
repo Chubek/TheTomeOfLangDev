@@ -1,0 +1,476 @@
+%%
+%% chapter-91.ltx — JIT Compilation
+%%
+%% Part IX: Code Generation and Runtime Systems
+%%
+
+\label{ch:jit}
+
+\section{Introduction}\label{sec:jit-intro}
+
+Just-in-time (JIT) compilation is the technique of compiling code at runtime, after the program has started executing. Unlike ahead-of-time (AOT) compilation, which produces machine code before execution, JIT compilation observes the program's actual behavior and uses this information to generate optimized code tailored to the program's runtime characteristics. This ability to specialize based on observed behavior is the key advantage of JIT compilation.
+
+JIT compilation is the engine behind the performance of modern dynamic language implementations: Java's HotSpot VM, JavaScript's V8, .NET's RyuJIT, and many others. This chapter covers the architecture of modern JIT compilers, from tiered compilation and method-level compilation to on-stack replacement, guarded optimization, and deoptimization.
+
+\section{Tiered Compilation}\label{sec:tiered-compilation}
+
+\subsection{The Motivation}\label{sec:tiered-motivation}
+
+Compilation takes time. If every method is fully optimized before its first execution, startup time suffers. If methods are never optimized, steady-state performance suffers. \emph{Tiered compilation} resolves this tension by compiling each method at increasing levels of optimization as it is executed more frequently.
+
+\begin{definition}[Tiered Compilation]\label{def:tiered-compilation}
+\emph{Tiered compilation} is a strategy in which methods are compiled at multiple optimization levels (tiers). A method starts at the lowest tier (interpreted or minimally compiled) and is recompiled at higher tiers as it is executed more frequently.
+\end{definition}
+
+\subsection{Typical Tier Structure}\label{sec:tier-structure}
+
+\begin{table}[htbp]
+\centering
+\caption{Typical JIT compilation tiers}
+\label{tab:jit-tiers}
+\begin{tabular}{llll}
+\hline
+\textbf{Tier} & \textbf{Name} & \textbf{Speed} & \textbf{Quality} \\
+\hline
+0 & Interpreter & Slowest & No optimization \\
+1 & Baseline JIT & Fast compile & Minimal optimization \\
+2 & Profiling JIT & Moderate & Collects profiles \\
+3 & Optimizing JIT & Slow compile & Full optimization \\
+4 & Peak/Agressive & Very slow compile & Maximum optimization \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{HotSpot's Tiered Compilation}\label{sec:hotspot-tiers}
+
+Java's HotSpot VM uses five tiers:
+\begin{enumerate}
+  \item \textbf{Tier 0}: Interpreter. Executes bytecode directly. Collects invocation counts and back-edge counts.
+  \item \textbf{Tier 1}: C1 (client compiler) with no profiling. Fast compilation, basic optimizations (inlining, constant folding).
+  \item \textbf{Tier 2}: C1 with minimal profiling. Collects basic type profiles.
+  \item \textbf{Tier 3}: C1 with full profiling. Collects method profiles, receiver types, branch probabilities.
+  \item \textbf{Tier 4}: C2 (server compiler). Full optimization using collected profiles.
+\end{enumerate}
+
+Methods are promoted to higher tiers based on invocation counts and back-edge counts, with thresholds adjusted by the tier's compilation speed.
+
+\section{Method-Level Compilation}\label{sec:method-level}
+
+\subsection{Compiling Individual Methods}\label{sec:compiling-methods}
+
+In a method-level JIT, each method (or function) is compiled independently. The JIT:
+\begin{enumerate}
+  \item Reads the method's bytecode or IR.
+  \item Builds an internal representation (HIR $\to$ LIR in HotSpot, or a graph IR in Graal).
+  \item Applies optimizations (inlining, escape analysis, scalar replacement).
+  \item Generates machine code.
+  \item Installs the compiled code so that future calls to the method enter the compiled version.
+\end{enumerate}
+
+\subsection{Inline Caching}\label{sec:inline-caching}
+
+\begin{definition}[Inline Cache]\label{def:inline-cache}
+An \emph{inline cache} is a mechanism for speeding up dynamic dispatch by caching the result of the most recent method lookup at each call site.
+\end{definition}
+
+\begin{itemize}
+  \item \textbf{Monomorphic}: the call site has seen exactly one receiver type. The cached lookup is a simple type check and direct call.
+  \item \textbf{Polymorphic}: the call site has seen a few (2--4) receiver types. A chain of type checks selects the correct target.
+  \item \textbf{Megamorphic}: the call site has seen many receiver types. Falls back to a full dynamic dispatch.
+\end{itemize}
+
+The JIT uses inline cache state to decide which methods to inline: monomorphic call sites are inlined aggressively; megamorphic sites are not.
+
+\subsection{Call Patching}\label{sec:call-patching}
+
+When a method is compiled, calls to it must be redirected from the interpreter (or baseline code) to the compiled version. This is done by:
+\begin{itemize}
+  \item \textbf{Trampolines}: calls go through a trampoline that initially jumps to the interpreter. When the method is compiled, the trampoline is patched to jump to the compiled code.
+  \item \textbf{Inline cache updates}: the inline cache at each call site is updated to point to the compiled code.
+  \item \textbf{Code dependencies}: the runtime tracks which compiled code depends on which methods, enabling deoptimization when assumptions are violated.
+\end{itemize}
+
+\section{On-Stack Replacement}\label{sec:osr}
+
+\subsection{The Problem}\label{sec:osr-problem}
+
+Method-level compilation only takes effect when a method is \emph{called}. But long-running loops may never return, so the compiled version is never entered. \emph{On-stack replacement} (OSR) solves this by allowing a running method to be replaced mid-execution.
+
+\begin{definition}[On-Stack Replacement]\label{def:osr}
+\emph{On-stack replacement} (OSR) is a technique that allows a running method's activation frame to be replaced with a compiled version, even while the method is executing (typically at a loop back-edge).
+\end{definition}
+
+\subsection{OSR Entry}\label{sec:osr-entry}
+
+When a loop back-edge count exceeds a threshold:
+\begin{enumerate}
+  \item The JIT compiles an \emph{OSR entry} version of the method, which begins execution at the loop header.
+  \item The OSR entry expects the interpreter's state (local variables, operand stack) to be mapped to the compiled code's registers and stack slots.
+  \item At the next back-edge, the interpreter transfers control to the OSR entry, passing its state.
+\end{enumerate}
+
+\subsection{OSR Challenges}\label{sec:osr-challenges}
+
+OSR introduces several complications:
+\begin{itemize}
+  \item \textbf{State mapping}: the interpreter's state must be correctly mapped to the compiled code's expectations.
+  \item \textbf{Phantom values}: variables that are live in the compiled code but not in the interpreter at the OSR point may have undefined values.
+  \item \textbf{Multiple OSR points}: a method with multiple loops may need multiple OSR entries.
+  \item \textbf{Deoptimization}: the OSR-compiled code may need to deoptimize back to the interpreter (see \cref{ch:deoptimization}).
+\end{itemize}
+
+\section{Guarded Optimization}\label{sec:guarded-optimization}
+
+\subsection{Speculative Assumptions}\label{sec:speculative-assumptions}
+
+JIT compilers make \emph{speculative assumptions} based on observed behavior:
+
+\begin{itemize}
+  \item \textbf{Type speculation}: ``this call site always receives objects of type \texttt{String}.''
+  \item \textbf{Null speculation}: ``this reference is never null.''
+  \item \textbf{Class speculation}: ``this object's class is always \texttt{HashMap}.''
+  \item \textbf{Value speculation}: ``this loop bound is always 10.''
+  \item \textbf{Inline caching}: ``this virtual call always resolves to \texttt{String.length()}.''
+\end{itemize}
+
+\subsection{Guards}\label{sec:guards}
+
+Each assumption is protected by a \emph{guard}: a runtime check that verifies the assumption holds.
+
+\begin{definition}[Guard]\label{def:guard}
+A \emph{guard} is a runtime check inserted by the JIT compiler to verify a speculative assumption. If the guard fails, execution transfers to a \emph{deoptimization} path.
+\end{definition}
+
+\begin{example}[Type Guard]\label{ex:type-guard}
+If the JIT speculates that a virtual call always targets \texttt{String.toUpperCase()}, it inserts a guard:
+\begin{verbatim}
+  ; Guard: check that receiver is a String
+  cmp [obj.type], STRING_TYPE_ID
+  jne DEOPTIMIZE
+  ; Speculatively inlined call to String.toUpperCase()
+  call String_toUpperCase
+\end{verbatim}
+If the receiver is not a \texttt{String}, the guard fails and execution deoptimizes.
+\end{example}
+
+\subsection{Guard Elision}\label{sec:guard-elision}
+
+If the JIT can prove that a guard always succeeds (e.g., through type inference or class hierarchy analysis), it may elide the guard entirely. This is common for final classes and methods.
+
+\section{Deoptimization}\label{sec:deoptimization}
+
+\subsection{The Concept}\label{sec:deopt-concept}
+
+When a guard fails, the compiled code can no longer continue safely. It must \emph{deoptimize}: transfer control back to the interpreter (or a less-optimized compiled version) that can handle the general case.
+
+\begin{definition}[Deoptimization]\label{def:deoptimization}
+\emph{Deoptimization} is the process of abandoning an optimized compiled frame and reconstructing the equivalent interpreter (or baseline) frame(s), so that execution can continue correctly in the unoptimized code.
+\end{definition}
+
+\subsection{Frame Reconstruction}\label{sec:frame-reconstruction}
+
+Deoptimization requires reconstructing the interpreter's view of the execution state:
+\begin{enumerate}
+  \item The compiled code's registers and stack slots are mapped back to the interpreter's local variables and operand stack.
+  \item A new interpreter frame is created (or an existing one is modified) with the reconstructed state.
+  \item The instruction pointer is set to the deoptimization point (the instruction after the guard).
+  \item Execution resumes in the interpreter.
+\end{enumerate}
+
+This mapping is described by \emph{deoptimization metadata} (or \emph{deopt descriptors}) generated by the JIT compiler for each potential deoptimization point.
+
+\subsection{Cost of Deoptimization}\label{sec:deopt-cost}
+
+Deoptimization is expensive:
+\begin{itemize}
+  \item Frame reconstruction involves memory allocation and copying.
+  \item The interpreter runs much slower than compiled code.
+  \item Frequent deoptimization (``deopt storms'') can severely degrade performance.
+\end{itemize}
+
+The JIT must balance speculation aggressiveness: too many assumptions lead to frequent deoptimization; too few miss optimization opportunities.
+
+\section{Modern JITs}\label{sec:modern-jits}
+
+\subsection{HotSpot (Java)}\label{sec:hotspot}
+
+HotSpot is the reference implementation for Java, developed by Oracle:
+\begin{itemize}
+  \item \textbf{C1} (client compiler): fast compilation, basic optimizations, profiling.
+  \item \textbf{C2} (server compiler): slow compilation, aggressive optimizations (escape analysis, loop unrolling, vectorization).
+  \item \textbf{GraalVM}: a modern replacement for C2, using an intermediate representation (Graal IR) with graph-based optimizations and speculative optimization via the Truffle framework.
+\end{itemize}
+
+\subsection{V8 (JavaScript)}\label{sec:v8}
+
+V8 is Google's JavaScript engine:
+\begin{itemize}
+  \item \textbf{Sparkplug}: a fast baseline compiler (non-optimizing, but generates machine code rather than interpreting bytecode).
+  \item \textbf{Maglev}: a mid-tier optimizing compiler with quick compilation and moderate optimizations.
+  \item \textbf{TurboFan}: a full optimizing compiler with a graph-based IR, supporting speculative optimization and on-stack replacement.
+  \item \textbf{Orinoco}: the garbage collector (concurrent, parallel, generational).
+\end{itemize}
+
+\subsection{GraalVM}\label{sec:graalvm}
+
+GraalVM is a polyglot VM that supports Java, JavaScript, Python, Ruby, and other languages:
+\begin{itemize}
+  \item \textbf{Graal compiler}: a modern optimizing compiler using a sea-of-nodes IR.
+  \item \textbf{Truffle framework}: a language implementation framework that uses partial evaluation to automatically specialize interpreters.
+  \item \textbf{SubstrateVM}: a native image compiler that produces ahead-of-time compiled executables.
+\end{itemize}
+
+\subsection{.NET RyuJIT}\label{sec:ryujit}
+
+RyuJIT is the .NET runtime's JIT compiler:
+\begin{itemize}
+  \item \textbf{Tiered compilation}: QuickJIT (fast, minimal) $\to$ Optimizing JIT (full optimization).
+  \item \textbf{PGO}: profile-guided optimization using runtime-collected profiles.
+  \item \textbf{ReadyToRun}: pre-compiled code with relocations for fast startup.
+  \item \textbf{NativeAOT}: ahead-of-time compilation to native code.
+\end{itemize}
+
+\section{JIT Compiler Architecture}\label{sec:jit-architecture}
+
+\subsection{IR Design for JITs}\label{sec:jit-ir}
+
+JIT compilers need IRs that support:
+\begin{itemize}
+  \item \textbf{Fast construction}: the IR must be built quickly from bytecode.
+  \item \textbf{Speculative operations}: guards, deoptimization points, and type assertions.
+  \item \textbf{Incremental optimization}: the ability to add optimizations without rebuilding the entire IR.
+  \item \textbf{Machine code emission}: direct generation of machine code from the IR.
+\end{itemize}
+
+\subsection{Graph IR for JITs}\label{sec:jit-graph-ir}
+
+Modern JITs use graph-based IRs:
+\begin{itemize}
+  \item \textbf{HotSpot C2}: uses an ideal graph (sea of nodes) with phi functions, control and data edges.
+  \item \textbf{Graal}: uses a sea-of-nodes IR with typed nodes, supporting speculative optimization.
+  \item \textbf{V8 TurboFan}: uses a typed graph IR with node types for each operation.
+  \item \textbf{.NET RyuJIT}: uses a hierarchical IR (HIR $\to$ LIR) with SSA form.
+\end{itemize}
+
+\subsection{Compilation Threads}\label{sec:jit-threads}
+
+JIT compilation runs on separate threads to avoid blocking the application:
+\begin{itemize}
+  \item \textbf{Compiler threads}: dedicated threads for compilation.
+  \item \textbf{Compilation queues}: methods are queued for compilation when they become hot.
+  \item \textbf{Priority}: compilation priority is based on invocation count and estimated benefit.
+  \item \textbf{Background compilation}: the application continues to run (in the interpreter) while compilation proceeds.
+\end{itemize}
+
+\section{JIT Testing and Debugging}\label{sec:jit-testing}
+
+\subsection{Testing JIT Compilers}\label{sec:jit-testing-methods}
+
+Testing JIT compilers is challenging because:
+\begin{itemize}
+  \item Behavior depends on execution history (which methods are compiled, when).
+  \item Speculative optimizations may or may not be taken depending on runtime values.
+  \item Deoptimization paths are rarely exercised.
+\end{itemize}
+
+Testing strategies include:
+\begin{itemize}
+  \item \textbf{Deterministic mode}: force compilation at specific points.
+  \item \textbf{Stress testing}: randomly trigger compilation and deoptimization.
+  \item \textbf{Differential testing}: compare JIT output with interpreter output.
+  \item \textbf{Fuzzing}: generate random programs to stress-test the JIT.
+\end{itemize}
+
+\subsection{Debugging JIT-Compiled Code}\label{sec:jit-debugging}
+
+Debugging JIT-compiled code requires:
+\begin{itemize}
+  \item Mapping machine code back to source (debug info in JIT output).
+  \item Supporting breakpoints in compiled code (trap instructions, deoptimization).
+  \item Handling deoptimization during debugging (the debugger must force deoptimization).
+  \item Displaying the correct call stack (including inlined frames).
+\end{itemize}
+
+\section{Advanced Tiered Compilation Strategies}\label{sec:advanced-tiered}
+
+\subsection{Adaptive Threshold Tuning}\label{sec:adaptive-thresholds}
+
+The thresholds that trigger promotion between tiers are critical to performance. Setting them too low causes excessive compilation (wasting CPU time on methods that are rarely called). Setting them too high delays optimization (the interpreter runs hot methods for too long).
+
+\begin{definition}[Adaptive Thresholds]\label{def:adaptive-thresholds}
+\emph{Adaptive threshold tuning} adjusts the invocation and back-edge count thresholds dynamically based on the system's compilation resources, available memory, and observed program behavior.
+\end{definition}
+
+Modern JITs use several strategies:
+\begin{itemize}
+  \item \textbf{Startup-aware thresholds}: during startup, thresholds are raised to avoid compiling methods that are only called during initialization.
+  \item \textbf{Memory-aware thresholds}: when code cache pressure is high, thresholds are raised to reduce new compilations.
+  \item \textbf{Feedback-driven thresholds}: if a method is deoptimized frequently, its threshold is raised to avoid premature optimization.
+\end{itemize}
+
+\subsection{Compilation Budget Management}\label{sec:compilation-budget}
+
+JIT compilers must manage a \emph{compilation budget}: the amount of CPU time and memory allocated to compilation. This is especially important because:
+\begin{itemize}
+  \item Compilation competes with application threads for CPU time.
+  \item Compiled code consumes memory (code cache), which is finite.
+  \item Over-compilation wastes resources; under-compilation degrades performance.
+\end{itemize}
+
+\begin{algorithm}[htbp]
+\caption{Compilation Budget Management}
+\label{alg:compilation-budget}
+\begin{algorithmic}[1]
+\Procedure{ManageBudget}{}
+  \Let{available\_memory}{\text{code\_cache\_size} - \text{used\_memory}}
+  \If{available\_memory < \text{threshold}}
+    \State \textsc{IncreaseThresholds}()
+    \State \textsc{InvalidateColdCode}()
+  \EndIf
+  \Let{compiler\_threads}{\min(\text{max\_threads}, \lceil \text{hot\_methods} / 10 \rceil)}
+  \For{each method $m$ in compilation queue (sorted by score)}
+    \If{$m$.\text{score} > \text{threshold} \textbf{and} available\_memory > $m$.\text{estimated\_size}}
+      \State \textsc{Compile}(m)
+    \EndIf
+  \EndFor
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Code Cache Management}\label{sec:code-cache}
+
+The code cache stores all compiled code. When it fills up, the JIT must reclaim space:
+
+\begin{itemize}
+  \item \textbf{Code sweeping}: periodically scan compiled code for methods that are no longer hot and reclaim their space.
+  \item \textbf{Code aging}: track how long since a method was last executed; old, cold code is reclaimed first.
+  \item \textbf{Code dependencies}: when a method is reclaimed, all code that depends on it (e.g., inlined calls) must also be reclaimed or recompiled.
+\end{itemize}
+
+\section{Deoptimization in Depth}\label{sec:deoptimization-depth}
+
+\subsection{Deoptimization Storms}\label{sec:deopt-storms}
+
+A \emph{deoptimization storm} occurs when many methods deoptimize in rapid succession, typically because a global assumption has been violated (e.g., a new class is loaded that invalidates a class hierarchy assumption).
+
+\begin{definition}[Deoptimization Storm]\label{def:deopt-storm}
+A \emph{deoptimization storm} is a cascade of deoptimizations triggered by a single event, where each deoptimization may trigger further deoptimizations in dependent code.
+\end{definition}
+
+Mitigation strategies include:
+\begin{itemize}
+  \item \textbf{Batched deoptimization}: collect all deoptimizations and process them together.
+  \item \textbf{Assumption versioning}: instead of invalidating all code based on an assumption, version the assumption and only deoptimize code that uses the old version.
+  \item \textbf{Recompilation instead of deoptimization}: when a global assumption changes, recompile affected methods at the current tier rather than deoptimizing to the interpreter.
+\end{itemize}
+
+\subsection{Deoptimization and Inlining}\label{sec:deopt-inlining}
+
+When a method is inlined, its frame does not exist at runtime. Deoptimization must reconstruct not only the current frame but also the frames of all inlined callers:
+
+\begin{verbatim}
+  ; Original source:
+  ;   caller() { x = callee(); ... }
+  ;   callee() { return compute(); }
+  ; After inlining callee into caller:
+  ;   caller_compiled() { x = compute(); ... }
+  ; On deoptimization, must reconstruct:
+  ;   caller frame (with x = result of compute())
+  ;   callee frame (with return value)
+\end{verbatim}
+
+The deoptimization metadata must describe the state of each inlined method at the point of inlining, including local variables, operand stack, and held monitors.
+
+\section{On-Stack Replacement: Advanced Topics}\label{sec:osr-advanced}
+
+\subsection{OSR and Tiered Compilation}\label{sec:osr-tiered}
+
+OSR interacts with tiered compilation in important ways. When a method is OSR-compiled at tier $N$, and later a tier $N+1$ compilation becomes available, the OSR code must be replaced:
+
+\begin{enumerate}
+  \item The tier $N+1$ compiler generates a new OSR entry that maps from the tier $N$ code's state.
+  \item At the next loop back-edge, control transfers from tier $N$ to tier $N+1$.
+  \item The tier $N$ OSR code can then be reclaimed.
+\end{enumerate}
+
+This creates a chain of OSR transitions: interpreter $\to$ tier 1 $\to$ tier 2 $\to$ tier 3 $\to$ tier 4, each triggered by a loop back-edge.
+
+\subsection{Phantom Values and OSR}\label{sec:phantom-values}
+
+A particularly subtle OSR issue arises with \emph{phantom values}: variables that are live in the compiled code but not in the interpreter at the OSR point.
+
+\begin{definition}[Phantom Value]\label{def:phantom-value}
+A \emph{phantom value} is a variable that is introduced by the compiler (e.g., through scalar replacement, loop-invariant code motion) and has no corresponding location in the interpreter's state at the OSR entry point.
+\end{definition}
+
+The compiler must either:
+\begin{itemize}
+  \item Initialize the phantom value to a safe default (e.g., zero, null).
+  \item Restructure the OSR entry to compute the phantom value from the interpreter's state.
+  \item Avoid introducing phantom values that are live at OSR points.
+\end{itemize}
+
+\subsection{OSR in the Presence of Exceptions}\label{sec:osr-exceptions}
+
+When OSR occurs inside a try-catch block, the deoptimization metadata must correctly reconstruct the exception handler chain. This requires:
+\begin{itemize}
+  \item Tracking which exception handlers are active at the OSR point.
+  \item Reconstructing the handler chain in the interpreter frame.
+  \item Ensuring that any monitor exits required by exception handlers are performed correctly.
+\end{itemize}
+
+\section{JIT Compiler IR Design Patterns}\label{sec:jit-ir-patterns}
+
+\subsection{Ideal Graph (Sea of Nodes)}\label{sec:ideal-graph}
+
+The ideal graph, used by HotSpot C2, is a sea-of-nodes representation where:
+\begin{itemize}
+  \item Each node represents an operation (arithmetic, load, store, branch, phi, etc.).
+  \item Data edges connect producers to consumers.
+  \item Control edges connect nodes that have ordering constraints.
+  \item Phi nodes merge values from different control-flow paths.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw, fill=TomeBg, minimum width=1.2cm, minimum height=0.6cm, font=\footnotesize, align=center},
+  arr/.style={->, thick, >=stealth},
+  darr/.style={->, thick, >=stealth, dashed}
+]
+  \node[node] (phi) at (0, 2) {$\phi$};
+  \node[node, fill=TomeExBg] (add1) at (-2, 0) {add};
+  \node[node, fill=TomeExBg] (add2) at (2, 0) {add};
+  \node[node, fill=TomeDefBg] (load1) at (-3, -2) {load};
+  \node[node, fill=TomeDefBg] (const) at (-1, -2) {const};
+  \node[node, fill=TomeDefBg] (load2) at (1, -2) {load};
+  \node[node, fill=TomeDefBg] (const2) at (3, -2) {const};
+
+  \draw[arr] (add1) -- (phi);
+  \draw[arr] (add2) -- (phi);
+  \draw[arr] (load1) -- (add1);
+  \draw[arr] (const) -- (add1);
+  \draw[arr] (load2) -- (add2);
+  \draw[arr] (const2) -- (add2);
+\end{tikzpicture}
+\caption{Ideal graph fragment showing a phi node merging two additions}
+\label{fig:ideal-graph}
+\end{figure}
+
+\subsection{Peephole Optimization in JITs}\label{sec:jit-peephole}
+
+JIT compilers use peephole optimizations extensively because they are fast and effective:
+\begin{itemize}
+  \item \textbf{Algebraic simplification}: $x + 0 \to x$, $x \times 1 \to x$, $x \times 0 \to 0$.
+  \item \textbf{Strength reduction}: $x \times 2^n \to x \ll n$.
+  \item \textbf{Null check elimination}: if a value is proven non-null by a dominating guard, remove redundant null checks.
+  \item \textbf{Bounds check elimination}: if an index is proven in-bounds by a dominating check, remove redundant bounds checks.
+\end{itemize}
+
+\section{Summary}\label{sec:jit-summary}
+
+JIT compilation is the cornerstone of performance for dynamic and managed language implementations. By observing actual program behavior and specializing code accordingly, JIT compilers achieve performance that rivals or exceeds ahead-of-time compilation for many workloads. The key techniques---tiered compilation, inline caching, speculative optimization with guards, on-stack replacement, and deoptimization---form a coherent architecture that balances startup time, steady-state performance, and adaptability.
+
+\begin{historical}
+JIT compilation has its roots in the early days of Java. Sun's original JVM (1996) used a pure interpreter. The HotSpot VM (1999) introduced adaptive compilation, selecting methods for compilation based on profiling data. The concept of tiered compilation evolved through the 2000s and 2010s, with HotSpot eventually adopting a five-tier system. JavaScript JITs evolved rapidly in the late 2000s: V8's introduction of hidden classes and inline caching (2008) revolutionized JavaScript performance. The concept of on-stack replacement, pioneered by the Self VM (1994), is now standard in all serious JIT compilers. Modern JITs like GraalVM and V8's TurboFan represent the state of the art, using sophisticated IRs and speculative optimization to achieve remarkable performance.
+\end{historical}

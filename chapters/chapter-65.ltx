@@ -1,0 +1,570 @@
+%%
+%% chapter-65.ltx — Interprocedural Analysis
+%%
+
+\section{Introduction}\label{sec:interprocedural-intro}
+
+The dataflow analyses of the preceding chapters operate on a single procedure at a time. This \emph{intraprocedural} approach treats each procedure call as a black box: the call may modify any global variable, and any parameter may take any value. While this is sound, it is imprecise---often wildly so. Consider a function \texttt{swap(x, y)} that exchanges its arguments. An intraprocedural analysis cannot determine that after the call, \texttt{x} holds the old value of \texttt{y} and vice versa. It must conservatively assume that both \texttt{x} and \texttt{y} could be anything.
+
+\emph{Interprocedural analysis} extends dataflow analysis across procedure boundaries, enabling the analyzer to reason about the effects of calls, the flow of values through parameters and returns, and the calling context. The result is dramatically more precise information, at the cost of significantly greater complexity.
+
+The fundamental challenge of interprocedural analysis is the \emph{context problem}: a procedure may be called from many different sites, and the information valid at one call site may not be valid at another. A naive approach that merges information from all call sites loses precision. Context-sensitive analyses address this by distinguishing different calling contexts.
+
+\section{Call Graphs and Call Sites}\label{sec:call-graphs}
+
+\subsection{The Call Graph}\label{sec:call-graph-def}
+
+\begin{definition}[Call Graph]\label{def:call-graph}
+A \textbf{call graph} is a directed graph $CG = (V, E)$ where:
+\begin{itemize}
+  \item $V$ is the set of procedures (functions, methods) in the program.
+  \item $E \subseteq V \times V$ is the set of call edges: $(p, q) \in E$ if procedure $p$ contains a call site that may invoke procedure $q$.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Call Site]\label{def:call-site}
+A \textbf{call site} is a program point at which a procedure call occurs. A call site $c$ in procedure $p$ is associated with:
+\begin{itemize}
+  \item The \textbf{actual parameters}: the arguments passed at the call.
+  \item The \textbf{return site}: the program point to which control returns after the call.
+  \item The set of \textbf{possible targets}: the procedures that might be invoked.
+\end{itemize}
+\end{definition}
+
+For statically typed languages with monomorphic dispatch, the possible targets at a call site can often be determined exactly. For languages with dynamic dispatch (virtual methods, higher-order functions), the set of possible targets may be larger and must be approximated.
+
+\begin{definition}[Supergraph]\label{def:supergraph}
+The \textbf{interprocedural supergraph} (or system dependence graph) $G^* = (N^*, E^*)$ is constructed from the CFGs of all procedures by adding:
+\begin{itemize}
+  \item \textbf{Call edges} from each call site node to the entry node of each possible target.
+  \item \textbf{Return edges} from each exit node to the return site of each corresponding call.
+\end{itemize}
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.0cm,
+  block/.style={rectangle, draw=TomeInk, fill=TomeBg, minimum width=1.8cm, minimum height=0.6cm, align=center, font=\small},
+  edge_style/.style={->, thick, color=TomeInk},
+  call_edge/.style={->, thick, dashed, color=TomeGold}
+]
+  % Main procedure
+  \node[block] (m1) {main: $a = 1$};
+  \node[block, below=of m1] (m2) {call f(a)};
+  \node[block, below=of m2] (m3) {$b = \mathit{result}$};
+  
+  % Procedure f
+  \node[block, right=2.5cm of m1] (f1) {f(x)};
+  \node[block, below=of f1] (f2) {$y = x + 1$};
+  \node[block, below=of f2] (f3) {return y};
+  
+  \draw[edge_style] (m1) -- (m2);
+  \draw[edge_style] (m2) -- (m3);
+  \draw[edge_style] (f1) -- (f2);
+  \draw[edge_style] (f2) -- (f3);
+  \draw[call_edge] (m2) -- node[above, font=\small] {call} (f1);
+  \draw[call_edge] (f3) -- node[below, font=\small] {ret} (m3);
+\end{tikzpicture}
+\caption{An interprocedural supergraph with a single call site.}
+\label{fig:supergraph}
+\end{figure}
+
+\subsection{The Context Problem}\label{sec:context-problem}
+
+\begin{definition}[Context Problem]\label{def:context-problem}
+The \textbf{context problem} arises when a procedure $q$ is called from multiple call sites in different procedures. An interprocedural analysis must decide how to handle the confluence of information from different calling contexts at the entry of $q$.
+\end{definition}
+
+\begin{example}[Context Problem]\label{ex:context-problem}
+Consider:
+\begin{verbatim}
+  void main() {
+    int a = 1;
+    int b = f(a);    // call site 1
+    int c = f(10);   // call site 2
+  }
+  int f(int x) {
+    return x + 1;
+  }
+\end{verbatim}
+At the entry of \texttt{f}, the value of \texttt{x} is 1 at call site 1 and 10 at call site 2. A context-insensitive analysis merges these to get $x = \top$ (unknown). A context-sensitive analysis tracks the two calling contexts separately and determines that $x = 1$ in one context and $x = 10$ in the other.
+\end{example}
+
+\section{Context-Insensitive Analysis}\label{sec:context-insensitive}
+
+The simplest approach to interprocedural analysis ignores the context problem entirely. It treats the interprocedural supergraph as a single, large CFG and applies standard dataflow analysis.
+
+\begin{definition}[Context-Insensitive Analysis]\label{def:context-insensitive}
+A \textbf{context-insensitive} interprocedural analysis applies a standard intraprocedural dataflow algorithm to the interprocedural supergraph, treating call and return edges as ordinary control-flow edges.
+\end{definition}
+
+\begin{definition}[Call-String Validity]\label{def:call-string-valid}
+A path in the supergraph is \textbf{realizable} if the sequence of calls and returns along the path forms a balanced parenthesis string (every return matches the most recent unmatched call).
+\end{definition}
+
+\begin{theorem}[Soundness of Context-Insensitive Analysis]\label{thm:ci-sound}
+Context-insensitive interprocedural analysis is sound but imprecise. It considers all paths in the supergraph, including unrealizable paths that do not correspond to any actual execution.
+\end{theorem}
+
+The imprecision arises because context-insensitive analysis allows ``call-return mismatches'': paths that enter a procedure through one call site and exit through a different call site's return edge.
+
+\section{The Call-String Approach}\label{sec:call-string}
+
+The \emph{call-string} approach, introduced by Sharir and Pnueli~\cite{sharir1981two}, achieves context sensitivity by tagging each dataflow fact with the sequence of call sites that led to it.
+
+\begin{definition}[Call String]\label{def:call-string}
+A \textbf{call string} (or \textbf{calling context}) is a sequence of call sites $c_1, c_2, \ldots, c_k$ representing the nesting of procedure calls. The empty sequence $\epsilon$ represents the top-level context.
+\end{definition}
+
+\begin{definition}[Call-String Analysis]\label{def:cs-analysis}
+In the \textbf{call-string approach}, the dataflow information at each program point is a mapping from call strings to lattice values:
+\[
+\mathit{DF}[n] : \mathit{CallStrings} \to \mathcal{L}
+\]
+The analysis maintains separate dataflow facts for each calling context.
+\end{definition}
+
+\subsection{Bounded Call Strings}\label{sec:bounded-cs}
+
+Since the set of all call strings is infinite (for recursive programs), practical implementations bound the length of call strings.
+
+\begin{definition}[$k$-Limited Call Strings]\label{def:k-limited}
+A \textbf{$k$-limited call-string analysis} retains only the last $k$ call sites in each call string. Two contexts that differ only in call sites beyond the $k$-th most recent are merged.
+\end{definition}
+
+\begin{example}[1-Limited Call Strings]\label{ex:1-limited}
+With $k = 1$, the analysis distinguishes contexts based only on the most recent call site. In the example above, the two calls to \texttt{f} are distinguished because they come from different call sites. However, if \texttt{f} calls itself recursively, all recursive invocations are merged into a single context.
+\end{example}
+
+\subsection{Complexity}\label{sec:cs-complexity}
+
+\begin{theorem}[Complexity of Call-String Analysis]\label{thm:cs-complexity}
+For a program with $|S|$ call sites, $|N|$ nodes in the supergraph, lattice height $h$, and call-string bound $k$, the $k$-limited call-string analysis has complexity:
+\[
+O(h \cdot |N| \cdot |S|^k)
+\]
+This is polynomial for fixed $k$ but exponential in $k$.
+\end{theorem}
+
+The exponential dependence on $k$ makes full call-string analysis impractical for large $k$. In practice, $k = 1$ or $k = 2$ is used, providing a reasonable tradeoff between precision and cost.
+
+\section{The Functional Approach (Sharir--Pnueli)}\label{sec:functional-approach}
+
+The \emph{functional approach} represents the effect of each procedure as a \emph{function} from input dataflow values to output dataflow values, rather than explicitly tracking call strings.
+
+\begin{definition}[Procedure Summary Function]\label{def:summary-fn}
+The \textbf{summary function} for procedure $p$ is a function $\phi_p : \mathcal{L} \to \mathcal{L}$ that maps the dataflow values at $p$'s entry to the dataflow values at $p$'s exit.
+\end{definition}
+
+\subsection{Computing Summary Functions}\label{sec:computing-summaries}
+
+The summary function for a procedure is computed by composing the transfer functions along all paths through the procedure:
+
+\begin{definition}[Summary Function Composition]\label{def:summary-composition}
+For a procedure $p$ with entry $n_0$ and exit $n_e$:
+\[
+\phi_p = \bigsqcup_{\text{paths } \pi \text{ from } n_0 \text{ to } n_e} f_\pi
+\]
+where $f_\pi$ is the composition of transfer functions along path $\pi$.
+\end{definition}
+
+For distributive transfer functions over a finite lattice, the summary function can be represented compactly. If $\mathcal{L}$ is a powerset lattice with $m$ elements, the summary function is determined by its values on the $m$ singleton sets, requiring $O(m^2)$ space.
+
+\subsection{The IOFM Framework}\label{sec:iofm}
+
+The \emph{Interprocedural, Finite, Distributive, Subset} (IFDS) framework of Reps, Horwitz, and Sagiv~\cite{reps1995precise} provides an efficient algorithm for interprocedural dataflow analysis when the transfer functions are distributive and the lattice is a powerset.
+
+\begin{definition}[IFDS Problem]\label{def:ifds}
+An \textbf{IFDS problem} is an interprocedural dataflow problem where:
+\begin{enumerate}
+  \item The dataflow domain is a finite set $D$ (the lattice is $2^D$).
+  \item All transfer functions are distributive over $\cup$.
+  \item The merge operator is $\cup$ (may-analysis) or $\cap$ (must-analysis).
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[IFDS Complexity]\label{thm:ifds-complexity}
+The IFDS problem can be solved in time $O(|E|^* \cdot |D|^3)$, where $|E|^*$ is the number of edges in the supergraph. This is cubic in the size of the dataflow domain but linear in the size of the program.
+\end{theorem}
+
+The key insight of IFDS is that the interprocedural analysis can be reduced to a graph reachability problem on an \emph{exploded supergraph}, where each node $n$ in the original supergraph is expanded into $|D| + 1$ nodes (one for each dataflow fact, plus a special ``realizable path'' node).
+
+\section{Summary-Based Analysis}\label{sec:summary-based}
+
+Summary-based analysis computes, for each procedure, a compact representation of its effect on the program state. This summary is then used at call sites to update the caller's dataflow information.
+
+\begin{definition}[Summary]\label{def:summary}
+A \textbf{procedure summary} is a description of:
+\begin{itemize}
+  \item Which definitions generated by the procedure may reach the caller.
+  \item Which variables may be modified by the procedure.
+  \item What constraints hold on the return value.
+\end{itemize}
+\end{definition}
+
+\subsection{Bottom-Up Summary Computation}\label{sec:bottom-up}
+
+In a \emph{bottom-up} approach, summaries are computed starting from the leaves of the call graph (procedures that call no others) and propagating upward:
+
+\begin{algorithm}[H]
+\caption{Bottom-Up Summary Computation}
+\label{alg:bottom-up}
+\begin{algorithmic}[1]
+\Require Call graph $CG$ in reverse topological order
+\ForAll{procedures $p$ in reverse topological order}
+  \State Compute intraprocedural dataflow solution for $p$
+  \ForAll{call sites $c$ in $p$}
+    \State Use summary of called procedure to refine dataflow at $c$
+  \EndFor
+  \State Compute summary $\phi_p$ from refined dataflow
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Top-Down Analysis with Summaries}\label{sec:top-down}
+
+In a \emph{top-down} approach, the analysis starts from the main procedure and uses summaries to avoid re-analyzing called procedures:
+
+\begin{algorithm}[H]
+\caption{Top-Down Analysis with Summaries}
+\label{alg:top-down}
+\begin{algorithmic}[1]
+\Require Call graph $CG$, initial context for main
+\State Analyze main procedure with initial context
+\ForAll{call sites $c$ encountered during analysis}
+  \State Determine calling context at $c$
+  \If{summary exists for this context}
+    \State Apply summary to compute effect of call
+  \Else
+    \State Analyze called procedure in new context
+    \State Compute and cache summary
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Scalability Challenges}\label{sec:scalability}
+
+Interprocedural analysis faces several scalability challenges:
+
+\subsection{Recursion}\label{sec:recursion}
+
+Recursive procedures create cycles in the call graph, making summary computation non-trivial. The summary of a recursive procedure depends on itself, requiring a fixedpoint computation.
+
+\begin{definition}[Recursive Summary Computation]\label{def:recursive-summary}
+For a recursive procedure $p$, the summary function $\phi_p$ satisfies:
+\[
+\phi_p = F(\phi_p)
+\]
+where $F$ is the functional that computes the summary given the summary of recursive calls. The least fixedpoint of $F$ is the desired summary.
+\end{definition}
+
+\subsection{Polymorphism and Dynamic Dispatch}\label{sec:polymorphism}
+
+In object-oriented languages, the target of a method call depends on the dynamic type of the receiver. This creates a coupling between pointer analysis (Chapter~\ref{sec:pointer-analysis}) and interprocedural analysis: the call graph depends on the points-to information, which in turn depends on the interprocedural analysis.
+
+\begin{definition}[On-the-Fly Call Graph Construction]\label{def:otf-cg}
+\textbf{On-the-fly} call graph construction interleaves pointer analysis and interprocedural analysis: the call graph is refined as the pointer analysis discovers new types, and the pointer analysis is refined as the call graph reveals new flow paths.
+\end{definition}
+
+\subsection{Large-Scale Applications}\label{sec:large-scale}
+
+For industrial-strength compilers and analysis tools, the call graph of a large program can contain tens of thousands of procedures and millions of call edges. Scalability techniques include:
+
+\begin{itemize}
+  \item \textbf{Call graph pruning}: Removing edges that are provably infeasible (e.g., calls through null pointers).
+  \item \textbf{Incremental analysis}: Re-analyzing only the parts of the call graph affected by a code change.
+  \item \textbf{Summarization hierarchies}: Grouping related procedures and computing hierarchical summaries.
+  \item \textbf{Parallel analysis}: Analyzing independent subgraphs concurrently.
+\end{itemize}
+
+\begin{historical}
+The foundational work on interprocedural dataflow analysis was done by Sharir and Pnueli in 1981~\cite{sharir1981two}, who introduced both the call-string and functional approaches. The IFDS framework of Reps, Horwitz, and Sagiv~\cite{reps1995precise} (1995) provided a major breakthrough by showing that a large class of interprocedural analyses could be solved as graph reachability problems. The IDE (Interprocedural, Distributive, Environment) framework extended IFDS to handle environment problems like constant propagation. More recently, the field has moved toward demand-driven and incremental approaches for scalability.
+\end{historical}
+
+\section{The IDE Framework}\label{sec:ide-framework}
+
+The \emph{Interprocedural, Distributive, Environment} (IDE) framework of Sagiv, Reps, and Horwitz~\cite{sagiv1996interprocedural} extends IFDS to handle \emph{environment problems} like constant propagation, where the dataflow facts are not simply subsets but carry values.
+
+\begin{definition}[IDE Problem]\label{def:ide}
+An \textbf{IDE problem} is an interprocedural dataflow problem where:
+\begin{enumerate}
+  \item The dataflow domain is an \emph{environment}: a mapping from variables to values in a finite lattice.
+  \item All transfer functions are distributive and can be represented as linear functions over the environment.
+  \item The merge operator combines environments pointwise.
+\end{enumerate}
+\end{definition}
+
+The IDE framework represents transfer functions as \emph{micro-functions}: for each variable $x$ and each possible value $v$, the micro-function specifies the value of $x$ after the transfer function, given that $x$ had value $v$ before. This representation enables efficient composition of transfer functions.
+
+\begin{theorem}[IDE Complexity]\label{thm:ide-complexity}
+The IDE problem can be solved in time $O(|E|^* \cdot |D|^3)$, the same complexity as IFDS, despite the additional expressiveness.
+\end{theorem}
+
+\section{Demand-Driven Interprocedural Analysis}\label{sec:demand-driven-ipa}
+
+For many applications, computing the full interprocedural dataflow solution is unnecessary. \emph{Demand-driven} analysis answers specific queries: ``Is variable $x$ constant at program point $p$?'' or ``Does definition $d$ reach point $p$?''
+
+\begin{definition}[Demand-Driven Analysis]\label{def:demand-driven-ipa}
+A \textbf{demand-driven} interprocedural analysis computes dataflow information only as needed to answer a specific query. It works backward from the query point, exploring only the parts of the call graph that are relevant.
+\end{definition}
+
+Demand-driven analysis can be dramatically more efficient than whole-program analysis when the number of queries is small relative to the program size. However, it may do redundant work when many queries share common subproblems.
+
+\section{Incremental Interprocedural Analysis}\label{sec:incremental-ipa}
+
+When a program changes, re-analyzing the entire program from scratch is wasteful. \emph{Incremental} analysis updates only the parts of the analysis result affected by the change.
+
+\begin{definition}[Incremental Analysis]\label{def:incremental-ipa}
+An \textbf{incremental} interprocedural analysis maintains the analysis result and, when the program changes, updates only the affected parts. This requires:
+\begin{itemize}
+  \item Tracking dependencies between analysis results and program points.
+  \item Determining the scope of the change's impact.
+  \item Re-computing only the affected analysis results.
+\end{itemize}
+\end{definition}
+
+\section{Summary}\label{sec:interprocedural-summary}
+
+Interprocedural analysis extends the power of dataflow analysis beyond procedure boundaries, enabling reasoning about the flow of values and definitions across calls. The key challenge is the context problem: distinguishing different calling contexts to avoid spurious information flow. The call-string approach achieves this by explicitly tracking call histories, while the functional approach uses procedure summaries. The IFDS framework provides an efficient algorithm for the important special case of distributive subset problems, and the IDE framework extends this to environment problems like constant propagation. Scalability remains an active area of research, particularly for languages with dynamic dispatch and large codebases. Demand-driven and incremental approaches offer practical solutions for specific use cases.
+
+\section{The Call-String Approach in Detail}\label{sec:call-string-detail}
+
+The \emph{call-string} approach, introduced by Sharir and Pnueli~\cite{sharir1981framework}, is one of the most intuitive methods for achieving context sensitivity. The core idea is to tag each dataflow fact with the sequence of call sites that led to its computation.
+
+\begin{definition}[Call String]\label{def:call-string}
+A \textbf{call string} is a sequence of call sites $[s_1, s_2, \ldots, s_k]$ representing the path of calls from the program entry to the current procedure. The \emph{length} of the call string is $k$, the number of call sites in the sequence.
+\end{definition}
+
+\begin{definition}[Call-String Analysis]\label{def:call-string-analysis}
+In a \textbf{$k$-call-string} analysis, each dataflow fact at a program point $p$ in procedure $f$ is associated with the last $k$ call sites on the path from the entry to $f$. Two facts with different call strings are kept separate, even if they occur at the same program point.
+\end{definition}
+
+\subsection{1-CFA vs.\ 0-CFA}\label{sec:k-cfa}
+
+The parameter $k$ controls the precision/cost tradeoff:
+
+\begin{itemize}
+  \item \textbf{0-CFA} ($k = 0$): No call-string information. All calling contexts are merged. This is equivalent to context-insensitive analysis.
+  \item \textbf{1-CFA} ($k = 1$): Each fact is tagged with the most recent call site. This distinguishes direct callers but merges recursive calls.
+  \item \textbf{$k$-CFA} ($k > 1$): Each fact is tagged with the last $k$ call sites. Higher $k$ gives more precision but increases the analysis cost by a factor of $O(|S|^k)$, where $|S|$ is the number of call sites.
+\end{itemize}
+
+\begin{theorem}[Call-String Complexity]\label{thm:call-string-complexity}
+A $k$-CFA analysis has time complexity $O(|E| \cdot |D| \cdot |S|^k)$, where $|E|$ is the number of edges in the supergraph, $|D|$ is the domain size, and $|S|$ is the number of call sites. For $k \geq 1$, this is exponential in $k$.
+\end{theorem}
+
+\subsection{Call-String Cloning}\label{sec:call-string-cloning}
+
+A practical implementation technique for call-string analysis is \emph{procedure cloning}: creating separate copies of a procedure for each distinct calling context.
+
+\begin{algorithm}[H]
+\caption{Procedure Cloning for Call-String Analysis}
+\label{alg:proc-cloning}
+\begin{algorithmic}[1]
+\Require Program $P$ with call graph $G$, context-sensitivity depth $k$
+\Ensure Cloned program $P'$ with context-sensitive analysis
+\State Compute call strings of length $k$ for each procedure
+\ForAll{procedures $f$ with call strings $cs_1, cs_2, \ldots, cs_m$}
+  \State Create copies $f_1, f_2, \ldots, f_m$ of $f$
+  \For{each call site $s$ calling $f$}
+    \State Determine the call string $cs_i$ at $s$
+    \State Redirect $s$ to call $f_i$
+  \EndFor
+\EndFor
+\State Run context-insensitive analysis on $P'$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Procedure Cloning]\label{ex:proc-cloning}
+Consider:
+\begin{verbatim}
+  void main() {
+    int x = 5;
+    f(x);
+    int y = 10;
+    f(y);
+  }
+  void f(int a) {
+    g(a);
+  }
+  void g(int b) {
+    // What is b?
+  }
+\end{verbatim}
+With 1-CFA, $g$ is cloned into $g_1$ (called from $f$ when $f$ is called with $x$) and $g_2$ (called from $f$ when $f$ is called with $y$). In $g_1$, $b = 5$; in $g_2$, $b = 10$. Without cloning, $b \in \{5, 10\}$ at the analysis point.
+\end{example}
+
+\section{Summary-Based (Functional) Approach}\label{sec:summary-based-detail}
+
+The \emph{summary-based} or \emph{functional} approach represents the effect of a procedure as a \emph{function} from input dataflow values to output dataflow values. This avoids the exponential blowup of the call-string approach.
+
+\begin{definition}[Procedure Summary Function]\label{def:summary-fn}
+The \textbf{summary function} for a procedure $f$ is a function $\phi_f : D^{in} \to D^{out}$ that maps the dataflow values at $f$'s entry to the dataflow values at $f$'s exit. For a distributive flow function $f_{path}$ along a path through $f$, the summary is $\phi_f(d) = \bigsqcup_{path} f_{path}(d)$.
+\end{definition}
+
+\subsection{Computing Summaries Iteratively}\label{sec:summary-iterative}
+
+Summaries are computed by a fixedpoint iteration over the call graph:
+
+\begin{algorithm}[H]
+\caption{Summary-Based Interprocedural Analysis}
+\label{alg:summary-ipa}
+\begin{algorithmic}[1]
+\Require Call graph $G$, initial summaries $\phi_f^0 = \lambda d.\top$ for all $f$
+\Ensure Converged summaries $\phi_f^*$ for all $f$
+\Repeat
+  \ForAll{procedures $f$ in bottom-up order}
+    \State Compute $\phi_f^{i+1}$ using current summaries of callees
+    \State $\Delta = \phi_f^{i+1} \sqcap \phi_f^i$
+    \If{$\Delta \neq \bot$}
+      \State Mark callers of $f$ as changed
+    \EndIf
+  \EndFor
+\Until{no summaries change}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Summary Convergence]\label{thm:summary-convergence}
+For a finite-height lattice and monotone summary functions, the summary-based iteration converges in at most $O(|F| \cdot h)$ iterations, where $|F|$ is the number of procedures and $h$ is the lattice height.
+\end{theorem}
+
+\subsection{Summary Representation}\label{sec:summary-representation}
+
+For distributive functions over a finite lattice, the summary function can be represented compactly:
+
+\begin{definition}[Linear Summary Representation]\label{def:linear-summary}
+A distributive function $f : 2^S \to 2^S$ over a powerset lattice can be represented by its values on singleton sets: $f(X) = \bigcup_{x \in X} f(\{x\})$. This requires storing $|S|$ values, one for each singleton.
+\end{definition}
+
+\begin{example}[Summary Representation]\label{ex:summary-rep}
+For reaching definitions with definition set $D = \{d_1, d_2, d_3\}$:
+\begin{verbatim}
+  Summary of f:
+    f({d1}) = {d1, d3}    // d1 survives, d3 is generated
+    f({d2}) = {}           // d2 is killed
+    f({d3}) = {d3}         // d3 survives
+  Therefore:
+    f({d1, d2}) = {d1, d3}
+    f({d1, d2, d3}) = {d1, d3}
+\end{verbatim}
+\end{example}
+
+\section{Handling Recursion in Interprocedural Analysis}\label{sec:recursion-handling}
+
+Recursion poses a fundamental challenge for interprocedural analysis because the call graph contains cycles.
+
+\subsection{Recursion-Summarization}\label{sec:recursion-summarization}
+
+\begin{definition}[Recursive Summary]\label{def:recursive-summary}
+For a recursive procedure $f$, the summary $\phi_f$ is defined as the \emph{least fixedpoint} of the equation:
+\[
+\phi_f = \lambda d.\; \bigsqcup_{path \in f} f_{path}(d, \phi_f)
+\]
+where $f_{path}$ may invoke $\phi_f$ recursively. This fixedpoint exists when the lattice has finite height and the functions are monotone.
+\end{definition}
+
+\subsection{Unrolling-Based Approach}\label{sec:unrolling-approach}
+
+An alternative to recursive summarization is to \emph{unroll} the recursion to a bounded depth $d$:
+
+\begin{algorithm}[H]
+\caption{Bounded Recursion Unrolling}
+\label{alg:recursion-unroll}
+\begin{algorithmic}[1]
+\Require Recursive procedure $f$, unrolling depth $d$
+\Ensure Approximate summary $\phi_f^d$
+\State Create $d$ copies of $f$: $f^1, f^2, \ldots, f^d$
+\State In $f^i$, replace recursive calls with calls to $f^{i+1}$
+\State In $f^d$, replace recursive calls with $\lambda d.\top$ (no information)
+\State Compute summaries bottom-up: $\phi_{f^d}, \phi_{f^{d-1}}, \ldots, \phi_{f^1}$
+\State Return $\phi_f^d = \phi_{f^1}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Unrolling Soundness]\label{thm:unrolling-sound}
+The summary computed by unrolling to depth $d$ is a sound over-approximation of the true recursive summary: $\phi_f^d \sqsupseteq \phi_f^*$. As $d \to \infty$, $\phi_f^d$ converges to $\phi_f^*$.
+\end{theorem}
+
+\section{Interprocedural Analysis for Object-Oriented Programs}\label{sec:ipa-oo}
+
+Object-oriented languages introduce additional challenges for interprocedural analysis.
+
+\subsection{Virtual Dispatch Resolution}\label{sec:virtual-dispatch}
+
+\begin{definition}[Class Hierarchy Analysis]\label{def:cha}
+\textbf{Class hierarchy analysis} (CHA) resolves virtual calls by examining the class hierarchy: if a method $m$ is declared in class $C$ and no subclass of $C$ overrides $m$, then the call target is uniquely determined.
+\end{definition}
+
+\begin{definition}[Rapid Type Analysis]\label{def:rta}
+\textbf{Rapid type analysis} (RTA) iteratively refines the set of instantiated classes and the set of possible call targets. A method is a potential call target only if its declaring class (or a subclass that overrides it) is actually instantiated.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Rapid Type Analysis}
+\label{alg:rta}
+\begin{algorithmic}[1]
+\Require Program $P$, entry point $e$
+\Ensure Call graph $G$ and instantiated class set $I$
+\State $I \gets \emptyset$; $G \gets \{(e, \text{targets}(e))\}$
+\State $W \gets \{e\}$
+\While{$W \neq \emptyset$}
+  \State Remove $m$ from $W$
+  \ForAll{instructions $s$ in $m$}
+    \If{$s$ is a \texttt{new} $C$()}
+      \State $I \gets I \cup \{C\}$
+      \State Add new call targets enabled by $C$ to $W$
+    \ElsIf{$s$ is a virtual call $r.m'()$}
+      \State Compute targets using $I$
+      \State Add new edges to $G$ and targets to $W$
+    \EndIf
+  \EndFor
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Devirtualization}\label{sec:devirtualization}
+
+\begin{definition}[Devirtualization]\label{def:devirtualization}
+\textbf{Devirtualization} replaces a virtual call with a direct call when the analysis determines that only one target is possible. This enables inlining and other interprocedural optimizations.
+\end{definition}
+
+\begin{example}[Devirtualization]\label{ex:devirtualization}
+\begin{verbatim}
+  // Before devirtualization:
+  Animal a = new Dog();
+  a.speak();  // virtual call
+  
+  // After CHA determines only Dog.speak() is possible:
+  Animal a = new Dog();
+  Dog.speak(a);  // direct call, can be inlined
+\end{verbatim}
+\end{example}
+
+\section{Compositional vs.\ Non-Compositional Analysis}\label{sec:compositional-ipa}
+
+\begin{definition}[Compositional Analysis]\label{def:compositional}
+An interprocedural analysis is \textbf{compositional} if the analysis result for a procedure depends only on the procedure's code and the analysis results of its \emph{immediate} callees (via their summaries). The whole-program result is obtained by composing the per-procedure results.
+\end{definition}
+
+\begin{definition}[Non-Compositional Analysis]\label{def:non-compositional}
+A \textbf{non-compositional} analysis inlines all procedures (conceptually or literally) and analyzes the resulting monolithic program. This avoids the need for summaries but can lead to code explosion.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Property} & \textbf{Compositional} & \textbf{Non-Compositional} \\
+\hline
+Scalability & Good (summarize once) & Poor (code explosion) \\
+Precision (recursive) & May lose precision & Exact (up to unrolling) \\
+Incremental updates & Easy (re-summarize) & Hard (re-analyze all) \\
+Implementation complexity & Higher & Lower \\
+Memory usage & Lower & Higher \\
+\hline
+\end{tabular}
+\caption{Compositional vs.\ non-compositional interprocedural analysis.}
+\label{tab:compositional-comparison}
+\end{table}

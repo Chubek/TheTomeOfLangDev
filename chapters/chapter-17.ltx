@@ -1,0 +1,539 @@
+%% chapter-17.ltx — Names, Binding, and the Environment Model
+%% Part II: Programming Language Design
+
+%% ============================================================
+%% 17.1 Introduction
+%% ============================================================
+\section{Introduction}\label{sec:names-binding-intro}
+
+Names are the primary means by which programmers refer to computational
+entities: variables, functions, types, modules, labels.  The rules that
+govern how names are associated with the entities they denote are among the
+most fundamental aspects of any programming language.
+
+In this chapter, we study the theory of names and binding.  We begin with
+the concept of \emph{name resolution}---how a name occurrence is connected
+to its declaration.  We then examine \emph{binding time}---when the
+association between a name and its entity is established.  We develop the
+\emph{environment model} of evaluation, which provides a formal framework
+for understanding how names are resolved during program execution.  We
+conclude with the implementation of symbol tables and the treatment of
+overloading and name mangling.
+
+\begin{definition}[Binding]\label{def:binding}
+  A \emph{binding} is an association between a name (identifier) and the
+  entity it denotes (a variable, function, type, module, etc.).  The
+  binding is established by a \emph{declaration} and used by
+  \emph{references} (occurrences of the name).
+\end{definition}
+
+%% ============================================================
+%% 17.2 Name Resolution
+%% ============================================================
+\section{Name Resolution}\label{sec:name-resolution}
+
+\subsection{The Name Resolution Problem}\label{sec:name-resolution-problem}
+
+\begin{definition}[Name Resolution]\label{def:name-resolution}
+  \emph{Name resolution} is the process of determining, for each occurrence
+  of a name in a program, which declaration it refers to.  This is also
+  called \emph{identifier resolution} or \emph{binding resolution}.
+\end{definition}
+
+Name resolution is a prerequisite for all other phases of compilation.
+Before the compiler can type-check, optimize, or generate code for an
+expression, it must know what each name refers to.
+
+\begin{example}[Name Resolution]\label{ex:name-resolution}
+  Consider:
+  \begin{verbatim}
+  let x = 1 in
+  let f = fun y -> x + y in
+  let x = 2 in
+  f x
+  \end{verbatim}
+  Name resolution must determine:
+  \begin{itemize}
+    \item The \texttt{x} in \texttt{x + y} refers to the first \texttt{x} (value 1).
+    \item The \texttt{x} in \texttt{f x} refers to the second \texttt{x} (value 2).
+    \item The \texttt{y} in \texttt{x + y} refers to the parameter \texttt{y}.
+  \end{itemize}
+\end{example}
+
+\subsection{Scope and Binding}\label{sec:scope-binding}
+
+\begin{definition}[Scope]\label{def:scope}
+  The \emph{scope} of a declaration is the region of the program in which
+  the binding established by the declaration is visible.  A name occurrence
+  is \emph{bound} if it falls within the scope of a declaration; otherwise,
+  it is \emph{free} (or \emph{unbound}).
+\end{definition}
+
+\begin{definition}[Binding Time]\label{def:binding-time}
+  The \emph{binding time} is the point during the program lifecycle when a
+  binding is established:
+  \begin{itemize}
+    \item \textbf{Language design time}: The meaning of keywords is fixed.
+    \item \textbf{Compile time}: Types, static addresses, and optimizations.
+    \item \textbf{Link time}: Resolution of external references.
+    \item \textbf{Load time}: Dynamic library loading.
+    \item \textbf{Run time}: Dynamic typing, dynamic binding, reflection.
+  \end{itemize}
+\end{definition}
+
+\subsection{Static vs. Dynamic Scoping}\label{sec:static-vs-dynamic-scoping}
+
+\begin{definition}[Static (Lexical) Scoping]\label{def:static-scoping}
+  Under \emph{static scoping}, the binding of a name is determined by the
+  program text (the lexical structure).  A name refers to the declaration
+  in the nearest enclosing scope in the source code.
+\end{definition}
+
+\begin{definition}[Dynamic Scoping]\label{def:dynamic-scoping}
+  Under \emph{dynamic scoping}, the binding of a name is determined by the
+  call stack at runtime.  A name refers to the most recent binding
+  established by a caller in the dynamic call chain.
+\end{definition}
+
+\begin{example}[Static vs. Dynamic Scoping]\label{ex:static-dynamic-scoping}
+  \begin{verbatim}
+  let x = 1
+  let f = fun () -> x
+  let g = fun () -> let x = 2 in f ()
+  \end{verbatim}
+  \begin{itemize}
+    \item With \emph{static scoping}: \texttt{g()} returns 1 (the \texttt{x}
+      in \texttt{f} refers to the global \texttt{x}).
+    \item With \emph{dynamic scoping}: \texttt{g()} returns 2 (the \texttt{x}
+      in \texttt{f} refers to the \texttt{x} bound by \texttt{g}).
+  \end{itemize}
+\end{example}
+
+Most modern languages use static scoping.  Dynamic scoping is found in
+Emacs Lisp, some shell scripting languages, and as a special feature in
+Common Lisp (\texttt{special} variables).
+
+\subsection{Name Resolution Rules}\label{sec:name-resolution-rules}
+
+The rules for name resolution vary across languages:
+
+\begin{itemize}
+  \item \textbf{Single-pass}: Names must be declared before use (C, Pascal).
+  \item \textbf{Two-pass}: Names can be used before declaration (Java, C\#).
+  \item \textbf{Block-scoped}: Names are visible within their enclosing
+    block (C99, Java, Rust).
+  \item \textbf{Function-scoped}: Names are visible throughout their
+    enclosing function (JavaScript \texttt{var}).
+  \item \textbf{Hoisting}: Declarations are moved to the top of their scope
+    (JavaScript \texttt{var} and \texttt{function}).
+\end{itemize}
+
+%% ============================================================
+%% 17.3 Binding Time and Binding Rules
+%% ============================================================
+\section{Binding Time and Binding Rules}\label{sec:binding-time-rules}
+
+\subsection{Early vs. Late Binding}\label{sec:early-vs-late}
+
+\begin{definition}[Early Binding]\label{def:early-binding}
+  \emph{Early binding} (static binding) resolves names at compile time or
+  link time.  The binding is fixed before the program runs.
+\end{definition}
+
+\begin{definition}[Late Binding]\label{def:late-binding}
+  \emph{Late binding} (dynamic binding) resolves names at runtime.  The
+  binding can change during execution.
+\end{definition}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Binding Time Examples}
+  \label{tab:binding-time}
+  \begin{tabular}{lll}
+    \hline
+    \textbf{Binding} & \textbf{Time} & \textbf{Example} \\
+    \hline
+    Keyword meaning & Design time & \texttt{if} means conditional \\
+    Type of variable & Compile time & \texttt{int x} \\
+    Function address & Link time & External function call \\
+    Method dispatch & Run time & Virtual method call \\
+    Variable value & Run time & Assignment \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\subsection{The Binding Spectrum}\label{sec:binding-spectrum}
+
+Languages exist on a spectrum from early to late binding:
+
+\begin{itemize}
+  \item \textbf{Very early}: Haskell, Agda---almost everything is resolved
+    at compile time.
+  \item \textbf{Early}: C, Rust---types and addresses are fixed at compile
+    time.
+  \item \textbf{Mixed}: Java, C\#---types are checked at compile time, but
+    method dispatch is dynamic.
+  \item \textbf{Late}: Python, Ruby---most bindings are resolved at runtime.
+  \item \textbf{Very late}: Lisp, Smalltalk---almost everything is dynamic.
+\end{itemize}
+
+\begin{insight}
+Earlier binding enables more optimization and earlier error detection, but
+reduces flexibility.  Later binding enables more flexibility and dynamic
+behavior, but makes optimization harder and errors harder to detect.  The
+right point on the spectrum depends on the application domain.
+\end{insight}
+
+%% ============================================================
+%% 17.4 Static and Dynamic Binding
+%% ============================================================
+\section{Static and Dynamic Binding}\label{sec:static-dynamic-binding}
+
+\subsection{Static Binding}\label{sec:static-binding-detail}
+
+Static binding is the default in most compiled languages.  Under static
+binding:
+
+\begin{itemize}
+  \item \textbf{Variables}: Each variable occurrence is resolved to a
+    specific memory location (stack slot, register, or global address).
+  \item \textbf{Functions}: Each function call is resolved to a specific
+    code address.
+  \item \textbf{Types}: Each type annotation is resolved to a specific type.
+  \item \textbf{Overloads}: Each overloaded function call is resolved to a
+    specific overload.
+\end{itemize}
+
+\subsection{Dynamic Binding}\label{sec:dynamic-binding-detail}
+
+Dynamic binding defers resolution to runtime:
+
+\begin{itemize}
+  \item \textbf{Virtual methods}: The method to call is determined by the
+    runtime type of the receiver.
+  \item \textbf{Dynamic dispatch}: In dynamically typed languages, the
+    operation to perform is determined by the runtime types of the
+    arguments.
+  \item \textbf{Dynamic loading}: Modules and libraries can be loaded at
+    runtime, and their bindings resolved dynamically.
+  \item \textbf{Reflection}: Programs can inspect and modify their own
+    bindings at runtime.
+\end{itemize}
+
+\subsection{Implementation of Dynamic Binding}\label{sec:dynamic-binding-impl}
+
+Dynamic binding is typically implemented through:
+
+\begin{itemize}
+  \item \textbf{Virtual method tables (vtables)}: Each object contains a
+    pointer to a table of function pointers; method calls go through the
+    table.
+  \item \textbf{Inline caching}: The first time a method is called on an
+    object of a given type, the method address is cached; subsequent calls
+    check the cache.
+  \item \textbf{Hash tables}: In highly dynamic languages, method lookup is
+    performed via hash table search.
+\end{itemize}
+
+%% ============================================================
+%% 17.5 Environment Model of Evaluation
+%% ============================================================
+\section{The Environment Model of Evaluation}\label{sec:environment-model}
+
+The environment model provides a formal framework for understanding how
+names are resolved during program evaluation.  It is the semantic foundation
+for both static and dynamic scoping.
+
+\subsection{Environments}\label{sec:environments}
+
+\begin{definition}[Environment]\label{def:environment}
+  An \emph{environment} is a finite mapping from names to values (or
+  locations):
+  \[
+    \rho \in \Env = \Name \finfun \Val
+  \]
+  We write $\rho[x \mapsto v]$ for the environment that extends $\rho$ with
+  the binding $x \mapsto v$.
+\end{definition}
+
+\begin{definition}[Environment Lookup]\label{def:env-lookup}
+  The lookup of name $x$ in environment $\rho$ is:
+  \[
+    \rho(x) = \begin{cases}
+      v & \text{if } \rho = \rho'[x \mapsto v] \\
+      \rho'(x) & \text{if } \rho = \rho'[y \mapsto v] \text{ and } y \neq x \\
+      \texttt{unbound} & \text{if } x \notin \mathrm{dom}(\rho)
+    \end{cases}
+  \]
+\end{definition}
+
+\subsection{The Environment Model for a Simple Language}\label{sec:env-model-simple}
+
+Consider a simple language with variables, let-bindings, functions, and
+application:
+
+\begin{grammar}{Simple Language}
+  \production{e}{x \alt n \alt e_1 + e_2 \alt \mathbf{let}\ x = e_1\ \mathbf{in}\ e_2 \alt \mathbf{fun}\ x \to e \alt e_1\ e_2}
+\end{grammar}
+
+The evaluation relation is $\bconfig{e, \rho} \evalto v$, meaning
+``expression $e$ in environment $\rho$ evaluates to value $v$'':
+
+\begin{semrules}{Environment Model}
+  \semrule{
+    \rho(x) = v
+  }{
+    \bconfig{x, \rho} \evalto v
+  }{\text{(Var)}} \\[6pt]
+  \semrule{
+    \bconfig{e_1, \rho} \evalto v_1 \quad
+    \bconfig{e_2, \rho} \evalto v_2
+  }{
+    \bconfig{e_1 + e_2, \rho} \evalto v_1 + v_2
+  }{\text{(Add)}} \\[6pt]
+  \semrule{
+    \bconfig{e_1, \rho} \evalto v_1 \quad
+    \bconfig{e_2, \rho[v_1/x]} \evalto v
+  }{
+    \bconfig{\mathbf{let}\ x = e_1\ \mathbf{in}\ e_2, \rho} \evalto v
+  }{\text{(Let)}} \\[6pt]
+  \semruleaxiom{
+    \bconfig{\mathbf{fun}\ x \to e, \rho} \evalto \langle \mathbf{fun}\ x \to e, \rho \rangle
+  }{\text{(Fun)}} \\[6pt]
+  \semrule{
+    \bconfig{e_1, \rho} \evalto \langle \mathbf{fun}\ x \to e, \rho' \rangle \quad
+    \bconfig{e_2, \rho} \evalto v_2 \quad
+    \bconfig{e, \rho'[x \mapsto v_2]} \evalto v
+  }{
+    \bconfig{e_1\ e_2, \rho} \evalto v
+  }{\text{(App)}}
+\end{semrules}
+
+\begin{insight}
+The environment model captures static scoping naturally: when a function is
+applied, it uses the environment $\rho'$ that was captured when the function
+was \emph{created}, not the environment $\rho$ of the caller.  This is the
+essence of lexical scoping.
+\end{insight}
+
+\subsection{Closures}\label{sec:closures-env}
+
+\begin{definition}[Closure]\label{def:closure-env}
+  A \emph{closure} is a pair $\langle e, \rho \rangle$ consisting of a
+  function body $e$ and an environment $\rho$ that captures the bindings
+  visible at the point where the function was defined.
+\end{definition}
+
+Closures are the mechanism by which static scoping is implemented.  When a
+function is created, the current environment is captured; when the function
+is applied, the captured environment is used to resolve names in the
+function body.
+
+\subsection{Dynamic Scoping in the Environment Model}\label{sec:dynamic-env}
+
+Under dynamic scoping, function application uses the \emph{caller's}
+environment rather than the captured environment:
+
+\begin{semrules}{Dynamic Scoping}
+  \semrule{
+    \bconfig{e_1, \rho} \evalto \mathbf{fun}\ x \to e \quad
+    \bconfig{e_2, \rho} \evalto v_2 \quad
+    \bconfig{e, \rho[x \mapsto v_2]} \evalto v
+  }{
+    \bconfig{e_1\ e_2, \rho} \evalto v
+  }{\text{(Dyn-App)}}
+\end{semrules}
+
+Note the difference: in the static rule, the body $e$ is evaluated in
+$\rho'[x \mapsto v_2]$ where $\rho'$ is the captured environment; in the
+dynamic rule, it is evaluated in $\rho[x \mapsto v_2]$ where $\rho$ is the
+caller's environment.
+
+%% ============================================================
+%% 17.6 Symbol Tables and Their Implementation
+%% ============================================================
+\section{Symbol Tables and Their Implementation}\label{sec:symbol-tables}
+
+\subsection{Symbol Table Abstract Data Type}\label{sec:symbol-table-adt}
+
+\begin{definition}[Symbol Table]\label{def:symbol-table}
+  A \emph{symbol table} is a data structure that records information about
+  declarations.  It supports the following operations:
+  \begin{itemize}
+    \item $\texttt{enter\_scope}()$: Begin a new scope.
+    \item $\texttt{exit\_scope}()$: End the current scope.
+    \item $\texttt{insert}(name, info)$: Record a declaration.
+    \item $\texttt{lookup}(name)$: Find the declaration of a name.
+  \end{itemize}
+\end{definition}
+
+\subsection{Implementation Strategies}\label{sec:symbol-table-impl}
+
+\subsubsection{Linear List}
+
+The simplest implementation is a linked list of (name, info) pairs.  Lookup
+is $O(n)$; insertion is $O(1)$.  Suitable for small programs or as a
+pedagogical example.
+
+\subsubsection{Hash Table per Scope}
+
+Each scope has its own hash table.  Scopes are linked in a chain (the
+\emph{scope stack}).  Lookup traverses the chain from innermost to
+outermost scope:
+
+\begin{algorithmic}[1]
+\Function{Lookup}{$name$}
+  \For{each scope $s$ from innermost to outermost}
+    \If{$name \in s.\texttt{table}$}
+      \State \Return $s.\texttt{table}[name]$
+    \EndIf
+  \EndFor
+  \State \Return \texttt{not found}
+\EndFunction
+\end{algorithmic}
+
+Average lookup is $O(1)$ per scope; worst case is $O(d)$ where $d$ is the
+nesting depth.
+
+\subsubsection{Tree-Based Symbol Tables}
+
+A tree structure mirrors the block structure of the program.  Each node
+represents a scope and contains a hash table of local declarations plus
+pointers to parent and child scopes.
+
+\subsubsection{Fully Persistent Data Structures}
+
+For languages with first-class environments (e.g., Scheme), symbol tables
+must support persistence---the ability to create new versions without
+destroying old ones.  Persistent hash maps (e.g., hash array mapped tries)
+provide $O(\log n)$ lookup and update with structural sharing.
+
+\subsection{Symbol Table Contents}\label{sec:symbol-table-contents}
+
+A symbol table entry typically records:
+
+\begin{itemize}
+  \item \textbf{Name}: The identifier string.
+  \item \textbf{Kind}: Variable, function, type, module, label, etc.
+  \item \textbf{Type}: The declared or inferred type.
+  \item \textbf{Scope level}: The nesting depth.
+  \item \textbf{Storage}: Stack offset, register, global address, etc.
+  \item \textbf{Attributes}: \texttt{const}, \texttt{static},
+    \texttt{mutable}, visibility, etc.
+\end{itemize}
+
+%% ============================================================
+%% 17.7 Overloading and Name Mangling
+%% ============================================================
+\section{Overloading and Name Mangling}\label{sec:overloading-mangling}
+
+\subsection{Function Overloading}\label{sec:function-overloading}
+
+\begin{definition}[Overloading]\label{def:overloading}
+  \emph{Function overloading} allows multiple functions with the same name
+  but different parameter types to coexist.  The compiler selects the
+  appropriate function based on the types of the arguments.
+\end{definition}
+
+\begin{example}[Function Overloading in C++]\label{ex:overloading-cpp}
+  \begin{verbatim}
+  int add(int a, int b) { return a + b; }
+  double add(double a, double b) { return a + b; }
+  string add(string a, string b) { return a + b; }
+  \end{verbatim}
+  The call \texttt{add(1, 2)} resolves to the first overload;
+  \texttt{add(1.0, 2.0)} resolves to the second.
+\end{example}
+
+\subsection{Overload Resolution}\label{sec:overload-resolution}
+
+Overload resolution is the process of selecting the best matching overload:
+
+\begin{enumerate}
+  \item \textbf{Exact match}: The argument types exactly match the parameter
+    types.
+  \item \textbf{Promotion}: The argument types can be promoted (e.g.,
+    \texttt{int} to \texttt{long}).
+  \item \textbf{Conversion}: The argument types can be converted (e.g.,
+    \texttt{int} to \texttt{double}).
+  \item \textbf{User-defined conversion}: A user-defined conversion function
+    applies.
+\end{enumerate}
+
+\begin{definition}[Ambiguous Overload]\label{def:ambiguous-overload}
+  An overloaded call is \emph{ambiguous} if no single overload is better
+  than all others.  This is a compile-time error.
+\end{definition}
+
+\subsection{Name Mangling}\label{sec:name-mangling}
+
+\begin{definition}[Name Mangling]\label{def:name-mangling}
+  \emph{Name mangling} (name encoding) is the technique of encoding
+  additional information (parameter types, namespace, class) into the
+  internal name of a function or variable, so that overloaded functions
+  have distinct linker names.
+\end{definition}
+
+\begin{example}[Name Mangling in C++]\label{ex:name-mangling}
+  \begin{verbatim}
+  int add(int, int)         -> _Z3addii
+  double add(double, double) -> _Z3adddd
+  void Foo::bar(int)         -> _ZN3Foo3barEi
+  \end{verbatim}
+  The Itanium C++ ABI encoding scheme encodes the function name, namespace,
+  class, and parameter types into a unique string.
+\end{example}
+
+\subsection{Operator Overloading}\label{sec:operator-overloading}
+
+\begin{definition}[Operator Overloading]\label{def:operator-overloading}
+  \emph{Operator overloading} allows operators (\texttt{+}, \texttt{*},
+  \texttt{==}, etc.) to be defined for user-defined types.  The operator
+  is resolved based on the types of its operands.
+\end{definition}
+
+Operator overloading is supported in C++, Rust, Haskell (through type
+classes), Python (through special methods like \texttt{\_\_add\_\_}), and
+Scala.
+
+\begin{example}[Operator Overloading in Rust]\label{ex:operator-rust}
+  \begin{verbatim}
+  use std::ops::Add;
+  
+  struct Complex { re: f64, im: f64 }
+  
+  impl Add for Complex {
+      type Output = Complex;
+      fn add(self, other: Complex) -> Complex {
+          Complex {
+              re: self.re + other.re,
+              im: self.im + other.im,
+          }
+      }
+  }
+  \end{verbatim}
+  This allows \texttt{c1 + c2} to work for \texttt{Complex} values.
+\end{example}
+
+%% ============================================================
+%% 17.8 Summary
+%% ============================================================
+\section{Summary}\label{sec:names-binding-summary}
+
+Names and binding are the connective tissue of programming languages.  The
+rules governing name resolution determine how programs are understood by
+both compilers and programmers.
+
+The environment model provides a clean formal framework for understanding
+name resolution.  It captures both static and dynamic scoping, and it
+reveals the essential role of closures in implementing lexical scoping.
+
+Symbol tables are the compiler's data structure for recording and looking
+up bindings.  Their design must balance efficiency (fast lookup) with
+expressiveness (supporting overloading, namespaces, modules, and generic
+instantiation).
+
+Overloading and name mangling illustrate the interaction between the
+source-level view (names) and the implementation-level view (addresses).
+The compiler must bridge this gap, resolving overloaded names to specific
+implementations and generating unique internal names for the linker.

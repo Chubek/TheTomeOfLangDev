@@ -1,0 +1,516 @@
+%%
+%% chapter-74.ltx — Global Dataflow Optimization
+%%
+
+\section{Introduction}\label{sec:global-dataflow-intro}
+
+Global dataflow optimizations use dataflow analysis (Chapters~\ref{sec:dataflow-intro}--\ref{sec:forward-backward}) to transform the program across basic block boundaries. Unlike local optimizations, which examine only a single block, global optimizations consider the entire control-flow graph, enabling transformations that exploit information flowing from distant parts of the program.
+
+The major global dataflow optimizations are:
+\begin{itemize}
+  \item Global constant propagation
+  \item Common subexpression elimination
+  \item Dead code elimination
+  \item Copy propagation
+  \item Loop-invariant code motion
+\end{itemize}
+
+Each of these is driven by a specific dataflow analysis and applied when the analysis provides sufficiently precise information.
+
+\section{Global Constant Propagation}\label{sec:global-const-prop}
+
+\subsection{Overview}\label{sec:gcp-overview}
+
+Global constant propagation extends the local constant propagation of Chapter~\ref{sec:constant-folding} across the entire program. It uses the constant propagation dataflow analysis (Section~\ref{sec:constant-propagation}) to determine which variables have constant values at each program point.
+
+\begin{definition}[Global Constant Propagation]\label{def:gcp}
+\textbf{Global constant propagation} replaces a use of variable $x$ at program point $p$ with the constant $c$ if the constant propagation analysis determines that $x = c$ at $p$.
+\end{definition}
+
+\subsection{Implementation}\label{sec:gcp-impl}
+
+\begin{algorithm}[H]
+\caption{Global Constant Propagation}
+\label{alg:gcp}
+\begin{algorithmic}[1]
+\Require Program $P$, constant propagation analysis results
+\Ensure Program with constants propagated
+\ForAll{uses of variable $x$ at program point $p$}
+  \If{$\mathit{const}[p](x) = c$ for some constant $c$}
+    \State Replace use of $x$ with $c$
+  \EndIf
+\EndFor
+\State Run local constant folding to simplify resulting expressions
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Conditional Constant Propagation}\label{sec:conditional-cp}
+
+\emph{Conditional constant propagation} (also known as \emph{sparse conditional constant propagation}, SCCP) combines constant propagation with unreachable code elimination. It recognizes that if a branch condition is constant, the untaken branch is unreachable, and code in the untaken branch should not be analyzed.
+
+\begin{definition}[Sparse Conditional Constant Propagation]\label{def:sccp}
+\textbf{SCCP} simultaneously computes:
+\begin{itemize}
+  \item The constant value of each variable at each program point.
+  \item The executability of each basic block.
+\end{itemize}
+A block is executable only if it is reachable via an executable edge. An edge is executable only if the branch condition does not prevent it from being taken.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Sparse Conditional Constant Propagation}
+\label{alg:sccp}
+\begin{algorithmic}[1]
+\Require Program $P$
+\Ensure Constants propagated, unreachable code identified
+\State $\mathit{const}[v] \gets \bot$ for all variables $v$
+\State $\mathit{exec}[B] \gets \text{false}$ for all blocks $B$
+\State $\mathit{exec}[B_0] \gets \text{true}$
+\State $\mathit{worklist} \gets \{B_0\}$ (executable blocks) $\cup$ $\{v \mid v \text{ has constant value}\}$
+\While{$\mathit{worklist} \neq \emptyset$}
+  \State Pick item from $\mathit{worklist}$
+  \If{item is a block $B$}
+    \State Evaluate statements in $B$ using current constant values
+    \State Update constant values and executable edges
+    \State Add newly executable blocks and changed constants to $\mathit{worklist}$
+  \ElsIf{item is a variable $v$ with new constant value}
+    \State Propagate new value to all uses of $v$ in executable blocks
+    \State Add affected blocks to $\mathit{worklist}$
+  \EndIf
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\section{Common Subexpression Elimination}\label{sec:cse}
+
+\subsection{Overview}\label{sec:cse-overview}
+
+\emph{Common subexpression elimination} (CSE) avoids recomputing an expression whose value is already available.
+
+\begin{definition}[Common Subexpression Elimination]\label{def:cse}
+\textbf{CSE} replaces a computation of expression $e$ at point $p$ with a reference to a previously computed value of $e$, provided that:
+\begin{itemize}
+  \item $e$ was computed at some earlier point $q$.
+  \item No modification of any operand of $e$ occurs between $q$ and $p$.
+\end{itemize}
+\end{definition}
+
+\subsection{Local CSE}\label{sec:local-cse}
+
+Local CSE operates within a single basic block. It maintains a table of available expressions and their computed values.
+
+\begin{algorithm}[H]
+\caption{Local Common Subexpression Elimination}
+\label{alg:local-cse}
+\begin{algorithmic}[1]
+\Require Basic block $B$
+\Ensure Block with common subexpressions eliminated
+\State $\mathit{table} \gets \emptyset$
+\ForAll{statements $s$ in $B$}
+  \If{$s$ is $t = e$ where $e$ is in $\mathit{table}$}
+    \State Replace $s$ with $t = t_e$ (where $t_e$ holds the previous value of $e$)
+  \ElsIf{$s$ is $t = e$}
+    \State Add $(e, t)$ to $\mathit{table}$
+  \ElsIf{$s$ modifies variable $x$}
+    \State Remove all expressions involving $x$ from $\mathit{table}$
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Global CSE}\label{sec:global-cse}
+
+Global CSE uses the available expressions analysis (Section~\ref{sec:available-expressions}) to determine which expressions are available at each program point.
+
+\begin{definition}[Global CSE]\label{def:global-cse}
+\textbf{Global CSE} replaces a computation of $e$ at point $p$ with a reference to a previous computation of $e$ if $e$ is \emph{available} at $p$ (i.e., $e$ was computed on every path reaching $p$ and no operand was modified since).
+\end{definition}
+
+\section{Dead Code Elimination}\label{sec:global-dce}
+
+\subsection{Overview}\label{sec:dce-overview}
+
+\emph{Dead code elimination} (DCE) removes code whose results are never used.
+
+\begin{definition}[Dead Code]\label{def:dead-code}
+A computation is \textbf{dead} if its result is never used. An instruction is dead if:
+\begin{itemize}
+  \item It has no side effects (no memory writes, no I/O, no exceptions).
+  \item Its result is not used by any live instruction.
+\end{itemize}
+\end{definition}
+
+\subsection{Iterative DCE}\label{sec:iterative-dce}
+
+\begin{algorithm}[H]
+\caption{Iterative Dead Code Elimination}
+\label{alg:dce}
+\begin{algorithmic}[1]
+\Require Program $P$
+\Ensure Program with dead code removed
+\State Mark all instructions as ``dead''
+\State Mark all instructions with side effects as ``live''
+\Repeat
+  \ForAll{instructions $i$ marked ``live''}
+    \ForAll{operands $x$ of $i$}
+      \State Mark the definition of $x$ as ``live''
+    \EndFor
+  \EndFor
+\Until{no new instructions are marked live}
+\State Remove all instructions still marked ``dead''
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Unreachable Code Elimination}\label{sec:unreachable}
+
+\emph{Unreachable code elimination} removes basic blocks that cannot be reached from the entry.
+
+\begin{definition}[Unreachable Code]\label{def:unreachable}
+A basic block $B$ is \textbf{unreachable} if there is no path from the entry block to $B$ in the CFG.
+\end{definition}
+
+Unreachable code is detected by a simple reachability analysis (DFS or BFS from the entry).
+
+\section{Copy Propagation}\label{sec:copy-propagation}
+
+\subsection{Overview}\label{sec:copy-prop-overview}
+
+\emph{Copy propagation} replaces uses of a variable $x$ with the variable $y$ when $x$ is a copy of $y$ (i.e., $x = y$ was executed and neither has been modified since).
+
+\begin{definition}[Copy Propagation]\label{def:copy-prop}
+\textbf{Copy propagation} replaces a use of $x$ with $y$ if there is an available copy $x = y$ at that point (i.e., $x = y$ was executed and neither $x$ nor $y$ has been redefined since).
+\end{definition}
+
+\subsection{Available Copies Analysis}\label{sec:available-copies}
+
+The dataflow analysis for copy propagation tracks \emph{available copies}: pairs $(x, y)$ such that $x = y$ has been executed and neither $x$ nor $y$ has been subsequently modified.
+
+\begin{definition}[Available Copies]\label{def:avail-copies}
+A copy $x = y$ is \textbf{available} at point $p$ if on every path from the entry to $p$, the copy $x = y$ is executed and neither $x$ nor $y$ is subsequently modified.
+\end{definition}
+
+\subsection{Interaction with Other Optimizations}\label{sec:copy-interaction}
+
+Copy propagation often enables further optimizations:
+\begin{itemize}
+  \item After copy propagation, the copy instruction $x = y$ may become dead (if $x$ is no longer used).
+  \item Copy propagation can expose constants for constant folding.
+  \item Copy propagation can expose common subexpressions for CSE.
+\end{itemize}
+
+\section{Loop-Invariant Code Motion}\label{sec:licm}
+
+\subsection{Overview}\label{sec:licm-overview}
+
+\emph{Loop-invariant code motion} (LICM) moves computations that produce the same value in every iteration of a loop to before the loop.
+
+\begin{definition}[Loop-Invariant Computation]\label{def:loop-invariant}
+A computation $e$ is \textbf{loop-invariant} in loop $L$ if it produces the same value in every iteration of $L$. This holds if:
+\begin{itemize}
+  \item All operands of $e$ are loop-invariant (either constants or defined outside the loop with loop-invariant values), or
+  \item $e$ is defined in the loop but only by loop-invariant computations.
+\end{itemize}
+\end{definition}
+
+\subsection{Implementation}\label{sec:licm-impl}
+
+\begin{algorithm}[H]
+\caption{Loop-Invariant Code Motion}
+\label{alg:licm}
+\begin{algorithmic}[1]
+\Require Loop $L$ with preheader $B_\mathit{pre}$
+\Ensure Loop-invariant computations moved to preheader
+\State Compute loop-invariant statements iteratively:
+\State $\mathit{invariant} \gets \{s \mid \text{all operands of } s \text{ are constants or defined outside } L\}$
+\Repeat
+  \State $\mathit{invariant}_{\mathit{old}} \gets \mathit{invariant}$
+  \State $\mathit{invariant} \gets \mathit{invariant} \cup \{s \in L \mid \text{all operands of } s \text{ are in } \mathit{invariant}\}$
+\Until{$\mathit{invariant} = \mathit{invariant}_{\mathit{old}}$}
+\ForAll{statements $s \in \mathit{invariant}$}
+  \If{$s$ has no side effects and its result is used in $L$}
+    \State Move $s$ to the preheader $B_\mathit{pre}$
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Safety Conditions}\label{sec:licm-safety}
+
+Moving a computation out of a loop is safe only if:
+\begin{enumerate}
+  \item The computation has no side effects (or its side effects are acceptable outside the loop).
+  \item The computation does not raise an exception that would not have been raised inside the loop.
+  \item The moved computation dominates the loop exit (or the result is only used inside the loop).
+\end{enumerate}
+
+\section{Sparse Evaluation (SSA-Based Optimization)}\label{sec:sparse-eval}
+
+\subsection{SSA Form}\label{sec:ssa-form}
+
+\emph{Static Single Assignment} (SSA) form is a program representation where each variable is assigned exactly once. SSA form makes dataflow information explicit through $\phi$-functions.
+
+\begin{definition}[SSA Form]\label{def:ssa}
+A program is in \textbf{static single assignment} (SSA) form if every variable is defined exactly once. At control-flow merge points, $\phi$-functions select the appropriate value:
+\[
+x = \phi(x_1, x_2, \ldots, x_k)
+\]
+means $x$ takes the value of $x_i$ if control arrived from the $i$-th predecessor.
+\end{definition}
+
+\subsection{SSA-Based Optimization}\label{sec:ssa-optimization}
+
+In SSA form, many optimizations become simpler:
+\begin{itemize}
+  \item \textbf{Constant propagation}: Follow use-def chains to propagate constants.
+  \item \textbf{Dead code elimination}: Remove definitions with no uses.
+  \item \textbf{Copy propagation}: Eliminate copies by merging variables (SSA coalescing).
+  \item \textbf{Global value numbering}: Identify equivalent expressions through the SSA graph.
+\end{itemize}
+
+\begin{definition}[Sparse Problem]\label{def:sparse-problem-global}
+A dataflow problem is \textbf{sparse} if the transfer function is the identity at most program points. In SSA form, only $\phi$-functions and definitions have non-trivial transfer functions, making the analysis sparse.
+\end{definition}
+
+The \emph{sparse evaluation} approach computes dataflow information only at the ``interesting'' points ($\phi$-functions and definitions) and propagates it through the use-def chains. This can be dramatically more efficient than evaluating at every program point.
+
+\begin{historical}
+Global dataflow optimization has been a central topic in compiler research since the 1970s. The classic paper by Cocke and Schwartz~\cite{cocke1970programming} (1970) laid the foundation for global optimization using dataflow analysis. The SSA form, introduced by Cytron et al.~\cite{cytron1991efficient} (1991), revolutionized compiler optimization by making dataflow information explicit. Sparse evaluation, developed by Weise and Crew~\cite{weise1993efficient} (1993) and later by Click~\cite{click1995combining} (1995), exploits the sparsity of SSA form to compute dataflow information efficiently. Modern compilers like LLVM and GCC apply these optimizations as standard passes.
+\end{historical}
+
+\section{Global Value Numbering}\label{sec:gcvn}
+
+\emph{Global value numbering} (GVN) is a powerful optimization that identifies expressions that compute the same value, even if they are syntactically different.
+
+\begin{definition}[Value Number]\label{def:value-number}
+A \textbf{value number} is an identifier assigned to an expression such that two expressions have the same value number if and only if they are guaranteed to compute the same value. GVN assigns value numbers to all expressions in the program.
+\end{definition}
+
+\begin{definition}[Global Value Numbering]\label{def:gcvn}
+\textbf{Global value numbering} extends local value numbering across basic block boundaries. Two expressions at different program points receive the same value number if they are guaranteed to compute the same value at their respective points.
+\end{definition}
+
+\subsection{GVN with $\phi$-functions}\label{sec:gcvn-phi}
+
+In SSA form, GVN must handle $\phi$-functions. A $\phi$-function $x = \phi(x_1, x_2, \ldots, x_k)$ has the same value as all of its operands if they all have the same value number.
+
+\begin{example}[GVN with $\phi$]\label{ex:gcvn-phi}
+\begin{verbatim}
+  // Block 1:
+  a = 5;
+  
+  // Block 2:
+  b = 5;
+  
+  // Block 3 (merge):
+  c = phi(a, b)  // Both a and b have value number for 5
+  // Therefore c also has value number for 5
+\end{verbatim}
+\end{example}
+
+\section{Partial Redundancy Elimination}\label{sec:pre}
+
+\emph{Partial redundancy elimination} (PRE) is a general optimization that subsumes CSE, LICM, and other redundancy-eliminating transformations.
+
+\begin{definition}[Partial Redundancy]\label{def:partial-redundancy}
+A computation is \textbf{partially redundant} at a program point if it can be made redundant (available on all paths) by inserting the computation on some paths where it is not currently computed.
+\end{definition}
+
+PRE uses a combination of forward and backward dataflow analyses to determine where to insert computations to eliminate redundancy.
+
+\section{Summary}\label{sec:global-dataflow-summary}
+
+Global dataflow optimizations exploit information computed by dataflow analysis to transform the program across basic block boundaries. The major optimizations---constant propagation, CSE, dead code elimination, copy propagation, and loop-invariant code motion---are all instances of the general dataflow framework. Global value numbering identifies semantically equivalent expressions across blocks. Partial redundancy elimination subsumes CSE and LICM in a unified framework. SSA form simplifies these optimizations by making dataflow information explicit through use-def chains and $\phi$-functions. Sparse evaluation exploits the structure of SSA form to compute dataflow information efficiently. Together, these optimizations form the backbone of the middle-end of modern optimizing compilers.
+
+\section{Sparse Evaluation in Detail}\label{sec:sparse-evaluation-detail}
+
+\emph{Sparse evaluation} exploits the structure of SSA form to compute dataflow information only at points where it is relevant, rather than at every program point.
+
+\begin{definition}[Sparse Problem]\label{def:sparse-problem}
+A dataflow problem is \textbf{sparse} if the dataflow values at a program point depend only on the values at the definitions that reach that point, not on all program points. In SSA form, each use of a variable is reached by exactly one definition (the $\phi$-function or assignment that defines the SSA name).
+\end{definition}
+
+\begin{definition}[Sparse Evaluation Representation]\label{def:sparse-rep}
+In \textbf{sparse evaluation}, dataflow information is stored only at:
+\begin{itemize}
+  \item \textbf{Definition points}: Where a variable is assigned.
+  \item \textbf{$\phi$-function locations}: Where control flow merges.
+  \item \textbf{Use points}: Where a variable is read.
+\end{itemize}
+Basic blocks that neither define, $\phi$-merge, nor use the variable are skipped entirely.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Sparse Constant Propagation}
+\label{alg:sparse-constprop}
+\begin{algorithmic}[1]
+\Require SSA-form program, lattice of constants $L$
+\ensure Constant value for each SSA name
+\State Initialize: $val(v) \gets \bot$ for all SSA names $v$
+\State $W \gets$ all definition points
+\While{$W \neq \emptyset$}
+  \State Remove definition $d: v = f(u_1, \ldots, u_k)$ from $W$
+  \State $val^{new}(v) \gets f_L(val(u_1), \ldots, val(u_k))$
+  \If{$v$ is a $\phi$-function: $v = \phi(v_1, v_2, \ldots, v_m)$}
+    \State $val^{new}(v) \gets \bigsqcup_i val(v_i)$
+  \EndIf
+  \If{$val^{new}(v) \neq val(v)$}
+    \State $val(v) \gets val^{new}(v)$
+    \ForAll{uses $u$ of $v$}
+      \If{$u$ is a definition $d'$}
+        \State Add $d'$ to $W$
+      \ElsIf{$u$ is in a $\phi$-function at block $B$}
+        \State Add the $\phi$-function at $B$ to $W$
+      \EndIf
+    \EndFor
+  \EndIf
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Sparse Evaluation Complexity]\label{thm:sparse-complexity}
+Sparse evaluation computes the same result as dense evaluation but in time proportional to the number of definitions and uses, rather than the number of program points. For constant propagation in SSA form, this is $O(|V| \cdot |E|)$ where $|V|$ is the number of SSA names and $|E|$ is the number of edges in the SSA graph.
+\end{theorem}
+
+\section{SSA-Based Optimizations}\label{sec:ssa-optimizations}
+
+SSA form enables several powerful optimization techniques that are difficult or inefficient in non-SSA form.
+
+\subsection{SSA-Based Global Value Numbering}\label{sec:ssa-gvn}
+
+\begin{definition}[SSA-Based GVN]\label{def:ssa-gvn}
+In SSA form, \textbf{global value numbering} can exploit the fact that each SSA name has a unique definition. Two SSA names have the same value number if they are defined by equivalent expressions with equivalent operands.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{SSA-Based Global Value Numbering}
+\label{alg:ssa-gvn}
+\begin{algorithmic}[1]
+\Require SSA-form program
+\Ensure Value number for each SSA name
+\State $VN \gets$ empty hash table
+\ForAll{SSA names $v$ in topological order of SSA graph}
+  \If{$v = c$ (constant)}
+    \State $VN[v] \gets \text{hash}(c)$
+  \ElsIf{$v = u_1 \oplus u_2$}
+    \State $e \gets (\oplus, VN[u_1], VN[u_2])$ \Comment{Canonical form}
+    \If{$e \in VN$}
+      \State $VN[v] \gets VN[e]$ \Comment{Same value as previous}
+    \Else
+      \State $VN[v] \gets \text{new value number}$
+      \State $VN[e] \gets VN[v]$
+    \EndIf
+  \ElsIf{$v = \phi(v_1, \ldots, v_k)$}
+    \State $VN[v] \gets$ value number based on $VN[v_1], \ldots, VN[v_k]$
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{SSA-Based Dead Code Elimination}\label{sec:ssa-dce}
+
+\begin{definition}[SSA-Based DCE]\label{def:ssa-dce}
+In SSA form, \textbf{dead code elimination} is simplified: a definition $v = e$ is dead if $v$ has no uses. Since each use has exactly one reaching definition, there is no ambiguity about which definition to remove.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{SSA-Based Dead Code Elimination}
+\label{alg:ssa-dce}
+\begin{algorithmic}[1]
+\Require SSA-form program
+\Ensure Program with dead code removed
+\State Mark all definitions with uses as ``needed''
+\State $W \gets$ all side-effecting definitions (stores, calls, etc.)
+\While{$W \neq \emptyset$}
+  \State Remove $d$ from $W$
+  \ForAll{operands $u$ of $d$}
+    \If{$u$'s definition is not marked}
+      \State Mark $u$'s definition as needed
+      \State Add $u$'s definition to $W$
+    \EndIf
+  \EndFor
+\EndWhile
+\State Remove all unmarked definitions
+\end{algorithmic}
+\end{algorithm}
+
+\section{Loop-Invariant Code Motion in SSA}\label{sec:ssa-licm}
+
+\begin{definition}[SSA-Based LICM]\label{def:ssa-licm}
+In SSA form, \textbf{loop-invariant code motion} identifies definitions whose operands are all defined outside the loop. Such definitions can be hoisted to the loop preheader.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{SSA-Based Loop-Invariant Code Motion}
+\label{alg:ssa-licm}
+\begin{algorithmic}[1]
+\Require SSA-form program with loop $L$ and preheader $B_{pre}$
+\Ensure Loop-invariant code hoisted to $B_{pre}$
+\State Compute dominator tree and loop nesting
+\ForAll{definitions $v = e$ in $L$}
+  \If{all operands of $e$ are defined outside $L$}
+    \State Hoist $v = e$ to $B_{pre}$
+    \State Update SSA: $v$ is now defined in $B_{pre}$
+  \EndIf
+\EndFor
+\State Fix $\phi$-functions at loop header if needed
+\end{algorithmic}
+\end{algorithm}
+
+\section{Partial Redundancy Elimination in SSA}\label{sec:ssa-pre}
+
+\emph{Partial redundancy elimination} (PRE) in SSA form uses the \emph{value numbering} framework to identify and eliminate redundant computations.
+
+\begin{definition}[SSA-PRE]\label{def:ssa-pre}
+\textbf{SSA-PRE} extends value numbering to express anticipation: a computation is \emph{anticipated} at a point if it will be used on all paths from that point forward. PRE inserts computations at points where they are anticipated but not yet available.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{SSA-Based PRE (Simplification)}
+\label{alg:ssa-pre}
+\begin{algorithmic}[1]
+\Require SSA-form program
+\ensure Redundant computations eliminated
+\State Compute value numbers for all expressions
+\ForAll{expressions $e$ with value number $vn$}
+  \State Find all definitions of $vn$
+  \State Find all uses of $vn$
+  \If{some uses are not dominated by any single definition}
+    \State Insert $\phi$-like expressions at dominance frontiers
+    \State Hoist computation to earliest anticipable point
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[SSA-PRE Correctness]\label{thm:ssa-pre-correct}
+SSA-PRE is equivalent to the classical PRE algorithm of Morel and Renvoise but operates directly on the SSA graph, avoiding the need for separate forward and backward dataflow analyses. The result is the same set of code motions, computed more efficiently.
+\end{theorem}
+
+\section{Global Optimization Pass Ordering}\label{sec:pass-ordering}
+
+The order in which global optimizations are applied significantly affects the quality of the generated code.
+
+\begin{definition}[Phase Ordering Problem]\label{def:phase-ordering}
+The \textbf{phase ordering problem} is the problem of determining the optimal sequence of optimization passes. Different orderings can produce different code quality, and finding the optimal ordering is undecidable in general.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{ll}
+\hline
+\textbf{Pass} & \textbf{Typical Position} \\
+\hline
+Mem2Reg (SSA construction) & First \\
+Instruction combining & Early \\
+SCCP (sparse constant prop.) & Early, iterated \\
+GVN/PRE & Middle \\
+Dead code elimination & After each major pass \\
+Loop-invariant code motion & After loop detection \\
+Loop unrolling & Middle-late \\
+Vectorization & Late (after loop opts) \\
+Tail call elimination & Late \\
+\hline
+\end{tabular}
+\caption{Typical pass ordering in modern compilers (LLVM-style).}
+\label{tab:pass-ordering}
+\end{table}

@@ -1,0 +1,479 @@
+%%
+%% chapter-71.ltx — Widening and Narrowing
+%%
+
+\section{Introduction}\label{sec:widening-narrowing-intro}
+
+When the abstract domain has infinite ascending chains---as do the interval and polyhedra domains---naive iteration may never terminate. Consider a loop that increments a counter: the interval for the counter grows by 1 at each iteration, producing an infinite ascending chain $[0,0] \sqsubseteq [0,1] \sqsubseteq [0,2] \sqsubseteq \cdots$. \emph{Widening} is the key technique for ensuring termination on such domains: it forces convergence by jumping to an over-approximation of the limit. \emph{Narrowing} then recovers precision lost by widening.
+
+The theory of widening and narrowing was introduced by Cousot and Cousot~\cite{cousot1979constructive} in 1979 and remains one of the most important practical tools in abstract interpretation.
+
+\section{The Problem of Infinite Ascending Chains}\label{sec:infinite-chains}
+
+\begin{definition}[Ascending Chain Condition]\label{def:acc}
+A lattice $L$ satisfies the \textbf{ascending chain condition} (ACC) if every ascending chain $x_1 \sqsubseteq x_2 \sqsubseteq \cdots$ is eventually stationary: there exists $N$ such that $x_n = x_N$ for all $n \geq N$.
+\end{definition}
+
+Many useful abstract domains do \emph{not} satisfy ACC:
+
+\begin{itemize}
+  \item The interval domain: $[0,0] \sqsubset [0,1] \sqsubset [0,2] \sqsubset \cdots$
+  \item The polyhedra domain: infinitely many increasingly precise polyhedra
+  \item The domain of finite sets of integers under subset ordering
+\end{itemize}
+
+For these domains, Kleene iteration may produce an infinite ascending chain that never reaches a fixedpoint. Widening solves this problem by artificially forcing convergence.
+
+\section{Widening Operators: Definition and Examples}\label{sec:widening-operators}
+
+\begin{definition}[Widening Operator]\label{def:widening}
+A \textbf{widening operator} on a lattice $L$ is a function $\nabla : L \times L \to L$ satisfying:
+\begin{enumerate}
+  \item $x \sqsubseteq x \nabla y$ (extensiveness: widening only increases)
+  \item $y \sqsubseteq x \nabla y$ (upper bound: widening is an upper bound)
+  \item For any ascending chain $x_0 \sqsubseteq x_1 \sqsubseteq \cdots$, the sequence defined by $y_0 = x_0$, $y_{n+1} = y_n \nabla x_{n+1}$ is eventually stationary.
+\end{enumerate}
+\end{definition}
+
+The third condition is the crucial one: it ensures that widening forces any ascending chain to converge in finitely many steps.
+
+\subsection{Widening for Intervals}\label{sec:interval-widening}
+
+\begin{definition}[Interval Widening]\label{def:interval-widening}
+The standard widening for the interval domain is:
+\[
+[a_1, b_1] \nabla [a_2, b_2] = [a, b]
+\]
+where:
+\[
+a = \begin{cases} a_1 & \text{if } a_2 \geq a_1 \\ -\infty & \text{if } a_2 < a_1 \end{cases}
+\qquad
+b = \begin{cases} b_1 & \text{if } b_2 \leq b_1 \\ +\infty & \text{if } b_2 > b_1 \end{cases}
+\]
+\end{definition}
+
+\begin{example}[Interval Widening]\label{ex:interval-widen}
+Consider the loop:
+\begin{verbatim}
+  i = 0;
+  while (i < 100) {
+    i = i + 1;
+  }
+\end{verbatim}
+The iteration produces:
+\begin{align*}
+  y_0 &= [0, 0] \\
+  y_1 &= y_0 \nabla [0, 1] = [0, 1] \quad \text{(upper bound increased, so } +\infty) \\
+  \text{Actually: } y_1 &= [0, +\infty] \quad \text{(since } 1 > 0, \text{ upper bound goes to } +\infty)
+\end{align*}
+Wait, let me be precise: $y_0 = [0,0]$, after one iteration the body gives $[0,1]$. Since $1 > 0$ (the upper bound increased), widening gives $[0, +\infty]$. The next iteration gives $[0, +\infty] \nabla [0, +\infty] = [0, +\infty]$ (stable). The loop condition $i < 100$ refines this to $[0, 99]$.
+\end{example}
+
+\subsection{Widening for Polyhedra}\label{sec:polyhedra-widening}
+
+\begin{definition}[Polyhedra Widening]\label{def:polyhedra-widening}
+The standard widening for polyhedra is \textbf{constraint removal}:
+\[
+P_1 \nabla P_2 = \text{the largest face of } P_2 \text{ that contains all constraints of } P_1 \text{ that are satisfied by all of } P_2
+\]
+In practice: a constraint of $P_2$ is kept only if it is also a constraint of $P_1$ (or is implied by the kept constraints).
+\end{definition}
+
+\begin{example}[Polyhedra Widening]\label{ex:polyhedra-widen}
+Consider:
+\begin{verbatim}
+  i = 0; j = 0;
+  while (i < n) {
+    i = i + 1;
+    j = j + 2;
+  }
+\end{verbatim}
+After $k$ iterations, the polyhedron is $\{i = k, j = 2k, i \geq 0, j \geq 0\}$. Widening removes the constraints $i = k$ and $j = 2k$ (since they change between iterations) but keeps $i \geq 0$ and $j \geq 0$. The result is $\{i \geq 0, j \geq 0\}$, which is then refined by the loop guard to $\{0 \leq i < n, j = 2i\}$.
+\end{example}
+
+\section{Narrowing for Precision Recovery}\label{sec:narrowing-precision}
+
+Widening often loses significant precision. \emph{Narrowing} is a post-processing step that iteratively refines the widened solution.
+
+\begin{definition}[Narrowing Operator]\label{def:narrowing}
+A \textbf{narrowing operator} $\triangle : L \times L \to L$ satisfies:
+\begin{enumerate}
+  \item If $y \sqsubseteq x$, then $y \sqsubseteq x \triangle y \sqsubseteq x$
+  \item For any descending chain $x_0 \sqsupseteq x_1 \sqsupseteq \cdots$, the sequence $y_0 = x_0$, $y_{n+1} = y_n \triangle x_{n+1}$ is eventually stationary.
+\end{enumerate}
+\end{definition}
+
+\subsection{Narrowing for Intervals}\label{sec:interval-narrowing}
+
+\begin{definition}[Interval Narrowing]\label{def:interval-narrowing}
+The standard narrowing for intervals replaces $-\infty$ and $+\infty$ bounds with finite values when possible:
+\[
+[a_1, b_1] \triangle [a_2, b_2] = [a, b]
+\]
+where:
+\[
+a = \begin{cases} a_2 & \text{if } a_1 = -\infty \\ a_1 & \text{otherwise} \end{cases}
+\qquad
+b = \begin{cases} b_2 & \text{if } b_1 = +\infty \\ b_1 & \text{otherwise} \end{cases}
+\]
+\end{definition}
+
+\begin{example}[Interval Narrowing]\label{ex:interval-narrow}
+After widening, we have $i \in [0, +\infty]$. The loop guard $i < 100$ gives $i \in [0, 99]$. Narrowing: $[0, +\infty] \triangle [0, 99] = [0, 99]$. The infinite upper bound is replaced by the finite bound from the guard.
+\end{example}
+
+\subsection{Convergence of Narrowing}\label{sec:narrowing-convergence}
+
+\begin{theorem}[Narrowing Convergence]\label{thm:narrowing-conv}
+Narrowing produces a descending chain that is eventually stationary. However, it may not reach the least fixedpoint---it converges to a post-fixedpoint that is sound but potentially imprecise.
+\end{theorem}
+
+In practice, narrowing is applied for a fixed number of iterations (typically 2--3) or until no further refinement is possible.
+
+\section{Delayed Widening}\label{sec:delayed-widening}
+
+Applying widening too early can lose precision unnecessarily. \emph{Delayed widening} postpones the application of widening until the iteration has stabilized for a few steps.
+
+\begin{definition}[Delayed Widening]\label{def:delayed-widening}
+\textbf{Delayed widening} with delay $d$ applies widening only after the value at a program point has remained unchanged for $d$ consecutive iterations. Formally:
+\[
+y_{n+1} = \begin{cases}
+  F(y_n) & \text{if } F(y_n) = F(y_{n-1}) = \cdots = F(y_{n-d}) \\
+  y_n \nabla F(y_n) & \text{otherwise}
+\end{cases}
+\]
+\end{definition}
+
+\begin{example}[Delayed Widening]\label{ex:delayed-widen}
+Consider a loop that first increments a counter and then stabilizes:
+\begin{verbatim}
+  i = 0;
+  while (i < 3) {
+    i = i + 1;
+  }
+\end{verbatim}
+With delay $d = 3$, widening is not applied until after iteration 3. By that time, the counter has reached its final value $i = 3$, and no widening is needed. The result is $i \in [3, 3]$ (exact) instead of $i \in [0, +\infty]$ (widened).
+\end{example}
+
+\section{Widening with Thresholds}\label{sec:widening-thresholds}
+
+Instead of jumping directly to $+\infty$, \emph{widening with thresholds} uses a finite set of threshold values.
+
+\begin{definition}[Widening with Thresholds]\label{def:threshold-widening}
+Given a set of thresholds $T = \{t_1, t_2, \ldots, t_k\}$ (with $t_1 < t_2 < \cdots < t_k$), the widening for intervals is:
+\[
+[a_1, b_1] \nabla_T [a_2, b_2] = [a, b]
+\]
+where $b$ is the smallest threshold $t_i \in T$ such that $t_i \geq b_2$, or $+\infty$ if no such threshold exists.
+\end{definition}
+
+\begin{example}[Threshold Widening]\label{ex:threshold-widen}
+With thresholds $T = \{1, 2, 4, 8, 16, 32, 64, 128, 256\}$:
+\begin{verbatim}
+  i = 0;
+  while (i < 100) { i = i + 1; }
+\end{verbatim}
+The widening sequence is: $[0,0] \to [0,1] \to [0,2] \to [0,4] \to [0,8] \to [0,16] \to [0,32] \to [0,64] \to [0,128] \to [0,128]$ (stable). Then the loop guard refines to $[0, 99]$. The result is more precise than standard widening ($[0, +\infty]$) while still terminating.
+\end{example}
+
+\subsection{Choosing Thresholds}\label{sec:choosing-thresholds}
+
+The choice of thresholds affects both precision and performance:
+\begin{itemize}
+  \item \textbf{Powers of 2}: $\{1, 2, 4, 8, 16, \ldots\}$ --- good for loops with exponential behavior.
+  \item \textbf{Linear}: $\{10, 20, 30, \ldots\}$ --- good for loops with linear bounds.
+  \item \textbf{Program-derived}: Extract thresholds from loop bounds in the source code.
+\end{itemize}
+
+\section{Practical Considerations}\label{sec:widening-practical}
+
+\subsection{Widening on the Right Side}\label{sec:right-widening}
+
+The widening operator is not commutative: $x \nabla y \neq y \nabla x$ in general. The standard convention is $x \nabla y$ where $x$ is the previous value and $y$ is the new value ($y \sqsupseteq x$).
+
+\subsection{Combining Widening Strategies}\label{sec:combining-strategies}
+
+In practice, multiple widening strategies are combined:
+\begin{enumerate}
+  \item Start with delayed widening (delay $d = 2$ or $3$).
+  \item Use threshold widening instead of jumping to infinity.
+  \item Apply narrowing for 2--3 iterations after widening converges.
+\end{enumerate}
+
+\subsection{Widening in the Presence of Joins}\label{sec:widening-joins}
+
+When multiple paths merge at a control-flow join point, widening must be applied carefully. The standard approach is to widen only at loop headers (back edges in the CFG), not at general join points.
+
+\begin{definition}[Widening Points]\label{def:widening-points}
+\textbf{Widening points} are the set of program points where widening is applied. Typically, these are:
+\begin{itemize}
+  \item Loop headers (targets of back edges)
+  \item Widening is \emph{not} applied at general if-then-else merge points
+\end{itemize}
+\end{definition}
+
+\begin{insight}
+Widening is one of the most important ideas in practical static analysis. Without it, analyses on infinite domains would never terminate. With it, we can analyze programs with arbitrary loops and data structures. The art lies in choosing the right widening strategy: too aggressive (jumping to infinity immediately) loses too much precision; too conservative (delaying too long) takes too many iterations. Threshold widening and delayed widening provide a good balance for most applications.
+\end{insight}
+
+\begin{historical}
+Widening and narrowing were introduced by Cousot and Cousot in 1979~\cite{cousot1979constructive} as part of the abstract interpretation framework. The concept was inspired by the theory of extrapolation in numerical analysis. The application of widening to the polyhedra domain was developed by Halbwachs~\cite{halbwachs1993automatic} (1993). Threshold widening was proposed by Halbwachs and Henry~\cite{halbwachs2010delayed} (2010) as a way to improve precision without sacrificing termination. Modern tools like Astr\'ee use sophisticated combinations of widening strategies, including per-variable widening thresholds derived from the program's loop bounds.
+\end{historical}
+
+\section{Widening in Relational Domains}\label{sec:relational-widening}
+
+\subsection{Octagon Widening}\label{sec:octagon-widening}
+
+Widening for the octagon domain applies interval widening to each constraint independently:
+
+\begin{definition}[Octagon Widening]\label{def:octagon-widening}
+For each constraint $\pm x_i \pm x_j \leq c$ in the octagon:
+\begin{itemize}
+  \item If the bound $c$ increases (becomes less restrictive), apply interval widening: set $c = +\infty$.
+  \item If the bound $c$ stays the same or decreases, keep it.
+\end{itemize}
+\end{definition}
+
+\subsection{Polyhedra Widening Variants}\label{sec:polyhedra-widening-variants}
+
+Several variants of polyhedra widening have been developed:
+
+\begin{itemize}
+  \item \textbf{Standard widening}: Remove constraints that are not stable.
+  \item \textbf{Widening with thresholds}: Only remove constraints when they exceed a threshold.
+  \item \textbf{Widening with convergence acceleration}: Use extrapolation to predict the limit.
+  \item \textbf{Localized widening}: Only widen constraints involving loop variables.
+\end{itemize}
+
+\section{Practical Guidelines for Widening}\label{sec:widening-guidelines}
+
+Based on experience with industrial-strength analyzers like Astr\'ee, the following guidelines have emerged:
+
+\begin{enumerate}
+  \item \textbf{Always use threshold widening} instead of jumping to infinity. Choose thresholds based on loop bounds in the source code.
+  \item \textbf{Delay widening} by 2--3 iterations to allow simple loops to converge without widening.
+  \item \textbf{Apply narrowing} for 2--3 iterations after widening to recover precision.
+  \item \textbf{Widen only at loop headers}, not at general join points.
+  \item \textbf{Use per-variable widening}: different variables may need different widening strategies.
+  \item \textbf{Monitor convergence}: if the analysis is taking too many iterations, increase the aggressiveness of widening.
+\end{enumerate}
+
+\section{Summary}\label{sec:widening-summary}
+
+Widening and narrowing are the key techniques for ensuring termination and recovering precision in abstract interpretation over infinite domains. Widening forces convergence by jumping to an over-approximation of the limit of an ascending chain. Narrowing iteratively refines the widened solution to recover lost precision. Delayed widening and threshold widening provide practical improvements in precision. Widening in relational domains (octagons, polyhedra) requires careful handling of constraint stability. Practical guidelines from industrial analyzers suggest using threshold widening, delayed widening, and narrowing in combination. The choice of widening strategy is a critical design decision in building a static analyzer.
+
+\section{Delayed Widening}\label{sec:delayed-widening}
+
+\emph{Delayed widening} postpones the application of widening for a fixed number of iterations, allowing simple loops to converge without widening.
+
+\begin{definition}[Delayed Widening]\label{def:delayed-widening}
+\textbf{Delayed widening} applies the standard join operation for the first $d$ iterations at a loop header, and only begins applying widening after iteration $d$. Formally:
+\[
+x^{n+1} = \begin{cases}
+x^n \sqcup f(x^n) & \text{if } n < d \\
+x^n \nabla f(x^n) & \text{if } n \geq d
+\end{cases}
+\]
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Fixpoint with Delayed Widening}
+\label{alg:delayed-widening}
+\begin{algorithmic}[1]
+\Require Loop header $h$, transfer function $f_h$, delay $d$
+\Ensure Widened fixpoint at $h$
+\State $x^0 \gets \bot$; $n \gets 0$
+\Repeat
+  \State $x^{new} \gets f_h(x^n)$
+  \If{$n < d$}
+    \State $x^{n+1} \gets x^n \sqcup x^{new}$ \Comment{Standard join}
+  \Else
+    \State $x^{n+1} \gets x^n \nabla x^{new}$ \Comment{Widening}
+  \EndIf
+  \State $n \gets n + 1$
+\Until{$x^{n} = x^{n-1}$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Delayed Widening Benefit]\label{ex:delayed-benefit}
+\begin{verbatim}
+  // Loop: x = 0; while (x < 3) { x = x + 1; }
+  
+  // Without delay (widening from iteration 1):
+  // x⁰ = [0, 0], x¹ = [0, 1], x² = [0, 1] ∇ [0, 2] = [0, +∞]
+  // Result: x ∈ [0, +∞]  (imprecise!)
+  
+  // With delay d = 3:
+  // x⁰ = [0, 0], x¹ = [0, 1], x² = [0, 2], x³ = [0, 3]
+  // x⁴ = [0, 3] ∇ [0, 4] = [0, +∞]
+  // But x³ already converged to [0, 3] (loop exits at x = 3)
+  // Result: x ∈ [0, 3]  (precise!)
+\end{verbatim}
+\end{example}
+
+\begin{theorem}[Delayed Widening Termination]\label{thm:delayed-termination}
+Delayed widening with delay $d$ still terminates for any ascending chain satisfying the ascending chain condition on the abstract domain, because after the delay, standard widening guarantees convergence.
+\end{theorem}
+
+\section{Threshold Widening}\label{sec:threshold-widening-detail}
+
+\emph{Threshold widening} restricts widening to a set of predetermined threshold values, preventing the analysis from jumping to infinity prematurely.
+
+\begin{definition}[Threshold Widening]\label{def:threshold-widening}
+Given a set of thresholds $T = \{t_1, t_2, \ldots, t_k\}$ (with $t_1 < t_2 < \cdots < t_k < +\infty$), the \textbf{threshold widening} for intervals is:
+\[
+[a, b] \nabla_T [a', b'] = \begin{cases}
+[a, b'] & \text{if } b' \leq t_i \text{ for some } t_i \geq b \\
+[a, t_i] & \text{where } t_i = \min\{t \in T \mid t \geq b'\} \\
+[a, +\infty] & \text{if } b' > t_k
+\end{cases}
+\]
+\end{definition}
+
+\begin{example}[Threshold Widening]\label{ex:threshold-widening}
+\begin{verbatim}
+  Thresholds: T = {10, 100, 1000}
+  
+  // Iteration sequence:
+  [0, 1] ∇_T [0, 2] = [0, 2]     (2 ≤ 10, no widening needed)
+  [0, 2] ∇_T [0, 3] = [0, 3]     (3 ≤ 10)
+  ...
+  [0, 9] ∇_T [0, 10] = [0, 10]   (10 is a threshold)
+  [0, 10] ∇_T [0, 11] = [0, 100] (11 > 10, jump to next threshold)
+  [0, 100] ∇_T [0, 101] = [0, 1000]
+  [0, 1000] ∇_T [0, 1001] = [0, +∞]
+\end{verbatim}
+\end{example}
+
+\subsection{Automatic Threshold Selection}\label{sec:auto-thresholds}
+
+Thresholds can be selected automatically from the program source:
+
+\begin{definition}[Syntactic Threshold Extraction]\label{def:syntactic-thresholds}
+\textbf{Syntactic threshold extraction} collects all numeric constants appearing in loop conditions as thresholds. For \texttt{while (x < N)}, the threshold is $N$.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Automatic Threshold Extraction}
+\label{alg:threshold-extraction}
+\begin{algorithmic}[1]
+\Require Program $P$ with loop headers $H$
+\Ensure Threshold sets $T_h$ for each $h \in H$
+\ForAll{loop headers $h \in H$}
+  \State $T_h \gets \emptyset$
+  \ForAll{conditions $c$ at $h$}
+    \State Extract constants $k_1, k_2, \ldots$ from $c$
+    \State $T_h \gets T_h \cup \{k_1, k_2, \ldots\}$
+  \EndFor
+  \State Sort $T_h$ in ascending order
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Narrowing Strategies}\label{sec:narrowing-strategies}
+
+Narrowing recovers precision lost during widening. Different strategies offer different tradeoffs.
+
+\subsection{Standard Narrowing}\label{sec:standard-narrowing}
+
+\begin{definition}[Standard Narrowing]\label{def:standard-narrowing}
+After widening converges to $x^*$, \textbf{standard narrowing} iterates:
+\[
+x^{n+1} = x^n \triangle f(x^n)
+\]
+where $\triangle$ is the narrowing operator. For intervals:
+\[
+[a, +\infty] \triangle [a, b] = [a, b]
+\]
+\end{definition}
+
+\subsection{Localized Narrowing}\label{sec:localized-narrowing}
+
+\begin{definition}[Localized Narrowing]\label{def:localized-narrowing}
+\textbf{Localized narrowing} only narrows constraints that involve variables that have changed since the last iteration. This prevents unnecessary narrowing steps and improves efficiency.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Narrowing with Iteration Bound}
+\label{alg:narrowing-bound}
+\begin{algorithmic}[1]
+\Require Widened fixpoint $x^*$, transfer function $F$, max narrowing iterations $m$
+\Ensure Narrowed fixpoint
+\State $x \gets x^*$; $i \gets 0$
+\Repeat
+  \State $x^{new} \gets x \triangle F(x)$
+  \If{$x^{new} = x$}
+    \State \Return $x$
+  \EndIf
+  \State $x \gets x^{new}$
+  \State $i \gets i + 1$
+\Until{$i \geq m$}
+\State \Return $x$ \Comment{Return after max iterations}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Narrowing Convergence]\label{thm:narrowing-convergence}
+Narrowing converges in at most $h$ iterations where $h$ is the height of the abstract domain below the widened fixpoint. For the interval domain with widening to $+\infty$, narrowing converges in at most 1 step per variable.
+\end{theorem}
+
+\section{Widening with Lookahead}\label{sec:widening-lookahead}
+
+\begin{definition}[Widening with Lookahead]\label{def:widening-lookahead}
+\textbf{Widening with lookahead} examines the next few values in the ascending chain to predict the limit more accurately. Instead of jumping to the immediate next threshold, it looks ahead to predict where the chain will stabilize.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Widening with Lookahead}
+\label{alg:widening-lookahead}
+\begin{algorithmic}[1]
+\Require Current value $x^n$, sequence of recent values $x^{n-k}, \ldots, x^n$
+\Ensure Widened value $x^{n+1}$
+\State Compute differences $\delta_i = x^{n-i+1} - x^{n-i}$ for $i = 1, \ldots, k$
+\If{differences are constant ($\delta_1 = \delta_2 = \cdots = \delta_k$)}
+  \State Predict limit: extrapolate linear sequence to next threshold
+  \State \Return threshold-based widening to predicted limit
+\Else
+  \State \Return standard widening
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\section{Practical Widening Configuration}\label{sec:widening-config}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{Configuration} & \textbf{Delay} & \textbf{Thresholds} & \textbf{Narrowing} \\
+\hline
+Conservative & 0 & None ($\to +\infty$) & 1 iteration \\
+Balanced & 2 & From source constants & 3 iterations \\
+Aggressive & 4 & Extended set & 5 iterations \\
+Precision-first & 3 & Dense (10, 50, 100, ...) & Until convergence \\
+\hline
+\end{tabular}
+\caption{Practical widening configurations for different analysis goals.}
+\label{tab:widening-config}
+\end{table}
+
+\begin{tikzpicture}[
+  node distance=1.2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=blue!10},
+  arr/.style={->, thick}
+]
+  \node[block] (init) {Initial $x^0 = \bot$};
+  \node[block, right=2cm of init] (join) {Join $x^n \sqcup f(x^n)$};
+  \node[block, right=2cm of join] (check) {Delay $< d$?};
+  \node[block, right=2cm of check] (widen) {Widen $x^n \nabla_T f(x^n)$};
+  \node[block, below=1cm of widen] (narrow) {Narrow $x \triangle F(x)$};
+  \node[block, left=2cm of narrow] (result) {Result $x^*$};
+  
+  \draw[arr] (init) -- (join);
+  \draw[arr] (join) -- (check);
+  \draw[arr] (check) -- node[above, font=\tiny] {yes} (join);
+  \draw[arr] (check) -- node[above, font=\tiny] {no} (widen);
+  \draw[arr] (widen) -- (narrow);
+  \draw[arr] (narrow) -- (result);
+  
+  \node[font=\small, above=0.3cm of check] {Iteration control};
+\end{tikzpicture}

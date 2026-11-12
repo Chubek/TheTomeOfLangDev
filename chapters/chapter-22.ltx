@@ -1,0 +1,462 @@
+%% chapter-22.ltx — Gradual Typing
+%% Part II: Programming Language Design
+
+%% ============================================================
+%% 22.1 Introduction
+%% ============================================================
+\section{Introduction}\label{sec:gradual-intro}
+
+The choice between static and dynamic typing has traditionally been seen as
+a binary decision: a language is either statically typed (like Haskell or
+Java) or dynamically typed (like Python or Ruby).  But this dichotomy is
+false.  \emph{Gradual typing} provides a spectrum between static and
+dynamic, allowing programmers to choose the appropriate level of type
+checking for each part of their program.
+
+Gradual typing was introduced by Siek and Taha~\cite{siek2006gradual} and
+has since been adopted by TypeScript, Python (via type hints and mypy),
+Hack (Facebook's PHP variant), and many other languages.  It represents one
+of the most significant developments in programming language design in the
+twenty-first century.
+
+In this chapter, we develop the theory and practice of gradual typing.
+We begin with the motivation: why combine static and dynamic typing?  We
+then develop the formal framework: the gradual guarantee, type casts, blame
+tracking, and sound gradual typing.  We survey implementations: Typed
+Racket, TypeScript, and Pyright.
+
+\begin{definition}[Gradual Typing]\label{def:gradual-typing}
+  \emph{Gradual typing} is a type system design that allows each program
+  component to be either statically typed or dynamically typed, with
+  well-defined interactions between the two.  The type $\texttt{?}$ (or
+  \texttt{Any}, \texttt{dynamic}) represents an unknown or untyped value.
+\end{definition}
+
+%% ============================================================
+%% 22.2 Motivation: Dynamic Meets Static
+%% ============================================================
+\section{Motivation: Dynamic Meets Static}\label{sec:gradual-motivation}
+
+\subsection{The Limitations of Pure Approaches}\label{sec:limitations}
+
+\textbf{Purely static typing} has limitations:
+\begin{itemize}
+  \item \textbf{Prototyping}: Type annotations slow down rapid exploration.
+  \item \textbf{Legacy code}: Migrating a large untyped codebase to a
+    typed language is expensive.
+  \item \textbf{Heterogeneous data}: Processing data of unknown or varying
+    types (JSON, configuration files) is awkward.
+  \item \textbf{Metaprogramming}: Reflection, eval, and code generation
+    resist static typing.
+\end{itemize}
+
+\textbf{Purely dynamic typing} has limitations:
+\begin{itemize}
+  \item \textbf{Late error detection}: Type errors are found at runtime,
+    possibly in production.
+  \item \textbf{Documentation}: Without types, the programmer must read
+    the code to understand what a function expects.
+  \item \textbf{Optimization}: The compiler cannot use type information for
+    optimization.
+  \item \textbf{Refactoring}: Without types, large-scale changes are risky.
+\end{itemize}
+
+\subsection{The Gradual Solution}\label{sec:gradual-solution}
+
+Gradual typing offers the best of both worlds:
+\begin{itemize}
+  \item \textbf{Static where it matters}: Critical code paths are
+    statically typed for safety and performance.
+  \item \textbf{Dynamic where needed}: Prototypes, legacy code, and
+    metaprogramming can remain dynamically typed.
+  \item \textbf{Migration path}: Code can be gradually migrated from
+    dynamic to static typing.
+  \item \textbf{Interoperability}: Typed and untyped code can call each
+    other.
+\end{itemize}
+
+\begin{example}[Gradual Typing in Python]\label{ex:gradual-python}
+  \begin{verbatim}
+  # Untyped (dynamic)
+  def process(data):
+      return data["result"]
+  
+  # Gradually typed
+  def process(data: dict[str, Any]) -> Any:
+      return data["result"]
+  
+  # Fully typed
+  def process(data: dict[str, Result]) -> Result:
+      return data["result"]
+  \end{verbatim}
+  The programmer can choose the level of typing for each function.
+\end{example}
+
+%% ============================================================
+%% 22.3 The Gradual Guarantee
+%% ============================================================
+\section{The Gradual Guarantee}\label{sec:gradual-guarantee}
+
+\subsection{The Consistency Relation}\label{sec:consistency}
+
+\begin{definition}[Consistency]\label{def:consistency}
+  Two types $\tau_1$ and $\tau_2$ are \emph{consistent} (written $\tau_1
+  \sim \tau_2$) if they could plausibly be the same type, given that
+  $\texttt{?}$ represents an unknown type:
+  \begin{align*}
+    \texttt{?} & \sim \tau \quad \text{for all } \tau \\
+    \tau & \sim \texttt{?} \quad \text{for all } \tau \\
+    \tau & \sim \tau \quad \text{for all } \tau \\
+    \tau_1 \to \tau_2 & \sim \sigma_1 \to \sigma_2
+      \quad \text{if } \tau_1 \sim \sigma_1 \text{ and } \tau_2 \sim \sigma_2
+  \end{align*}
+\end{definition}
+
+Consistency is reflexive and symmetric but \emph{not transitive}:
+$\Int \sim \texttt{?}$ and $\texttt{?} \sim \Bool$, but $\Int \not\sim \Bool$.
+
+\subsection{The Gradual Guarantee}\label{sec:gradual-guarantee-detail}
+
+\begin{definition}[Gradual Guarantee]\label{def:gradual-guarantee}
+  A gradually typed language satisfies the \emph{gradual guarantee} if:
+  \begin{enumerate}
+    \item \textbf{Dynamic gradual guarantee}: Removing type annotations
+      from a program does not introduce new static errors.  The program
+      behaves as a dynamically typed program.
+    \item \textbf{Static gradual guarantee}: Adding type annotations to a
+      program does not change its dynamic behavior (except to catch errors
+      earlier).
+  \end{enumerate}
+\end{definition}
+
+\begin{theorem}[Gradual Guarantee (Siek and Taha)]\label{thm:gradual-guarantee}
+  Let $p$ be a program and $p'$ be the same program with some type
+  annotations removed (replaced by $\texttt{?}$).  Then:
+  \begin{enumerate}
+    \item If $p$ is statically well-typed, then $p'$ is also well-typed.
+    \item If $p$ evaluates to a value $v$, then $p'$ evaluates to the same
+      value $v$ (modulo casts).
+  \end{enumerate}
+\end{theorem}
+
+\begin{insight}
+The gradual guarantee ensures that adding type annotations is always safe:
+it can only catch more errors, never change the program's behavior.  This
+is what makes gradual typing practical: programmers can add types
+incrementally, with confidence that existing code will continue to work.
+\end{insight}
+
+%% ============================================================
+%% 22.4 Type Casts and Blame Tracking
+%% ============================================================
+\section{Type Casts and Blame Tracking}\label{sec:casts-blame}
+
+\subsection{The Need for Casts}\label{sec:need-for-casts}
+
+When typed and untyped code interact, the boundary between them must be
+enforced.  This is done through \emph{casts}: runtime type checks that
+verify values crossing the boundary.
+
+\begin{definition}[Cast]\label{def:cast}
+  A \emph{cast} $\langle \tau_1 \Rightarrow \tau_2 \rangle^l$ is a runtime
+  operation that checks whether a value of type $\tau_1$ is also of type
+  $\tau_2$.  The label $l$ identifies the source location for error
+  reporting.
+\end{definition}
+
+\begin{example}[Cast at the Boundary]\label{ex:cast-boundary}
+  \begin{verbatim}
+  # Typed function
+  def add(x: int, y: int) -> int:
+      return x + y
+  
+  # Untyped caller
+  result = add("hello", "world")  # Cast error at boundary
+  \end{verbatim}
+  At the call boundary, the arguments are cast from $\texttt{?}$ to
+  $\Int$.  The cast fails because \texttt{"hello"} is not an integer.
+\end{example}
+
+\subsection{Blame Tracking}\label{sec:blame-tracking}
+
+\begin{definition}[Blame]\label{def:blame}
+  \emph{Blame tracking} is the mechanism for determining which side of a
+  typed/untyped boundary is responsible for a cast failure.  The blame is
+  assigned to the side that introduced the inconsistent type.
+\end{definition}
+
+\begin{example}[Blame Assignment]\label{ex:blame}
+  \begin{verbatim}
+  # typed_module.py
+  def process(x: int) -> int:
+      return x + 1
+  
+  # untyped_module.py
+  from typed_module import process
+  result = process("hello")  # BLAME: untyped_module.py
+  \end{verbatim}
+  The blame is assigned to \texttt{untyped\_module.py} because it passed a
+  string where an integer was expected.
+\end{example}
+
+\begin{theorem}[Blame Correctness]\label{thm:blame-correctness}
+  If a cast fails, the blame is always assigned to the correct party:
+  the code that introduced the inconsistent type.  Typed code is never
+  blamed for a cast failure.
+\end{theorem}
+
+\subsection{The Gradually Typed Lambda Calculus (GTLC)}\label{sec:gtlc}
+
+The GTLC is the foundational calculus for gradual typing:
+
+\begin{grammar}{GTLC}
+  \production{e}{x \alt \lambda x:\tau.\, e \alt e_1\ e_2 \alt \langle e : \tau_1 \Rightarrow \tau_2 \rangle^l \alt \mathbf{blame}\ l}
+\end{grammar}
+
+\begin{grammar}{GTLC Types}
+  \production{\tau}{\Int \alt \Bool \alt \tau_1 \to \tau_2 \alt \texttt{?}}
+\end{grammar}
+
+The operational semantics includes cast insertion and blame:
+
+\begin{semrules}{GTLC Cast Semantics}
+  \semrule{
+    v \text{ has type } \tau_2
+  }{
+    \langle v : \tau_1 \Rightarrow \tau_2 \rangle^l \stepsto v
+  }{\text{(Cast-OK)}} \\[6pt]
+  \semrule{
+    v \text{ does not have type } \tau_2
+  }{
+    \langle v : \tau_1 \Rightarrow \tau_2 \rangle^l \stepsto \mathbf{blame}\ l
+  }{\text{(Cast-Fail)}}
+\end{semrules}
+
+%% ============================================================
+%% 22.5 Gradual Type Inference
+%% ============================================================
+\section{Gradual Type Inference}\label{sec:gradual-inference}
+
+\subsection{The Challenge}\label{sec:gradual-inference-challenge}
+
+Type inference for gradually typed languages must handle the interaction
+between static types and the dynamic type $\texttt{?}$.  The consistency
+relation (which is not transitive) complicates unification.
+
+\subsection{Approaches to Gradual Inference}\label{sec:gradual-inference-approaches}
+
+\subsubsection{Optional Annotations}
+
+The simplest approach: require type annotations at function boundaries,
+infer types locally.  This is the approach taken by TypeScript and mypy.
+
+\subsubsection{Constraint-Based Inference}
+
+Generate constraints from the program and solve them:
+\begin{itemize}
+  \item \textbf{Equality constraints}: $\tau_1 = \tau_2$ (as in HM).
+  \item \textbf{Consistency constraints}: $\tau_1 \sim \tau_2$ (new for
+    gradual typing).
+  \item \textbf{Consistency does not determine a unique solution}: Multiple
+    solutions may exist; the system must choose the most informative one.
+\end{itemize}
+
+\subsubsection{The Obstruction Problem}\label{sec:obstruction}
+
+\begin{definition}[Obstruction]\label{def:obstruction}
+  The \emph{obstruction problem} arises when consistency constraints
+  prevent the inference of a more precise type.  For example, if
+  $x : \texttt{?}$ and we use $x + 1$, the constraint $x \sim \Int$ does
+  not determine $x : \Int$ (since $\texttt{?} \sim \Int$ is already
+  satisfied).
+\end{definition}
+
+\subsection{Sound Gradual Typing}\label{sec:sound-gradual}
+
+\begin{definition}[Sound Gradual Typing]\label{def:sound-gradual}
+  A gradually typed language is \emph{sound} if well-typed programs never
+  get stuck (in the sense of type errors).  Cast failures are caught at
+  runtime and reported as blame.
+\end{definition}
+
+Sound gradual typing requires:
+\begin{itemize}
+  \item \textbf{Cast insertion}: The compiler inserts casts at boundaries
+    between typed and untyped code.
+  \item \textbf{Blame tracking}: Cast failures are attributed to the
+    correct party.
+  \item \textbf{Type safety}: The cast insertion preserves type safety.
+\end{itemize}
+
+\begin{theorem}[Sound Gradual Typing (Siek et al.)]\label{thm:sound-gradual}
+  The GTLC with cast insertion and blame tracking satisfies type soundness:
+  if $\vdash e : \tau$ then $e$ either evaluates to a value, diverges, or
+  raises blame, but never gets stuck.
+\end{theorem}
+
+%% ============================================================
+%% 22.6 Implementations
+%% ============================================================
+\section{Implementations}\label{sec:gradual-implementations}
+
+\subsection{Typed Racket}\label{sec:typed-racket}
+
+\begin{historical}
+Typed Racket~\cite{tobinhoch2008typed} was developed at Northwestern
+University and PLT Inc.  It was the first language to combine gradual
+typing with a sophisticated type system (including unions, intersections,
+and occurrence typing).
+\end{historical}
+
+Typed Racket's key features:
+\begin{itemize}
+  \item \textbf{Occurrence typing}: The type of a variable is refined based
+    on type tests:
+    \begin{verbatim}
+    (: f (-> (U String Number) String))
+    (define (f x)
+      (if (string? x)
+          (string-upcase x)  ; x : String here
+          (number->string x))) ; x : Number here
+    \end{verbatim}
+  \item \textbf{Interoperability}: Typed and untyped Racket modules can
+    call each other; casts are inserted at boundaries.
+  \item \textbf{Blame tracking}: Cast failures report the source of the
+    inconsistent type.
+\end{itemize}
+
+\subsection{TypeScript}\label{sec:typescript}
+
+\begin{historical}
+TypeScript was developed by Microsoft, first released in 2012 by Anders
+Hejlsberg~\cite{typescript2012}.  It adds a static type system to JavaScript
+while maintaining full backward compatibility.
+\end{historical}
+
+TypeScript's type system features:
+\begin{itemize}
+  \item \textbf{Structural typing}: Types are compatible based on their
+    structure, not their names.
+  \item \textbf{Union and intersection types}: \texttt{string | number},
+    \texttt{A \& B}.
+  \item \textbf{Type narrowing}: Control flow analysis refines types.
+  \item \textbf{Generics}: Parametric polymorphism with constraints.
+  \item \texttt{any}: The dynamic type; disables type checking.
+  \item \texttt{unknown}: A type-safe alternative to \texttt{any}; requires
+    type narrowing before use.
+\end{itemize}
+
+\begin{example}[TypeScript Gradual Typing]\label{ex:typescript}
+  \begin{verbatim}
+  // Untyped JavaScript (valid TypeScript)
+  function add(x, y) { return x + y; }
+  
+  // Gradually typed
+  function add(x: any, y: any): any { return x + y; }
+  
+  // Fully typed
+  function add(x: number, y: number): number { return x + y; }
+  \end{verbatim}
+\end{example}
+
+\subsection{Pyright and mypy}\label{sec:pyright-mypy}
+
+Python's gradual typing ecosystem includes:
+
+\begin{itemize}
+  \item \textbf{Type hints} (PEP 484): Standard syntax for type annotations.
+  \item \textbf{mypy}: The original type checker for Python.
+  \item \textbf{Pyright}: Microsoft's type checker (powers Pylance in VS
+    Code).
+  \item \textbf{Strict mode}: Increasing levels of type checking.
+\end{itemize}
+
+\begin{example}[Python Gradual Typing]\label{ex:python-gradual}
+  \begin{verbatim}
+  # No types (dynamic)
+  def process(data):
+      return data["result"]
+  
+  # Partial types
+  def process(data: dict) -> Any:
+      return data["result"]
+  
+  # Full types
+  def process(data: dict[str, Result]) -> Result:
+      return data["result"]
+  \end{verbatim}
+\end{example}
+
+\subsection{Comparison of Implementations}\label{sec:gradual-comparison}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Gradual Typing Implementations}
+  \label{tab:gradual-comparison}
+  \begin{tabular}{lllll}
+    \hline
+    \textbf{Language} & \textbf{Dynamic Type} & \textbf{Sound} & \textbf{Blame} & \textbf{Inference} \\
+    \hline
+    Typed Racket & \texttt{Any} & Yes & Yes & Local \\
+    TypeScript & \texttt{any} & No & No & Structural \\
+    Python/mypy & \texttt{Any} & Partial & Partial & Local \\
+    Hack & \texttt{dynamic} & Partial & Partial & Local \\
+    Gradualizer (Erlang) & \texttt{any()} & Yes & Yes & Local \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\subsection{The Soundness Gap}\label{sec:soundness-gap}
+
+\begin{definition}[Soundness Gap]\label{def:soundness-gap}
+  The \emph{soundness gap} is the difference between the type system's
+  guarantees and the actual runtime behavior.  TypeScript has a significant
+  soundness gap: the type system allows certain programs that will fail at
+  runtime.
+\end{definition}
+
+TypeScript's soundness gaps include:
+\begin{itemize}
+  \item \texttt{any} disables all checking.
+  \item Structural typing allows unsound coercions.
+  \item \texttt{null} and \texttt{undefined} are assignable to any type
+    (unless \texttt{strictNullChecks} is enabled).
+  \item Type assertions (\texttt{as}) bypass checking.
+\end{itemize}
+
+\begin{insight}
+The soundness gap in TypeScript is a deliberate design choice: it allows
+TypeScript to be adopted incrementally in existing JavaScript codebases.
+A fully sound type system would require more annotations and reject more
+programs, which would reduce adoption.  The trade-off between soundness and
+practicality is a central tension in gradual typing.
+\end{insight}
+
+%% ============================================================
+%% 22.7 Summary
+%% ============================================================
+\section{Summary}\label{sec:gradual-summary}
+
+Gradual typing represents a paradigm shift in the static vs.\ dynamic
+typing debate.  Rather than forcing a binary choice, it provides a spectrum
+that allows programmers to choose the appropriate level of type checking
+for each part of their program.
+
+The theoretical foundation of gradual typing rests on three pillars:
+\begin{enumerate}
+  \item \textbf{The consistency relation}: Defines when two types are
+    compatible in the presence of the dynamic type.
+  \item \textbf{The gradual guarantee}: Ensures that adding type
+    annotations is always safe.
+  \item \textbf{Blame tracking}: Ensures that type errors at boundaries
+    are attributed to the correct party.
+\end{enumerate}
+
+Implementations of gradual typing range from fully sound (Typed Racket) to
+pragmatically unsound (TypeScript).  Each makes different trade-offs
+between soundness, usability, and adoption.
+
+Gradual typing is likely to become the dominant paradigm for type systems
+in the coming decades.  As the software industry recognizes that the
+static/dynamic dichotomy is false, languages will increasingly provide
+gradual typing as a way to get the benefits of both worlds.

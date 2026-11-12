@@ -1,0 +1,574 @@
+%%
+%% chapter-62.ltx — Multi-Level IR
+%%
+
+\label{ch:multi-level-ir}
+
+Modern compilation targets a diverse landscape of hardware---CPUs, GPUs, TPUs, FPGAs, quantum processors---and serves an increasingly diverse set of domains---machine learning, graphics, quantum computing, database query processing. A single IR cannot adequately serve all these needs. \emph{Multi-level IRs} address this challenge by providing a framework for defining multiple IR \emph{dialects}, each suited to a particular domain or abstraction level, with systematic lowering between them. The MLIR project~\cite{lattner2021} is the most prominent realization of this vision.
+
+%% ============================================================
+%% Section 62.1
+%% ============================================================
+\section{Motivation: Different Abstractions for Different Domains}\label{sec:multi-level-motivation}
+
+The fundamental problem is that different domains require different abstractions.
+
+\subsection{The Abstraction Gap}\label{sec:abstraction-gap}
+
+\begin{example}[Tensor computation]\label{ex:tensor-gap}
+A machine learning program operates on \emph{tensors}: multi-dimensional arrays with operations like matrix multiplication, convolution, and reduction. These operations have rich algebraic properties (associativity, distributivity) that enable high-level optimizations (fusion, tiling, parallelization).
+
+When lowered to a traditional IR (e.g., LLVM), these properties are lost: a matrix multiplication becomes a triple-nested loop, and the compiler must rediscover the structure from the loop nest.
+\end{example}
+
+\begin{example}[Quantum computation]\label{ex:quantum-gap}
+A quantum program operates on \emph{qubits} and \emph{quantum gates}: unitary transformations on quantum states. These operations have properties (commutativity of certain gates, circuit identities) that enable quantum-specific optimizations (gate cancellation, circuit simplification).
+
+When lowered to a traditional IR, these properties are completely lost.
+\end{example}
+
+\subsection{The Multi-Level Solution}\label{sec:multi-level-solution}
+
+The multi-level IR approach maintains multiple levels of abstraction, each with its own operations, types, and semantics. The program is progressively lowered from high-level abstractions to low-level machine operations, with each level preserving the structure relevant to that level.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (tensor) {Tensor Dialect\\(matmul, conv, reduce)};
+  \node[block, below=of tensor] (linalg) {Linalg Dialect\\(generic ops, loops)};
+  \node[block, below=of linalg] (scf) {SCF Dialect\\(for, if, while)};
+  \node[block, below=of scf] (affine) {Affine Dialect\\(affine loops, memrefs)};
+  \node[block, below=of affine] (llvm) {LLVM Dialect\\(LLVM IR operations)};
+
+  \draw[arrow] (tensor) -- node[right, font=\small] {lower} (linalg);
+  \draw[arrow] (linalg) -- node[right, font=\small] {lower} (scf);
+  \draw[arrow] (scf) -- node[right, font=\small] {lower} (affine);
+  \draw[arrow] (affine) -- node[right, font=\small] {lower} (llvm);
+
+  \node[font=\small, left=0.5cm of tensor, align=right] {High-level\\(domain-specific)};
+  \node[font=\small, left=0.5cm of affine, align=right] {Low-level\\(machine-like)};
+\end{tikzpicture}
+\caption{Multi-level IR: a program is progressively lowered from domain-specific abstractions (tensor operations) to machine-level operations (LLVM IR). Each level preserves the structure relevant to that level.}\label{fig:multi-level}
+\end{figure}
+
+%% ============================================================
+%% Section 62.2
+%% ============================================================
+\section{MLIR: Dialects and Lowering}\label{sec:mlir}
+
+MLIR (Multi-Level Intermediate Representation) is a framework for building compilers that use multiple IR levels. It provides the infrastructure for defining dialects, converting between them, and applying optimizations at each level.
+
+\subsection{Dialects}\label{sec:mlir-dialects}
+
+\begin{definition}[Dialect]\label{def:dialect}
+A \emph{dialect} in MLIR is a collection of:
+\begin{itemize}
+  \item \textbf{Operations.} The operations defined by the dialect (e.g., \texttt{tensor.matmul}, \texttt{affine.for}).
+  \item \textbf{Types.} The types used by the dialect (e.g., \texttt{tensor<4x4xf32>}, \texttt{memref<4x4xf32>}).
+  \item \textbf{Attributes.} Compile-time constant values (e.g., integer constants, dense elements).
+  \item \textbf{Semantics.} The meaning of each operation, specified informally or formally.
+\end{itemize}
+\end{definition}
+
+\subsection{Example: The Affine Dialect}\label{sec:affine-dialect}
+
+The \texttt{affine} dialect represents loop nests with affine (linear) bounds and access patterns:
+
+\begin{verbatim}
+  affine.for %i = 0 to %N {
+    affine.for %j = 0 to %M {
+      %val = affine.load %A[%i + %j] : memref<100xf32>
+      affine.store %val, %B[%i * 2 + %j] : memref<200xf32>
+    }
+  }
+\end{verbatim}
+
+The affine dialect enables polyhedral optimizations (loop interchange, fusion, tiling, parallelization) because the loop bounds and array accesses are affine functions of the loop variables.
+
+\subsection{Example: The Linalg Dialect}\label{sec:linalg-dialect}
+
+The \texttt{linalg} dialect represents linear algebra operations in a generic form:
+
+\begin{verbatim}
+  %C = linalg.matmul ins(%A, %B : tensor<4x8xf32>, tensor<8x16xf32>)
+                     outs(%C_init : tensor<4x16xf32>) -> tensor<4x16xf32>
+\end{verbatim}
+
+The \texttt{linalg} dialect supports operations like matrix multiplication, convolution, and reduction, with generic indexing maps that enable pattern-based optimization.
+
+\subsection{Lowering Between Dialects}\label{sec:mlir-lowering}
+
+Lowering converts operations from one dialect to another, typically from a higher-level dialect to a lower-level one:
+
+\begin{verbatim}
+  // Before lowering (tensor dialect):
+  %C = tensor.matmul %A, %B : tensor<4x8xf32>, tensor<8x16xf32> -> tensor<4x16xf32>
+
+  // After lowering (linalg dialect):
+  %C = linalg.matmul ins(%A, %B) outs(%C_init) : tensor<4x8xf32>, tensor<8x16xf32> -> tensor<4x16xf32>
+
+  // After further lowering (scf + memref dialect):
+  %C_mem = bufferization.to_memref %C_init
+  scf.for %i = 0 to 4 {
+    scf.for %j = 0 to 16 {
+      scf.for %k = 0 to 8 {
+        %a = memref.load %A[%i, %k]
+        %b = memref.load %B[%k, %j]
+        %c = memref.load %C_mem[%i, %j]
+        %prod = arith.mulf %a, %b
+        %sum = arith.addf %c, %prod
+        memref.store %sum, %C_mem[%i, %j]
+      }
+    }
+  }
+\end{verbatim}
+
+%% ============================================================
+%% Section 62.3
+%% ============================================================
+\section{High-Level to Low-Level IR Transitions}\label{sec:transitions}
+
+The transition from high-level to low-level IR involves several key transformations.
+
+\subsection{Bufferization}\label{sec:bufferization}
+
+\emph{Bufferization} converts tensor (value semantics) operations to memref (reference semantics) operations:
+
+\begin{verbatim}
+  // Before (tensor):
+  %t1 = tensor.generate { ... } : tensor<100xf32>
+  %t2 = tensor.extract_slice %t1[0][50] : tensor<100xf32> to tensor<50xf32>
+
+  // After (memref):
+  %m1 = memref.alloc() : memref<100xf32>
+  // ... fill %m1 ...
+  %m2 = memref.subview %m1[0][50] : memref<100xf32> to memref<50xf32>
+\end{verbatim}
+
+Bufferization determines where to allocate memory and how to manage lifetimes, a critical step for efficient execution.
+
+\subsection{Loop Lowering}\label{sec:loop-lowering}
+
+High-level loop constructs are lowered to lower-level loops:
+
+\begin{verbatim}
+  // Before (affine):
+  affine.for %i = 0 to %N step 1 {
+    affine.load %A[%i * 2 + 1]
+  }
+
+  // After (scf):
+  scf.for %i = %c0 to %N step %c1 {
+    %idx = arith.muli %i, %c2
+    %idx2 = arith.addi %idx, %c1
+    memref.load %A[%idx2]
+  }
+\end{verbatim}
+
+The affine dialect's structure (affine bounds and accesses) is lost in the scf dialect, but the optimizations enabled by the affine structure (tiling, parallelization) have already been applied.
+
+\subsection{Type Lowering}\label{sec:type-lowering}
+
+High-level types are lowered to low-level types:
+
+\begin{verbatim}
+  // Before:
+  tensor<4x4xf32>   // 4x4 tensor of 32-bit floats
+
+  // After:
+  memref<4x4xf32>   // 4x4 memref of 32-bit floats
+
+  // After further lowering:
+  !llvm.ptr          // pointer to float array (flattened)
+\end{verbatim}
+
+%% ============================================================
+%% Section 62.4
+%% ============================================================
+\section{Preserving Structure During Lowering}\label{sec:preserving-structure}
+
+A key challenge in multi-level IRs is preserving high-level structure during lowering, so that optimizations can be applied at the appropriate level.
+
+\subsection{The Structure Preservation Problem}\label{sec:structure-problem}
+
+When a high-level operation is lowered to a sequence of low-level operations, the high-level structure is lost. For example, a matrix multiplication lowered to a triple loop is no longer recognizable as a matrix multiplication.
+
+\subsection{Solutions}\label{sec:structure-solutions}
+
+\begin{itemize}
+  \item \textbf{Gradual lowering.} Lower through multiple intermediate levels, each preserving some structure.
+  \item \textbf{Selective lowering.} Lower only the parts of the program that need to be lowered; keep high-level operations where possible.
+  \item \textbf{Structure tagging.} Add metadata to low-level operations indicating their high-level origin.
+  \item \textbf{Bidirectional conversion.} Allow raising low-level operations back to high-level ones (e.g., recognizing loop nests as matrix multiplications).
+\end{itemize}
+
+\subsection{One-Shot vs. Incremental Lowering}\label{sec:oneshot-vs-incremental}
+
+\begin{itemize}
+  \item \textbf{One-shot lowering.} Convert the entire program from one dialect to another in a single pass. Simple but loses structure.
+  \item \textbf{Incremental lowering.} Convert one operation (or small group) at a time, allowing interleaved optimization. Preserves structure but is more complex.
+\end{itemize}
+
+MLIR supports both approaches, with the \texttt{--convert-X-to-Y} passes providing one-shot lowering and the dialect conversion infrastructure supporting incremental lowering.
+
+%% ============================================================
+%% Section 62.5
+%% ============================================================
+\section{Cross-Dialect Optimization}\label{sec:cross-dialect}
+
+One of the most powerful features of multi-level IRs is the ability to perform optimizations that span multiple dialects.
+
+\subsection{Fusion Across Dialects}\label{sec:cross-fusion}
+
+\begin{verbatim}
+  // Before fusion (linalg dialect):
+  %B = linalg.matmul ins(%A, %W1) outs(%B_init) // matmul
+  %C = linalg.generic { ... } ins(%B) outs(%C_init) // element-wise op on result
+
+  // After fusion:
+  %C = linalg.generic { ... } ins(%A, %W1) outs(%C_init) {
+    // fused: compute matmul element and apply element-wise op in one pass
+  }
+\end{verbatim}
+
+The fusion optimization combines two operations into one, reducing memory traffic. This optimization requires understanding both the \texttt{linalg.matmul} and \texttt{linalg.generic} operations.
+
+\subsection{Tiling and Parallelization}\label{sec:cross-tiling}
+
+\begin{verbatim}
+  // Before tiling (affine dialect):
+  affine.for %i = 0 to %N {
+    affine.for %j = 0 to %M {
+      %v = affine.load %A[%i, %j]
+      affine.store %v, %B[%i, %j]
+    }
+  }
+
+  // After tiling:
+  affine.for %i0 = 0 to %N step 32 {
+    affine.for %j0 = 0 to %M step 32 {
+      affine.for %i1 = %i0 to min(%i0 + 32, %N) {
+        affine.for %j1 = %j0 to min(%j0 + 32, %M) {
+          %v = affine.load %A[%i1, %j1]
+          affine.store %v, %B[%i1, %j1]
+        }
+      }
+    }
+  }
+
+  // After parallelization:
+  affine.parallel (%i0, %j0) = (0, 0) to (%N, %M) step (32, 32) {
+    // tile body (parallelized)
+  }
+\end{verbatim}
+
+\subsection{Cross-Dialect Analysis}\label{sec:cross-analysis}
+
+Cross-dialect analyses combine information from multiple levels:
+\begin{itemize}
+  \item \textbf{Memory analysis.} Combine tensor-level analysis (what data is accessed) with memref-level analysis (where it is stored).
+  \item \textbf{Alias analysis.} Combine high-level type information (tensors don't alias) with low-level pointer analysis.
+  \item \textbf{Effect analysis.} Combine high-level effect annotations (pure tensor operations) with low-level effects (memory writes).
+\end{itemize}
+
+%% ============================================================
+%% Section 62.6
+%% ============================================================
+\section{Case Studies: Tensor Compilation, Quantum Computing}\label{sec:case-studies}
+
+\subsection{Tensor Compilation (MLIR + IREE)}\label{sec:tensor-compilation}
+
+The IREE (Intermediate Representation Execution Environment) project uses MLIR to compile tensor programs for diverse hardware:
+
+\begin{enumerate}
+  \item \textbf{Input:} TensorFlow/JAX/PyTorch model (as MHLO dialect).
+  \item \textbf{High-level optimization:} Fusion, constant folding, layout optimization (MHLO $\to$ Linalg).
+  \item \textbf{Loop transformation:} Tiling, parallelization, vectorization (Linalg $\to$ Affine/SCF).
+  \item \textbf{Hardware-specific lowering:} Generate code for CPU (LLVM), GPU (SPIR-V/CUDA), or TPU.
+\end{enumerate}
+
+The multi-level approach enables:
+\begin{itemize}
+  \item High-level optimizations (fusion) that are impossible at the loop level.
+  \item Hardware-specific optimizations (GPU tiling, vectorization) at the appropriate level.
+  \item A single compiler that targets multiple hardware platforms.
+\end{itemize}
+
+\subsection{Quantum Computing (QIRO, QuiRL)}\label{sec:quantum-compilation}
+
+Quantum computing compilers use multi-level IRs to optimize quantum circuits:
+
+\begin{enumerate}
+  \item \textbf{Quantum dialect.} High-level quantum operations (gates, measurements, error correction).
+  \item \textbf{Circuit dialect.} Quantum circuits as sequences of gates.
+  \item \textbf{Pulse dialect.} Low-level pulse sequences for specific hardware.
+\end{enumerate}
+
+Optimizations at the quantum level include:
+\begin{itemize}
+  \item \textbf{Gate cancellation.} Adjacent inverse gates cancel: $H \cdot H = I$.
+  \item \textbf{Circuit rewriting.} Replace expensive gate sequences with equivalent cheaper ones.
+  \item \textbf{Qubit routing.} Map logical qubits to physical qubits, minimizing SWAP gates.
+\end{itemize}
+
+\begin{verbatim}
+  // Quantum dialect:
+  %q0 = quantum.alloc : !quantum.qubit
+  %q1 = quantum.alloc : !quantum.qubit
+  quantum.h %q0                  // Hadamard on q0
+  quantum.cnot %q0, %q1          // CNOT: q0 control, q1 target
+  quantum.h %q0                  // Hadamard on q0
+  // Optimization: H-CNOT-H = a specific gate sequence
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (ml) {ML Framework\\(TF/JAX/PyTorch)};
+  \node[block, below=of ml] (mhlo) {MHLO Dialect};
+  \node[block, below=of mhlo] (linalg) {Linalg Dialect};
+  \node[block, below left=1.5cm and 0.5cm of linalg] (cpu) {CPU\\(LLVM)};
+  \node[block, below=1.5cm of linalg] (gpu) {GPU\\(SPIR-V)};
+  \node[block, below right=1.5cm and 0.5cm of linalg] (tpu) {TPU\\(custom)};
+
+  \draw[arrow] (ml) -- (mhlo);
+  \draw[arrow] (mhlo) -- (linalg);
+  \draw[arrow] (linalg) -- (cpu);
+  \draw[arrow] (linalg) -- (gpu);
+  \draw[arrow] (linalg) -- (tpu);
+\end{tikzpicture}
+\caption{Multi-level compilation for machine learning: a model from a high-level framework is lowered through multiple dialects to hardware-specific code for CPU, GPU, or TPU.}\label{fig:ml-compilation}
+\end{figure}
+
+\begin{insight}
+The multi-level IR approach represents a paradigm shift in compiler design. Instead of a single IR that tries to serve all purposes, a multi-level IR provides a spectrum of abstractions, each suited to a particular kind of optimization. The key insight is that structure is valuable: a matrix multiplication expressed as \texttt{matmul} can be optimized in ways that a triple loop cannot. By preserving structure as long as possible (through gradual lowering), the compiler can apply the most powerful optimizations at the highest possible level.
+\end{insight}
+
+\begin{historical}
+The multi-level IR concept was realized in the MLIR project, initiated by Chris Lattner at Google in 2019~\cite{lattner2021}. MLIR grew out of the limitations of LLVM IR for machine learning workloads: LLVM's type system and operations were too low-level to express tensor computations efficiently. MLIR's dialect system allows new abstractions to be added without modifying the core infrastructure. The project has been adopted by LLVM, TensorFlow, PyTorch, and many other projects, demonstrating the value of the multi-level approach. The concept of multi-level IRs extends beyond ML: quantum computing compilers (QIRO, QuiRL), database systems (for query optimization), and graphics compilers (for shader optimization) all benefit from domain-specific abstractions that can be progressively lowered to machine code.
+\end{historical}
+
+%% ============================================================
+%% Section 62.7
+%% ============================================================
+\section{Advanced MLIR Dialects and Cross-Dialect Optimization}\label{sec:mlir-advanced}
+
+\subsection{Defining Custom Dialects}\label{sec:custom-dialects}
+
+MLIR's extensibility comes from its ability to define custom dialects. Each dialect encapsulates a level of abstraction with its own operations, types, and semantics.
+
+\begin{definition}[Dialect Definition]\label{def:dialect-def}
+A dialect in MLIR consists of:
+\begin{itemize}
+  \item \textbf{Operations.} Defined by their name, operands, results, attributes, and regions.
+  \item \textbf{Types.} Custom types with parsing, printing, and verification.
+  \item \textbf{Attributes.} Compile-time constant values specific to the dialect.
+  \item \textbf{Interfaces.} Contracts that operations can implement (e.g., \texttt{SideEffect}, \texttt{InferType}).
+  \item \textbf{Traits.} Static properties of operations (e.g., \texttt{Commutative}, \texttt{ConstantLike}).
+\end{itemize}
+\end{definition}
+
+\begin{verbatim}
+  // Example: Defining a custom dialect for image processing
+  def ImageDialect : Dialect {
+    let name = "img";
+    let summary = "Image processing operations";
+  }
+
+  // Operations:
+  def Img_Convolve : Op<ImageDialect, "convolve"> {
+    let arguments = (ins
+      TensorType:$input,
+      TensorType:$kernel
+    );
+    let results = (outs TensorType:$output);
+    let assemblyFormat = "$input `,` $kernel attr-dict `:` type($input)";
+  }
+
+  // Usage:
+  %result = img.convolve %image, %kernel : tensor<256x256xf32>, tensor<3x3xf32>
+\end{verbatim}
+
+\subsection{Dialect Conversion Infrastructure}\label{sec:dialect-conversion}
+
+MLIR provides a dialect conversion framework for systematically lowering operations from one dialect to another:
+
+\begin{algorithm}[H]
+\caption{Dialect Conversion}\label{alg:dialect-conversion}
+\begin{algorithmic}[1]
+\Function{ConvertDialect}{$\mathrm{module}, \mathrm{source\_dialect}, \mathrm{target\_dialect}$}
+  \State $\mathrm{converter} \gets \mathrm{ConversionPatternRewriter}()$
+  \For{each operation $op$ in $\mathrm{module}$}
+    \If{$op.\mathrm{dialect} == \mathrm{source\_dialect}$}
+      \State $\mathrm{pattern} \gets \mathrm{find\_pattern}(op, \mathrm{target\_dialect})$
+      \If{$\mathrm{pattern} \neq \mathrm{null}$}
+        \State $\mathrm{converter}.\mathrm{replaceOp}(op, \mathrm{pattern}.\mathrm{rewrite}(op))$
+      \Else
+        \State $\mathrm{converter}.\mathrm{legalize}(op)$ \Comment{Mark as legal in target}
+      \EndIf
+    \EndIf
+  \EndFor
+  \State \Return $\mathrm{module}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cross-Dialect Optimization Patterns}\label{sec:cross-dialect-patterns}
+
+Cross-dialect optimizations exploit information from multiple abstraction levels:
+
+\begin{verbatim}
+  // Pattern 1: Tensor-level fusion followed by loop-level tiling
+  // Step 1: Fuse matmul + bias + relu at the tensor level
+  %fused = linalg.fused_matmul_bias_relu %A, %B, %bias
+           : tensor<4x8xf32>, tensor<8x16xf32>, tensor<16xf32>
+           -> tensor<4x16xf32>
+
+  // Step 2: Lower to loops with tiling
+  scf.for %i = 0 to 4 step 2 {
+    scf.for %j = 0 to 16 step 4 {
+      scf.for %k = 0 to 8 step 2 {
+        // Tiled matmul with fused bias and relu
+        // Each tile fits in cache
+      }
+    }
+  }
+
+  // Step 3: Vectorize the innermost loops
+  // The tile size is chosen to match SIMD register width
+\end{verbatim}
+
+\subsection{The Affine Dialect: Polyhedral Optimization}\label{sec:affine-polyhedral}
+
+The affine dialect enables polyhedral optimization by restricting loop bounds and array accesses to affine functions of loop variables:
+
+\begin{verbatim}
+  // Affine dialect: all bounds and accesses are affine
+  affine.for %i = 0 to %N {
+    affine.for %j = %i + 1 to %M {
+      %v = affine.load %A[2 * %i + %j] : memref<100xf32>
+      affine.store %v, %B[%i + %j] : memref<200xf32>
+    }
+  }
+
+  // Polyhedral transformations enabled:
+  // 1. Loop interchange: swap %i and %j loops
+  // 2. Loop fusion: merge two loop nests with same bounds
+  // 3. Tiling: split loops into outer (tile) and inner (element) loops
+  // 4. Parallelization: mark outer loops as parallel
+  // 5. Skewing: apply affine transformation to iteration space
+\end{verbatim}
+
+\begin{table}[htbp]
+\centering
+\caption{MLIR dialects and their roles in the compilation pipeline}\label{tab:mlir-dialects}
+\begin{tabular}{p{2.5cm}p{3cm}p{3cm}p{3cm}}
+\hline
+\textbf{Dialect} & \textbf{Abstraction} & \textbf{Key Operations} & \textbf{Optimizations} \\
+\hline
+\texttt{tensor} & Value semantics & generate, extract & High-level fusion \\
+\texttt{linalg} & Named ops & matmul, conv & Operation fusion \\
+\texttt{affine} & Affine loops & for, load, store & Polyhedral opts \\
+\texttt{scf} & Structured CF & for, if, while & Loop transforms \\
+\texttt{memref} & Memory refs & alloc, load, store & Buffer optimization \\
+\texttt{arith} & Arithmetic & add, mul, cmp & Constant folding \\
+\texttt{llvm} & LLVM IR & load, store, call & LLVM optimizations \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Multi-Level IR for Other Domains}\label{sec:multi-level-other}
+
+The multi-level IR approach extends beyond machine learning:
+
+\begin{itemize}
+  \item \textbf{Circuit design.} High-level hardware descriptions lowered to gate-level netlists and then to physical layout.
+  \item \textbf{Database queries.} Relational algebra lowered to query plans and then to execution operators.
+  \item \textbf{Graphics shaders.} High-level shading languages lowered through optimization passes to GPU machine code.
+  \item \textbf{Scientific computing.} PDE specifications lowered to discretized forms and then to parallel loop nests.
+\end{itemize}
+
+\begin{verbatim}
+  // Multi-level IR for database queries:
+  // Level 1: Relational algebra
+  result = project(name, filter(age > 18, users))
+
+  // Level 2: Query plan
+  Scan(users) -> Filter(age > 18) -> Project(name)
+
+  // Level 3: Execution operators
+  for row in scan(users):
+    if row.age > 18:
+      emit(row.name)
+
+  // Level 4: Machine code
+  // Loop with comparison, branch, and memory access
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.6cm, fill=TomeBg, font=\small, align=center},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (ml) {ML/Tensor};
+  \node[block, below=of ml] (quantum) {Quantum};
+  \node[block, below=of quantum] (graphics) {Graphics};
+  \node[block, below=of graphics] (database) {Database};
+  \node[block, below=of database] (hardware) {Hardware};
+
+  \node[block, right=2cm of ml] (linalg) {Linalg};
+  \node[block, right=2cm of quantum] (circuit) {Circuit};
+  \node[block, right=2cm of graphics] (spirv) {SPIR-V};
+  \node[block, right=2cm of database] (operators) {Operators};
+  \node[block, right=2cm of hardware] (rtl) {RTL};
+
+  \node[block, right=2cm of linalg] (llvm) {LLVM};
+  \node[block, right=2cm of circuit] (pulse) {Pulse};
+  \node[block, right=2cm of spirv] (gpu) {GPU ISA};
+  \node[block, right=2cm of operators] (exec) {Execution};
+  \node[block, right=2cm of rtl] (gds) {GDSII};
+
+  \draw[arrow] (ml) -- (linalg);
+  \draw[arrow] (quantum) -- (circuit);
+  \draw[arrow] (graphics) -- (spirv);
+  \draw[arrow] (database) -- (operators);
+  \draw[arrow] (hardware) -- (rtl);
+
+  \draw[arrow] (linalg) -- (llvm);
+  \draw[arrow] (circuit) -- (pulse);
+  \draw[arrow] (spirv) -- (gpu);
+  \draw[arrow] (operators) -- (exec);
+  \draw[arrow] (rtl) -- (gds);
+
+  \node[font=\small, above=0.3cm of ml, align=center] {Domain};
+  \node[font=\small, above=0.3cm of linalg, align=center] {Mid-level};
+  \node[font=\small, above=0.3cm of llvm, align=center] {Target};
+\end{tikzpicture}
+\caption{Multi-level IR across domains. Each domain has its own high-level dialect, mid-level representation, and target-specific lowering. The MLIR framework provides the infrastructure for all of them.}\label{fig:multi-level-domains}
+\end{figure}
+
+%% ============================================================
+%% Section 62.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-62}
+
+Multi-level IRs address the fundamental challenge of compiling diverse programs to diverse hardware. By providing a framework for defining domain-specific dialects and systematically lowering between them, multi-level IRs preserve high-level structure while enabling low-level optimization. The MLIR project has demonstrated the practical viability of this approach, with applications in machine learning, quantum computing, and beyond.
+
+The key design principles are:
+\begin{itemize}
+  \item \textbf{Dialects.} Each level of abstraction is a dialect with its own operations, types, and semantics.
+  \item \textbf{Gradual lowering.} Programs are lowered through multiple levels, preserving structure at each level.
+  \item \textbf{Cross-dialect optimization.} Optimizations can operate at the most appropriate level, using information from multiple dialects.
+\end{itemize}
+
+For further reading, we recommend the MLIR overview paper~\cite{lattner2021}, the IREE documentation~\cite{iree2024}, and the survey of multi-level IRs by Lattner et al.

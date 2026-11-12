@@ -1,0 +1,2764 @@
+Compilation of functional languages using
+ow graph analysis
+Pieter H. Hartel
+
+
+
+Hugh Glaser
+
+y
+
+John M. Wild
+
+z
+
+July 21, 1996
+
+SUMMARY
+
+A system based on the notion of a ow graph is used to formally specify and to implement a
+compiler for a lazy functional language. The compiler takes a simple functional language as input
+and generates C. The generated C program can then be compiled, and loaded with an extensive
+run-time system to provide the facility to experiment with di erent analysis techniques. The
+compiler provides a single, uni ed, ecient, formal framework for all the analysis and synthesis
+phases, including the generation of C. Many of the standard techniques, such as strictness and
+boxing analyses, have been included.
+KEY WORDS
+
+Compilation of lazy functional languages, ow graph, program analysis, program synthesis,
+strictness.
+INTRODUCTION
+
+The functional programming community has identi ed a number of di erent analysis techniques
+that can improve the implementation of functional languages. Each of these is of sucient
+complexity that it requires a signi cant body of research to exploit to the full. A good implementation, however, needs to perform a large number of such analyses, as well as synthesising
+appropriate code to take advantage of the information provided. Fortunately, many of the analyses have similar structures, and so a system can be provided in which analysis techniques can
+be imported, provided they are de ned in the required manner. In addition to providing a
+framework for the analysis, it is desirable that the system should provide a similar framework
+for the synthesis, ideally as far as the production of code.
+As compile time analysis for functional programming languages becomes more complicated,
+good compiler organisation becomes increasingly important. Our method, based on the ow
+graph, focuses on compiler organisation as well as the need to generate ecient code. The
+ow graph framework allows for importing most of the analyses that have been reported in the
+literature into a single system. This is done in such a way that it is both possible to reason
+about the optimisations in a formal way and to implement them eciently.
+Dept. of Computer Systems, University of Amsterdam, Kruislaan 403, 1098 SJ Amsterdam, The Netherlands,
+Email: pieter@fwi.uva.nl
+y Dept. of Electronics and Computer Science, University of Southampton, Southampton, SO9 5NH, England,
+Email: H.Glaser@southampton.ac.uk
+z
+XAM Ltd, 71a Town street, Armley, Leeds, LS12 3HD, England
+
+
+1
+
+In the literature many program analyses have been proposed [1], but strictness analysis is
+the most popular in the functional programming community. We will therefore concentrate on
+strictness analysis in the examples. The analyses performed by the compiler include many others,
+such as boxing and sharing analysis and all have been speci ed in the same formal framework.
+In the literature, a large variation is found in the abstract domain of strictness analysis. The
+more general the abstract domain, the more there are practical and to a lesser extent theoretical
+diculties when solving the domain equations by xed point nding techniques [2]. Our pilot
+compiler [3] performed nothing more advanced than backwards abstract interpretation on a twopoint domain with a very simple xed point nding algorithm and it showed promising results.
+Since then, both the domain and the xed point nding algorithm have been extended.
+From the outset we found that the abstract syntax tree when used as a basis for abstract
+interpretation methods is too limited. In the compiler the functions being compiled are represented as a ow graph, which is essentially an abstract syntax tree turned into a graph by tying
+the leafs of the syntax tree that represent function arguments back to the root. The structure
+thus formed supports forwards analysis as easily as backwards analysis. This is an advantage because it makes it possible to integrate the best kinds of analysis in a single framework. Examples
+of forwards and backwards analysis [4] will be given.
+Attribute grammars [5, 6] can also be used to express forwards and backwards analysis, but
+attribute grammar systems are primarily concerned with specifying computations on syntax
+trees. Although there is a close relationship between a syntax tree and a ow graph, for the
+purpose of abstract interpretation of functional programs it is all-important to trace explicitly
+where variables, such as function arguments and names of let expressions, are de ned and where
+they are used. By restricting the ow of information to that required for functional languages,
+a special purpose system is provided that is more ecient than a general purpose attribute
+grammar system. To express attribute propagation a notation is used that is more explicit (and
+also lower level) than that found in general purpose attribute grammar systems.
+The next section gives an introduction to the implementation of lazy evaluation using compiled graph reduction. In the third and fourth sections, the use of a ow graph is discussed
+as a basic data structure to support the analysis and compilation of lazy functional programs.
+Section 3 shows that a ow graph allows for a theoretically sound underpinning of the compilation algorithms in the sense that a ow graph can be given the same meaning as the standard
+denotational semantics commonly de ned for lazy functional languages. Section 4 presents two
+of the many analysis phases performed by the compiler in some detail, showing how a ow graph
+supports the intuition of what is going on during the analysis. The implementation of an analysis over a ow graph is described in Section 5. In Section 6 some of the results are compared to
+those reported by other researchers and the performance gures for both the compiler and the
+compiled code are discussed. The last section presents the conclusions.
+AN INTRODUCTION TO THE IMPLEMENTATION OF LAZY EVALUATION
+
+The evaluation strategy used in an implementation of a purely functional language such as
+Miranda1 [7] or Haskell [8] is lazy evaluation [9]. This strategy is radically di erent from that
+used in implementations of imperative programming languages such as C, Pascal and Fortran.
+Lazy evaluation determines, partly at compile time and partly at runtime, when expressions are
+evaluated; the programmer determines only what will be evaluated. In imperative languages,
+the programmer determines to a large extent when expressions are evaluated.
+The lazy evaluation strategy is best explained using an example. Consider the function
+Append in Figure 1, which is written in a functional notation close to Miranda and Haskell.
+1
+
+Miranda is a trademark of Research software Ltd.
+
+2
+
+Function application is indicated by juxtaposition. Parentheses are used to enforce priorities,
+not to gather the arguments to a function as is usual in many other programming languages.
+For example (Append (Tl x) y) should be read as: apply Tl to x, then apply Append to its two
+arguments, (Tl x) and y.
+1: Append : [] ! [] ! []
+2: Append x y = if Null x then y
+3:
+else Cons (Hd x) (Append (Tl x) y)
+4: Main = Append (Cons 1 Nil ) (Cons 2 Nil )
+Figure 1: De nition of running example Append and a main expression
+The rst line of the program is the type speci cation of Append. The type de nes Append to
+take two arguments, both lists of (the same) unspeci ed element type , and to return a list of
+the same type. The second line tests whether the rst argument is an empty list. In that case,
+the Null test yields True and the second argument list is returned. Otherwise the constructor
+function Cons combines the rst element of the present list with the recursive application of
+Append (line 3).
+Most lazy functional languages provide elaborate syntax to allow for a more elegant formulation of functions using pattern matching on arguments and in x operators. As the purpose of
+this section is to explain the principles of the evaluation strategy we have refrained from using
+such syntax as it would unnecessarily complicate matters.
+The main expression at line 4 in Figure 1 applies Append to 2 singleton lists. Here Nil
+represents the empty list. The answer of this program is thus a two element list, whose rst
+element is 1, and whose second element is 2.
+The example shows that:
+ Append is a pure function: it has no side e ects, as there are no assignments present;
+ the order of evaluation is not explicitly stated (note that there are no semi colons);
+ allocation and reclamation of storage is left to the system (garbage collection [10]);
+ the interface to the outside world is completely speci ed by the parameters and result.
+Functional programming takes the burden of much of the book-keeping associated with the
+actual computation away from the programmer. Functional languages thus have a number of
+advantages [11].
+Unfortunately, there is a price to be paid for these advantages. In relieving the programmer of
+the burden of specifying evaluation order and storage management, the system requires greater
+intelligence on the part of the implementation. In practice, this means that the implementation
+should support a suitable execution model and have an ecient storage management system.
+We will say no more about storage management systems; a good survey is given by Cohen [10].
+A good execution model for functional languages is lazy evaluation. The two key properties
+of lazy evaluation are: rstly, an expression is evaluated only when its value is needed, and
+secondly an expression is evaluated at most once. The implementation and not the programmer
+decides when expressions are evaluated. In particular, when the value of an expression is never
+needed, it will never be evaluated. Lazy evaluation can be implemented entirely at runtime,
+by interpreting a suitable representation of the program [12, 9]. Deciding at runtime which
+expressions need to be evaluated next is expensive; much can be gained by making decisions at
+3
+
+compile time. This is the purpose of strictness analysis. According to the classical de nition, a
+monadic function of type f : d ! r is strict in its argument if:
+
+8 x : (x = ?) ! (f x = ?)
+Here the symbol ? may be read as \totally unde ned". The operational interpretation of this
+de nition is that it is safe to evaluate x to head normal form [13] (to a value or data constructor)
+before, or in parallel to evaluating f x, because when the computation of x diverges, that of
+f x also diverges. Hence termination is not a ected by the choice of evaluation strategy. Since
+expressions do not have side e ects in pure functional languages, the correctness of the answer
+is also not a ected by the evaluation strategy. The de nition of strictness can be generalised to
+functions of more than one argument, by requiring that the strictness of a particular argument
+must be totally independent of the values of the other arguments.
+
+Graph Reduction
+
+Graph reduction [14] is a technique for implementing lazy evaluation. It forms the basis for
+many implementations of functional languages [15, 16, 17, 18, 19]. To explain the principles of
+graph reduction, consider the evaluation of Append with the arguments (Cons 1 Nil ) and (Cons
+2 Nil ), as shown in Figure 2. Here a list is built out of CONS (for list CONStructor) and NIL
+nodes and a suspended function application is built out of SUSP nodes. More will be said shortly
+about the purpose of a suspension. The left descendant of CONS and SUSP nodes points at the
+rst argument and the right descendant points at the second argument.
+SUSP Append
+
+@
+
+)
+
+@@
+RCONS
+CONS
+@RNIL
+@RNIL
+2
+1
+
+CONS
+
+)
+@R
+1 SUSP Append
+1
+@
+@@R
+NIL
+CONS
+@RNIL
+2
+
+CONS
+
+@RCONS
+@RNIL
+2
+
+Figure 2: Reduction of Append (Cons 1 Nil ) (Cons 2 Nil ) to Cons 1 (Cons 2 Nil )
+The graph that represents the application of Append to its arguments is reduced (= evaluated) in two stages, using the rules of the program, to the graph that represents the required
+list. There are three important issues involved in correctly implementing graph reduction:
+ When Append is called, the rst argument x is always examined by the Null test. Therefore,
+the argument must have been evaluated before the Null test takes place. The function
+Append is said to be strict in its rst argument. The implementation can take advantage
+of this knowledge by making the compiled code evaluate the actual argument expression
+before calling Append. Other examples of strict functions are Hd, Tl and Null.
+ The second argument to Append is never examined, and should therefore not be evaluated
+if it is as yet unevaluated. The second argument to Append is thus a non-strict argument.
+The compiler must arrange for the compiled code to construct a suspension for any actual
+argument expression that is passed as a second argument to Append. A suspension is a
+form of an expression that can be saved, such that it can be reduced later, when the value
+of the expression is actually required. Another example of non-strictness is provided by
+4
+
+the Cons function, which is non-strict in boths its arguments. This is actually the reason
+why in the second frame of Figure 2 a suspension is built for Append. The suspension
+building and evaluation mechanism is thus an implementation consequence of the rst key
+property of lazy evaluation.
+ To implement the second key property of lazy evaluation it is necessary to update each
+suspension when it is evaluated, in case it represents an expression that is shared between
+other expressions.
+Sometimes the value of a suspension is never required, so work may be saved by storing an
+expression as a suspension rather than by reducing it and storing the result value. However,
+building and reducing suspensions carries a signi cant cost, so the compiler should make sure
+that suspensions are only built when necessary. When laziness and thus suspensions are not
+required, the compiler must generate ordinary code as in imperative programs. The strictness
+analysis pass of the compiler serves this purpose and it is an important part of an ecient
+implementation of a lazy functional language. In the next section, when the implementation is
+discussed, this point will be explained in more detail.
+Although providing an excellent basis for evaluating functional programs, pure graph reduction incurs a number of performance penalties:
+
+ Evaluation switches between contexts, as di erent parts of the graph are required;
+ Delayed computations, such as the second argument to Append, can make greater demands
+
+on storage and processor power than early reduction;
+ Updating unshared nodes is wasteful, but not always avoidable;
+ Examining nodes to nd out whether they have already been reduced is also an overhead;
+ Since the underlying target machines do not have a \graph reducing" instruction set, there
+is an element of interpretation of the graph.
+
+One of the ways of avoiding these penalties is to avoid interpreting the graph whenever possible. This reduces the context switching, as well as making the underlying evaluation mechanism
+more ecient. It is possible to do this because the graph reduction machine has a two stroke
+cycle when calling a function: Firstly, the graph corresponding to the function body is created,
+and secondly this graph is reduced. It is often possible to short-circuit this process by compiling native machine code that mimics the actions of creating and reducing a graph without
+actually allocating any heap storage. Eciency is gained by avoiding graph creation, graph
+interpretation and allocation and reclamation of heap storage. To perform this optimisation, it
+is necessary to analyse the program to determine when native machine code can be compiled
+and when a suspension must be made that can be reduced later.
+Another area in which improvements can be made is to avoid examining nodes to see if they
+have been evaluated. The overhead of this operation is twofold. Firstly it requires work to
+examine the node, and secondly it requires \tags", or some other method, so that evaluated and
+unevaluated nodes can be distinguished. Various methods have been proposed to reduce this
+penalty [13].
+
+Combining graph reduction with the evaluation of a C program
+
+To expose the principles of graph reduction when coupled with the standard call-by-value evaluation method of ordinary C programs, let us look at a complete C program that implements
+lazy evaluation of the Append function and the main expression given with it in Figure 1. The
+5
+
+C program will be presented in small units, some of which form part of the runtime library
+associated with the compiler, while other parts are generated by the compiler. The C program
+is based on actual compiled code and on the runtime system that has been developed with the
+compiler, but it has been simpli ed to make the presentation succinct.
+Runtime data structures
+The run time system manipulates tagged heap nodes. Four tag values are de ned for the purpose
+of presenting the compiled code of the Append function:
+#define INT
+#define CONS
+#define NIL
+#define SUSP
+
+1
+2
+3
+4
+
+The heap consists of data structures of type node. Each node accommodates either an integer
+(tag INT), a list constructor (tag CONS), a nil node (tag NIL) or a suspension (tag SUSP). A
+suspension implements a suspended function application; in addition to the tag, it contains
+three elds: The rst eld (fun) points at a prelude routine (see below). The remaining two
+elds contain pointers to the arguments of the suspended function. A suspension must be
+capable of accommodating a pointer to a prelude routine and all pointers to its arguments. In
+the present example only binary functions such as Append can be handled. This restriction is
+not essential, but imposed to keep the presentation reasonably simple.
+Each node has a tag eld that allows the type of the node to be determined at run time. In
+some implementations of lazy functional languages, no tag is required. Instead the purpose of
+the tag is served in a di erent way, which requires less space but is also more complicated to
+explain [20].
+#define PTR
+typedef struct
+int
+union
+
+struct NODE *
+NODE
+tag;
+
+f
+
+f
+
+int
+struct
+
+val;
+
+f
+
+/* tag INT */
+/* tag CONS */
+
+g
+f
+
+/* tag SUSP */
+
+PTR
+hd;
+PTR
+tl;
+cons;
+
+struct
+
+g
+
+g data;
+
+PTR
+(* fun) ();
+PTR
+arg1;
+PTR
+arg2;
+susp;
+
+g
+
+node;
+typedef PTR ptr;
+
+Some macros are useful for accessing often used elds of the various data structures. These
+macros correspond to some of the primitive functions used in the example program:
+#define Null(x)
+#define Hd(x)
+#define Tl(x)
+
+((x)->tag == NIL)
+((x)->data.cons.hd)
+((x)->data.cons.tl)
+
+6
+
+The heap and the allocation routines
+The heap is de ned as an array of nodes. To allocate a node from the heap, the variable top
+must be incremented. All nodes are thus of the same size, which is rather a waste of space. In
+a real implementation, nodes will be more tightly packed, but this has not been done to avoid
+cluttering the code with address and size calculations. Also, to keep the presentation simple,
+there is no provision for dealing with heap over ow. In a real implementation, this would trigger
+the garbage collector, which gathers the nodes that are still in use, and makes the remaining
+nodes available for reuse [10].
+10000
+#define HEAP SIZE
+node
+heap[HEAP SIZE];
+ptr
+top
+= heap;
+
+For each node type, an allocation routine is de ned, which claims a node from the heap, and
+initialises the elds of the node. The allocation routines increment the heap pointer top as a side
+e ect. All four allocation routines return a pointer to the newly allocated node. The allocation
+routines call a trace routine, which prints the string passed as an argument and the contents of
+the allocated node. This allows a trace to be made of the reduction process when the program
+is executed. Tracing is not normally part of an implementation; it is included in the C code for
+demonstration purposes only.
+ptr
+int
+
+f
+
+g
+ptr
+ptr
+
+f
+
+g
+
+Int(i)
+i;
+ptr
+r;
+r = top++;
+r->tag = INT;
+r->data.val = i;
+trace(3,"Int
+","r",r);
+return r;
+
+Cons(h,t)
+h,t;
+ptr
+r;
+r = top++;
+r->tag = CONS;
+r->data.cons.hd = h;
+r->data.cons.tl = t;
+trace(3,"Cons ","r",r);
+return r;
+
+ptr
+
+f
+
+Nil()
+ptr
+r;
+r = top++;
+r->tag = NIL;
+trace(3,"Nil
+return r;
+
+g
+ptr
+ptr
+ptr
+
+f
+
+","r",r);
+
+Suspend(f,a1,a2)
+(* f) ();
+a1,a2;
+ptr
+r;
+r = top++;
+r->tag = SUSP;
+r->data.susp.fun = f;
+r->data.susp.arg1 = a1;
+r->data.susp.arg2 = a2;
+trace(3,"Susp ","r",r);
+return r;
+
+g
+
+This completes the discussion of the basic runtime support for graph reduction. There are two
+more routines to be de ned (Reduce and Print), but we will rst discuss the code generated by
+the compiler for Append and its main expression.
+The C code generated for Append
+The C code generated by the compiler for Append is shown in Figure 3. It consists of two
+parts. The rst part is the routine Append, which is the genuine translation of Append into
+
+7
+
+C. The C routine has a structure that is very similar to that of Append as shown in Figure 1.
+The main di erence (apart from the syntax) is that the C version contains calls to Reduce and
+Suspend, which together implement the required laziness. Where laziness is not required, a
+direct translation has taken place, for instance the boolean expression in the functional version
+is identical to that in the C version (again apart from the syntax). The compiler has worked hard
+to generate this particular code, because most of the laziness that is implied in the functional
+notation is not present in the C code.
+ptr
+ptr
+
+Prel Append();
+Reduce();
+
+ptr
+ptr
+
+Append(x,y)
+x,y;
+
+f
+
+g
+ptr
+ptr
+
+f
+
+g
+.
+
+trace(5,"Append","x",x,"y",y);
+if (Null(x))
+return Reduce(y);
+else
+return Cons(Hd(x),Suspend(Prel Append,Tl(x),y));
+
+g
+g
+
+f
+
+f
+
+Prel Append(x,y)
+x,y;
+trace(5,"Prel ","x",x,"y",y);
+return Append(Reduce(x),y);
+
+Figure 3: The C code generated for the function Append
+
+The second part of the code generated for Append is the prelude routine Prel_Append. This
+routine can be viewed as a second \entry point" to Append. The only di erence between the
+two is that, whenever Append is called, the rst argument must already be evaluated to head
+normal form. Under circumstances where this can not be guaranteed, the compiler arranges for
+a call to Prel_Append instead. The compiled code for the recursive call in the body of Append
+uses Prel_Append instead of Append, because the compiler does not know whether Tl(x) will
+deliver a head normal form or not. In the prelude routine, the compiler generates a direct call
+to Append.
+The reducer
+The heart of the graph reduction machinery consists of two routines: the reducer (Reduce) and
+the need to print (Print). The reducer is called from many places to assure that a certain node
+is to head normal form. There is only one node type that does not qualify as a head normal
+form: the suspension. The reducer performs its task of activating a function that has been
+suspended as follows. First the pointer to the prelude routine is extracted from the suspension.
+This prelude routine is then called with the pointers to the arguments of the suspended function.
+The prelude routine calls the reducer to bring all strict arguments in head normal form (in the
+case of the Append example the reducer is applied to the rst argument only), then calls the
+function proper.
+
+8
+
+As soon as the activated function returns, the prelude routine will also return. Then the
+suspension that used to be associated with the suspension is updated with the result that has
+just been computed. This is necessary to guarantee that no shared computation is evaluated
+more than once.
+ptr
+ptr
+
+f
+
+Reduce(x)
+x;
+ptr
+r;
+trace(3,"Reduce","x",x);
+switch (x->tag)
+case SUSP:
+r = x->data.susp.fun(x->data.susp.arg1,x->data.susp.arg2);
+trace(5,"Update","x",x,"r",r);
+*x = *r;
+/* Update the result */
+break;
+default:
+break;
+
+f
+
+g
+
+g
+
+return x;
+
+The code shows that when the reducer is applied to a data object, it has no e ect. One of the
+optimisations a good compiler applies is to remove redundant calls to the reducer.
+The need to print
+The execution of a lazy functional program is driven by the \need to print" the answer. The
+answer is often a list of some values. In the Append example, the result is a list of two integers,
+namely (Cons 1 (Cons 2 Nil )).
+The need to print is implemented by the Print routine. It recurses through the data generated by the main program. The need to print ensures, that each node it encounters is in head
+normal form by calling the reducer on the node before examining its tag. The three cases in the
+code below cover all possible tag values that represent head normal forms:
+ptr
+ptr
+
+f
+
+g
+
+Print(x)
+x;
+x = Reduce(x);
+switch (x->tag)
+case INT:
+printf("%d",x->data.val);
+break;
+case NIL:
+break;
+case CONS:
+Print(x->data.cons.hd);
+Print(x->data.cons.tl);
+break;
+
+f
+
+g
+
+The reducer and the need to print are part of the runtime system. The only missing part of the
+C program is a main function. This is generated by the compiler from the functional program.
+9
+
+The main program and the execution trace
+The main program rst constructs the two lists that will be appended and calls the Print routine
+to display the result list:
+main()
+
+f
+
+g
+
+ptr
+x,y,z;
+x = Cons(Int(1),Nil());
+y = Cons(Int(2),Nil());
+z = Suspend(Prel Append,x,y);
+Print(z);
+
+This completes the C program that implements the functional program from Figure 1.
+To study the runtime behaviour of the program, the trace that it produces will now be
+examined. The trace consists of one line per routine call. The name of the routine being traced
+appears rst, followed by a colon. Then for each argument of the routine, the address of the
+argument is printed, followed by an interpretation of the contents of the node. The interpretation
+begins with the name of the tag, and is followed by a printout of the elds of the node. All
+addresses are printed in hexadecimal, and the rst heap address is 00.
+The rst six lines are the result of constructing the two argument lists by the main program:
+Int
+Nil
+Cons
+Int
+Nil
+Cons
+
+: r=00(INT 1)
+: r=10(NIL)
+: r=20(CONS 00 10)
+: r=30(INT 2)
+: r=40(NIL)
+: r=50(CONS 30 40)
+
+The next line is produced by the call to Suspend also from the main program. Hereafter, the
+state of the graph in the heap is exactly as shown in the rst frame in Figure 2.
+Susp
+
+: r=60(SUSP Prel Append 20 50)
+
+The next trace line is produced by the reducer on demand from the need to print. The reducer
+discovers a suspension at address 60 and thus calls the prelude routine Prel_Append:
+Reduce: x=60(SUSP Prel Append 20 50)
+Prel : x=20(CONS 00 10)
+
+y=50(CONS 30 40)
+
+The last trace line above, from the prelude routine, shows that the actual arguments are both
+head normal forms, so that in this case the call to reduce the rst argument (below) is redundant.
+After discovering this, reducer returns control to Prel_Append:
+Reduce: x=20(CONS 00 10)
+
+Having ensured that the rst argument is a head normal form, Append is called. This is the last
+action taken by Prel_Append. The next trace line shows that Append is entered:
+Append: x=20(CONS 00 10)
+
+y=50(CONS 30 40)
+
+The Append routine now tests its rst argument using the macro Null. The tests yields False,
+so that a suspension is made of the recursive call to Prel_Append. The Append routine has now
+completed its task of creating a head normal form in the form of a list constructor and thus
+returns control to the reducer.
+10
+
+Susp
+Cons
+
+: r=70(SUSP Prel Append 10 50)
+: r=80(CONS 00 70)
+
+The reducer takes the result of the computation that has just been completed (at address 80)
+and copies it over the suspension at address 60:
+Update: x=60(SUSP Prel Append 20 50)
+
+r=80(CONS 00 70)
+
+The need to print now regains control and recurses on the head of the new list constructor node
+at address 60. The need to print calls the reducer to make sure that the head of the list is a
+head normal form, which it is (the integer 1):
+Reduce: x=00(INT
+
+1)
+
+The integer is then printed:
+1
+
+At this point, the state of the heap is exactly as shown in the second frame of Figure 2. The
+need to print now calls the reducer to deal with the suspension at address 70. This proceeds
+along the same lines as the reduction of the SUSP node at address 60:
+Reduce: x=70(SUSP Prel Append 10 50)
+Prel : x=10(NIL)
+Reduce: x=10(NIL)
+Append: x=10(NIL)
+
+y=50(CONS 30 40)
+y=50(CONS 30 40)
+
+When Append is entered for the second time, the end of the input list has been reached, so that
+this time the Null test yields True. The Append routine ensures that the result that it will
+return is indeed a head normal form:
+Reduce: x=50(CONS 30 40)
+
+The second suspension of Append at address 70 is then updated with the constructor node at
+address 50:
+Update: x=70(SUSP Prel Append 10 50)
+
+r=50(CONS 30 40)
+
+Finally the need to print receives the updated list constructor node and prints its contents:
+Reduce: x=30(INT 2)
+2
+Reduce: x=40(NIL)
+
+During this discussion we have glossed over several important issues, many of which are necessary
+to make the mechanism ecient. The main point is that the implementation of lazy evaluation
+requires an optimising compiler, which is able to spot as many expressions as possible that do
+not require the laziness. Such expressions may be compiled using the ordinary C evaluation
+strategy, which is more ecient than the graph reduction machinery. The remaining sections
+of the paper discuss the core of such an optimising compiler, emphasising both the structure of
+the compiler and the analyses that avoid laziness whenever possible.
+THE FLOW GRAPH
+
+A ow graph is a compile time representation of a program. This section gives the de nition
+of a ow graph, then de nes a mapping from an abstract syntax onto a ow graph and nally
+gives a denotational semantics of a ow graph.
+11
+
+The de nition of a ow graph
+
+A ow graph represents a functional program that is being compiled. It is worth commenting
+that this graph is not the same as the graph that will be reduced at run time. A ow graph is
+more like an abstract syntax tree, with an important di erence: a ow graph has extra structure
+that makes it more convenient for program analysis and synthesis than a syntax tree. This extra
+structure also makes it a graph. Figure 4 shows the ow graph for the function Append. The
+\extra" structure consists of the two SWITCH nodes, the two LAMBDA nodes and the connecting
+USE nodes. Removing these nodes would yield an abstract syntax tree.
+The edges of a ow graph are labelled with an integer number. The nodes have names
+that indicate their purpose. There are 11 di erent node types. The BIND and LAMBDA nodes
+represent function application and abstraction respectively. A primitive data object is created
+by a SOURCE node and unwanted objects are explicitly destroyed by a SINK node. The IMPORT
+and EXPORT nodes regulate the exchange of information across function boundaries. The USE
+nodes specify that a particular object may be used at more than one place. This is achieved by
+allowing two or more USE nodes to connect to a common input edge. None of the other nodes
+in the ow graph are allowed to share an input edge or to share an output edge.
+Although these seven nodes are sucient to compile eciently, adding a small number of
+node types enhances the ease of expressing the compilation algorithms without unduly increasing
+the complexity of the compiler. The extra nodes are SWITCH and MERGE to represent the if then
+else construct and CALL and RESULT to present the compiler with information about the presence
+of fully saturated calls (as opposed to partial applications) and fully abstracted functions.
+Much of the program analysis and code synthesis in a compiler is based on value representations. It is thus convenient to keep explicit track of the generators and consumers of each
+value (cf. def/use information in conventional compilers). This is speci cally the task of the
+SWITCH and USE nodes, which explicitly route information from where it is produced to where it
+is needed. These nodes also account for a major part of the extra information that makes a ow
+graph di erent from a syntax tree. The ideas involved are perhaps best exposed by giving an
+operational reading of what may happen when we try to \execute" the ow graph. Note that
+following the analyses, the compiler is capable of collapsing parts of the ow graph to straight
+sections of imperative code, while other parts will build suspensions.
+When Append is called with two actual arguments, the rst enters the graph at edge 104 and
+the second at edge 102. Following the direction of the arrows, the rst argument is distributed
+by two USE nodes to edges 108 and 114. The BIND node binds the Null test function appearing on
+edge 109 to its input on edge 108 and produces a suspension on edge 110. The CALL node signals
+that this suspension is actually a fully saturated call, which could be evaluated if necessary. The
+data item owing along edge 108 may either be a list that has been evaluated to a certain extent,
+or an as yet completely unevaluated object. The Null test, when asked to produce a truth value,
+requires its argument to be in head normal form, so a completely unevaluated object will have
+to be reduced to head normal form before the Null test can be carried out. The analyses to be
+discussed later decide when the object eventually appearing on edge 108 will be evaluated and
+also when the Null test function will be called.
+We would like to stress that, in a ow graph, suspensions of functions may ow down arcs
+as well as ordinary data values and so the ow graph itself is neutral with respect to the order
+of evaluation.
+From strictness analysis it follows that Append is strict in its rst argument, so that the Null
+test is duly applied to a head normal form. The Null test causes a truth value rather than a
+suspension to emerge on edge 113, and also on edges 115, 119 and 156 (because of the three USE
+nodes).
+Supposing the Null test yields False, the SWITCH nodes will pass their input values on edges
+12
+
+105
+
+EXPORT
+
+Append
+
+IMPORT 109
+
+101
+
+LAMBDA
+
+104
+USE
+
+Null
+
+103
+
+LAMBDA
+
+102
+
+USE
+
+USE
+
+108
+BIND
+
+110
+
+118
+
+114
+
+CALL
+
+119
+
+USE
+
+113
+USE
+
+115 SWITCH
+
+120
+
+117
+
+116
+
+IMPORT 123
+
+Hd
+
+122
+BIND
+
+USE
+
+USE
+IMPORT 133
+
+Tl
+
+124
+
+132
+BIND
+
+142
+
+134
+
+CALL
+
+CALL
+IMPORT 138
+
+127
+
+121
+
+USE
+
+USE
+
+SINK
+
+SWITCH
+
+Append
+
+137
+BIND
+
+BIND
+
+143
+
+144
+CALL
+
+IMPORT 128
+
+Cons
+
+147
+
+148
+
+BIND
+
+BIND
+
+149
+
+154
+USE
+
+156
+
+CALL
+
+152
+MERGE
+
+159
+RETURN
+
+Figure 4: Flow graph for Append x y = if Null x then y else Cons (Hd x) (Append (Tl x) y)
+
+13
+
+114 and 118 respectively down to edges 117 and 121 respectively. No values then appear on
+edges 116 and 120. After passing a few more BIND and CALL nodes, an object appears on edge
+152, which represents the result of the current call to Append. Because the MERGE node shares
+its control input edge 156 with the two SWITCH nodes, MERGE will select input from edge 152
+and pass that object to edge 159. Input 154, which does not carry a value, is ignored by MERGE.
+Finally the function result must be communicated to the caller by RETURN.
+Should the Null test return True, the rst argument to Append is disposed of by the SINK
+node at edge 116 and the second argument is passed through the USE node connecting edges 120
+and 154.
+A graphical representation is convenient to reason about in a loose manner, but does not
+lend itself to a more formal approach. Therefore the ow graph of all functions within a program
+to be compiled are manipulated as a set of nodes. A node is a 4-tuple of the following form:
+input(s), type, quali er, output(s)
+
+Here, input(s) and output(s) are tuples of edges. Depending on the type of the node, such a
+tuple contains 0, 1, 2 or 3 edges. The next component in the ow graph node is the type,
+which indicates one of the 11 node types that are de ned. Each node carries a further quali er
+that represents information speci c to the node. The SOURCE node carries the sourced value as
+quali er and the IMPORT and EXPORT export nodes carry the name of the imported or exported
+function. The quali er of the remaining nodes is empty.
+All edges in the ow graph of a compilation unit are uniquely numbered. In Figure 4 the
+edges of all but the LAMBDA and EXPORT nodes are read from left to right as they appear in the
+input and output tuples. The edges of LAMBDA and EXPORT are read from right to left.
+The results of an analysis on a ow graph are represented by attributes of the edges. An
+attribute is a 3-tuple of the form:
+attribute, edge, value
+
+The rst component is the name of the attribute, the second the edge number to which it applies
+and the third the attribute value. All program analysis and synthesis of the compiler is speci ed
+as a function over the set in which nodes (4-tuples) and attributes (3-tuples) coexist. This set
+is called a ow graph set.
+Here, as an example, is the subset of nodes that corresponds to the Null test in Append:
+
+;; IMPORT; Null ;109
+#
+
+(109; 108); BIND; ;;110
+
+#
+
+110; CALL; ;; 113
+The subset of nodes corresponding to the conditional expression in Append:
+
+   = if    then    else   
+is the set:
+
+(156; 154; 152); MERGE ; ;;159
+
+#
+
+159; RETURN; ;; 101
+Gathering all the nodes in Figure 4 in a set yields the complete ow graph set for Append. A
+formal derivation of the set will be discussed in the following sections.
+14
+
+Intermediate, the compiler input language
+
+The input language of the compiler, Intermediate, is intended as a target for a front end. Intermediate can be regarded as a form of sugared -calculus. Figure 5 shows the abstract syntax
+of an Intermediate program p. More complex constructs, such as pattern matching and local
+function de nitions are not supported and must therefore be compiled to the syntax of Figure 5,
+prior to the transformation of the parse tree into a ow graph. Compilation of pattern matching,
+lambda lifting and several other standard transformations are more convenient to apply to a
+parse tree than to a ow graph. Peyton Jones [13] discusses these transformations in detail.
+p ::= d1 : : : dn
+d ::= f
+
+x1 : : : xn = e
+
+(f and x1 : : : xn are identi ers)
+
+e ::= let x1 = e1 : : : xn = en in e
+if eb then et else ee
+ef ea
+x
+f
+
+j
+j
+j
+j
+j Nil
+
+(function application)
+(name of an argument or let introduced name)
+(function name)
+(Nil or other constants)
+Figure 5: The abstract syntax of Intermediate, the ow graph compiler input language
+
+Intermediate does not support case and letrec expressions, because the simpler the input
+language, the fewer di erent node types are needed in the ow graph representation. The if
+construct could be replaced by a case construct, which would require multiway instead of binary
+SWITCH and MERGE nodes. This is certainly feasible but not strictly necessary.
+It is not possible to build a letrec construct into Intermediate, as this would introduce
+arbitrary cycles in the ow graph. This is not a restriction on the power of Intermediate, as
+programmers often write letrec expressions when a cascade of let expressions would do equally
+well. Prior to the generation of the ow graph, the compiler must translate all non-recursive
+letrec expressions into let expressions and it must transform the remaining, genuinely self
+referential local de nitions into applications of the xed point combinator Fix [21].
+
+Set notation
+
+Before we can describe how a ow graph may be created and used, we must digress brie y
+to introduce suitable notation. This consists of a notation for sets and for rewriting sets with
+pattern matching on suitably selected subsets. The notation is similar to that used in functional
+programming languages for pattern matching on lists. Braces (f g) and semi-colons (;) are used
+with sets, in the same way as brackets ([ ]) and colons (:) are conventionally used with lists.
+Parentheses are used to group expressions as normal. The semantics of pattern matching on
+sets and lists di er in that the former do not imply any ordering on the elements, whereas the
+latter do. The two function de nitions below illustrate these points. PairList always takes the
+rst two elements of its argument list. On the other hand, when PairSet is applied to a set of
+numbers, any two set elements may be selected and added, followed by applying PairList to the
+remainder of the set:
+PairList : [Num ] ! [Num ]
+PairSet : fNum g ! fNum g
+PairList (a : b : x) = a + b : PairList x
+PairSet (a; b; x) = a + b; PairSet x
+PairList
+x
+=x
+PairSet
+x
+=x
+When pattern matching on either sets or lists, actual arguments are considered top down, left to
+right. Variables in patterns always consist of lower case letters, possibly adorned with subscripts.
+15
+
+These variables are bound to values by the pattern matching. Repeated variables of the same
+name must all match the same value.
+Elements of tuples are separated by commas, which have a higher priority than the semicolons that separate set elements. Thus when dealing with sets of tuples, the brackets surrounding tuples are omitted. A set containing three 2-tuples is written as: fa; b; c; d; e; f g. The
+function Zip below rewrites all pairs of 2-tuples in the argument set to 2-tuples of two element
+sets. Both x and (Zip x) are thus sets:
+Zip :
+f  g ! ffg  fgg
+Zip (a1 ; b1 ; a2 ; b2 ; x) = fa1 ; a2 g; fb1 ; b2 g; Zip x
+Zip
+x
+=x
+
+A shorthand notation is often convenient to refer to the entire argument set on the left hand
+side of a de ning equation. The section symbol x is used for this purpose. De ne an auxiliary
+function Aux thus:
+Aux : f  g ! fg  fg
+Aux fa1 ; b1 ; a2 ; b2 g = fa1 ; a2 g; fb1 ; b2 g
+The rst clause of Zip can now be de ned as follows:
+z
+
+x
+
+}|
+
+{
+
+Zip (a1 ; b1 ; a2 ; b2 ; x) = Aux (x n x); Zip x
+
+Here n is the asymmetric set di erence operator.
+It is also convenient to use the \: : : " notation to indicate that any number of the surrounding
+indexed patterns may occur:
+Aux 0 :
+f  g
+! fg  fg
+0
+Aux fa1 ; b1 ; : : : ; an ; bn g = fa1 ; : : : ; an g; fb1 ; : : : ; bn g
+
+The function Aux 0 rewrites any number of pairs in one step rather than exactly two as Aux does.
+The index pattern n is also bound to the appropriate actual value. If the pattern n is indeed a
+variable, there are no restrictions on the number of occurrences of ai ; bi . In particular there may
+be no occurrences at all, in which case n is bound to 0, and the interpretation of the de nition
+of Aux 0 becomes:
+Aux 0 ; = ;; ;
+Here ; is the same as fg, the empty set.
+
+Generating a ow graph from Intermediate
+
+The compiler constructs a ow graph from the parse tree of an Intermediate program using
+the compilation functions Fprg, Fdef and Fexp shown in Figure 6. The presentation has been
+simpli ed where the code to calculate edge labels has been replaced by comments stating which
+variables are to be bound to new unique integer labels.
+The function Fdef transforms a function de nition into a ow graph. It generates the
+LAMBDA, RETURN and EXPORT nodes that are associated with the header of the function and
+relies on Fexp to generate the nodes for the body of the function. Fexp receives as parameters the
+expression to be compiled, an environment and an edge label. The environment initially maps
+the functions arguments onto edge labels. When encountering let expressions, the mapping is
+extended with the local symbols and the associated edge labels. The environment mapping is
+represented as a set of (name, edge) pairs. The edge label passed to Fexp as the third parameter
+is the output edge to be associated with the ow graph compiled for the expression.
+16
+
+Fprg : [ p ]
+Fdef : [ d ]
+Fexp : [ e ]
+Fprg [ d1 : : : dn ]
+Fdef [ f
+
+! Graph
+! Graph
+! fIdent  Edge g ! Edge ! Graph
+= Fdef [ d1 ] [ : : : [ Fdef [ dn ]
+
+x1 : : : xn = e ]
+= l0 ; RETURN; ; l1 ;
+l1 ; LAMBDA; ; (hn ; l2 ) ; : : : ; ln ; LAMBDA; ; (h1 ; ln+1 );
+ln+1 ; EXPORT; f; ;
+Fexp [ e ] x1 ; h1 ; : : : ; xn ; hn l0
+
+;
+;
+
+where
+
+f
+
+;
+
+;
+
+g
+
+l0 : : : ln+1 and h1 : : : hn are unique labels
+
+Fexp [ if b then t else e ] fx1 ; h1 ; : : : ; xn ; hn g lx
+= lb ; USE; ;; lm ; (lm ; lt ; le ); MERGE; ;; lx ;
+Fexp [ b ] fx1 ; h1 ; : : : ; xn ; hn g lb [
+Fswt h1 c1 v1 t1 e1 [ : : : [ Fswt hn cn vn tn en [
+Fexp [ t ] fx1 ; t1 ; : : : ; xn ; tn g lt [
+Fexp [ e ] fx1 ; e1 ; : : : ; xn ; en g le
+where
+Fswt hi ci vi ti ei = lb ; USE; ;; ci ; hi ; USE; ;; vi ; (ci ; vi ); SWITCH; ;; (ti ; ei )
+c1 : : : cn ; v1 : : : vn ; t1 : : : tn ; e1 : : : en ; and lb ; lt ; le ; lm are unique labels
+Fexp [ let x1 = e1 : : : xn = en in e ] r lx
+= Fexp [ e1 ] r l1 [ : : : [ Fexp [ en ] r ln [
+Fexp [ e ] (x1 ; l1 ; : : : ; xn; ln ; r0 ) lx
+where
+r 0 = f(y; h) 2 r j y 6= xi ^ 1  i  ng
+l1 : : : ln are unique labels
+Fexp [ f a ] r lx
+
+= (lf ; la ); BIND; ;; lx ; Fexp [ f ] r lf [ Fexp [ a ] r la
+where
+lf and la are unique labels
+
+Fexp [ x ] (x; h; r) lx = h; USE; ;; lx
+Fexp [ f ] r lx
+= ;; IMPORT; f; lx
+Fexp [ True ] r lx = ;; SOURCE; True ; lx
+
+(True and other constants)
+
+Figure 6: Simpli ed scheme to transform an Intermediate program into a ow graph (the CALL
+and SINK nodes are added later by separate schemes not shown here)
+
+17
+
+The derivation of the ow graph for Append commences as shown below. The nodes that
+are generated in previous steps are not shown in subsequent steps; dots are shown instead:
+Fdef [ Append x y = if Null x then y else Cons (Hd x) (Append (Tl x) y) ]
+=
+(Fdef )
+159; RETURN; ;; 101;
+101; LAMBDA; ;; (102; 103); 103; LAMBDA; ;; (104; 105);
+105; EXPORT; Append ; ;;
+Fexp [ if Null x then y else Cons (Hd x) (Append (Tl x) y) ] fx; 104; y; 102g 159
+=
+(Fexp )
+:::
+
+113; USE; ;; 156; (156; 154; 152); MERGE ; ;; 159;
+Fexp [ Null x ] fx; 104; y; 102g 113[
+Fswt 104 115 114 116 117[
+Fswt 102 118 119 120 121[
+Fexp [ y ] fx; 116; y; 120g 154[
+Fexp [ Cons (Hd x) (Append (Tl x) y) ] fx; 117; y; 121g 152
+=
+(3  Fexp ; 2  Fswt )
+:::
+
+(108; 109); BIND ; ;; 113
+Fexp [ Null ] fx; 104; y; 102g 108[
+Fexp [ x ] fx; 104; y; 102g 109[
+113; USE; ;; 115; 104; USE ; ;; 114; (115; 114); SWITCH ; ;; (116; 117);
+113; USE; ;; 119; 102; USE ; ;; 118; (119; 118); SWITCH ; ;; (120; 121);
+120; USE; ;; 154;
+(147; 148); BIND ; ;; 152
+Fexp [ Cons (Hd x) ] fx; 117; y; 121g 147
+Fexp [ (Append (Tl x) y) ] fx; 117; y; 121g 148
+= etc.
+
+Denotational semantics of a ow graph
+
+Figure 7 shows the abstract syntax and the syntactic and semantic domains that are used to
+describe the semantics of a ow graph. The value Error is included as a separate domain to
+distinguish between certain typing errors and ?. The semantic function Fix is the standard
+xed point function. The meaning of a ow graph g formed from n function de nitions is given
+by (Exp g). This meaning has the form of a tuple (1 ; : : : ; n ) where k 2 Dev , 1  k  n. The
+function Def gives the meaning of an edge in a graph, given a particular environment.
+The de nitions of the semantic functions Def and Exp are given in Figure 8. As is standard
+practice, the domain projection, injection and membership tests have been omitted. The full
+version of the BIND rule would be:
+z
+
+x
+
+}|
+
+{
+
+Def ((a; b); BIND; ;; d; g) d  = if f E Func then (f j Func ) (Def x b ) else ?e
+where f = Def x a 
+The rst argument to the functions Def and Exp speci es a set of nodes that represent a
+ow graph, from which the element(s) of current interest are selected by pattern matching.
+The Exp rule takes all EXPORT nodes from the argument set and returns the meaning of the
+ow graph as a tuple. A given EXPORT node with input edge ak provides the starting edge for the
+
+18
+
+Syntactic domains:
+a; b; c; d; e 2 Edge
+i
+2 Ident
+g
+2 Graph
+v
+2 Value
+
+(Edges are natural numbers)
+(Identi ers)
+(Power set of vertices)
+(Constants, such as numbers, True, False and Nil )
+
+Abstract syntax:
+G ::= fV1 ; : : : ; Vn g
+
+(A graph is a set of vertices)
+
+;
+;
+
+V ::= a
+; LAMBDA ; ; (d; e)
+(a; b) ; SWITCH ; ; (d; e)
+; SOURCE ; v ; d
+; IMPORT ; i ; d
+a
+; CALL
+; ;d
+a
+; USE
+; ;d
+
+j
+j ;
+j ;
+j
+j
+
+;
+;
+
+j (a; b) ; BIND ; ; ; d
+j (a; b; c) ; MERGE ; ; ; d
+j a
+; SINK
+;;;;
+j a
+; EXPORT ; i ; ;
+j a
+; RETURN ; ; ; d
+
+Semantic domains:
+1 ; 2 ; : : : 2 Dev 
+= Error + Num + Bool + Func + f?l ; Nil g + [Dev  Dev ]
+
+2 Env = Ident ! Dev
+(Environments)
+Error = f?e g
+(?e is a type error)
+Num = f?n ; 0; : : :g
+(Domain of numeric values)
+Bool = f?b ; True ; False g
+Func = Dev ! Dev
+Semantic functions:
+Fix : Func ! Dev
+if : Bool ! Dev ! Dev ! Dev
+Def : Graph ! Edge ! Env ! Dev
+Exp : Graph ! Dev
+Figure 7: Abstract syntax, and syntactic and semantic domains of a ow graph
+
+19
+
+second argument of the application of Def. The third argument to Def is a local environment,
+which expresses the meaning of all primitive functions and also contains bindings of all ik to the
+xed point variables k . This local environment is used by the IMPORT clause in the de nition
+of Def, where i is either the name of a primitive whose meaning is known, or it is ik ; the name
+of a function being de ned.
+Semantic equations:
+Def (a; LAMBDA; ;; (d; e);
+Def (a; LAMBDA; ;; (d; e);
+
+g ) d  = d
+g ) e  = d
+
+ Def x a 
+Def ((a; b); BIND; ;; d;
+g ) d  = (Def x a ) (Def x b )
+Def ((a; b); SWITCH; ;; (d; e); g) d  = if Def x a  then Def x b  else ?e
+Def ((a; b); SWITCH; ;; (d; e); g) e  = if Def x a  then ?e else Def x b 
+Def ((a; b; c); MERGE; ;; d; g) d  = if Def x a  then Def x b  else Def x c 
+Def (;; SOURCE; True ; d; g) d  = True (similarly for other constants)
+Def (;; IMPORT; i; d;
+g ) d (i;  ; ) = 
+Def (a; CALL; ;; d;
+g ) d  = Def x a 
+Def (a; RETURN; ;; d;
+g ) d  = Def x a 
+Def (a; USE; ;; d;
+g ) d  = Def x a 
+Def
+g d  = ?e (i none of the other Def clauses apply)
+Exp (a1 ; EXPORT; i1 ; ; ; : : : ; an ; EXPORT; in ; ;; g)
+= Fix (  (a1 ; : : : ; an )  (Def x a1 ; : : : ; Def x an ) )
+where
+ = (i1 ; a1 ; : : : ; in ; an ; Primitives )
+
+Primitives = f Cons ; 1  2 Cons 1 2 ;
+Hd ; 1
+Hd 1 ;
+Null ; 1
+Null 1 ;
+Tl ; 1
+Tl 1 ; : : : g
+
+Figure 8: Semantic equations Def and Exp of a ow graph
+The LAMBDA and SWITCH nodes are special because they have two outputs rather than one.
+The second parameter to Def decides for which of the two outputs d or e, the semantics must
+be given. This is expressed by the non-linear pattern match in the two equations for LAMBDA as
+follows:
+Def (a; LAMBDA; ;; (d; e); g) d  = d
+Def (a; LAMBDA; ;; (d; e); g) e  = d  Def x a 
+Def
+g x  = ?e
+
+
+
+Def (a; LAMBDA; ;; (d; e); g) x  = if x = d then d
+else if x = e then d  Def x a 
+else ?e
+The rst LAMBDA clause states that the name of the bound variable corresponding to the LAMBDA
+node is to be a unique identi er, here generated by edge number (all edge numbers are unique).
+
+20
+
+The meaning of the other output edge of the LAMBDA node as given by the second LAMBDA
+clause is a -abstraction that binds the variable introduced by the rst LAMBDA clause. In the
+semantics of Append to be presented below, the variables 102 and 104 are introduced by the
+LAMBDA clauses.
+The meaning of both the d and e outputs of the SWITCH node depends on the meaning of the
+control input a and that of the value input b. The rst SWITCH clause states that if the meaning
+of the control input is True, the meaning of the d output is the same as that of the b input. If
+the meaning of the control input is False that of the d output is irrelevant, which is indicated
+by ?e . This is to ensure that the meaning of all edges is de ned, whether actually used or not.
+The control input a of a SWITCH node is intended to also steer a MERGE node (via a network of
+USE nodes), so that both may operate in synchrony. In a correct program, a ?e value derived
+from a SWITCH node never passes through a MERGE.
+The derivation of the semantics for the ow graph of Append from Figure 4 is shown below.
+At each step only the node is shown that is of current interest, i.e. the one whose output edge
+matches the current value of the second argument to Def. Each invocation of Def has the entire
+set of nodes at its disposal. The rst ve steps of the derivation are:
+Exp g = Exp (105; EXPORT; Append ; ;;
+g1 )
+= Fix ( 105  Def (103; LAMBDA; ;; (104; 105);
+g2 ) 105 )
+= Fix ( 105  (104  Def (101; LAMBDA; ;; (102; 103);
+g3 ) 103 ) )
+= Fix ( 105  (104  (102  Def (159; RETURN; ;; 101;
+g4 ) 101 ) ) )
+= Fix ( 105  (104  (102  Def ((156; 154; 152); MERGE ; ;; 159; g5 ) 159 ) ) )
+:::
+
+where
+
+ = (Append ; 105 ; Primitives )
+
+The process continues for a while until a xed point expression is reached. We found the process
+so tedious that we wrote a small functional program as suggested by Stoy [22] to do the rewriting.
+The resulting xed point expression for Append is:
+Exp g = Fix ( 105  (104  (102  if Null 104 then 102
+else Cons (Hd 104 ) ( 105 (Tl 104 ) 102 ) ) ) )
+
+This concludes the presentation of the syntax and semantics of the ow graph that is at the
+heart of the compiler.
+PROGRAM ANALYSIS ON THE FLOW GRAPH
+
+The compiler performs a variety of major program analyses, such as strictness, boxing and
+sharing analysis. In addition a number of minor analyses are performed to support the major
+analyses. The compiler synthesizes code based on the ndings of the analysis phases up to the
+point where a complete C program has been generated.
+Each analysis and synthesis function is formally speci ed as a set of rewrite rules on a
+ow graph set, together with a set of attributes that represent the information gathered by
+the analysis. A rewrite rule on a ow graph set selects nodes and attributes, and replaces the
+selected items by a new set of items. In most cases, the rewrite rules only add one or more
+attributes to the ow graph set, thus gradually increasing the information about the program
+being compiled. In the compiler, the analysis and synthesis functions are applied in a certain
+order, so that each pass adds a further set of attributes to the ow graph set. At the end of
+the compilation process, the C code generated for the functional program is present as a set of
+attributes, which only need to be printed so as to form the compiled program.
+21
+
+All major analyses performed by the compiler (i.e. not just strictness analysis but also boxing
+analysis etc.) are based on Wadler's linear domain [23]. The principles of the analyses will be
+described using the simplest domain possible that still provides useful information. This twopoint domain consists of the points 0 and 1. The meaning of these values is as follows: 0 signi es
+that \absolutely no information" is present and 1 means that \all information" is present. It
+depends on the analysis what \information" actually means. In the context of strictness analysis
+the point 1 means that a head normal form is required. In the context of boxing analysis it
+means that an object is required that need not be stored in the heap.
+In the following sections a backwards and a forwards analysis are described over the twopoint domain. The extension of the analysis over a larger domain is discussed in some detail in
+the section \Projection analysis".
+
+Strictness analysis: a backwards analysis
+
+The principle of strictness analysis is the observation, that at run time, a function application
+is evaluated only if the answer is really needed. At compile time strictness analysis derives the
+information required to implement this as follows: the \seed" for the analysis process is planted
+at the exit (i.e. the RETURN node) of a function. By obeying the rewrite rules of the analysis, the
+strictness information travels upwards to the entries of a function (i.e. the LAMBDA, SOURCE and
+IMPORT nodes). Restricting our attention to the two-point domain allows for the mechanism to
+be discussed in detail, without having to describe at the same time methods to nd xed points
+(see section \Recursive function de nitions and xed point iteration"). The strictness analysis
+is given by the function U in Figure 9.
+For each type of node in the ow graph, there is a rule in an analysis or synthesis function.
+Such a function either propagates information downwards, from the entry points towards the
+exits of a ow graph, or upwards, from the exit points towards the entry points. The U function
+propagates information upwards. The rewrite rules that perform upwards propagation take
+attributes for the output edges of each node and compute the attributes for the input edges.
+Downwards propagation reverses the overall ow of information so it requires the rewrite rules
+to take attributes on their input edges and to produce attributes for the output edges. The U
+analysis de nes an upwards ow, whereas the D function, also in Figure 9 de nes a downwards
+ow. Often a complete analysis or synthesis phase requires a combination of an upwards and a
+downwards ow, which thus requires two separate functions, and two separate attributes.
+The use of a ow graph thus requires that the direction of the information ow is made explicit in the program analysis and synthesis functions. This contrasts with the way an attribute
+grammar propagates information. The ow of information implicit in the computation of inherited attributes in an attribute grammar corresponds to upwards propagation in a ow graph.
+The information ow in calculating synthesised attributes in an attribute grammar corresponds
+to downwards information propagation in a ow graph. Since the ow graph formalism enforces
+the use of separate analysis and synthesis functions for the production of separate attributes, it
+can be considered as a speci cation method that is of a lower level than an attribute grammar.
+On the other hand, a ow graph is simpler to implement in an ecient way.
+In the next two sections, the analysis functions given in Figure 9 will be applied to the ow
+graph for Append to explain exactly how analysis on the ow graph takes place.
+The rst argument of Append
+The U analysis determines the strictness of the arguments of a function represented as a ow
+graph. The strictness is represented by SUP attributes (for Strictness UP). As the U function
+performs backwards analysis, the nodes are visited from bottom to top, starting with the RETURN
+node. The analysis is \seeded" at the input edges a of the RETURN, SINK and EXPORT nodes.
+
+22
+
+U (a; LAMBDA; q; (d; e);
+
+U (SUP; a; 0;
+
+Figure 9: Strictness and availability analysis functions U and D
+
+23
+
+x)
+
+[xnx
+
+U ((a; b); BIND; q; d; ABS; b; e; zSUP; e; ue{;
+SUP; d; ud; x)=U (SUP; a; ud; SUP; b; ud ^ ue; {;
+U ((a; b); SWITCH; q; (d; e);
+SUP; d; ud; SUP; e; ue; x)=U (SUP; a; 0; SUP; b; ud ^ ue;
+U ((a; b; c); MERGE; q; d;
+SUP; d; ud; x)=U (SUP; a; ud; SUP; b; ud; SUP; c; ud;
+U (;; SOURCE; q; d;
+SUP; d; ud; x)=U (
+U (;; IMPORT; q; d;
+SUP; d; ud; x)=U (
+U (a; SINK; q; ;;
+x)=U (SUP; a; 0;
+U (a; EXPORT; q; ;;
+x)=U (SUP; a; 0;
+U (a; CALL; q; d;
+SUP; d; ud; x)=U (SUP; a; ud;
+U (a; RETURN; q; d;
+x)=U (SUP; a; 1;
+U (a; USE; q1; d1 ; : : : ; a; USE; qm ; dm ; SUP; d1 ; ud1 ; : : : ; SUP; dm ; udm ; x)=U (SUP; a; ud1 _ : : : _ udm ;
+Ux
+=x
+
+x)
+x)
+x)
+x)
+x)
+x)
+x)
+x)
+x)
+x)
+
+[xnxn{
+[xnx
+[xnx
+[xnx
+[xnx
+[xnx
+[xnx
+[xnx
+[xnx
+[xnx
+
+D(a; LAMBDA; q; (d; e); SUP; d; ud;
+D((a; b); BIND; q; d;
+
+x)
+x)
+
+[xnx
+[xnx
+
+x)
+
+[ { [ x[
+
+x)
+
+[xnx
+
+x)=
+
+{
+}|
+
+z
+
+x)=D (SDN; d; ud; SDN; e; 0;
+SDN; a; da; SDN; b; db; x)=D(SDN; d; da;
+
+{
+
+}|
+
+{
+
+D((a; b); SWITCH; q; (d; e); SUP; d; ud; SUP; e; ue;
+D((a; b); SWITCH; q; (d; e);
+D((a; b; c); MERGE; q; d;
+
+D((a; b; c); MERGE; q; d;
+D(;; SOURCE; q; d;
+D(;; IMPORT; q; d;
+D(a; SINK; q; ;;
+D(a; EXPORT; q; ;;
+D(a; CALL; q; d;
+D(a; RETURN; q; d;
+D(a; USE; q1 ; d1 ; : : : ; a; USE; qm; dm ;
+Dx
+
+z
+
+x
+
+}|
+
+z
+
+{
+
+SDN; a; 0; SDN; b; db; x)=D(SDN; d; db _ ud _ ue; SDN; e; db _ ud _ ue;
+fa; SINK; q; ;; b; USE; q; d; b; USE; q; eg
+SDN; a; 1; SDN; b; db; x)=D(SDN; d; db; SDN; e; db;
+
+x
+}|
+
+{
+
+SDN; a; 0; SDN; b; db; SDN; c; dc; x)=D(SDN; d; 0;
+x) [ x[
+f;; IMPORT; If ; a + 1;
+(a + 1; a); BIND; q; b + 1; SDN; a + 1; 1; ABS; a; If 1 ;
+(b + 1; b); BIND; q; c + 1; SDN; b + 1; 1; ABS; b; If 2 ;
+(c + 1; c); BIND; q; d 1; SDN; c + 1; 1; ABS; c; If 3 ;
+d 1; CALL; q; d; SDN; d 1; 1g
+SDN; a; 1; SDN; b; db; SDN; c; dc; x)=D(SDN; d; db ^ dc;
+x) [ x n x
+x)=D (SDN; d; 1;
+x) [ x n x
+x)=D (SDN; d; 1;
+x) [ x n x
+SDN; a; da; x)=D(
+x) [ x n x
+SDN; a; da; x)=D(
+x) [ x n x
+SDN; a; da; x)=D(SDN; d; da;
+x) [ x n x
+x)=D (SDN; d; 0;
+x) [ x n x
+SDN; a; da; x)=D(SDN; d1 ; da ; : : : ; SDN; dm ; da;
+x) [ x n x
+
+=x
+
+Figure 9 shows that all these nodes are allowed to \ re" without requiring already existing SUP
+attributes; all other rewrite rules need an existing SUP attribute to re. In the Append example,
+the rst SUP attribute that appears in the ow graph set is generated by the RETURN on edge
+159. The attribute value 1 states that a head normal form is associated with edge 159. The
+relevant subset of the ow graph set that represents Append and its attributes is shown below.
+Attributes are shown next to the edge to which they belong. The arrows on the edges indicate
+the direction of the information propagation:
+(156; 154; 152); MERGE ; ;;159
+
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+To help understand the method, the reader may wish to annotate the edges in Figure 4 with
+the value of the SUP attributes as the derivation proceeds.
+The second rewrite step taken by the U function is to combine the newly generated attribute
+on edge 159 with the MERGE node that connects to edge 159. The MERGE rule in Figure 9 speci es
+that the formal attribute value ud (actual value 1) as received on the formal d-edge (actual value
+159) of the MERGE node is to be sent on formal edges a, b and c. In the Append example this
+means that the attribute value 1 now appears on edges 156, 154 and 152 respectively. Only one
+of these attributes, that for edge 156, is shown below, together with the relevant part of the
+Append ow graph set:
+113; USE; ;;156
+
+" SUP; 156; 1
+(156; 154; 152); MERGE ; ;;159
+
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+Now three rewrites are possible: one involving the USE node on edge 156, one involving the USE
+node on edge 154 and one involving the CALL node on edge 152. The choice here is to proceed
+with the rst possibility, so the next rewrite rule to consider is the USE rule in Figure 9. This rule
+states that to compute the value of the SUP attribute on the a-edge, the SUP attributes for all
+USE nodes that have the same a-edge must be combined using the logical or (_). In the Append
+example, this means that SUP attributes on edges 156, 115, and 119 are in principle required
+rst, before progress can be made. However, the _ operator has the nice algebraic property
+that if one of its operands is 1, the value of the remaining operands does not matter, for the
+answer will always be 1. The SUP attribute on edge 156, which has just been calculated by the
+MERGE rule, is 1, so the USE rule may now set the SUP attribute on edge 113 to 1, regardless of
+the values of the SUP attributes on edges 115 and 119. This yields the following (partial) state
+of the ow graph set:
+110; CALL; ;;113
+
+" SUP; 113; 1
+113; USE; ;;156
+
+" SUP; 156; 1
+
+(156; 154; 152); MERGE ; ;;159
+
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+The fourth rewrite is an application of the CALL rule in Figure 9, which copies the SUP attribute
+24
+
+on edge 113 over to edge 110, yielding:
+(109; 108); BIND ; ;;110
+
+" SUP; 110; 1
+110; CALL; ;;113
+
+" SUP; 113; 1
+113; USE; ;;156
+
+" SUP; 156; 1
+(156; 154; 152); MERGE ; ;;159
+
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+The fth rewrite rule to be applied is the BIND rule. Figure 9 shows that the BIND rule not only
+requires a SUP attribute on the d-edge, but also the ABS attribute on the b-edge, as well as the
+SUP attribute on some other edge e as speci ed by ABS; b; e. The ABS attributes are generated
+by the A scheme, which is not described in the paper because it is similar to the U scheme in
+the way attributes are propagated. The A scheme works out connections between formal and
+actual arguments of functions. A formal argument is identi ed with the d-edge of a LAMBDA
+node, whereas an actual argument is identi ed with the b-edge of a BIND node. In the Append
+example, the ABS attribute value on edge 137 is edge 104, to note the correspondence between
+an actual rst argument (137) of Append and the formal rst argument (104). Similarly, the
+ABS attribute value carried by edge 142 is edge 102.
+Before continuing the derivation two problems should be considered: the rst is how to
+deal with higher order functions and the second is how to represent prede ned properties of
+primitive functions. Both problems are e ectively solved by the one and the same mechanism:
+add unconnected edges to the ow graph.
+When the compiler does not know a function by its name, the ABS attribute points at an
+unconnected edge that carries a set of attributes with \no information". This means that absolutely no information is available about functions passed as a parameter, or functions returned
+by other functions (see also section \Projection analysis").
+When the compiler needs information about a primitive function, the ABS attribute points at
+an unconnected edge that carries all the required information. For example, the ABS attribute on
+edge 108 points at the edge corresponding to the formal argument edge (say edge Null 1 ) of Null.
+One of the required properties, the SUP attribute, speci es whether Null is a strict function.
+This is indeed the case: to determine whether the end of a list has been reached, the top level
+constructor of the list must be evaluated to head normal form. The attribute specifying this
+fact is thus SUP; Null 1 ; 1.
+Adding primitive functions to the compiler thus means allocating one or more extra edges
+and entering the desired properties for these edges in a table. This makes it easy to extend and
+alter the set of primitives supported by the compiler.
+Returning to the BIND rule in Figure 9 we see that it can now be applied, since Null is a
+primitive and all the attributes speci ed in the BIND rule are present. The computation involved
+in the generation of the new attribute on the b-edge (edge 108 in case of the Append example)
+requires taking the logical and (^) of the SUP attribute on the e edge (Null 1 ) and the incoming
+SUP attribute on the d-edge (110). The value of both SUP attributes is 1, so the new value of
+the SUP attribute on edge 108 is 1. In the ow graph set below, the three relevant attributes
+are shown next to edge 108. Only the rst is a newly generated attribute, the ABS attribute is
+generated by a previous compilation scheme and the attribute SUP; Null 1 ; 1 is loaded into the
+
+25
+
+ow graph set at initialisation:
+104; USE; ;;108
+
+" SUP; 108; 1; ABS; 108; Null 1; SUP; Null 1 ; 1
+(109;108); BIND; ;;110
+" SUP; 110; 1
+110; CALL; ;;113
+" SUP; 113; 1
+113; USE; ;;156
+
+" SUP; 156; 1
+
+(156; 154; 152); MERGE ; ;;159
+
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+The fth rewrite brings a SUP attribute to the formal argument edge (104) of the Append's rst
+argument. The attribute value is 1, which means that Append is strict in its rst argument:
+103; LAMBDA; ;; (104; 105)
+" SUP; 104; 1
+104; USE; ;;108
+
+" SUP; 108; 1
+(109;108); BIND; ;;110
+
+" SUP; 110; 1
+110; CALL; ;;113
+
+" SUP; 113; 1
+113; USE; ;;156
+
+" SUP; 156; 1
+
+(156; 154; 152); MERGE ; ;;159
+
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+This rather lengthy discussion is really a proof of the fact that, given the rules of Figure 9, if
+a head normal form is required as output of Append, there must be a head normal form on the
+rst argument of Append. In the usual formal notation we have just proved that:
+
+,
+
+8 x; y : (Append x y 6= ?) U! (x 6= ?)
+8 x; y : (x = ?) ! (Append x y = ?)
+
+(contra positive rule)
+
+The rewrite rules of Figure 9 are the deduction rules used in the strictness proof.
+The second argument of Append
+The second argument to Append is not a strict argument, but how will the proof system deal
+with it? Consider again the MERGE rule in Figure 9. The MERGE rule states that the SUP
+attribute on the d-edge is copied verbatim onto the a-, b- and c-edges. Recalling the meaning of
+the SUP attribute, the MERGE rule thus says that if a head normal form is required on the d-edge,
+then normal forms are also required on the b- and c-edges. These last two edges represent the
+expressions in the then and else branches of a conditional, so in e ect the MERGE rule suggests
+that the conditional is strict in all its arguments! This is not the case, as the MERGE rule is
+simply a formalisation of the way code will eventually be generated for the conditional in the
+C output. The use of the C \if f g else f g" construct in the generated code (c.f. Figure 3)
+
+26
+
+guarantees that only one of the two branches will be evaluated. Which one it is depends on
+the boolean expression. So the boolean expression must always be evaluated, and it is safe
+to generate code to also evaluate the then- and else-branches of the conditional. When the
+generated C program is actually executed, only the branch chosen by the boolean expression
+will actually be evaluated and the code for the other branch will be skipped. The part of the ow
+graph set that corresponds to tracing the ow graph through the else-branch of the conditional
+is shown below:
+149; CALL; ;;152
+" SUP; 152; 1
+(156; 154; 152); MERGE; ;;159
+" SUP; 159; 1
+159; RETURN; ;; 101
+The CALL rule copies the SUP attribute on its d edge (152) over to its a edge (149):
+(148; 147); BIND ; ;;149
+
+" SUP; 149; 1
+149 ; CALL; ;; 152
+
+" SUP; 152; 1
+(156; 154;152); MERGE; ;;159
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+The next rewrite to consider is another BIND application, this time involving the second argument
+of the primitive function Cons. This function is not strict in either of its arguments, so the formal
+argument edges for Cons (edge Cons 1 for the rst argument and Cons 2 for the second) both
+carry a SUP attribute value 0. With this information the SUP attribute calculated by the BIND
+rule yields 0 for the SUP attribute on edge 147 (because 1 ^ 0 = 0):
+144; CALL; ;;147
+
+" SUP; 147; 0; ABS; 147; Cons 2; SUP; Cons 2; 0
+(148;147); BIND; ;;149
+" SUP; 149; 1
+149 ; CALL; ;; 152
+" SUP; 152; 1
+(156; 154;152); MERGE; ;;159
+" SUP; 159; 1
+159; RETURN; ;; 101
+
+It is not dicult but a bit tedious to continue the reasoning up to the point where the SWITCH
+rule has been reached, because once the SUP attribute has turned to 0, no CALL or BIND rule
+can deliver the value 1. A single USE node such as that on edge 120, or on edge 121 copies the
+SUP attribute on the d-edge over to the a-edge. Such a \single" USE node cannot alter a SUP
+attribute. Hence the state of the relevant part of the ow graph set after the SWITCH rule has
+red is as shown below. Here the SUP attributes for both edges 120 and 121 are shown:
+102; CALL; ;;118
+
+" SUP; 118; 0
+
+(119;118); SWITCH; ;; (120;121)
+SUP; 120; 1 " " SUP; 121; 0
+
+27
+
+The nal rewrite step brings the SUP attribute home to the LAMBDA node corresponding to the
+second argument of Append:
+101; LAMBDA; ;; (102; 103)
+" SUP; 102; 0
+102; CALL; ;;118
+
+" SUP; 118; 0
+
+(119,118); SWITCH; ;; (120;121)
+SUP; 120; 1 " " SUP; 121; 0
+This second derivation shows that with the rules as given by U in Figure 9, it is not possible to
+prove that Append is strict also in its second argument. Hence the compiler must assume that
+it is non-strict for safety reasons.
+
+Availability analysis: a forwards analysis
+
+The compiler uses the strictness information present in the form of SUP attributes to decide when
+head normal forms are present at run time as follows: an expression on an edge that carries a
+SUP attribute value of 1 is in head normal form. An expression on an edge that carries a SUP
+attribute of 0 may, or may not be in head normal form. This way of using strictness analysis is
+not sucient for the compiler to generate good code. This can be explained as follows. The part
+of the Append ow graph that represents applications of Hd and Tl contains only SUP attribute
+values of 0 (the edges involved are 122{124, 127, 132{134 and 137). Because of this, the code
+generator must assume that the actual arguments presented to Hd (edge 122) and Tl (edge 132)
+are not head normal forms, for a value 0 represents \no information". This is a safe, but overly
+pessimistic assumption because in actual fact the expressions associated with edges 122 and 132
+are head normal forms. The problem is that the necessary information is present in the ow
+graph, but not at the right place. The information is present at edge 104, which carries a SUP
+attribute of 1 because it represents a strict argument. What needs to be done now is to transfer
+this information explicitly to edges 122 and 132. This is one of the purposes of the D function
+in Figure 9.
+We shall now trace the execution of the D function up to the point where all the information
+necessary to generate the code for Append as shown in Figure 3 is available. The rst rewrite rule
+of interest is the LAMBDA rule, which \re ects" the SUP attribute on the b-edge as a SDN attribute
+on the same edge. The edges now point downwards to make the direction of the information
+ow explicit:
+103; LAMBDA; ;; (104; 105)
+# SUP; 104; 1; SDN; 104; 1
+104; USE; ;; 114
+The USE rule propagates the SDN attribute on its input edge to its output edge yielding:
+103; LAMBDA; ;; (104; 105)
+# SUP; 104; 1; SDN; 104; 1
+104; USE; ;;114
+# SDN; 114; 1
+(115;114); SWITCH; ;; (116; 117)
+The SWITCH rule also propagates the SUP attribute on its data input edge to both its output
+
+28
+
+edges. Only one of the generated attributes is shown below:
+103; LAMBDA; ;; (104; 105)
+# SUP; 104; 1; SDN; 104; 1
+104; USE; ;;114
+# SDN; 114; 1
+(115;114); SWITCH; ;; (116;117)
+
+# SDN; 117; 1
+117; USE; ;; 122
+
+The last step of interest is another application of the USE rule, which delivers the SDN attribute
+to the BIND node.
+103; LAMBDA; ;; (104; 105)
+# SUP; 104; 1; SDN; 104; 1
+104; USE; ;;114
+# SDN; 114; 1
+(115;114); SWITCH; ;; (116; 117)
+# SDN; 117; 1
+117; USE; ;;122
+# SDN; 122; 1
+(123;122); BIND; 124
+The propagation of the SDN attribute from edge 104 to edge 132 proceeds in a similar way. The
+SDN attributes for the remaining edges are also propagated, but these are not essential. The
+
+code generation function now has sucient information to generate good code, as it \knows"
+that head normal forms will always be associated with edges 108, 123 and 132. This particular
+information permits the use of the macros Null, Hd and Tl in the C code for Append:
+return Cons(Hd(x),Suspend(Prel Append,Tl(x),y));
+
+Without the information that x is a head normal form, the generated code would have had to
+construct suspensions for the Hd and Tl functions as follows:
+return Cons(Suspend(Prel Hd,x),Suspend(Prel Append,Suspend(Prel Tl,x),y));
+
+The unoptimised version of the code is considerably worse, because of the relatively heavy cost
+of implementing the suspensions.
+
+Dealing with conditionals in a non-strict context
+
+The D function serves a second purpose. At the introduction of the use of the C \if f g else f g"
+construct in the compiled code, it has been tacitly assumed that the corresponding conditional
+expression in the functional program appears in a strict context. This is indeed the case in the
+Append function. However, a conditional might also appear in a non-strict context, for example
+as one of the arguments to Cons thus:
+Foo x y z = Cons (if x then y else z ) Nil
+
+In this case, the C code should build a suspension of the conditional function rather than try to
+execute the conditional. The desired code is thus:
+
+29
+
+ptr
+ptr
+
+f
+g
+
+Foo(x,y,z)
+x,y,z;
+return Cons(Suspend(Prel If,x,y,z),Nil());
+
+To achieve this goal, there are two SWITCH rules and two MERGE rules in the D function. If the
+conditional expression appears in a non-strict context (the SDN attribute on the control inputs
+then has the value 0), the rst SWITCH rule matches. This rule replaces the SWITCH node by
+USE and SINK nodes. The rst MERGE rule then also matches, which replaces the MERGE node
+by BIND and CALL nodes. After these two changes have been made, the conditional expression
+is represented by an ordinary chain of BIND nodes, just like any other function application. The
+allocation mechanism of unique edge labels takes this possibility into account. This is one of
+the reasons why the edge labels in Figure 4 are not consecutive numbers.
+If the conditional expression appears in a strict context (the SDN attribute on the control
+inputs has the value 1), the second MERGE rule and the second SWITCH rule match. This does
+not change the structure of the ow graph, but simply propagates the SDN attribute.
+In either case, the attributes that are necessary for further processing must be added explicitly to the ow graph set. This requires some care on behalf of the designer of ow graph rewrite
+rules, because it is quite easy to miss an attribute out, or attach an attribute to the wrong edge.
+In general, a ow graph is not so well suited to applications that make many changes to the
+structure of the graph. For this reason, our compiler consists of two major parts: the rst part
+implements the passes that make large changes to the program represented as an ordinary parse
+tree. The second part performs mainly program analysis and synthesis on the ow graph set,
+while only making a few small changes to the structure.
+
+Recursive function de nitions and xed point iteration
+
+The derivation of the strictness properties of Append as they have been presented in the previous
+three sections are incomplete in the sense that the presence of a recursive call to Append has
+not been taken into account. In the particular case of Append this issue could safely be ignored,
+as the recursive call does not a ect the strictness or non-strictness of the arguments. In general
+the recursive calls cannot be ignored. The denotational semantics make this point explicit by
+using the xed point combinator Fix (see Figure 8) to derive the real meaning of the ow graph
+for Append. As program analysis derives an abstract meaning of functions, there must also be
+an element of xed point computation. Finding xed points during program analysis is a rather
+dicult subject to which a signi cant body literature is devoted [1].
+For the two-point domain xed points can be found as follows: De ne an initial approximation to the strictness of each formal argument of all functions in a compilation unit. This
+approximation must necessarily assume that no user de ned function is strict in any of its arguments. As a consequence, the SUP attributes for the formal argument edges of a user de ned
+function start with the value 0. By preloading these attributes into the ow graph set, as well
+as the attributes for the primitive functions, as has been assumed earlier, all formal argument
+edges will carry a SUP attribute. Fixed point iteration can simply consist of running the analysis
+function (U ) a number of times, until the SUP attribute values have reached a stable value (the
+xed point). It is prudent to limit the number of repetitions allowed, although in practice we
+found that not even the larger benchmark programs used require more than six iterations. In
+fact very little improvement to the approximation is gained beyond the second iteration. This
+method thus implements the xed point iteration at the level of the ow graph analysis.
+If a more detailed domain than the two-point domain is used this method should not be used
+for the following reason. In the two-point domain, an attribute either carries no information (0)
+30
+
+or all information (1). This allows for only one transition to be made (from 0 to 1). Once an
+attribute reaches the value 1, it can never change again. Enlarging the number of points in the
+domain will also enlarge the number of possible transitions, so it will take longer for attributes
+to reach a stable value. Therefore, when more detail is required than the two-point domain has
+to o er, the xed point iteration must be built into the representation of the attributes. This
+means, that instead of working with values, such as 0 and 1, the attribute values must represent
+dependencies of the form:
+Append is strict in its second argument if Append is strict in its second argument
+and if Cons is strict in its second argument.
+Since Cons is non-strict in any of its arguments, the only conclusion that can be drawn from
+this statement is that Append is not strict in its second argument. However, when considering
+more detailed information, the situation changes considerably. The next section will show that
+the ow graph framework also supports analysis where detailed, contextual information plays
+an important role.
+
+Projection analysis
+
+Projection analysis extends strictness analysis to reasoning about higher order functions (i.e.
+functions that take functions as arguments or functions that return other functions) and/or
+structured data (as opposed to atomic data) [23, 24, 25, 26, 27, 28]. Common to all approaches
+is the search for a non- at domain that allows useful information to be determined at a reasonable
+cost. The most ambitious approach uses an in nite domain of arbitrary structure. The twopoint domain [29] thus far described is the simplest domain that will provide useful information.
+The information gathered by strictness analysis of a particular function is always valid; that
+is it is independent of the context in which the function is used. Projection analysis gathers
+more detailed information, which takes into account in which context a function is used. This
+information is thus only valid in the appropriate context.
+Projection analysis allows a compiler to generate code that is speci cally optimised towards
+the intended context. Consider as an example a call to Append in a context where the entire
+spine of the result list is known to be needed. A spine is a chain of list constructor nodes, linked
+via their tail elds and ending at a Nil node. The head elements of the constructor nodes may
+assume any value. A spine is shown below as a list [x1 ; : : : ; xn ] of arbitrary values. When
+asking Append to produce a spine, it is safe to evaluate both its arguments to spines before
+calling Append. This is safe because even if the computation for one of the arguments to a spine
+diverges, the call to Append will also diverge. Schematically we have the result of strictness
+analysis and that of projection analysis with respect to a spine as:
+Append ?
+y
+= ?
+(Strictness analysis)
+Append [x1 ; : : : ; xn ] [y1 ; ; : : : ; ym ] = [x1 ; : : : ; xn ; y1 ; : : : ; ym ] (Projection analysis)
+A spine is just one example of a useful context with respect to lists. There are many other
+contexts that are also useful for lists and even more contexts for arbitrary data structures.
+The next two sections provide a brief description of the implementation of projection analysis
+in the ow graph compiler.
+Structured data
+The ow graph compiler performs analysis over Wadler's linear domain [23], as shown in Figure 10. This allows the compiler to infer certain properties of functions that operate on lists.
+The domain is not detailed enough to gather information about arbitrary list structure or any
+other data structures.
+
+31
+
+We found it more convenient to represent points in the linear domain by numbers in the
+range 0 to N rather than a string of 1, ? and 2 symbols. (N is speci ed as a compiler option).
+This numerical notation has been borrowed from Burn [24].
+Wadler
+
+Burn
+
+1 2n = 2n + 1 | where n = N  2 ^ N is odd
+? 2n = 2n
+| where n = N  2 ^ N is even
+:::
+
+? 22
+12
+?2
+1
+?
+
+= 4
+= 3
+= 2
+= 1
+= 0
+
+| a spine of spine normal forms
+| a spine of head normal forms
+| a spine normal form
+| a head normal form
+| no information
+
+Figure 10: The correspondence between Wadler's and Burn's domain nomenclature
+function/argument
+Null
+Cons =f irst
+Cons =second
+Hd
+Tl
+
+PRO attributes (N is a compiler option)
+PRO; Null 1 ; j0 1 1 1 1 : : : 1
+j
+PRO; Cons 1 ;j0 0 0 1 2 : : : N 2j
+PRO; Cons 2 ;j0 0 2 3 4 : : : N
+j
+PRO; Hd 1 ; j0 1 1 1 1 : : : 1
+j
+PRO; Tl 1 ; j0 1 2 2 2 : : : 2
+j
+
+Figure 11: The primitives used in Append and their projection attributes
+A projection attribute, as delivered and used by the projection analysis in the compiler, is
+a vector: PRO; a; jn0 : : : nN j, where k; nk 2 f0 ; : : : ; N g. The elements of a projection vector
+say that given a function that is called in an i-style context, the expression in the function body
+that is associated with edge a may be evaluated using the ni -style. An element of the projection
+attribute can thus be viewed as an evaluation transformer [25, 26]. The projection attributes
+for the primitive functions used in Append are shown in the second column of Figure 11. Vector
+elements are counted starting from 0. Element 1 gives the minimum requirements that must
+be satis ed for the function to produce a 1-style (head normal form) result, element 2 gives
+the requirements for a 2-style (spine normal form) result etc. For example Cons has a 0 at
+position 1 in the projection attribute for both its arguments, so it requires no more than 0-style
+(unreduced) inputs to produce a 1-style result. The remaining primitives shown are strict and
+thus require at least a 1-style argument to produce a 1-style result.
+The next vector elements (at position 2, which corresponds to a spine strict context) show
+a greater variety. The Null test function needs to inspect the top level list constructor only, to
+decide whether a list is empty or not; it never needs access to the tail of any list, hence the 1 at
+positions 1 : : : N of its projection vector. The Hd function ignores the tail of a list constructor
+so here again a 1-style argument is required. The second argument to Cons and the argument
+to Tl must both be 2-style if a 2-style result is needed.
+At the next level up in the abstract domain (position 3) Tl cannot insist on a 3-style argument, as this would imply evaluation to head normal form of the head of the list, which might
+not be needed. It is safe however for Cons to require a 3-style second argument. A 1-style rst
+argument is now in order too, because it will become the new head of a 3-style list.
+The information in Figure 11 can now be used as the starting point for projection analysis.
+We will not discuss the analysis here, but refer the reader to a technical report [30]. Instead we
+32
+
+will show the results of the analysis.
+The code that is generated by the compiler for functions to be called in the various context
+styles, implements compile time choice [31, 32] of versions. This means that for each possible
+context (1,2,3 etc.) the compiler creates a version of those functions that are capable of delivering
+the right style of list. For Append there is version that produces a head normal form but also a
+version that delivers a spine. The C code generated for Append that may be used in a context
+that requires a spine, is:
+ptr
+ptr
+
+f
+g
+
+SpineAppend(x,y)
+x,y;
+
+f
+
+if (Null(x))
+return y;
+else
+return Cons(Hd(x),SpineAppend(Tl(x),y));
+
+g
+g
+
+f
+
+Comparing SpineAppend to Append (see Figure 3) shows that the former is considerably more
+ecient. The rst di erence is, that SpineAppend does not build a suspension for the recursive
+call. This is safe, because upon entry, both arguments x and y to SpineAppend are already
+evaluated to spines. Therefore Tl(x) will also be a spine, so the invariant that the arguments
+must both be spines is satis ed for the recursive call. Because of the call-by-value semantics of C
+programs, Cons evaluates its arguments, so when a call to SpineAppend returns, the entire result
+will have been created to form a new spine. The second di erence between the two C versions
+compiled for Append is that there is no call to the reducer in the then-branch of SpineAppend.
+Such a call is unnecessary because the argument y is guaranteed to be a spine when SpineAppend
+is entered.
+The compiler organisation does not depend on the fact that Wadler's linear domain is used,
+although that makes it quite straight forward to build and solve the xed point equations.
+Changing the domain would require a rework of several of the analyses. It would be interesting
+to investigate what changes have to be made and how the quality of the generated code would
+be a ected by using an abstract domain with a ner structure.
+Higher order functions
+The ow graph compiler does not perform any of the analysis taking higher order functions
+into account. In spite of this apparent shortcoming, the compiler generates good code even
+for applications that use higher order functions. The compiler generates a specialised copy of a
+function that takes another function as an argument. Consider the de nition of the function Map
+and a main expression below. The rst actual argument of Map is the trigonometric function
+Sin:
+1: Map : ( ! ) ! [] ! []
+2: Map
+f
+x = if
+Null x then Nil
+3:
+else Cons (f (Hd x)) (Map f (Tl x))
+4: Main = Map Sin (Cons 2 Nil )
+Specialisation transforms the program above into the equivalent program below. The task of
+the higher order function Map is taken over by the rst order function Map 0 , which has the Sin
+
+33
+
+function built in. Because of this, the Map 0 function is not a polymorphic function:
+1: Map 0 : [Num ] !
+2: Map 0
+x
+= if Null x then Nil
+3:
+else Cons (Sin (Hd x)) (Map 0 (Tl x))
+4: Main = Map 0 (Cons 2 Nil )
+Specialisation thus lessens the need for analysis over higher order functions, although it does
+not remove all higher order functions.
+IMPLEMENTING A FLOW GRAPH ANALYSIS FUNCTION IN C
+
+A ow graph and the associated forwards and backwards functions are at the same time powerful enough to express useful analysis and synthesis functions and simple enough to enable an
+ecient implementation. The purpose of this section is to present a simpli ed version of the implementation in C of the U function from Figure 9. The required data structures are introduced
+rst, followed by the implementation of the analysis function.
+
+Data structures representing nodes, edges and attributes
+
+The nodes and attributes in a ow graph are implemented as a C structure. The a, b and c
+elds in the node structure are the input edges and the d and e elds are the output edges. The
+attributes appear as elds of the attrib structure. The abs and sup elds record the ABS and
+SUP attributes. The purpose of the fst eld will be explained shortly.
+typedef struct
+
+g node;
+typedef struct
+
+f
+
+f
+
+int
+int
+int
+int
+
+a,b,c;
+type;
+qualifier;
+d,e;
+
+int
+
+abs,sup,fst;
+
+g attrib;
+
+The nodes are accessed via two arrays of pointers to the nodes. The up array is used by the
+backwards analyses, and the dn is used by the forwards analyses. The node pointers in these
+two arrays are ordered such that attributes are always present when they are required. The up
+and dn arrays are traversed from beginning to end (see below). The variable node_count holds
+the number of nodes that are present in the ow graph. The node_count variable and the up
+and dn arrays are setup when the ow graph is built out of a parse tree. Unless nodes are added
+or removed (which is rare), these data structures remain unchanged. The cost of building the
+sorted arrays is thus amortised over many analysis and synthesis passes.
+200000
+#define MAX NODES
+node
+* up[MAX NODES];
+node
+* dn[MAX NODES];
+int
+node count;
+
+Attributes are stored in a separate array edge. Space is reserved to store all attributes of interest
+on each possible edge.
+34
+
+#define MAX EDGES
+600000
+attrib edge[MAX EDGES];
+
+The 11 node types are de ned as constants and some access macros are also de ned:
+#define BIND
+#define CALL
+#define EXPORT
+#define IMPORT
+#define LAMBDA
+#define MERGE
+#define RETURN
+#define SINK
+#define SOURCE
+#define SWITCH
+#define USE
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+#define TYPE(i)
+#define SUP(x)
+#define ABS(x)
+#define FST(x)
+
+(up[i]->type)
+(edge[x].sup)
+(edge[x].abs)
+(edge[x].fst)
+
+The C implementation of the U function
+
+The code of the C version of the U scheme is given below. It consists of two parts: the rst part
+initialises the SUP attributes on the edges that correspond to the formal arguments of all user
+de ned functions, so that the implementation of the BIND rule (see Figure 9) will always nd a
+SUP attribute.
+void
+
+f
+
+U()
+int
+i,a,b,c,d,e,x;
+for (i = 0; i < node count; i++)
+d = up[i]->d;
+if (TYPE(i) == LAMBDA)
+SUP(d) = 0;
+
+g
+
+f
+
+g
+
+f
+
+The second part of the function U visits each node of the ow graph, starting at the RETURN
+nodes and propagating the SUP attribute values towards the LAMBDA nodes. The for loop below
+corresponds to a single pass through the ow graph. To implement xed point iteration, the
+entire for loop should be performed a number of times, as discussed in the section \Recursive
+function de nitions and xed point iteration".
+
+f
+
+for (i = 0; i < node count; i++)
+a = up[i]->a; b = up[i]->b; c = up[i]->c;
+d = up[i]->d; e = up[i]->e;
+switch (TYPE(i))
+case LAMBDA:
+SUP(a) = 0;
+break;
+case BIND:
+x = ABS(b);
+SUP(a) = SUP(d);
+SUP(b) = SUP(d) && SUP(x);
+
+f
+
+35
+
+break;
+case SWITCH:
+SUP(a) = 0;
+SUP(b) = SUP(d) && SUP(e);
+break;
+case MERGE:
+SUP(a) = SUP(b) = SUP(c) = SUP(d);
+break;
+case SOURCE:
+break;
+case IMPORT:
+break;
+case SINK:
+SUP(a) = 0;
+break;
+case EXPORT:
+SUP(a) = 0;
+break;
+case CALL:
+SUP(a) = SUP(d);
+break;
+case RETURN:
+SUP(a) = 1;
+break;
+case USE:
+if (FST(d))
+SUP(a) = SUP(d);
+else
+SUP(a) |= SUP(d);
+
+g
+
+g
+
+g
+
+g
+g
+
+f
+
+f
+
+break;
+
+As indicated in the code, there is a slight complication in treatment of the USE node. The
+conditional in the USE case yields True only when the rst USE node with a particular input edge
+is encountered. In this case the output attribute (SUP(d)) is copied over to the input edge. Any
+subsequent output attributes are \or-ed"' with the rst in the else clause.
+There is a close correspondence between the U scheme and the C routine U. For each rule
+in the U scheme there is a corresponding case in the U routine. The actions in a rule, which
+consist of adding an attribute value, correspond to assigning the attribute value to a eld of the
+appropriate edge. Because such a simple correspondence exists, it is not dicult to implement
+a compilation scheme without special program manipulation tools.
+The control structure required to implement a set of rewrite rules over a ow graph is a single
+for loop, that visits the nodes in the right order. The time complexity of the implementation is
+thus O(node count). By allocating all the required data structures at once, the space complexity
+of an analysis routine is constant.
+RESULTS
+
+To assess the e ectiveness of the method, the results of the analyses is compared with related
+work and some performance results for both the compiler and the generated code are presented.
+36
+
+Figure 12 presents a few list functions taken from papers by Wadler [23] and Nocker [33].
+The in x operator : has been used instead of the Cons function to improve readability. The
+analysis results in the 4-point domain f0; 1; 2; 3g are shown for each argument as projection
+vectors (see also Figure 11).
+Wadler's method gives the same results as ours. The method used by Nocker gives better
+results because he uses a domain with a ner structure, which allows information about the
+head of a list to be represented. In Wadler's linear domain this is not possible.
+Wadler:
+Rev x
+= if Null x then Nil else Append (Rev (Tl x)) (Hd x : Nil )
+Last s
+= Hd (Rev s)
+Append x y = if Null x then y else Hd x : Append (Tl x) y
+Nocker:
+Foldr op r x = if Null x then r else op (Hd x) (Foldr op r (Tl x))
+Catenate l = Foldr Append Nil l
+Concat a b c = Catenate (a : b : c : Nil )
+function Nocker
+Wadler/Flow graph compiler
+Argument
+Argument
+rst
+second third
+rst
+second third
+Rev
+j0 2 2 3j
+j0 2 2 3j
+Last
+j0 2 2 2j
+j0 2 2 2j
+Append j0 1 2 3j j0 0 2 3j
+j0 1 2 3j j0 0 2 3j
+Foldr
+j0 0 0 0j j0 0 0 0j j0 1 1 1j j0 0 0 0j j0 0 0 0j j0 1 1 1j
+Concat j0 1 2 3j j0 0 2 3j j0 0 2 3j j0 0 1 1j j0 0 1 1j j0 0 1 1j
+Catenate j0 1 3 3j
+j0 1 3 3j
+Figure 12: Some list processing functions and the projection attributes of the arguments
+
+Compiler performance
+
+The rst two compiler passes build a ow graph from programs in Intermediate syntax. All
+remaining passes generate, manipulate and use attributes associated with the edges of the ow
+graph. Table 1 lists the individual passes applied to the lambda program, one of the benchmarks
+that we have available. The source text, without blank lines and comments, comprises 770
+lines, 276 functions. Of the total 54.22 seconds compilation time (on a SUN SPARC station
+1 with 16 MB memory) more than 45% is spent on the code generation (passes 32{36). The
+strictness analysis (passes 16 and 17) takes less than 5%. We will not go into the detail of
+the remaining passes but brie y mention some of the more interesting ones. Cheap eagerness
+causes expressions to be evaluated in a lazy context when it is de nitely cheaper to do so than it
+would be to build a suspension [34, 31]. The sets of edges that carry normal forms in some style
+determined by strictness/projection analysis and cheap eagerness analysis are combined in pass
+20. Passes 29{31 assist the compiler in attening the ow graph when printing the generated
+code.
+As described in the previous section, the ow graph compiler visits the nodes of the ow
+graph in a particular order. The nodes have to be sorted when new nodes appear or when
+nodes are made redundant. This implies that due to the rst sort phase the time complexity of
+the compiler will be at least O(n), where n represents the number of nodes in the ow graph.
+This number uctuates somewhat, but stays within 20% of the average (see the nodes column
+in Table 1). Subsequent sorts may be implemented with much better performance, or removed
+altogether by the use of a more sophisticated data structure.
+37
+
+Depending on the size N + 1 of the abstract domain and the particular analysis there may
+be some expensive operations that have to be performed for each node. It is not possible to give
+an a priori upper bound for the complexity of these operations.
+
+Runtime performance
+
+Some experiments have been performed with the compiler to assess the performance of the
+method. The benchmark programs are the result of collecting performance data on implementations of functional programming languages [35, 36]. The programs used are:
+1. em script runs a simple script through a functional implementation of the Unix text editor [37];
+2. gcode compiles a simple program into scalar G-machine code according to the compilation
+schemes as described by Johnsson [34];
+3. lambda ( S K K ) evaluates to I on an implementation of the -K calculus [36];
+4. sched 7 calculates an optimum schedule of 7 parallel jobs with a branch and bound algorithm [38];
+5. wave 3 predicts the tides in a rectangular estuary of the North Sea over a period of 3 
+20 minutes [38].
+A more detailed description of the run-time organisation than we have described here may be
+found in our paper [31], where we also argue that the statistic that provides the best indication
+for the quality of our method is the number of cell claims made. Table 2 shows the cell claims
+(as reported in our other papers [35, 36]) witnessed by Turner's standard combinator reduction
+machine [18], an early version of Johnsson's G-machine [34] and the C code produced by the
+ow graph compiler. The numbers apply to evaluation only; the cell claims required to build the
+initial expressions are not included. Our implementation method does not increase the cost of
+ordinary lazy graph reduction, such that it is safe to assume that when the number of cell claims
+has been reduced, the total execution time will also be lower. With the exception of wave, the
+number of primitive operations (multiplications, divisions etc.) performed by a benchmark is
+similar on all three implementation methods.
+The columns in Table 2 show a signi cant decrease in the number of claimed cells when
+moving from standard combinators via the G-machine to the ow graph compiler. This is as
+expected because standard combinators are virtually unoptimised; the G-machine compiler (as
+used to obtain the gures reported here) performs strictness analysis but only locally within a
+function and the ow graph compiler carries various forms of analyses across function boundaries.
+The set of cell claim gures labelled 2-point (N = 1) apply to a version of the compiler
+and runtime system, where the abstract domain is restricted to two points [3]. The second set
+of cell claim gures show that extending the abstract domain to three points (N = 2) gives a
+reduction in cell claims of about 25% for the bigger programs, which includes the advantage of
+using vector application nodes instead of chains of binary application cells.
+The wave program does not perform so well as the other programs on the G-machine, because
+it essentially requires fully-lazy lambda lifting, which the G-machine compiler does not provide.
+The ow graph compiler does not perform full-lazy lambda lifting either, but the performance of
+the wave program with the ow graph compiler is back in line with the others. The reason is that
+the two functions most often used by the wave program are passed suspensions as arguments
+by the G-machine. These functions are strict in all their arguments, which is detected and used
+to great advantage by the ow graph compiler. It generates code to evaluate the argument
+38
+
+Compiler pass
+nodes sec.
+1 parse input
+0 1.26
+2 build the ow graph
+15853 3.85
+3 sort nodes
+15853 1.20
+4 connect SINK nodes to dangling edges
+17234 0.21
+5 sort nodes
+17234 1.36
+6 constant folding
+17417 0.25
+7 sort nodes
+17356 1.45
+8 remove redundant nodes
+17891 0.13
+9 sort nodes
+13006 1.04
+10 propagate function contexts
+13006 0.15
+11 generate ABS attributes and CALL nodes
+14822 0.18
+12 sort nodes
+14822 1.14
+13 evaluate constant expressions
+14909 0.10
+14 sort nodes
+14909 1.27
+15 generate WID attributes
+14909 0.13
+16 build equations for strictness analysis
+14909 1.81
+17 solve equations
+14909 0.70
+18 build equations for cheap eagerness analysis 14909 1.16
+19 solve equations
+14909 0.61
+20 combine strictness and cheap eagerness
+14990 1.07
+21 sort nodes
+14969 1.24
+22 remove redundant nodes
+15494 0.11
+23 sort nodes
+14925 1.43
+24 group USE nodes with equal input edges
+14925 0.11
+25 build equations for boxing analyses
+14925 3.32
+26 solve boxing equations
+14925 1.98
+27 build equations for sharing analysis
+14925 1.17
+28 solve sharing equations
+14925 0.66
+29 ag tail calls
+14925 0.06
+30 derive total ordering on the nodes
+14925 0.21
+31 compute compile time reference counts
+14925 0.08
+32 generate expressions
+14925 4.91
+33 gather lists of temporaries
+14925 0.72
+34 generate declarations
+14925 5.34
+35 remove redundant versions of functions
+14925 0.20
+36 generate function bodies
+14925 13.61
+total seconds 54.22
+Table 1: Passes in the ow graph compiler with the size of the ow graph (in nodes) and the
+execution time of each pass (in seconds as measured on a SPARC Station 1)
+Implementation
+em gcode lambda sched wave
+Combinators
+733742 966963 77128 477243 424623
+G-machine
+245008 144709 18058 42246 403645
+Flow graph (2-point) 125101 57571
+9110 25485 16078
+Flow graph (3-point) 85625 40954
+7018 19591 11953
+Table 2: Cell claims for the benchmark programs with various compilers
+39
+
+expressions eagerly and pass their values on the stack. Because the two functions are called so
+often, this alone accounts for a reduction of over 300000 cell claims.
+We have extensively benchmarked the compiler and compared it to compilers for other lazy
+functional languages (LML [15], Haskell [8] and Clean [39]). The results show that the code
+generated by our compiler is often faster than that generated by other compilers [40].
+CONCLUSIONS
+
+An important task of an optimising compiler for a functional language is to minimise the number
+of cells claimed by the compiled code. Several techniques are available that help to reduce
+cell claims, most notably strictness analysis. A framework has been presented that allows the
+available techniques to be integrated in an ecient fashion.
+The program being compiled is represented as a ow graph, which is basically an abstract
+syntax tree with some extra nodes and edges. Their presence allows both forwards and backwards
+abstract interpretation to be performed with equal ease. This was found to be essential as
+strictness analysis is inherently more ecient when performed by backwards rather than forwards
+abstract interpretation [4]. Other analyses are most naturally performed in a forwards manner.
+Most information processed by forwards and backwards abstract interpretations ows along
+the edges in a ow graph. Sometimes information has to travel along a path that is not explicitly
+traced. In such a case an auxiliary analysis is de ned to establish the required paths, thus
+separating the issues of how to get the information where it is required and what the information
+itself should be.
+A ow graph is a lean structure since the only primitive that has been built into it (apart
+from function application and abstraction) is the conditional. Other primitive functions can be
+added or deleted without changing the structure of a ow graph. The properties of primitive
+functions are de ned by a number of tables, which are easily modi ed and extended.
+An algorithm has been presented to compile a functional program into a ow graph and to
+give the denotational semantics of a ow graph. This provides the theoretical underpinning of
+the ow graph framework.
+The compiler makes a large number of passes over the ow graph, adding, using and removing
+information piecemeal. The compiler has ne control over both the time and space complexity of
+the compilation process. The space and time complexity of the analyses in terms of the number
+of attributes processed are essentially O(n) where n represents the number of nodes in the ow
+graph that represent the program being compiled.
+The space requirements of the compiler are further reduced because of its organisation in
+many di erent passes. This makes it possible to decide when information will not be needed
+any more, such that the storage this information occupies can be reclaimed. For instance,
+after incorporating information carried by the SUP attributes into the SDN attributes, all storage
+occupied by the SUP attributes can be reclaimed. In the compiler separate attributes are stored
+in separate lists of linked blocks, so that such reclaims are cheap and easy.
+We have thus described the structure of a working system that can eciently compile lazy
+functional languages with a high level of analysis and a sound theoretical foundation.
+ACKNOWLEDGEMENTS
+
+We thank Marcel Beemster, Andy Gravell, Chris Hankin, Koen Langendoen, Theodosis Papathanassiadis, Wim Vree and the referees for their comments on draft versions of the paper.
+Stuart Bell has helped us to implement the compiler.
+40
+
+This work was supported by the Science and Engineering Research Council, UK, under grant
+No. GR/F 35081, FAST: Functional programming for arrays of Transputers.
+
+References
+[1] S. Abramsky and C. L. Hankin, editors. Abstract interpretation of declarative languages.
+Ellis Horwood, Chichester, England, 1987.
+[2] C. Clack and S. L. Peyton Jones. Strictness analysis { a practical approach. In J.-P. Jouannaud, editor, 2nd Functional programming languages and computer architecture, LNCS 201,
+pages 35{49, Nancy, France, Sep 1985. Springer-Verlag, Berlin.
+[3] H. W. Glaser, P. H. Hartel, and J. M. Wild. A pragmatic approach to the analysis and
+compilation of lazy functional languages. In K. Boyanov, editor, 2nd Parallel and distributed
+processing, pages 169{184, So a, Bulgaria, Mar 1990. North Holland, Amsterdam.
+[4] R. J. M. Hughes. Compile-time analysis of functional programs. In D. A. Turner, editor,
+Research topics in functional programming, pages 117{153, Reading, Massachusetts, 1990.
+Addison Wesley.
+[5] T. Johnsson. Attribute grammars as a functional programming paradigm. In G. Kahn,
+editor, 3rd Functional programming languages and computer architecture, LNCS 274, pages
+154{173, Portland, Oregon, Sep 1987. Springer-Verlag, Berlin.
+[6] R. Wilhelm. Tree transformations, functional languages and attribute grammars. In P. Deransart and M. Jourdan, editors, Attribute grammars and their applications (WAGA), LNCS
+461, pages 116{129, Paris, France, Sep 1990. Springer-Verlag, Berlin.
+[7] D. A. Turner. Miranda: A non-strict functional language with polymorphic types. In J.P. Jouannaud, editor, 2nd Functional programming languages and computer architecture,
+LNCS 201, pages 1{16, Nancy, France, Sep 1985. Springer-Verlag, Berlin.
+[8] P. Hudak, S. L. Peyton Jones, and P. L. Wadler (editors). Report on the programming
+language Haskell { a non-strict purely functional language, version 1.2. ACM SIGPLAN
+notices, 27(5):R1{R162, May 1992.
+[9] P. Henderson. Functional programming { Application and implementation. Prentice Hall,
+Englewood Cli s, New Jersey, 1980.
+[10] J. Cohen. Garbage collection of linked structures. ACM computing surveys, 13(3):341{367,
+Sep 1981.
+[11] R. J. M. Hughes. Why functional programming matters. The computer journal, 32(2):98{
+107, Apr 1989.
+[12] D. A. Turner. Another algorithm for bracket abstraction. J. symbolic logic, 44(2):267{270,
+Jun 1979.
+[13] S. L. Peyton Jones. The implementation of functional programming languages. Prentice
+Hall, Englewood Cli s, New Jersey, 1987.
+[14] C. P. Wadsworth. Semantics and pragmatics of the lambda calculus. PhD thesis, Oxford
+Univ, England, 1971.
+41
+
+[15] L. Augustsson and T. Johnsson. The Chalmers Lazy-ML compiler. The computer journal,
+32(2):127{141, Apr 1989.
+[16] S. Cox, H. W. Glaser, and M. Reeve. Compiling functional languages. In T. Johnsson, S. L.
+Peyton Jones, and K. Karlsson, editors, Implementation of functional languages, pages
+145{156, Aspenas, Sweden, Sep 1988. Programming Methodology group report 53, Dept.
+of Comp. Sci, Chalmers Univ. of Technology, Goteborg, Sweden.
+[17] J. Fairbairn and S. C. Wray. Tim: A simple lazy abstract machine to execute supercombinators. In G. Kahn, editor, 3rd Functional programming languages and computer architecture,
+LNCS 274, pages 34{45, Portland, Oregon, Sep 1987. Springer-Verlag, Berlin.
+[18] D. A. Turner. A new implementation technique for applicative languages. Software|
+practice and experience, 9(1):31{49, Jan 1979.
+[19] S. L. Peyton Jones. The spineless tagless G-machine: a second attempt. In H. W. Glaser and
+P. H. Hartel, editors, 3rd Implementation of functional languages on parallel architectures,
+pages 147{191, Southampton, England, Jun 1991. CSTR 91-07, Dept. of Electr. and Comp.
+Sci, Univ. of Southampton, England.
+[20] S. L. Peyton Jones. Implementing lazy functional languages on stock hardware: the spineless
+tagless G-machine. J. functional programming, 2(2):127{202, Apr 1992.
+[21] P. H. Hartel, H. W. Glaser, and J. M. Wild. FAST compiler user's guide. In FAST:
+Functional programming for arrays of transputers { The collected papers, pages 247{264.
+CSTR 93-15, Dept. of Electr. and Comp. Sci, Univ. of Southampton, England and DOC
+93/47, Dept. of Comp, Imperial College, London, England, Sep 1993.
+[22] J. E. Stoy. Denotational semantics: the Scott-Strachey approach to programming language
+theory. MIT Press, Cambridge, Massachusetts, 1977.
+[23] P. L. Wadler. Strictness analysis on non- at domains (by abstract interpretation over nite
+domains). In S. Abramsky and C. L. Hankin, editors, Abstract interpretation of declarative
+languages, pages 266{275, Chichester, England, 1987. Ellis Horwood.
+[24] G. L. Burn. Evaluation transformers { a model for the parallel evaluation of functional languages (extended abstract). In G. Kahn, editor, 3rd Functional programming languages and
+computer architecture, LNCS 274, pages 446{470, Portland, Oregon, Sep 1987. SpringerVerlag, Berlin.
+[25] G. L. Burn. Using projection analysis in compiling lazy functional programs. In Lisp and
+functional programming, pages 227{241, Nice, France, Jul 1990. ACM, New York.
+[26] G. L. Burn. Implementing the evaluation transformer model of reduction on parallel machines. J. functional programming, 1(3):329{366, Jul 1991.
+[27] R. J. M. Hughes. Backwards analysis of functional programs. In D. Bjrner, A. P. Ershov,
+and N. D. Jones, editors, Partial evaluation and mixed computation, pages 187{208, Gammel
+Avernaes, Denmark, Oct 1987. North Holland, Amsterdam.
+[28] P. L. Wadler and R. J. M. Hughes. Projections for strictness analysis. In G. Kahn, editor,
+3rd Functional programming languages and computer architecture, LNCS 274, pages 385{
+407, Portland, Oregon, Sep 1987. Springer-Verlag, Berlin.
+[29] A. Mycroft. Abstract interpretation and optimising transformations for applicative programs. PhD thesis, Univ. of Edinburg, Scotland, 1981.
+42
+
+[30] P. H. Hartel, H. W. Glaser, and J. M. Wild. Compilation of functional languages using ow
+graph analysis. Software|practice and experience, 24(2):127{173, Feb 1994.
+[31] P. H. Hartel, H. W. Glaser, and J. M. Wild. On the bene ts of di erent analyses in the
+compilation of functional languages. In H. W. Glaser and P. H. Hartel, editors, 3rd Implementation of functional languages on parallel architectures, pages 123{145, Southampton,
+England, Jun 1991. CSTR 91-07, Dept. of Electr. and Comp. Sci, Univ. of Southampton,
+England.
+[32] S. O. Finne and G. L. Burn. Assessing the evaluation transformer model of reduction on the
+spineless G-machine. In 6th Functional programming languages and computer architecture,
+pages 331{340, Copenhagen, Denmark, Jun 1993. ACM, New York.
+[33] E. G. J. M. H. Nocker. Strictness analysis using abstract reduction. In M. J. Plasmeijer,
+editor, 2nd Implementation of functional languages on parallel architectures, pages 171{201.
+Technical report 90-16, Dept. of Comp. Sci, Univ. of Nijmegen, The Netherlands, Jun 1990.
+[34] T. Johnsson. Ecient compilation of lazy evaluation. In Compiler construction, pages
+58{69, Montreal, Canada, Jun 1984. ACM SIGPLAN notices, 19(6).
+[35] P. H. Hartel. Performance of lazy combinator graph reduction. Software|practice and
+experience, 21(3):299{329, Mar 1991.
+[36] P. H. Hartel and A. H. Veen. Statistics on graph reduction of SASL programs. Software|
+practice and experience, 18(3):239{253, Mar 1988.
+[37] P. W. M. Koopman. Interactive programs in a functional language: A functional implementation of an editor. Software|practice and experience, 17(9):609{622, Sep 1987.
+[38] W. G. Vree. Design considerations for a parallel reduction machine. PhD thesis, Dept. of
+Comp. Sys, Univ. of Amsterdam, Dec 1989.
+[39] E. G. J. M. H. Nocker, J. E. W. Smetsers, M. C. J. D. van Eekelen, and M. J. Plasmeijer.
+Concurrent Clean. In E. H. L. Aarts, J. van Leeuwen, and M. Rem, editors, 3rd Parallel
+architectures and languages Europe (PARLE), LNCS 505/506, pages 202{220, Veldhoven,
+The Netherlands, Jun 1991. Springer-Verlag, Berlin.
+[40] P. H. Hartel and K. G. Langendoen. Benchmarking implementations of lazy functional
+languages. In 6th Functional programming languages and computer architecture, pages
+341{349, Copenhagen, Denmark, Jun 1993. ACM, New York.
+
+43
+
+

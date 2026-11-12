@@ -1,0 +1,458 @@
+%%
+%% chapter-59.ltx — Effect-Aware IR
+%%
+
+\label{ch:effect-ir}
+
+An effect-aware IR tracks the side effects of operations---I/O, memory allocation, synchronization, exceptions---as first-class information in the intermediate representation. By making effects explicit, the compiler can reason about purity, reorder operations safely, and specialize code based on effect information. This chapter develops the design and implementation of effect-aware IRs, from simple effect annotations to full effect-specialized compilation.
+
+%% ============================================================
+%% Section 59.1
+%% ============================================================
+\section{Tracking Effects in IR}\label{sec:tracking-effects}
+
+In a traditional IR, effects are implicit: a store instruction modifies memory, a call may perform arbitrary side effects. An effect-aware IR makes these effects explicit.
+
+\subsection{Effect Annotations on Operations}\label{sec:effect-annotations}
+
+Each operation in the IR carries an effect annotation describing what effects it may perform:
+
+\begin{verbatim}
+  %x = add i32 %a, %b          // pure: no effects
+  %y = load i32* %p             // reads: memory read
+  store i32 %v, i32* %p         // writes: memory write
+  %z = call @foo(%x)            // effects: {read, write, io} (conservative)
+  %w = call @pure_fn(%x)        // effects: {} (pure, verified by analysis)
+\end{verbatim}
+
+\subsection{Effect Lattices in IR}\label{sec:effect-lattices-ir}
+
+The IR defines an effect lattice that classifies operations:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  eff/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.6cm, fill=TomeBg, font=\small}
+]
+  \node[eff] (all) {All};
+  \node[eff, below left=1.2cm and 0.5cm of all] (io) {IO};
+  \node[eff, below right=1.2cm and 0.5cm of all] (mem) {Memory};
+  \node[eff, below left=1.2cm and 0cm of mem] (write) {Write};
+  \node[eff, below right=1.2cm and 0cm of mem] (read) {Read};
+  \node[eff, below=1.2cm of write] (pure) {Pure};
+
+  \draw[-] (pure) -- (read);
+  \draw[-] (pure) -- (write);
+  \draw[-] (read) -- (mem);
+  \draw[-] (write) -- (mem);
+  \draw[-] (mem) -- (all);
+  \draw[-] (io) -- (all);
+\end{tikzpicture}
+\caption{Effect lattice for an IR. Pure operations have no effects; memory operations read or write; IO operations perform input/output; All represents arbitrary effects.}\label{fig:effect-lattice-ir}
+\end{figure}
+
+\subsection{Effect Propagation}\label{sec:effect-propagation}
+
+Effects propagate through the IR: a composite operation has the union of the effects of its components.
+
+\begin{verbatim}
+  // Block B1:
+  %x = add i32 %a, %b          // effects: {}
+  %y = load i32* %p             // effects: {read}
+  %z = call @foo(%x)            // effects: {read, write, io}
+  // Block effects: {read, write, io} (union of all instructions)
+\end{verbatim}
+
+%% ============================================================
+%% Section 59.2
+%% ============================================================
+\section{Effect Annotations on Operations}\label{sec:effect-ops}
+
+Effect annotations can be attached to individual operations, basic blocks, or entire functions.
+
+\subsection{Operation-Level Effects}\label{sec:op-level}
+
+Each operation carries a set of effect tags:
+
+\begin{verbatim}
+  %x = add i32 %a, %b [pure]
+  %y = load i32* %p [read]
+  store i32 %v, i32* %p [write]
+  %z = call @foo(%x) [read, write, io]
+\end{verbatim}
+
+\subsection{Function-Level Effects}\label{sec:fn-level}
+
+Functions declare their effects in their signature:
+
+\begin{verbatim}
+  define i32 @pure_add(i32 %a, i32 %b) [pure] {
+    %sum = add i32 %a, %b
+    ret i32 %sum
+  }
+
+  define void @write_file(i8* %path, i8* %data) [io, write] {
+    // ...
+  }
+\end{verbatim}
+
+\subsection{Block-Level Effects}\label{sec:block-level}
+
+Basic blocks carry the union of their operations' effects, plus any effects from terminator instructions (branches, returns).
+
+%% ============================================================
+%% Section 59.3
+%% ============================================================
+\section{Effect-Based Optimization}\label{sec:effect-optimization}
+
+Effect information enables optimizations that are impossible or difficult without it.
+
+\subsection{Dead Code Elimination}\label{sec:effect-dce}
+
+Pure operations with no uses can be eliminated. Operations with effects cannot be eliminated even if their results are unused (the effects must be preserved).
+
+\begin{verbatim}
+  %x = add i32 %a, %b [pure]     // no uses -> can be eliminated
+  %y = load i32* %p [read]       // no uses -> can be eliminated (if no volatile)
+  call @foo() [io]               // no uses -> CANNOT be eliminated (has IO effect)
+\end{verbatim}
+
+\subsection{Code Motion}\label{sec:effect-code-motion}
+
+Pure operations can be moved freely (hoisted out of loops, sunk to their uses). Effectful operations can only be moved within the constraints of their effects.
+
+\begin{verbatim}
+  // Before:
+  for i = 0 to N:
+    %x = add i32 %a, %b [pure]     // can be hoisted
+    %y = load i32* %p [read]       // can be hoisted if %p doesn't change
+    store i32 %v, i32* %q [write]  // cannot be hoisted (changes each iteration)
+
+  // After:
+  %x = add i32 %a, %b [pure]       // hoisted
+  %y = load i32* %p [read]         // hoisted (if safe)
+  for i = 0 to N:
+    store i32 %v, i32* %q [write]  // stays in loop
+\end{verbatim}
+
+\subsection{Common Subexpression Elimination}\label{sec:effect-cse}
+
+Two pure operations with the same inputs produce the same result and can be merged. Two effectful operations cannot be merged even if their inputs are the same (the effects must be performed each time).
+
+\subsection{Inlining Decisions}\label{sec:effect-inlining}
+
+Effect information guides inlining decisions:
+\begin{itemize}
+  \item Pure functions are always good candidates for inlining (no side effects to worry about).
+  \item Functions with memory effects may be inlined if the memory effects are compatible with the call site.
+  \item Functions with IO effects are rarely inlined (IO is expensive and ordering-sensitive).
+\end{itemize}
+
+%% ============================================================
+%% Section 59.4
+%% ============================================================
+\section{Effect Specialization}\label{sec:effect-specialization}
+
+Effect specialization generates different code for different effect profiles. A function that is called with both pure and effectful arguments can be specialized for each case.
+
+\subsection{Pure vs. Effectful Specialization}\label{sec:pure-effectful}
+
+\begin{verbatim}
+  // Generic:
+  fn map(f: A -> B, xs: [A]) -> [B] {
+    xs.iter().map(f).collect()
+  }
+
+  // Specialized for pure f:
+  fn map_pure(f: A -> B [pure], xs: [A]) -> [B] {
+    // Can parallelize, vectorize, or fuse with consumers
+    xs.par_iter().map(f).collect()
+  }
+
+  // Specialized for effectful f:
+  fn map_io(f: A -> B [io], xs: [A]) -> [B] {
+    // Must execute sequentially, preserving IO order
+    xs.iter().map(f).collect()
+  }
+\end{verbatim}
+
+\subsection{Effect-Directed Dispatch}\label{sec:effect-dispatch}
+
+At call sites, the compiler can dispatch to the appropriate specialization based on the callee's effect profile:
+
+\begin{verbatim}
+  // Call site:
+  map(|x| x + 1, xs)  // pure closure -> use map_pure
+  map(|x| println(x), xs)  // IO closure -> use map_io
+\end{verbatim}
+
+%% ============================================================
+%% Section 59.5
+%% ============================================================
+\section{Examples: Pure Computation, IO, Allocation, Synchronization}\label{sec:effect-examples}
+
+\subsection{Pure Computation}\label{sec:pure-computation}
+
+Pure computations have no effects and can be freely optimized:
+
+\begin{verbatim}
+  // Pure: can be CSE'd, hoisted, parallelized
+  %result = call @compute(%input) [pure]
+\end{verbatim}
+
+\subsection{IO}\label{sec:io-effect}
+
+IO effects constrain ordering and prevent certain optimizations:
+
+\begin{verbatim}
+  // IO: cannot be reordered with other IO, cannot be eliminated
+  call @printf(i8* %format, ...) [io]
+\end{verbatim}
+
+\subsection{Allocation}\label{sec:alloc-effect}
+
+Allocation effects can be optimized by escape analysis:
+
+\begin{verbatim}
+  // Allocation: can be stack-allocated if the object doesn't escape
+  %obj = call @malloc(i64 32) [alloc]
+  // If %obj doesn't escape -> stack allocate
+  // If %obj escapes -> heap allocate
+\end{verbatim}
+
+\subsection{Synchronization}\label{sec:sync-effect}
+
+Synchronization effects (locks, atomics) constrain reordering:
+
+\begin{verbatim}
+  // Synchronization: cannot be reordered with memory operations
+  call @lock(%mutex) [sync_write]
+  // critical section
+  call @unlock(%mutex) [sync_write]
+\end{verbatim}
+
+%% ============================================================
+%% Section 59.6
+%% ============================================================
+\section{Implementation Strategies}\label{sec:effect-impl}
+
+\subsection{Effect Analysis Pass}\label{sec:effect-analysis}
+
+An effect analysis pass computes the effects of each operation, block, and function:
+
+\begin{algorithm}[H]
+\caption{Effect Analysis}\label{alg:effect-analysis}
+\begin{algorithmic}[1]
+\Function{AnalyzeEffects}{$\mathrm{IR}$}
+  \For{each operation $op$}
+    \State $\mathrm{effects}(op) \gets \mathrm{intrinsic\_effects}(op)$
+    \If{$op$ is a call}
+      \State $\mathrm{effects}(op) \gets \mathrm{effects}(op) \cup \mathrm{callee\_effects}(op)$
+    \EndIf
+  \EndFor
+  \For{each block $B$}
+    \State $\mathrm{effects}(B) \gets \bigcup_{op \in B} \mathrm{effects}(op)$
+  \EndFor
+  \For{each function $f$}
+    \State $\mathrm{effects}(f) \gets \bigcup_{B \in f} \mathrm{effects}(B)$
+  \EndFor
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Effect-Guided Optimization Pipeline}\label{sec:effect-pipeline}
+
+The optimization pipeline uses effect information at each stage:
+
+\begin{enumerate}
+  \item \textbf{Early cleanup.} Use effect information for DCE and CSE.
+  \item \textbf{Inlining.} Inline pure functions aggressively; be conservative with effectful functions.
+  \item \textbf{Loop optimization.} Hoist pure operations; respect effect ordering for effectful operations.
+  \item \textbf{Parallelization.} Parallelize pure loops; sequentialize effectful loops.
+  \item \textbf{Code generation.} Use effect information for register allocation (pure values can be recomputed instead of spilled).
+\end{enumerate}
+
+\begin{historical}
+Effect tracking in IRs has evolved from simple ``side-effect-free'' flags (as in LLVM's \texttt{readnone} and \texttt{readonly} attributes) to comprehensive effect systems integrated into the IR. The development of algebraic effects (see \cref{ch:effect-systems}) has provided a theoretical foundation for effect tracking, and modern compilers like Koka and the GHC optimizer have implemented effect-aware IRs that enable aggressive optimization based on effect information.
+\end{historical}
+
+%% ============================================================
+%% Section 59.7
+%% ============================================================
+\section{Advanced Effect-Based Optimization}\label{sec:effect-optimization-advanced}
+
+\subsection{Effect-Guided Loop Optimization}\label{sec:effect-loop-opts}
+
+Effect information is particularly valuable for loop optimization, where the distinction between pure and effectful operations determines what transformations are legal.
+
+\begin{verbatim}
+  // Before optimization:
+  for i = 0 to N {
+    %x = add i32 %a, %b [pure]           // loop-invariant, pure
+    %y = load i32* %p [read]             // loop-invariant if %p not modified
+    %z = call @compute(%x) [pure]        // loop-invariant, pure
+    store i32 %z, i32* %q [write]        // must stay in loop
+  }
+
+  // After effect-guided hoisting:
+  %x = add i32 %a, %b [pure]             // hoisted (pure, loop-invariant)
+  %y = load i32* %p [read]               // hoisted (read, %p not modified in loop)
+  %z = call @compute(%x) [pure]          // hoisted (pure, loop-invariant)
+  for i = 0 to N {
+    store i32 %z, i32* %q [write]        // stays (write effect)
+  }
+\end{verbatim}
+
+\subsection{Effect-Based Parallelization}\label{sec:effect-parallelization}
+
+Effect information determines whether a loop can be parallelized:
+
+\begin{algorithm}[H]
+\caption{Effect-Guided Parallelization}\label{alg:effect-parallel}
+\begin{algorithmic}[1]
+\Function{CanParallelize}{$\mathrm{loop}$}
+  \State $\mathrm{effects} \gets \mathrm{collect\_effects}(\mathrm{loop})$
+  \If{$\mathrm{effects} \cap \{\mathrm{io}, \mathrm{sync}\} \neq \emptyset$}
+    \State \Return \textbf{false} \Comment{IO or sync prevents parallelization}
+  \EndIf
+  \If{$\mathrm{effects} \cap \{\mathrm{write}\} \neq \emptyset$}
+    \State \Comment{Check for write-write or write-read conflicts}
+    \State $\mathrm{conflicts} \gets \mathrm{analyze\_dependencies}(\mathrm{loop})$
+    \If{$\mathrm{conflicts} \neq \emptyset$}
+      \State \Return \textbf{false}
+    \EndIf
+  \EndIf
+  \State \Return \textbf{true} \Comment{Pure or read-only: safe to parallelize}
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{verbatim}
+  // Parallelizable (pure body):
+  for i = 0 to N {
+    result[i] = f(input[i])  // pure: no side effects
+  }
+  // -> parallel_for i = 0 to N { result[i] = f(input[i]) }
+
+  // Not parallelizable (write conflicts):
+  for i = 0 to N {
+    total += input[i]  // write to 'total' creates a dependency
+  }
+  // -> must use reduction: parallel_reduce(+, input)
+
+  // Not parallelizable (IO):
+  for i = 0 to N {
+    println(input[i])  // IO: order matters
+  }
+  // -> must execute sequentially
+\end{verbatim}
+
+\subsection{Effect Specialization in Practice}\label{sec:effect-specialization-practice}
+
+Effect specialization generates different versions of a function for different effect profiles:
+
+\begin{verbatim}
+  // Generic function:
+  fn for_each<T>(xs: &[T], f: impl Fn(&T)) {
+    for x in xs { f(x); }
+  }
+
+  // Specialized for pure f:
+  fn for_each_pure<T>(xs: &[T], f: impl Fn(&T) [pure]) {
+    // Can vectorize, unroll, or parallelize
+    xs.par_iter().for_each(f);
+  }
+
+  // Specialized for IO f:
+  fn for_each_io<T>(xs: &[T], f: impl Fn(&T) [io]) {
+    // Must execute sequentially
+    for x in xs { f(x); }
+  }
+
+  // Call site dispatch:
+  for_each(data, |x| x * 2);        // pure -> for_each_pure
+  for_each(data, |x| println(x));   // IO   -> for_each_io
+\end{verbatim}
+
+\subsection{Effect-Based Inlining Decisions}\label{sec:effect-inlining-detail}
+
+Effect information guides inlining decisions with a cost model:
+
+\begin{table}[htbp]
+\centering
+\caption{Effect-based inlining decisions}\label{tab:effect-inlining}
+\begin{tabular}{p{2.5cm}p{2.5cm}p{3cm}p{3.5cm}}
+\hline
+\textbf{Callee Effect} & \textbf{Inline?} & \textbf{Reason} & \textbf{Caveat} \\
+\hline
+Pure & Always & No side effects to worry about & Code size \\
+Read only & Usually & Enables hoisting after inlining & May expose aliasing \\
+Write & Sometimes & May enable store forwarding & Ordering constraints \\
+IO & Rarely & IO ordering is fragile & Only if small \\
+Alloc & Depends & Escape analysis after inline & May enable stack alloc \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Effect Analysis for Exception Safety}\label{sec:effect-exception}
+
+Effect tracking can be extended to reason about exception safety:
+
+\begin{verbatim}
+  // Effect analysis for exception safety:
+  fn process() [exn] {
+    let resource = acquire();     // [alloc]
+    let result = compute(resource); // [pure, exn]
+    release(resource);             // [write]
+    result
+  }
+
+  // Problem: if compute() throws, release() is never called
+  // Effect analysis detects: resource leak on exception path
+
+  // Fix: use RAII or try-finally
+  fn process() [exn] {
+    let resource = acquire();     // [alloc]
+    let result = try {
+      compute(resource)           // [pure, exn]
+    } finally {
+      release(resource);          // [write] - always executed
+    };
+    result
+  }
+\end{verbatim}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (ir) {IR with Effects};
+  \node[block, below left=1.5cm and 0.5cm of ir] (analysis) {Effect Analysis};
+  \node[block, below right=1.5cm and 0.5cm of ir] (specialize) {Effect Specialization};
+  \node[block, below=1cm of analysis] (dce) {DCE / CSE};
+  \node[block, below=1cm of specialize] (parallel) {Parallelization};
+  \node[block, below=1.5cm of dce] (hoist) {Code Motion};
+  \node[block, below=1.5cm of parallel] (vector) {Vectorization};
+
+  \draw[arrow] (ir) -- (analysis);
+  \draw[arrow] (ir) -- (specialize);
+  \draw[arrow] (analysis) -- (dce);
+  \draw[arrow] (analysis) -- (parallel);
+  \draw[arrow] (dce) -- (hoist);
+  \draw[arrow] (parallel) -- (vector);
+\end{tikzpicture}
+\caption{Effect-guided optimization pipeline. Effect analysis feeds into multiple optimization passes: DCE/CSE for pure operations, parallelization for effect-free loops, code motion for hoisting, and vectorization for data-parallel operations.}\label{fig:effect-optimization-pipeline}
+\end{figure}
+
+%% ============================================================
+%% Section 59.8
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-59}
+
+Effect-aware IRs track side effects as first-class information, enabling the compiler to reason about purity, reorder operations safely, and specialize code based on effect profiles. The key design decisions are the effect lattice (what effects to track), the annotation mechanism (how to attach effects to operations), and the optimization strategies (how to use effect information).
+
+For further reading, we recommend the LLVM language reference on function attributes~\cite{llvm2024}, the Koka language paper~\cite{leijen2019}, and the GHC optimizer documentation.

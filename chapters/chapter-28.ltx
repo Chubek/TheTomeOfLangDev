@@ -1,0 +1,562 @@
+%% Chapter 28: Attribute Grammars and Syntax-Directed Semantics
+\label{ch:attribute-grammars}
+
+\section{Introduction to Attribute Grammars}
+\label{sec:ag-intro}
+
+Context-free grammars define the \emph{syntax} of a language---the set of valid strings. But syntax alone is insufficient for programming languages: we need to express \emph{context-sensitive} constraints such as type compatibility, variable declaration before use, and unique label names. \emph{Attribute grammars}, introduced by Donald Knuth in 1968, extend context-free grammars with attributes and semantic rules, providing a formal framework for syntax-directed semantics.
+
+The key insight of attribute grammars is that semantic information can be associated with the nodes of a parse tree and propagated through the tree via \emph{synthesized} and \emph{inherited} attributes. This approach is particularly well suited to compiler implementation, where the compiler front end must perform tasks such as type checking, name resolution, and intermediate code generation---all of which require context-sensitive information that flows through the parse tree.
+
+\begin{historical}
+Donald Knuth introduced attribute grammars in his 1968 paper ``Semantics of Context-Free Languages,'' motivated by the need for a formal framework for syntax-directed translation. The concept was independently anticipated by work on macro processing and tree translation. The subsequent development of attribute grammars was driven by the desire for automatic compiler generation: if semantic rules could be specified as attributes, then tools like parser generators could automatically determine evaluation order and generate efficient code. Key contributors include Der{\u{r}} (1950s, on tree translation), Waite and Hamilton (1970s, on attribute evaluation algorithms), and Reps (1980s, on the Synthesizer Generator).
+\end{historical}
+
+\section{Attribute Grammars: Basic Concepts}
+\label{sec:ag-basic}
+
+\subsection{Motivation}
+\label{sec:ag-motivation}
+
+Consider the task of computing the value of an arithmetic expression. A context-free grammar defines the structure:
+
+\begin{grammar}{Arithmetic Expressions}
+  E & \longrightarrow E + T \\
+    & \mid T \\
+  T & \longrightarrow T \times F \\
+    & \mid F \\
+  F & \longrightarrow ( E ) \\
+    & \mid \textbf{num}
+\end{grammar}
+
+This grammar defines which strings are valid expressions, but it does not tell us how to compute the value of an expression. We need additional information---\emph{attributes} attached to the grammar symbols and \emph{semantic rules} that define how attributes are computed.
+
+\subsection{Definition of Attribute Grammars}
+\label{sec:ag-definition}
+
+\begin{definition}[Attribute Grammar]
+\label{def:attribute-grammar}
+An \textbf{attribute grammar} is a context-free grammar $G = (N, T, P, S)$ augmented with:
+\begin{enumerate}
+  \item For each grammar symbol $X$ (terminal or nonterminal), a finite set of \textbf{attributes} $A(X) = S(X) \cup I(X)$, where $S(X)$ is the set of \textbf{synthesized} attributes and $I(X)$ is the set of \textbf{inherited} attributes.
+  \item For each production $p \in P$ of the form $X_0 \to X_1 X_2 \cdots X_n$, a set of \textbf{semantic rules} of the form:
+    \begin{itemize}
+      \item $X_i.a = f_p(X_0.b_0, X_1.b_1, \ldots, X_n.b_n)$ for synthesized attributes $a \in S(X_i)$
+      \item $X_i.a = f_p(X_0.b_0, X_1.b_1, \ldots, X_n.b_n)$ for inherited attributes $a \in I(X_i)$
+    \end{itemize}
+    where each $f_p$ is a function defined on the attributes of the grammar symbols in the production.
+\end{enumerate}
+\end{definition}
+
+The distinction between synthesized and inherited attributes is fundamental:
+
+\begin{definition}[Synthesized Attribute]
+\label{def:synthesized-attribute}
+A \textbf{synthesized} attribute of a grammar symbol $X_i$ in a production $X_0 \to X_1 \cdots X_n$ is an attribute whose value is computed from attributes of $X_i$ itself and attributes of the symbols $X_0, X_1, \ldots, X_n$ (including $X_i$'s own children in the parse tree). Synthesized attributes flow \emph{upward} in the parse tree.
+\end{definition}
+
+\begin{definition}[Inherited Attribute]
+\label{def:inherited-attribute}
+An \textbf{inherited} attribute of a grammar symbol $X_i$ in a production $X_0 \to X_1 \cdots X_n$ is an attribute whose value is computed from attributes of $X_0$ (the parent) and attributes of the sibling symbols $X_j$ ($j \neq i$). Inherited attributes flow \emph{downward} and \emph{sideways} in the parse tree.
+\end{definition}
+
+\begin{insight}
+The restriction on attribute dependencies is not merely technical---it ensures that attribute evaluation is well-defined. A synthesized attribute of $X_i$ can depend on attributes of $X_i$'s children and $X_i$ itself. An inherited attribute of $X_i$ can depend on attributes of $X_i$'s parent and siblings. These restrictions prevent circular dependencies in many practical grammars and ensure that attributes can be evaluated in a single pass (or a bounded number of passes) over the parse tree.
+\end{insight}
+
+\subsection{Example: Expression Evaluation}
+\label{sec:ag-example-eval}
+
+\begin{grammar}{Arithmetic Expressions with Attributes}
+  E & \longrightarrow E_1 + T \qquad & E.\textbf{val} = E_1.\textbf{val} + T.\textbf{val} \\
+    & \mid T \qquad & E.\textbf{val} = T.\textbf{val} \\
+  T & \longrightarrow T_1 \times F \qquad & T.\textbf{val} = T_1.\textbf{val} \times F.\textbf{val} \\
+    & \mid F \qquad & T.\textbf{val} = F.\textbf{val} \\
+  F & \longrightarrow ( E ) \qquad & F.\textbf{val} = E.\textbf{val} \\
+    & \mid \textbf{num} \qquad & F.\textbf{val} = \textbf{num}.\textbf{lexval}
+\end{grammar}
+
+All attributes in this grammar are synthesized: the value of each expression is computed from the values of its subexpressions, flowing upward through the parse tree. The attribute \textbf{val} is synthesized for $E$, $T$, and $F$, while \textbf{lexval} is a lexical attribute of the terminal \textbf{num}.
+
+\section{Dependency Graphs and Evaluation Order}
+\label{sec:dependency-graphs}
+
+\subsection{Dependency Graphs}
+\label{sec:dep-graphs}
+
+For a given parse tree, the \emph{dependency graph} (or \emph{attribute dependency graph}) captures the data flow between attribute instances.
+
+\begin{definition}[Dependency Graph]
+\label{def:dependency-graph}
+Given a parse tree $T$ of an attribute grammar, the \textbf{dependency graph} $D(T)$ is a directed graph where:
+\begin{itemize}
+  \item The nodes are the attribute instances: for each node $n$ in $T$ labeled with grammar symbol $X$, and each attribute $a \in A(X)$, there is a node $n.a$ in $D(T)$.
+  \item There is a directed edge from $m.b$ to $n.a$ if the semantic rule for $n.a$ depends on $m.b$.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Well-Defined Attribute Grammar]
+\label{def:well-defined-ag}
+An attribute grammar is \textbf{well-defined} (or \textbf{non-circular}) if for every parse tree $T$, the dependency graph $D(T)$ is a directed acyclic graph (DAG).
+\end{definition}
+
+If the dependency graph is a DAG, the attributes can be evaluated by any topological sort of the graph. If the graph contains a cycle, the attributes are circular and cannot be evaluated.
+
+\subsection{Evaluation Order}
+\label{sec:evaluation-order}
+
+\begin{definition}[Topological Evaluation Order]
+\label{def:topological-eval}
+A \textbf{topological evaluation order} for the dependency graph $D(T)$ is a linear ordering of the nodes such that if there is an edge from $m.b$ to $n.a$, then $m.b$ appears before $n.a$ in the ordering.
+\end{definition}
+
+For a non-circular attribute grammar, a topological evaluation order always exists. The challenge is to find an evaluation order that works for \emph{all} parse trees, not just a specific one.
+
+\begin{definition}[Ordered Attribute Grammar]
+\label{def:ordered-ag}
+An attribute grammar is \textbf{ordered} if there exists a single evaluation scheme (a fixed ordering of attribute evaluations for each production) that is consistent with all dependency graphs.
+\end{definition}
+
+Not all non-circular attribute grammars are ordered. For ordered grammars, a single pass over the parse tree (visiting nodes in a fixed order) suffices to evaluate all attributes.
+
+\subsection{Evaluation Algorithms}
+\label{sec:eval-algorithms}
+
+Several algorithms exist for evaluating attributes of a parse tree:
+
+\begin{itemize}
+  \item \textbf{Tree traversal methods}: For $S$-attributed grammars (only synthesized attributes), a single bottom-up traversal suffices. For $L$-attributed grammars, a single top-down traversal suffices.
+  \item \textbf{Rule-by-rule method}: Evaluate attributes in a fixed order for each production, repeating passes until all attributes are computed.
+  \item \textbf{Derivative method}: Construct a derivative grammar that encodes the evaluation order, then evaluate using a single tree traversal.
+  \item \textbf{Topological sort on demand}: For each parse tree, construct the dependency graph and evaluate attributes in topological order.
+\end{itemize}
+
+\section{Classes of Attribute Grammars}
+\label{sec:ag-classes}
+
+\subsection{S-Attributed Grammars}
+\label{sec:s-attributed}
+
+\begin{definition}[S-Attributed Grammar]
+\label{def:s-attributed}
+An attribute grammar is \textbf{S-attributed} if all attributes are synthesized (no inherited attributes).
+\end{definition}
+
+S-attributed grammars can be evaluated during bottom-up parsing (e.g., LR parsing) by evaluating attributes as reductions are performed. The evaluation order is a post-order traversal of the parse tree.
+
+\subsection{L-Attributed Grammars}
+\label{sec:l-attributed}
+
+\begin{definition}[L-Attributed Grammar]
+\label{def:l-attributed}
+An attribute grammar is \textbf{L-attributed} if each inherited attribute of $X_i$ in a production $X_0 \to X_1 \cdots X_n$ depends only on:
+\begin{itemize}
+  \item Inherited attributes of $X_0$ (the parent)
+  \item Synthesized or inherited attributes of $X_j$ for $j < i$ (left siblings)
+\end{itemize}
+\end{definition}
+
+L-attributed grammars can be evaluated during top-down parsing (e.g., LL parsing) by evaluating attributes as the parse tree is constructed from left to right. The left-to-right restriction ensures that all required attributes are available when needed.
+
+\begin{example}[L-Attributed Grammar for Type Checking]
+\label{ex:l-attributed-types}
+Consider a grammar for type declarations:
+\begin{grammar}{Type Declarations}
+  D & \longrightarrow T\; L \qquad & L.\textbf{type} = T.\textbf{type} \\
+  T & \longrightarrow \textbf{int} \qquad & T.\textbf{type} = \textbf{int} \\
+    & \mid \textbf{float} \qquad & T.\textbf{type} = \textbf{float} \\
+  L & \longrightarrow L_1 , \textbf{id} \qquad & L_1.\textbf{type} = L.\textbf{type}; \quad \textbf{addtype}(\textbf{id}.\textbf{entry}, L.\textbf{type}) \\
+    & \mid \textbf{id} \qquad & \textbf{addtype}(\textbf{id}.\textbf{entry}, L.\textbf{type})
+\end{grammar}
+
+The attribute \textbf{type} is inherited by $L$ from $T$ (its parent in the production for $D$) and then passed down through the list. The function \textbf{addtype} enters the type into the symbol table.
+\end{example}
+
+\subsection{Non-Circular Attribute Grammars}
+\label{sec:noncircular}
+
+The most general class of practical attribute grammars is the class of \emph{non-circular} attribute grammars---those whose dependency graphs are acyclic for all parse trees. This class includes both S-attributed and L-attributed grammars as special cases.
+
+\begin{theorem}[Non-Circularity Test]
+\label{thm:noncircular-test}
+There exists an algorithm to test whether an attribute grammar is non-circular. The algorithm constructs a ``higher-order'' dependency graph that over-approximates the dependency graphs of all parse trees and checks it for cycles.
+\end{theorem}
+
+The test is based on the observation that if the attribute grammar is circular, then there exists a parse tree whose dependency graph contains a cycle, and this cycle can be detected by analyzing the dependency patterns of individual productions.
+
+\section{Circular Attribute Detection}
+\label{sec:circular-detection}
+
+\subsection{The Problem of Circularity}
+\label{sec:circularity-problem}
+
+An attribute grammar is circular if there exists a parse tree whose dependency graph contains a cycle. Circularity means that some attribute values cannot be determined---they depend on themselves, directly or indirectly.
+
+\begin{example}[Circular Attribute Grammar]
+\label{ex:circular-ag}
+Consider a grammar with the production $A \to B\; C$ and semantic rules:
+\[
+B.i = C.s \qquad C.i = B.s
+\]
+If $B.s$ depends on $B.i$ and $C.s$ depends on $C.i$, then we have a circular dependency: $B.i \to C.s \to C.i \to B.s \to B.i$.
+\end{example}
+
+\subsection{Detecting Circularity}
+\label{sec:detect-circularity}
+
+The standard algorithm for detecting circularity works by constructing a \emph{partitioned dependency graph} for each production and then composing these graphs across all possible parse trees.
+
+\begin{definition}[Production Dependency Graph]
+\label{def:prod-dep-graph}
+For a production $p: X_0 \to X_1 \cdots X_n$, the \textbf{production dependency graph} has nodes for each attribute instance of $X_0, \ldots, X_n$ and edges representing direct dependencies in the semantic rules.
+\end{definition}
+
+The algorithm then checks whether the composition of production dependency graphs over all possible parse trees can create a cycle. This is done by computing a fixed point: starting with the direct dependencies, iteratively adding edges that arise from the composition of productions, until no new edges are added or a cycle is detected.
+
+\subsection{Handling Conditional Circularity}
+\label{sec:conditional-circularity}
+
+In practice, some attribute grammars are circular for certain parse trees but not others. For example, a grammar for type inference might have circular dependencies only for programs with recursive type definitions. Handling such cases requires:
+\begin{itemize}
+  \item \textbf{Iterative evaluation}: Evaluate attributes repeatedly until a fixed point is reached (or divergence is detected).
+  \item \textbf{Lazy evaluation}: Evaluate attributes on demand, detecting cycles at evaluation time.
+  \item \textbf{Relaxed attribute grammars}: Allow circular attributes but require that they converge to a fixed point.
+\end{itemize}
+
+\section{Applications of Attribute Grammars}
+\label{sec:ag-applications}
+
+\subsection{Type Checking}
+\label{sec:ag-type-checking}
+
+Type checking is one of the most important applications of attribute grammars. The type of each expression is a synthesized attribute, computed from the types of its subexpressions. Type environments are inherited attributes, passed down from declarations to uses.
+
+\begin{grammar}{Type Checking with Attributes}
+  E & \longrightarrow E_1 + E_2 \qquad & E.\textbf{type} = \textbf{if } E_1.\textbf{type} = \textbf{int} \land E_2.\textbf{type} = \textbf{int} \textbf{ then int else error} \\
+    & \longrightarrow E_1 = E_2 \qquad & E.\textbf{type} = \textbf{if } E_1.\textbf{type} = E_2.\textbf{type} \textbf{ then bool else error} \\
+    & \longrightarrow \textbf{id} \qquad & E.\textbf{type} = \textbf{lookup}(\textbf{id}.\textbf{entry}, \Gamma) \\
+    & \longrightarrow \textbf{num} \qquad & E.\textbf{type} = \textbf{int}
+\end{grammar}
+
+\subsection{Code Generation}
+\label{sec:ag-code-gen}
+
+Intermediate code generation can be specified as an attribute grammar where the synthesized attribute is the generated code for each construct:
+
+\begin{grammar}{Code Generation with Attributes}
+  E & \longrightarrow E_1 + E_2 \qquad & E.\textbf{code} = E_1.\textbf{code} \concat E_2.\textbf{code} \concat \textbf{gen}(\texttt{ADD}) \\
+    & \longrightarrow \textbf{id} \qquad & E.\textbf{code} = \textbf{gen}(\texttt{LOAD } \textbf{id}.\textbf{addr}) \\
+    & \longrightarrow \textbf{num} \qquad & E.\textbf{code} = \textbf{gen}(\texttt{LOADI } \textbf{num}.\textbf{val})
+\end{grammar}
+
+\subsection{Name Resolution}
+\label{sec:ag-name-resolution}
+
+Name resolution---binding identifiers to their declarations---is naturally expressed using inherited attributes for the environment and synthesized attributes for the resolved bindings.
+
+\subsection{Semantic Analysis in General}
+\label{sec:ag-semantic-analysis}
+
+Attribute grammars provide a general framework for semantic analysis, encompassing:
+\begin{itemize}
+  \item Scope analysis and symbol table construction
+  \item Type checking and type inference
+  \item Flow analysis (def-use chains, live variable analysis)
+  \item Intermediate code generation
+  \item Constant folding and simple optimizations
+\end{itemize}
+
+\section{Comparison with Operational Semantics}
+\label{sec:ag-vs-opsem}
+
+\subsection{Relationship to Structural Operational Semantics}
+\label{sec:ag-vs-sos}
+
+Attribute grammars and structural operational semantics (SOS) both provide formal frameworks for specifying the semantics of programming languages. However, they differ in several important respects:
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{3.5cm}p{5cm}p{5cm}}
+\hline
+\textbf{Aspect} & \textbf{Attribute Grammars} & \textbf{Operational Semantics} \\
+\hline
+Basis & Parse trees & Transition systems \\
+Semantics & Decorated trees & State transitions \\
+Compositionality & Tree-structured & Rule-based \\
+Evaluation & Batch (all attributes) & Step-by-step \\
+Termination & Guaranteed (if non-circular) & May not terminate \\
+Implementation & Direct (tree traversal) & Abstract machine \\
+\hline
+\end{tabular}
+\caption{Comparison of attribute grammars and operational semantics}
+\label{tab:ag-vs-opsem}
+\end{table}
+
+\subsection{Complementary Strengths}
+\label{sec:ag-complementary}
+
+Attribute grammars excel at specifying \emph{static} semantic properties---those that can be determined by examining the program text without executing it. Operational semantics excels at specifying \emph{dynamic} behavior---how programs execute step by step.
+
+In a complete language definition, both approaches are often used: attribute grammars for static semantics (type checking, scope analysis) and operational semantics for dynamic semantics (evaluation, execution).
+
+\section{Attribute Grammar Implementations}
+\label{sec:ag-implementations}
+
+\subsection{The Synthesizer Generator}
+\label{sec:synthesizer-generator}
+
+Reps and Teitelbaum's Synthesizer Generator (1984) was the first comprehensive environment for attribute grammar-based language definition. It provided:
+\begin{itemize}
+  \item Automatic evaluation order determination
+  \item Incremental attribute evaluation (re-evaluating only affected attributes when the program changes)
+  \item Interactive language development
+\end{itemize}
+
+\subsection{Modern Attribute Grammar Systems}
+\label{sec:modern-ag}
+
+Modern systems for attribute grammar-based language development include:
+\begin{itemize}
+  \item \textbf{JastAdd}: A Java-based system for attribute grammar specifications, used in compiler construction courses.
+  \item \textbf{UUAG} (Utrecht University Attribute Grammar): An extension of Haskell with attribute grammar constructs.
+  \item \textbf{Kiama}: A Scala library for attribute grammar-like processing of tree structures.
+  \item \textbf{Silver}: An attribute grammar system for composing language specifications (used in the AbleC extensible C compiler).
+\end{itemize}
+
+\section{Summary}
+\label{sec:ag-summary}
+
+Attribute grammars provide a powerful and practical framework for syntax-directed semantics. By extending context-free grammars with attributes and semantic rules, they enable the specification of context-sensitive properties in a declarative, compositional manner. The distinction between synthesized and inherited attributes captures the two fundamental directions of information flow in a parse tree, and the dependency graph provides a formal basis for determining evaluation order.
+
+The theory of attribute grammars continues to evolve, with ongoing research in areas such as higher-order attribute grammars, reference attributes, adaptive attribute grammars, and the integration of attribute grammars with functional programming languages.
+
+\begin{historical}
+The development of attribute grammars from Knuth's 1968 paper to modern language workbenches spans over five decades. Key milestones include: Knuth's original formulation (1968); the development of evaluation algorithms by Waite, Hamilton, and Der{\u{r}} (1970s); the classification into S-attributed, L-attributed, and non-circular grammars (1970s--1980s); the Synthesizer Generator (Reps and Teitelbaum, 1984); higher-order attribute grammars (Vogt, Swierstra, and Kuiper, 1989); reference attributes (Paakki, 1995); and modern systems like JastAdd (Ekman and Hedin, 2007) and Silver (Viera et al., 2018).
+\end{historical}
+
+%% ------------------------------------------------------------------
+%% Expanded sections for Chapter 28
+%% ------------------------------------------------------------------
+
+\section{Circular Attributes and Iterative Evaluation}
+\label{sec:circular-attributes}
+
+\subsection{Benign Circularity}
+\label{sec:benign-circularity}
+
+While Knuth's original definition requires non-circularity, many practical attribute grammars exhibit \emph{benign circularity}: the dependency graph may contain cycles for certain parse trees, but the attributes still converge to a well-defined fixed point through iterative evaluation.
+
+\begin{definition}[Benign Circularity]
+\label{def:benign-circularity}
+An attribute grammar is \textbf{benignly circular} if for every parse tree, the iterative evaluation of attributes (repeatedly applying semantic rules until no attribute changes) converges to a unique fixed point in a finite number of steps.
+\end{definition}
+
+\begin{example}[Type Inference with Circular Attributes]
+\label{ex:circular-type-inference}
+Consider a simple type inference system where the type of a recursive function depends on the type of its body, which in turn depends on the type of the function itself:
+\begin{grammar}{Circular Type Inference}
+  E & \longrightarrow \textbf{fun } f(x) = E_1 \qquad & \begin{array}{l} f.\textbf{type} = f.\textbf{type} \to E_1.\textbf{type} \\ E.\textbf{type} = f.\textbf{type} \end{array} \\
+    & \longrightarrow E_1\; E_2 \qquad & E.\textbf{type} = \text{result\_type}(E_1.\textbf{type}, E_2.\textbf{type})
+\end{grammar}
+The attribute $f.\textbf{type}$ appears on both sides of its defining equation---a circular dependency. However, iterative evaluation starting from $\textbf{unknown}$ converges to the correct type through successive approximations.
+\end{example}
+
+\subsection{Iterative Evaluation Algorithm}
+\label{sec:iterative-eval}
+
+\begin{algorithm}[htbp]
+\caption{Evaluate attributes with potential circularity}
+\begin{algorithmic}[1]
+\State Initialize all attributes to $\bottom$ (least defined value)
+\Repeat
+  \State $\text{changed} \gets \text{false}$
+  \For{each node $n$ in the parse tree}
+    \For{each attribute $a$ of $n$}
+      \State $v_{\text{old}} \gets n.a$
+      \State $n.a \gets f_p(\text{dependencies of } n.a)$
+      \If{$n.a \neq v_{\text{old}}$}
+        \State $\text{changed} \gets \text{true}$
+      \EndIf
+    \EndFor
+  \EndFor
+\Until{$\text{changed} = \text{false}$ or max iterations exceeded}
+\State \textbf{return} attribute values
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Convergence of Iterative Evaluation]
+\label{thm:iterative-convergence}
+If all semantic functions are \emph{monotone} with respect to a partial order on attribute values (where $\bottom \sqsubseteq v$ for all $v$), and the attribute domain is a \emph{finite-height lattice}, then iterative evaluation converges to the least fixed point.
+\end{theorem}
+
+\begin{proof}
+The attribute values form a finite-height lattice. Each iteration either increases some attribute value (moving up in the lattice) or reaches a fixed point. Since the lattice has finite height, the process must terminate. By the Knaster--Tarski theorem, the result is the least fixed point.
+\end{proof}
+
+\subsection{Demand-Driven Evaluation}
+\label{sec:demand-driven}
+
+An alternative to iterative evaluation is \emph{demand-driven} (lazy) evaluation: attributes are computed only when needed, and circular dependencies are detected at evaluation time.
+
+\begin{definition}[Demand-Driven Evaluation]
+\label{def:demand-driven}
+In \textbf{demand-driven evaluation}, each attribute is computed on demand. When an attribute is requested:
+\begin{enumerate}
+  \item If its value has already been computed, return it.
+  \item If it is currently being computed (on the evaluation stack), a cycle is detected.
+  \item Otherwise, mark it as ``being computed,'' evaluate its dependencies recursively, and store the result.
+\end{enumerate}
+\end{definition}
+
+Demand-driven evaluation is implemented in systems like JastAdd using a technique called \emph{rewritable attributes} with cycle detection.
+
+\section{Higher-Order Attribute Grammars}
+\label{sec:higher-order-ag}
+
+\subsection{Motivation}
+\label{sec:hoag-motivation}
+
+Standard attribute grammars compute values (numbers, strings, types) as attributes. \emph{Higher-order attribute grammars} (Vogt, Swierstra, Kuiper, 1989) allow attributes to be \emph{trees}---that is, an attribute can itself be a parse tree that has attributes.
+
+\begin{definition}[Higher-Order Attribute]
+\label{def:higher-order-attr}
+A \textbf{higher-order attribute} is an attribute whose value is a decorated parse tree. The tree has its own attributes, which can be accessed through the higher-order attribute.
+\end{definition}
+
+\begin{example}[Macro Expansion as Higher-Order Attributes]
+\label{ex:macro-hoag}
+Consider a language with macros. A macro invocation is a tree node whose \textbf{expanded} attribute is the parse tree of the macro expansion. The expanded tree has its own attributes (type, value, etc.) that can be accessed:
+\begin{grammar}{Macro Expansion}
+  E & \longrightarrow \textbf{macro}(args) \qquad & E.\textbf{expanded} = \text{expand}(E.\textbf{macro\_def}, args) \\
+    & & E.\textbf{type} = E.\textbf{expanded}.\textbf{type} \\
+    & & E.\textbf{value} = E.\textbf{expanded}.\textbf{value}
+\end{grammar}
+The attribute \textbf{expanded} is a higher-order attribute: its value is a parse tree that can be further decorated with attributes.
+\end{example}
+
+\subsection{Semantics of Higher-Order Attributes}
+\label{sec:hoag-semantics}
+
+Higher-order attributes introduce the possibility of \emph{infinite} trees (a macro that expands to itself). The semantics must handle this through a fixed-point construction:
+
+\begin{theorem}[Fixed-Point Semantics for HOAG]
+\label{thm:hoag-fixed-point}
+The semantics of a higher-order attribute grammar is given by the least fixed point of a continuous function on the domain of (possibly infinite) decorated trees. If the grammar is \emph{productive} (each expansion step produces a tree that is ``larger'' in some sense), the fixed point is a finite tree.
+\end{theorem}
+
+\section{Reference Attributes}
+\label{sec:reference-attributes}
+
+\subsection{The Need for References}
+\label{sec:ref-need}
+
+Many semantic analyses require building \emph{cross-references} between different parts of the parse tree. For example, a use of a variable must reference its declaration. \emph{Reference attributes} (Paakki, 1995) allow an attribute to hold a reference to another node in the parse tree.
+
+\begin{definition}[Reference Attribute]
+\label{def:reference-attr}
+A \textbf{reference attribute} is an attribute whose value is a reference (pointer) to another node in the parse tree. The referenced node can be accessed, and its attributes can be queried.
+\end{definition}
+
+\begin{example}[Name Resolution with Reference Attributes]
+\label{ex:ref-attr-names}
+\begin{grammar}{Name Resolution}
+  E & \longrightarrow \textbf{id} \qquad & E.\textbf{decl} = \text{lookup}(\textbf{id}.\textbf{name}, \Gamma) \\
+    & & E.\textbf{type} = E.\textbf{decl}.\textbf{type}
+\end{grammar}
+The attribute $E.\textbf{decl}$ is a reference attribute pointing to the declaration node of the identifier. The type of the expression is obtained by accessing the type attribute of the declaration.
+\end{example}
+
+\subsection{Reference Attributes and AST Navigation}
+\label{sec:ref-ast-nav}
+
+Reference attributes enable direct navigation of the abstract syntax tree, bypassing the tree structure imposed by the grammar. This is particularly useful for:
+\begin{itemize}
+  \item \textbf{Symbol table construction}: Declarations reference their scopes; uses reference their declarations.
+  \item \textbf{Control flow graphs}: Statement nodes reference their successors and predecessors.
+  \item \textbf{Data flow analysis}: Definition--use chains link definitions to their uses.
+\end{itemize}
+
+\section{Evaluation Strategies: A Comprehensive Comparison}
+\label{sec:eval-strategies-comparison}
+
+\subsection{Taxonomy of Evaluation Strategies}
+\label{sec:eval-taxonomy}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{3cm}p{3cm}p{3cm}p{3cm}}
+\hline
+\textbf{Strategy} & \textbf{Passes} & \textbf{Circularity} & \textbf{Incremental} \\
+\hline
+Tree walk & 1--many & No & No \\
+Rule-by-rule & $O(|A|)$ & No & No \\
+Topological sort & 1 & No & No \\
+Iterative & Many & Benign & Partial \\
+Demand-driven & On demand & Detected & Yes \\
+Higher-order & Fixed point & Productive & Partial \\
+\hline
+\end{tabular}
+\caption{Comparison of attribute evaluation strategies}
+\label{tab:eval-strategies}
+\end{table}
+
+\subsection{Incremental Attribute Evaluation}
+\label{sec:incremental-eval}
+
+When a program is edited (e.g., in an IDE), only a small portion of the parse tree changes. \emph{Incremental attribute evaluation} re-evaluates only the attributes affected by the change.
+
+\begin{definition}[Change Propagation]
+\label{def:change-propagation}
+Given a modified parse tree $T'$ and the dependency graph $D(T)$ of the original tree $T$:
+\begin{enumerate}
+  \item Identify the attributes whose values may have changed (those that depend on the modified nodes).
+  \item Re-evaluate only those attributes, propagating changes through the dependency graph.
+  \item Stop when no more attributes change.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Incremental Efficiency]
+\label{thm:incremental-efficiency}
+If the modification affects $k$ nodes and the maximum number of attributes that depend on any single node is $d$, then incremental evaluation takes $O(k \cdot d)$ time in the worst case, compared to $O(|T| \cdot |A|)$ for a full re-evaluation.
+\end{theorem}
+
+The Synthesizer Generator (Reps and Teitelbaum, 1984) was the first system to implement incremental attribute evaluation, achieving interactive response times for language-based editors.
+
+\section{Formal Properties of Attribute Grammars}
+\label{sec:ag-formal-properties}
+
+\subsection{The Complexity of Non-Circularity Testing}
+\label{sec:complexity-noncircular}
+
+\begin{theorem}[Complexity of Non-Circularity]
+\label{thm:complexity-nc}
+Testing whether an attribute grammar is non-circular is \textbf{PSPACE-complete}. The problem remains PSPACE-hard even for attribute grammars with only synthesized and inherited attributes (no higher-order or reference attributes).
+\end{theorem}
+
+Despite the theoretical complexity, practical non-circularity tests work well for most attribute grammars encountered in practice. The test constructs an over-approximation of the dependency graphs and checks it for cycles.
+
+\subsection{Absolutely Non-Circular Attribute Grammars}
+\label{sec:absolutely-nc}
+
+\begin{definition}[Absolutely Non-Circular]
+\label{def:absolutely-nc}
+An attribute grammar is \textbf{absolutely non-circular} if it is non-circular for \emph{every} parse tree, including those that are not derivable from the start symbol. This is a stronger condition than non-circularity (which only considers valid parse trees).
+\end{definition}
+
+Absolutely non-circular grammars can be tested in polynomial time, making them attractive for practical tools.
+
+\subsection{Attribute Grammar Transformations}
+\label{sec:ag-transformations}
+
+Several transformations can convert between different classes of attribute grammars:
+
+\begin{itemize}
+  \item \textbf{S-attributed to L-attributed}: Any S-attributed grammar is trivially L-attributed (no inherited attributes to constrain).
+  \item \textbf{L-attributed to S-attributed}: An L-attributed grammar can be converted to an S-attributed grammar by converting inherited attributes to synthesized attributes, at the cost of duplicating information in the parse tree.
+  \item \textbf{Non-circular to ordered}: Not all non-circular grammars can be converted to ordered grammars. The conversion may require grammar restructuring.
+\end{itemize}
+
+\begin{theorem}[Equivalence of AG Classes]
+\label{thm:ag-equivalence}
+Every non-circular attribute grammar can be simulated by a higher-order attribute grammar, and every higher-order attribute grammar can be simulated by a non-circular attribute grammar with reference attributes. The various classes of attribute grammars are thus equivalent in expressive power, differing only in convenience and efficiency.
+\end{theorem}

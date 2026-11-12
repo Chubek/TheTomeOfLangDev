@@ -1,0 +1,762 @@
+%%
+%% chapter-103.ltx — Symbolic Execution
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:symexec-intro}
+
+Symbolic execution is a program analysis technique in which programs are executed
+not with concrete input values, but with \emph{symbolic} values drawn from an
+infinite domain.  Instead of producing a single output, a symbolically executed
+program accumulates a set of \emph{path conditions}---logical formulae that
+characterize the inputs under which each execution path is taken.  The result is
+not a single trace but a \emph{tree of traces}, each annotated with constraints
+on the program's inputs.
+
+The technique was first described by King~\cite{king1976symbolic} in 1976 and
+has since become one of the most powerful methods for automated program analysis,
+test generation, and bug finding.  Modern symbolic execution engines such as
+KLEE~\cite{cadar2008klee}, angr~\cite{shoshitaishvili2016angr}, and
+S2E~\cite{chipounov2011s2e} have demonstrated the ability to find subtle bugs in
+real-world software, including security vulnerabilities in operating system
+kernels and file systems.
+
+At its core, symbolic execution can be understood as a generalization of concrete
+execution.  Where a concrete interpreter maps a program and an input to an
+output, a symbolic interpreter maps a program to a \emph{symbolic summary}---a
+disjunction of path conditions paired with symbolic outputs.  This perspective
+reveals the deep connection between symbolic execution and the denotational
+semantics studied in Part~III: a symbolic execution engine computes an
+\emph{approximation} of the program's denotation, expressed as a formula in a
+decidable fragment of first-order logic.
+
+In this chapter we develop the theory and practice of symbolic execution in
+depth.  We begin with the fundamental concepts of symbolic states and path
+conditions (\cref{sec:symexec-states}), then proceed to the design of symbolic
+execution engines (\cref{sec:symexec-engine}).  We examine the constraint
+solving problem and the role of SMT solvers (\cref{sec:symexec-smt}), address
+the path explosion problem and its mitigations (\cref{sec:symexec-path-explosion}),
+and discuss concolic execution as a hybrid approach (\cref{sec:symexec-concolic}).
+We conclude with applications and modern tools (\cref{sec:symexec-applications}).
+
+% ============================================================
+% Symbolic States and Path Conditions
+% ============================================================
+\section{Symbolic States and Path Conditions}\label{sec:symexec-states}
+
+\subsection{Symbolic Values}\label{sec:symexec-symvals}
+
+In concrete execution, each variable in a program is bound to a concrete value
+from some domain---an integer, a floating-point number, a pointer, and so forth.
+In symbolic execution, each variable is instead bound to a \emph{symbolic
+expression}---a term in a first-order language.
+
+\begin{definition}[Symbolic Value]\label{def:symval}
+A \emph{symbolic value} $v$ is a term in a sorted first-order language
+$\mathcal{L} = (\Sigma, \mathcal{S})$, where $\Sigma$ is a signature consisting
+of function symbols and constant symbols, and $\mathcal{S}$ is a set of sorts.
+We write $\mathcal{T}(\Sigma, \mathcal{V})$ for the set of all terms over
+$\Sigma$ and a set of symbolic variables $\mathcal{V}$.
+\end{definition}
+
+For a simple integer language, the signature might include:
+\[
+\Sigma = \{0, 1, +, -, \times, \mathit{ite}, \mathit{read}, \mathit{write}, \ldots\}
+\]
+where $\mathit{ite}$ is the if-then-else function and $\mathit{read}$,
+$\mathit{write}$ model memory operations.
+
+\begin{example}[Symbolic Expressions]\label{ex:symexpr}
+Consider the program fragment:
+\begin{verbatim}
+  x = input();
+  y = x + 1;
+  if (y > 10) {
+    z = y * 2;
+  } else {
+    z = y - 1;
+  }
+\end{verbatim}
+After the first two statements, the symbolic state maps $x \mapsto \alpha$ and
+$y \mapsto \alpha + 1$, where $\alpha$ is a fresh symbolic variable representing
+the unknown input.  At the branch, two paths emerge:
+\begin{itemize}
+\item \textbf{True branch:} path condition $\alpha + 1 > 10$, with
+      $z \mapsto (\alpha + 1) \times 2$.
+\item \textbf{False branch:} path condition $\neg(\alpha + 1 > 10)$, with
+      $z \mapsto (\alpha + 1) - 1$.
+\end{itemize}
+\end{example}
+
+\subsection{Symbolic States}\label{sec:symexec-state-def}
+
+A symbolic state captures the complete state of a symbolic execution at a given
+program point.  It generalizes the concrete state by replacing concrete values
+with symbolic expressions.
+
+\begin{definition}[Symbolic State]\label{def:symstate}
+A \emph{symbolic state} $\sigma$ is a triple $(\rho, \mu, \pi)$ where:
+\begin{itemize}
+\item $\rho : \mathit{Var} \to \mathcal{T}(\Sigma, \mathcal{V})$ is the
+      \emph{symbolic environment}, mapping program variables to symbolic
+      expressions;
+\item $\mu : \mathcal{T}(\Sigma, \mathcal{V}) \to \mathcal{T}(\Sigma, \mathcal{V})$
+      is the \emph{symbolic memory}, mapping symbolic addresses to symbolic
+      values (for languages with heap memory);
+\item $\pi \in \mathcal{F}(\Sigma, \mathcal{V})$ is the \emph{path condition},
+      a first-order formula constraining the symbolic variables.
+\end{itemize}
+\end{definition}
+
+The path condition $\pi$ is the conjunction of all branch conditions encountered
+along the path from the program entry to the current point.  It represents the
+necessary and sufficient condition on the input for execution to reach the
+current state along this particular path.
+
+\begin{definition}[Path Condition]\label{def:pathcond}
+The \emph{path condition} $\pi$ at a program point $p$ along path $\omega$ is
+defined inductively:
+\begin{itemize}
+\item At the entry point: $\pi_0 = \top$ (the trivially true formula).
+\item At a conditional branch $\mathbf{if}\ e\ \mathbf{then}\ s_1\ \mathbf{else}\ s_2$:
+  \begin{itemize}
+  \item Taking the true branch: $\pi' = \pi \land \SemBrack{e}_\rho$
+  \item Taking the false branch: $\pi' = \pi \land \neg\SemBrack{e}_\rho$
+  \end{itemize}
+\end{itemize}
+where $\SemBrack{e}_\rho$ denotes the symbolic evaluation of expression $e$
+under environment $\rho$.
+\end{definition}
+
+\subsection{Symbolic Evaluation Rules}\label{sec:symexec-rules}
+
+The symbolic evaluation of a program is defined by a set of inference rules that
+describe how each language construct transforms a symbolic state.
+
+\begin{semrules}{Symbolic Evaluation}
+  \frac{}{\config{x = e}{\sigma}{\pi} \longrightarrow \config{\mathbf{skip}}{\storeupdate{\rho}{x}{\SemBrack{e}_\rho}}{\pi}}
+  \quad \text{(assignment)} \\[12pt]
+  \frac{\SemBrack{e}_\rho = \top}{\config{\mathbf{if}\ e\ \mathbf{then}\ s_1\ \mathbf{else}\ s_2}{\sigma}{\pi} \longrightarrow \config{s_1}{\sigma}{\pi}}
+  \quad \text{(branch, true)} \\[12pt]
+  \frac{\SemBrack{e}_\rho = \bot}{\config{\mathbf{if}\ e\ \mathbf{then}\ s_1\ \mathbf{else}\ s_2}{\sigma}{\pi} \longrightarrow \config{s_2}{\sigma}{\pi}}
+  \quad \text{(branch, false)} \\[12pt]
+  \frac{\SemBrack{e}_\rho \neq \top \text{ and } \SemBrack{e}_\rho \neq \bot}{\config{\mathbf{if}\ e\ \mathbf{then}\ s_1\ \mathbf{else}\ s_2}{\sigma}{\pi} \longrightarrow \config{s_1}{\sigma}{\pi \land \SemBrack{e}_\rho} \;\mid\; \config{s_2}{\sigma}{\pi \land \neg\SemBrack{e}_\rho}}
+  \quad \text{(fork)}
+\end{semrules}
+
+The \textsc{fork} rule is the heart of symbolic execution: when the branch
+condition is neither trivially true nor trivially false (i.e., when the symbolic
+expression is not a constant), execution \emph{splits} into two paths.  Each
+path inherits the current symbolic state but extends the path condition with the
+appropriate branch constraint.
+
+\subsection{Feasibility and Satisfiability}\label{sec:symexec-feasibility}
+
+Not every path through a program is \emph{feasible}---some paths may be
+unreachable because their path conditions are unsatisfiable.  A fundamental
+operation in symbolic execution is checking whether a path condition is
+satisfiable.
+
+\begin{definition}[Feasible Path]\label{def:feasible-path}
+A path $\omega$ with path condition $\pi_\omega$ is \emph{feasible} if and only
+if $\pi_\omega$ is satisfiable, i.e., there exists an assignment of concrete
+values to the symbolic variables that makes $\pi_\omega$ true.
+\end{definition}
+
+\begin{theorem}[Soundness of Symbolic Execution]\label{thm:symexec-sound}
+If a path $\omega$ is explored by symbolic execution and its path condition
+$\pi_\omega$ is satisfiable, then there exists a concrete input that causes the
+program to follow path $\omega$.
+\end{theorem}
+
+\begin{proof}
+By construction, the path condition $\pi_\omega$ is the conjunction of all branch
+conditions along $\omega$.  If $\pi_\omega$ is satisfiable, any satisfying
+assignment provides concrete values for the input variables that cause each
+branch along $\omega$ to be taken in the specified direction.  By induction on
+the length of the path, the concrete execution with these inputs follows $\omega$.
+\end{proof}
+
+\subsection{Memory Modeling}\label{sec:symexec-memory}
+
+Modeling memory in symbolic execution presents unique challenges.  There are two
+principal approaches:
+
+\paragraph{Concrete addressing.}
+Memory is modeled as a map from concrete addresses to symbolic values.  This is
+simple but cannot handle symbolic pointers---pointers whose values depend on
+symbolic variables.
+
+\paragraph{Symbolic addressing.}
+Memory is modeled using the theory of arrays from SMT
+logic~\cite{bradley2007arrays}.  The $\mathit{read}$ and $\mathit{write}$
+functions satisfy the axioms:
+\[
+\mathit{read}(\mathit{write}(m, a, v), a) = v
+\]
+\[
+a \neq b \implies \mathit{read}(\mathit{write}(m, a, v), b) = \mathit{read}(m, b)
+\]
+This approach handles symbolic pointers but produces more complex constraints.
+
+\begin{insight}
+The choice of memory model has a profound impact on the performance and
+precision of symbolic execution.  Concrete addressing is faster but incomplete;
+symbolic addressing is more precise but generates harder constraints.  Modern
+engines typically use a hybrid approach, falling back to array-based reasoning
+only when symbolic pointers are encountered.
+\end{insight}
+
+% ============================================================
+% Symbolic Execution Engine Design
+% ============================================================
+\section{Symbolic Execution Engine Design}\label{sec:symexec-engine}
+
+\subsection{Architecture Overview}\label{sec:symexec-arch}
+
+A symbolic execution engine consists of several interacting components, each
+responsible for a distinct aspect of the analysis.  The architecture of a
+typical engine is shown in \cref{fig:symexec-arch}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, draw=TomeInk, fill=TomeBg, thick, minimum width=3cm, minimum height=1cm, align=center, rounded corners=2pt},
+  arr/.style={->, thick, TomeInk}
+]
+  \node[box] (input) {Input Program};
+  \node[box, right=1.5cm of input] (frontend) {Frontend \\ (Parser/IR)};
+  \node[box, right=1.5cm of frontend] (executor) {Symbolic \\ Executor};
+  \node[box, right=1.5cm of executor] (solver) {Constraint \\ Solver (SMT)};
+  \node[box, below=1.5cm of executor] (explorer) {Path \\ Explorer};
+  \node[box, below=1.5cm of solver] (output) {Results \\ (Tests/Bugs)};
+
+  \draw[arr] (input) -- (frontend);
+  \draw[arr] (frontend) -- (executor);
+  \draw[arr] (executor) -- (solver);
+  \draw[arr] (executor) -- (explorer);
+  \draw[arr] (explorer) -- (executor);
+  \draw[arr] (solver) -- (output);
+  \draw[arr] (explorer) -- (output);
+\end{tikzpicture}
+\caption{Architecture of a symbolic execution engine}\label{fig:symexec-arch}
+\end{figure}
+
+\subsection{The Executor Component}\label{sec:symexec-executor}
+
+The symbolic executor is the core component.  It processes instructions one at a
+time, maintaining the current symbolic state and forking execution at branches.
+The executor must handle:
+
+\begin{itemize}
+\item \textbf{Arithmetic operations:} Symbolic expressions are built by applying
+      function symbols to sub-expressions.  For example, $x + y$ where both
+      $x$ and $y$ are symbolic produces the expression $+(x, y)$.
+\item \textbf{Memory operations:} Loads and stores are translated to
+      $\mathit{read}$ and $\mathit{write}$ operations on the symbolic memory.
+\item \textbf{Function calls:} Two strategies exist: \emph{inter-procedural}
+      analysis (inlining or exploring called functions) and \emph{summary-based}
+      analysis (using pre-computed function summaries).
+\item \textbf{System calls and external functions:} These require special
+      handling, as their semantics are not captured by the program text.  Engines
+      typically provide \emph{environment models} that over-approximate the
+      effects of external functions.
+\end{itemize}
+
+\begin{algorithm}[htbp]
+\caption{Core Symbolic Execution Loop}\label{alg:symexec-core}
+\begin{algorithmic}[1]
+\Require Program $P$, initial symbolic state $\sigma_0$
+\Ensure Set of path conditions and final states
+\State $W \gets \{(\sigma_0, \mathit{entry})\}$ \Comment{Worklist}
+\State $\mathit{Results} \gets \emptyset$
+\While{$W \neq \emptyset$}
+  \State $(\sigma, pc) \gets \mathit{select}(W)$ \Comment{Path selection strategy}
+  \State $\mathit{instr} \gets \mathit{instruction\_at}(pc)$
+  \If{$\mathit{instr}$ is \textsc{halt}}
+    \State $\mathit{Results} \gets \mathit{Results} \cup \{(\sigma.\pi, \sigma.\rho)\}$
+  \ElsIf{$\mathit{instr}$ is \textsc{branch} $e$}
+    \State $v \gets \SemBrack{e}_{\sigma.\rho}$
+    \If{$v = \top$}
+      \State $W \gets W \cup \{(\sigma, pc_{\mathit{true}})\}$
+    \ElsIf{$v = \bot$}
+      \State $W \gets W \cup \{(\sigma, pc_{\mathit{false}})\}$
+    \Else
+      \State $\sigma_T \gets \sigma[\pi \mapsto \sigma.\pi \land v]$
+      \State $\sigma_F \gets \sigma[\pi \mapsto \sigma.\pi \land \neg v]$
+      \State $W \gets W \cup \{(\sigma_T, pc_{\mathit{true}}), (\sigma_F, pc_{\mathit{false}})\}$
+    \EndIf
+  \Else
+    \State $\sigma' \gets \mathit{execute}(\mathit{instr}, \sigma)$
+    \State $W \gets W \cup \{(\sigma', pc + 1)\}$
+  \EndIf
+\EndWhile
+\State \Return $\mathit{Results}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Path Selection Strategies}\label{sec:symexec-selection}
+
+The order in which paths are explored from the worklist has a significant impact
+on the effectiveness of symbolic execution.  Several strategies have been
+proposed:
+
+\begin{itemize}
+\item \textbf{Depth-first search (DFS):} Explores one path as deeply as
+      possible before backtracking.  Memory-efficient but may miss bugs on
+      short paths.
+\item \textbf{Breadth-first search (BFS):} Explores all paths uniformly.
+      More thorough but requires storing many states.
+\item \textbf{Shortest uncovered path first:} Prioritizes paths that have
+      covered the fewest new instructions, aiming for broad code coverage.
+\item \textbf{Random path selection:} Picks a random path from the worklist.
+      Surprisingly effective in practice~\cite{cadar2008klee}.
+\item \textbf{Coverage-optimized:} Uses heuristics to select paths likely to
+      cover new code or reach new states.
+\end{itemize}
+
+\subsection{State Merging}\label{sec:symexec-merging}
+
+When multiple execution paths converge at a join point (e.g., after an if-then-else
+where both branches merge), the engine can \emph{merge} the symbolic states to
+avoid redundant exploration.
+
+\begin{definition}[State Merging]\label{def:state-merge}
+Given two symbolic states $\sigma_1 = (\rho_1, \mu_1, \pi_1)$ and
+$\sigma_2 = (\rho_2, \mu_2, \pi_2)$ at the same program point, the
+\emph{merged state} $\sigma_{12} = (\rho_{12}, \mu_{12}, \pi_{12})$ is defined by:
+\[
+\rho_{12}(x) = \mathit{ite}(\pi_1, \rho_1(x), \rho_2(x)) \quad \text{for each variable } x
+\]
+\[
+\pi_{12} = \top \quad \text{(or } \pi_1 \lor \pi_2 \text{ if merging is partial)}
+\]
+\end{definition}
+
+State merging reduces the number of paths but produces more complex symbolic
+expressions, creating a trade-off between path count and constraint complexity.
+
+% ============================================================
+% Constraint Solving and SMT
+% ============================================================
+\section{Constraint Solving and SMT}\label{sec:symexec-smt}
+
+\subsection{The Role of SMT Solvers}\label{sec:symexec-smt-role}
+
+At every branch, the symbolic execution engine must determine whether the path
+condition is satisfiable.  If it is, the engine may also want to produce a
+satisfying assignment (a concrete test input).  This is the task of an
+\emph{SMT solver}---a decision procedure for satisfiability modulo theories.
+
+Modern symbolic execution engines rely heavily on SMT solvers such as
+Z3~\cite{demoura2008z3}, CVC4~\cite{barrett2011cvc4}, and
+Boolector~\cite{brummayer2010boolector}.  These solvers decide the
+satisfiability of formulae in combinations of decidable first-order theories,
+including:
+
+\begin{itemize}
+\item \textbf{Theory of bit-vectors (BV):} Models fixed-width integers with
+      overflow semantics, matching hardware arithmetic.
+\item \textbf{Theory of arrays (AR):} Models memory with read/write operations.
+\item \textbf{Theory of linear arithmetic (LA):} Models integer or real
+      arithmetic with linear constraints.
+\item \textbf{Theory of uninterpreted functions (UF):} Models functions with
+      no assumed properties beyond congruence.
+\end{itemize}
+
+\subsection{Theory Combinations}\label{sec:symexec-theories}
+
+The Nelson--Oppen combination method~\cite{nelson1979nelson} allows SMT solvers
+to decide satisfiability in the union of convex theories by exchanging equality
+information between theory solvers.
+
+\begin{theorem}[Nelson--Oppen Combination]\label{thm:nelson-oppen}
+Let $T_1$ and $T_2$ be two stably infinite, decidable theories over disjoint
+signatures $\Sigma_1$ and $\Sigma_2$.  Then satisfiability of quantifier-free
+formulae in $T_1 \cup T_2$ is decidable.
+\end{theorem}
+
+For symbolic execution, the most common combination is $\mathrm{QF\_ABV}$---the
+quantifier-free combination of arrays and bit-vectors.  This theory is expressive
+enough to model most imperative programs with arrays and fixed-width arithmetic.
+
+\subsection{Incremental Solving}\label{sec:symexec-incremental}
+
+Path conditions along a single execution path differ by a single conjunct.
+Rather than solving each path condition from scratch, modern engines use
+\emph{incremental solving}: they push the current state to the solver, add the
+new conjunct, check satisfiability, and pop back.
+
+\begin{insight}
+Incremental solving can yield order-of-magnitude speedups over non-incremental
+approaches, because the solver retains learned clauses and internal state across
+related queries.  This is one of the most important practical optimizations in
+symbolic execution.
+\end{insight}
+
+\subsection{Solver Queries}\label{sec:symexec-queries}
+
+Beyond satisfiability checking, symbolic execution engines issue several types
+of queries to the solver:
+
+\begin{itemize}
+\item \textbf{Satisfiability:} Is $\pi$ satisfiable? (For branch feasibility.)
+\item \textbf{Validity:} Is $\pi \implies \phi$ valid? (For assertion checking:
+      does assertion $\phi$ hold on all feasible paths?)
+\item \textbf{Model generation:} Given that $\pi$ is satisfiable, produce a
+      satisfying assignment. (For test generation.)
+\item \textbf{Unsat core extraction:} Given that $\pi$ is unsatisfiable, find a
+      minimal subset of conjuncts responsible. (For debugging infeasible paths.)
+\end{itemize}
+
+\subsection{Constraint Simplification}\label{sec:symexec-simplify}
+
+Symbolic expressions can grow very large during execution.  Constraint
+simplification is essential to keep solver queries manageable:
+
+\begin{itemize}
+\item \textbf{Constant folding:} Evaluate sub-expressions with all-concrete
+      operands.
+\item \textbf{Algebraic simplification:} Apply identities such as
+      $x + 0 = x$, $x \times 1 = x$, $x - x = 0$.
+\item \textbf{Expression hashing (hash-consing):} Ensure structurally identical
+      sub-expressions share a single representation, enabling efficient equality
+      checks and reducing memory usage.
+\item \textbf{Rewriting:} Apply domain-specific rewrite rules, such as
+      converting $\mathit{ite}(c, \mathit{ite}(c, a, b), d)$ to
+      $\mathit{ite}(c, a, d)$.
+\end{itemize}
+
+% ============================================================
+% Path Explosion and Mitigation
+% ============================================================
+\section{Path Explosion and Mitigation}\label{sec:symexec-path-explosion}
+
+\subsection{The Path Explosion Problem}\label{sec:symexec-explosion-def}
+
+The most significant challenge in symbolic execution is the \emph{path explosion
+problem}: the number of execution paths can grow exponentially with program size.
+A program with $n$ independent boolean branches has $2^n$ paths; a loop with $k$
+iterations and a branch in the body has $k+1$ paths per loop, compounding across
+nested loops.
+
+\begin{theorem}[Path Complexity]\label{thm:path-complexity}
+For a program with $b$ conditional branches, all reachable and independent,
+symbolic execution explores $2^b$ paths.  For a loop iterating at most $k$ times
+with a conditional body, the number of paths is $\sum_{i=0}^{k} 2^i = 2^{k+1}-1$.
+\end{theorem}
+
+This exponential blowup means that exhaustive symbolic execution is infeasible
+for all but the smallest programs.  The path explosion problem is not merely a
+practical inconvenience; it reflects a fundamental computational barrier, as
+symbolic execution subsumes the NP-hard satisfiability problem.
+
+\subsection{Search Heuristics}\label{sec:symexec-heuristics}
+
+Rather than exploring all paths, practical engines use heuristics to explore the
+\emph{most interesting} paths first:
+
+\begin{itemize}
+\item \textbf{Coverage-guided search:} Prioritize paths that traverse
+      uncovered basic blocks or branches.
+\item \textbf{Bug-directed search:} Prioritize paths that approach potential
+      error locations (e.g., null dereferences, buffer overflows).
+\item \textbf{Diversity-based search:} Select paths whose constraints are
+      maximally different from previously explored paths.
+\end{itemize}
+
+\subsection{Constraint Strengthening and Weakening}\label{sec:symexec-strengthen}
+
+\emph{Constraint strengthening} adds additional constraints to the path condition
+to prune infeasible paths earlier.  For example, if a variable $x$ is known to
+be in the range $[0, 100]$, adding $0 \leq x \leq 100$ to the path condition
+helps the solver detect infeasibility sooner.
+
+\emph{Constraint weakening} relaxes the path condition to enable merging of
+paths.  This trades precision for tractability: the analysis becomes an
+over-approximation, potentially reporting false positives but exploring fewer
+paths.
+
+\subsection{Loop Handling}\label{sec:symexec-loops}
+
+Loops are a major source of path explosion.  A loop that iterates $k$ times
+generates $k+1$ paths (for each possible number of iterations from 0 to $k$).
+Several techniques address this:
+
+\begin{itemize}
+\item \textbf{Loop bounding:} Limit the number of loop iterations explored.
+      This is sound for bug-finding (a bug that requires more iterations is not
+      found, but no false positives are introduced) but incomplete for
+      verification.
+\item \textbf{Loop summarization:} Compute a symbolic summary of the loop body
+      and apply it a symbolic number of times, using quantified formulae.
+\item \textbf{Loop invariant generation:} Discover invariants that hold at the
+      loop head, allowing the loop to be replaced by an assume statement.
+\end{itemize}
+
+\subsection{State Pruning}\label{sec:symexec-pruning}
+
+Several techniques prune the set of explored states:
+
+\begin{itemize}
+\item \textbf{Subsumption:} If state $\sigma_1$ at program point $p$ has path
+      condition $\pi_1$ and state $\sigma_2$ at the same point has $\pi_2$, and
+      $\pi_1 \implies \pi_2$ and $\rho_1 = \rho_2$, then $\sigma_2$ is subsumed
+      by $\sigma_1$ and can be discarded.
+\item \textbf{Redundant state detection:} If two states are syntactically
+      identical (same symbolic environment and same path condition modulo
+      simplification), only one need be kept.
+\item \textbf{Abstract symbolic execution:} Use abstract domains to merge
+      similar states, as in abstract interpretation (see \cref{ch:ai-theory}).
+\end{itemize}
+
+% ============================================================
+% Concolic Execution
+% ============================================================
+\section{Concolic Execution}\label{sec:symexec-concolic}
+
+\subsection{Motivation}\label{sec:concolic-motivation}
+
+Pure symbolic execution struggles with constraints that are difficult for SMT
+solvers---for example, constraints involving complex nonlinear arithmetic,
+cryptographic hash functions, or calls to unmodeled library functions.
+\emph{Concolic execution} (a portmanteau of \emph{concrete} and
+\emph{symbolic})~\cite{godefroid2005dart,sen2005cute} addresses this by running
+the program both concretely and symbolically in parallel.
+
+\subsection{The Concolic Approach}\label{sec:concolic-approach}
+
+In concolic execution, each symbolic variable is paired with a concrete value.
+The concrete values define a specific execution path; the symbolic expressions
+track the constraints along that path.  When the concrete execution encounters a
+branch, the engine:
+
+\begin{enumerate}
+\item Records the branch condition symbolically.
+\item Follows the branch indicated by the concrete value.
+\item After the execution completes, negates one of the recorded branch
+      conditions and solves for new concrete inputs.
+\item Re-executes with the new inputs.
+\end{enumerate}
+
+\begin{definition}[Concolic State]\label{def:concolic-state}
+A \emph{concolic state} is a pair $(\sigma_c, \sigma_s)$ where $\sigma_c$ is a
+concrete state (mapping variables to concrete values) and $\sigma_s$ is a
+symbolic state (mapping variables to symbolic expressions), such that for each
+variable $x$, the concrete value $\sigma_c(x)$ is a \emph{realization} of the
+symbolic expression $\sigma_s(x)$ under the current input assignment.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Concolic Execution}\label{alg:concolic}
+\begin{algorithmic}[1]
+\Require Program $P$, initial concrete input $\vec{c}_0$
+\Ensure Set of test inputs covering different paths
+\State $\vec{c} \gets \vec{c}_0$
+\State $\mathit{Inputs} \gets \{\vec{c}_0\}$
+\Loop
+  \State Execute $P$ concretely with $\vec{c}$, tracking symbolic path condition $\pi$
+  \State Let $\pi = c_1 \land c_2 \land \cdots \land c_n$ be the branch conditions
+  \State $\mathit{found} \gets \mathit{false}$
+  \For{$i = n$ down to $1$} \Comment{Try negating from the end}
+    \State $\pi' \gets c_1 \land \cdots \land c_{i-1} \land \neg c_i$
+    \If{$\mathrm{SMT.Solve}(\pi') = \mathit{sat}$ with model $\vec{c}'$}
+      \State $\vec{c} \gets \vec{c}'$
+      \State $\mathit{Inputs} \gets \mathit{Inputs} \cup \{\vec{c}\}$
+      \State $\mathit{found} \gets \mathit{true}$
+      \State \textbf{break}
+    \EndIf
+  \EndFor
+  \If{$\neg \mathit{found}$}
+    \State \textbf{break} \Comment{All paths explored}
+  \EndIf
+\EndLoop
+\State \Return $\mathit{Inputs}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Advantages of Concolic Execution}\label{sec:concolic-advantages}
+
+Concolic execution offers several advantages over pure symbolic execution:
+
+\begin{itemize}
+\item \textbf{Handling of complex operations:} When the symbolic path becomes
+      too complex for the solver, the concrete execution can still proceed,
+      using the concrete values to resolve branches.
+\item \textbf{No path explosion from concrete-determined branches:} Branches
+      whose conditions evaluate to concrete values do not cause forking.
+\item \textbf{Natural test generation:} Each concrete execution is a valid test
+      case; the negated constraints generate new, diverse test inputs.
+\item \textbf{Graceful degradation:} If the solver fails on a constraint, the
+      concrete execution continues with the concrete value.
+\end{itemize}
+
+\subsection{DART and CUTE}\label{sec:concolic-dart-cute}
+
+The first concolic execution systems were DART (Directed Automated Random
+Testing)~\cite{godefroid2005dart} and CUTE (Concolic Unit Testing
+Engine)~\cite{sen2005cute}.  DART interleaves random testing with symbolic
+execution: when symbolic execution gets stuck, it falls back to random input
+generation.  CUTE focuses on C programs and handles pointer-based data structures
+by generating inputs that exercise different structural configurations.
+
+\subsection{KLEE and SAGE}\label{sec:concolic-klee-sage}
+
+KLEE~\cite{cadar2008klee} operates on LLVM bitcode and performs pure symbolic
+execution (not concolic), but uses many of the same techniques.  It has been
+used to find bugs in GNU core utilities and device drivers.
+
+SAGE~\cite{godefroid2008sage}, developed at Microsoft, is a concolic execution
+engine that has been used to find security vulnerabilities in Windows.  SAGE
+runs programs at the x86 binary level, using a white-box fuzzing approach that
+has discovered hundreds of bugs in production software.
+
+% ============================================================
+% Applications
+% ============================================================
+\section{Applications}\label{sec:symexec-applications}
+
+\subsection{Test Generation}\label{sec:symexec-testgen}
+
+One of the most successful applications of symbolic execution is automated test
+generation.  The key insight is that each satisfiable path condition, together
+with its satisfying assignment, constitutes a test case that exercises a
+specific path through the program.
+
+\begin{definition}[Path Coverage]\label{def:path-coverage}
+A test suite $T$ \emph{achieves path coverage} for program $P$ if for every
+feasible path $\omega$ of $P$, there exists a test input $t \in T$ such that
+executing $P$ on $t$ follows path $\omega$.
+\end{definition}
+
+Symbolic execution can achieve path coverage (modulo the path explosion problem)
+by systematically exploring all feasible paths and generating a test input for
+each.  In practice, engines aim for weaker coverage criteria such as branch
+coverage or condition coverage, which are more tractable.
+
+\subsection{Bug Finding}\label{sec:symexec-bugs}
+
+Symbolic execution is particularly effective at finding specific classes of bugs:
+
+\begin{itemize}
+\item \textbf{Assertion violations:} At each $\mathbf{assert}(\phi)$, check
+      whether $\pi \land \neg\phi$ is satisfiable.
+\item \textbf{Null pointer dereferences:} At each pointer dereference $*p$,
+      check whether $\pi \land p = 0$ is satisfiable.
+\item \textbf{Buffer overflows:} At each array access $a[i]$, check whether
+      $\pi \land (i < 0 \lor i \geq |a|)$ is satisfiable.
+\item \textbf{Division by zero:} At each division $x / y$, check whether
+      $\pi \land y = 0$ is satisfiable.
+\item \textbf{Integer overflows:} Check whether arithmetic operations can
+      overflow their result type.
+\end{itemize}
+
+\subsection{Verification}\label{sec:symexec-verification}
+
+Symbolic execution can be used for \emph{bounded verification}: verifying that a
+program is correct up to a given bound on path length or loop iterations.  If
+all explored paths satisfy the specification, the program is verified \emph{up
+to that bound}.  This is weaker than full verification but can still provide
+strong guarantees.
+
+For programs with finite state spaces (e.g., programs operating on bounded
+inputs), symbolic execution can achieve \emph{full verification} by exhaustively
+exploring all paths.
+
+\subsection{Exploit Generation}\label{sec:symexec-exploit}
+
+In security applications, symbolic execution can be used to generate
+\emph{exploits}---concrete inputs that trigger a vulnerability.  Given a program
+and a vulnerability condition (e.g., ``the return address on the stack is
+overwritten''), symbolic execution finds an input that satisfies the
+vulnerability condition, effectively constructing an exploit.
+
+% ============================================================
+% Modern Tools
+% ============================================================
+\section{Modern Tools}\label{sec:symexec-tools}
+
+\subsection{KLEE}\label{sec:symexec-klee}
+
+KLEE~\cite{cadar2008klee} is a symbolic execution engine operating on LLVM
+bitcode.  Key features include:
+\begin{itemize}
+\item Operates on unmodified LLVM bitcode of C and C++ programs.
+\item Uses the STP (and later Z3) SMT solver for constraint solving.
+\item Supports the POSIX environment model for system calls.
+\item Generates test cases as input files for the program under test.
+\item Has found thousands of bugs in real-world software.
+\end{itemize}
+
+\subsection{angr}\label{sec:symexec-angr}
+
+angr~\cite{shoshitaishvili2016angr} is a binary analysis platform that includes
+a symbolic execution engine.  Key features include:
+\begin{itemize}
+\item Operates on raw binaries (no source code required).
+\item Uses the VEX intermediate representation for cross-architecture support.
+\item Provides a Python API for scripting analyses.
+\item Supports both symbolic execution and static analysis (value-set analysis,
+      dependency analysis).
+\end{itemize}
+
+\subsection{S2E}\label{sec:symexec-s2e}
+
+S2E~\cite{chipounov2011s2e} is a platform for in-vivo symbolic execution,
+running the target program inside a virtual machine alongside the symbolic
+execution engine.  This allows analysis of complete software stacks, including
+operating system kernels, device drivers, and applications.
+
+\subsection{Other Notable Systems}\label{sec:symexec-other}
+
+\begin{itemize}
+\item \textbf{ExeGlot} and \textbf{Otter}: Early symbolic execution systems.
+\item \textbf{jCUTE} and \textbf{Java PathFinder}: Symbolic execution for Java.
+\item \textbf{Pex}: Microsoft's symbolic execution framework for .NET.
+\item \textbf{Mayhem}: Combines symbolic execution with directed fuzzing for
+      automated exploit generation.
+\item \textbf{Driller}: Combines AFL (a fuzzer) with angr (a symbolic executor)
+      to overcome the limitations of each approach alone.
+\end{itemize}
+
+\begin{historical}
+Symbolic execution was first proposed by King~\cite{king1976symbolic} in 1976,
+contemporaneously with the development of dataflow analysis and abstract
+interpretation.  The technique remained largely theoretical for decades due to
+the lack of efficient constraint solvers.  The development of modern SMT solvers
+in the 2000s---particularly Z3~\cite{demoura2008z3}---transformed symbolic
+execution from a theoretical curiosity into a practical tool capable of analyzing
+real-world software.  The KLEE paper~\cite{cadar2008klee} is widely regarded as
+the work that demonstrated the practical viability of symbolic execution for bug
+finding in systems software.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:symexec-summary}
+
+Symbolic execution is a powerful technique for program analysis that bridges the
+gap between testing and verification.  By executing programs with symbolic inputs
+and accumulating path conditions, it can systematically explore the space of
+program behaviors and generate test cases, find bugs, or verify properties.
+
+The key challenges remain the path explosion problem and the cost of constraint
+solving.  Active research areas include:
+\begin{itemize}
+\item \textbf{Compositional symbolic execution:} Analyzing functions
+      independently and composing results to scale to large programs.
+\item \textbf{Machine learning for path selection:} Using learned models to
+      guide the exploration toward interesting paths.
+\item \textbf{Parallel symbolic execution:} Distributing the exploration across
+      multiple cores or machines.
+\item \textbf{Integration with fuzzing:} Combining the systematic exploration of
+      symbolic execution with the scalability of fuzz testing.
+\end{itemize}
+
+The reader interested in deeper treatment should consult the comprehensive survey
+by Baldoni et al.~\cite{baldoni2018survey} and the lecture notes by
+Bratberg~\cite{bratberg2020symexec}.

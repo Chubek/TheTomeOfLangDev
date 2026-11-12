@@ -1,0 +1,1427 @@
+Chapter 6
+
+Abstract Interpretation
+Nathan Wasser, Reiner Hähnle and Richard Bubel
+
+6.1 Introduction
+The previous chapters focused on the development of a faithful and relatively complete program logic for sequential Java. Consequently we obtain a formal language of
+high expressivity and a powerful calculus to prove the stated properties. Nevertheless
+expressivity comes with a cost, namely, an unpredictable degree of automation. This
+does not necessarily mean interaction with the theorem prover as such, but also
+the necessity to provide hand-crafted specifications like loop invariants or method
+contracts. The latter often needs to take idiosyncrasies of the theorem prover into
+account, at least, in regard of automation. This is also true in cases for which one is
+only interested in establishing simple properties like “No NullPointerExceptions
+are thrown.”
+Other techniques from static program analysis, like abstract interpretation as
+introduced by Cousot and Cousot [1977], utilize program abstraction to achieve
+full automation. But they pay with loss of precision that manifests itself in reduced
+expressivity (often only predefined properties can be expressed and ensured) and
+false positives.
+In this chapter we show how to integrate abstract interpretation in JavaDL to
+achieve high automation while also maintaining high precision. Our approach has
+two main characteristics: i) abstraction of the state representation instead of the
+program, and ii) full precision until a loop or (recursive) method call is encountered.
+Only at those program points is abstraction applied and then only on the state region
+which might be modified by the loop or method. All other object fields or local
+variables keep their exact symbolic value.
+
+165
+
+166
+
+6
+
+Abstract Interpretation
+
+6.2 Integrating Abstract Interpretation
+6.2.1 Abstract Domains
+We introduce notions commonly used in abstract interpretation [Cousot and Cousot,
+1977]. The core of abstract interpretation is abstract domains for the types occurring
+within the program. Each abstract domain forms a lattice and there is a mapping
+between each concrete domain DT (i.e., the externalization of a concrete program
+type) and its corresponding abstract domain AT . Their relationship is established by
+two total functions:
+T
+
+a :2D ! AT
+T
+
+g :A ! 2
+
+DT
+
+(abstraction function)
+(concretization function)
+
+The abstraction function maps a set of concrete domain elements onto an abstract
+domain element and the concretization function maps each abstract domain element
+onto a set of concrete domain elements, such that a(g(a)) = a and C ✓ g(a(C))
+holds. A pair of functions with the latter two properties is a special case of a Galois
+connection called Galois insertion. Figure 6.1 illustrates such a mapping. The arrows
+represent the concretization (from wheel to vehicle) and abstraction function (from
+vehicle to wheel).
+
+Figure 6.1 An example abstract domain: The concrete domain of vehicles is abstracted w.r.t. the
+number of wheels
+
+We can now summarize the above into a formal definition of an abstract domain.
+Definition 6.1 (Abstract Domain). Let D be a concrete domain (e.g., from a firstorder structure). An abstract domain A is a complete lattice with partial order v
+and join operator t. It is connected to D with an abstraction function a : 2D ! A
+and a concretization function g : A ! 2D which form a Galois insertion [Cousot and
+Cousot, 1977], i.e. a(g(a)) = a and C ✓ g(a(C)). In this chapter we only deal with
+countable abstract domains.
+Let f : A ! A be any function. The monotonic function f 0 : A ! A is defined as
+
+f 0 (a) = a t f (a). If A satisfies the ascending chain condition (trivially the case if
+
+6.2. Integrating Abstract Interpretation
+
+167
+
+A has finite height), then starting with any initial input x 2 A a least fixed point for
+f 0 on this input can be found by locating the stationary limit of the sequence hxi0 i,
+0
+where x00 = x and xn+1
+= f 0 (xn0 ).
+Abstract interpretation makes use of this when analyzing a program. Let p be
+a loop, x the only variable in p and a 2 A the abstract value of x before execution
+of the loop. Then we can see f as the abstract semantic function of a single loop
+iteration on the variable x. The fixed point for f 0 is an abstract value expressing
+an overapproximation of the set of all values of x before and after each iteration.
+Therefore it is sound to replace the loop with the assignment x = a.
+If A does not satisfy the ascending chain condition, there may not be a stationary
+limit for hxi0 i. In these cases a widening operator is required.
+Definition 6.2 (Widening Operator ·—·). A widening operator for an abstract domain A is a function — : A ⇥ A ! A, where
+1. 8a, b 2 A. a v a—b
+2. 8a, b 2 A. b v a—b
+3. for any sequence hy0n i and initial value for x00 the sequence hxn0 i is ultimately
+0
+stationary, where xn+1
+= xn0 —y0n .
+
+If A has a least element ?, it suffices to use this as the initial value for x00 , rather
+than proving the property for all possible initial values.
+Abstract domains come traditionally in two flavors relational and nonrelational.
+Advantages with relational abstract domains are expressiveness and the abilities to
+easily formulate often-occurring and helpful abstract notions such as i  a.length.
+The advantage of nonrelational abstract domains is their ease of use from an implementation standpoint, as nonrelational abstract domains care only about the actual
+variable being updated, rather than having potential to change multiple values at
+once. We choose a third path: using nonrelational abstract domains but including
+invariant suggestions which can model certain relational-style expressions such as
+the example i  a.length.
+To achieve a seamless integration of abstract domains within JavaDL, we refrain
+from the introduction of abstract elements as first-class members. Instead we use a
+different approach to refer to the element of an abstract domain:
+Definition 6.3 (ga,Z -symbols). Given a countable abstract domain A = {a1 , a2 , . . .}.
+For each abstract element ai 2 A {?} there
+• are infinitely many constant symbols ga, j 2 FSym, j 2 N and gaM
+2 g(ai ),
+i, j
+• is a unary predicate cai where caM
+is
+the
+characteristic
+predicate
+of
+set g(ai ).
+i
+
+The interpretation of a symbol gai , j is restricted to one of the concrete domain
+elements represented by ai , but otherwise not fixed. In other words, the only guarantee
+about (restriction on) the actual value of gai , j is to be an element of a(ai ).
+
+168
+
+6
+
+Abstract Interpretation
+
+6.2.2 Abstractions for Integers
+In this subsection, we introduce a simple abstract domain for integers, which we use
+to illustrate our approach. This abstract domain is called Sign Domain and shown in
+Figure 6.2. As its naming suggests, it abstracts from the actual integer values and
+
+g(>) = Z
+
+>
+
+g() = {i 2 Z | i  0}
+g( ) = {i 2 Z | i
+
+
+neg
+
+pos
+
+0
+
+0}
+
+g(neg) = {i 2 Z | i < 0}
+g(pos) = {i 2 Z | i > 0}
+g(0) = {0}
+
+g(?) = /0
+
+?
+Figure 6.2 Sign Domain: An abstract domain for integers
+
+distinguishes them only w.r.t. their sign. The associated abstraction and concretization
+function obviously form a Galois connection.
+The abstract domain is integrated into JavaDL by adding ga,Z symbols and their
+characteristic predicates ca for a 2 {neg, 0, pos, , , >}. The characteristic predicates are defined as follows:
+.
+8int x; (c0 (x) $ x = 0)
+
+8int x; (cneg (x) $ x < 0)
+8int x; (c (x) $ x  0)
+
+8int x; (c> (x) $ true)
+
+8int x; (cpos (x) $ x > 0)
+8int x; (c (x) $ x
+
+0)
+
+6.2.3 Abstracting States
+We now have all the parts together to explain how to abstract a given program state.
+We go further and embed the approach in a general notion of weakening, which
+provides us also with a natural soundness notion.
+Given the following sequent:
+c
+
+5 =) {i := c + 1} [i++;]i > 0
+
+The idea is to provide an abstraction rule that rewrites the above rule into:
+c
+
+5 =) {i := g pos,1 } [i++;]i > 0
+
+6.3. Loop Invariant Generation
+
+169
+
+where we replaced the ‘more’ complicated expression c + 1 on the right hand side
+of the update to i by a simpler gamma symbol. The latter sequent preserves the
+knowledge about the sign of i under which the box formula is evaluated (namely
+that it is strictly greater than 0), but we lose all knowledge about i’s actual value.
+More formally, if the latter sequent is valid then also the first one is valid. We call the
+update i := g pos,1 weaker than i := c + 1 as the first one allows more reachable states:
+For the sequent to be true, the formula behind i := g pos,1 must be true in all Kripke
+structures K , i.e., for any positive value of i as g pos,1 does not occur anywhere else
+in the sequent. The original sequent only requires the formula behind the update to
+be true for all values strictly greater than 5.
+We can formalize the weakening notion by introducing the update weakening rule
+from [Bubel et al., 2009]:
+.
+.
+G , U (x̄ = c̄) =) 9ḡ.U 0 (x̄ = c̄), D
+weakenUpdate
+G =) U j, D
+
+G =) U 0 j, D
+
+where x̄ denotes a sequence of all program variables occurring as left-hand sides
+in U and c̄ are fresh Skolem constants used to store the values of the variables
+x̄ under update U . The formula 9ḡ.j is a shortcut for 9ȳ.(cā (ȳ) ^ y[ḡ/ȳ]), where
+ȳ = (y1 , . . . , ym ) is a list of fresh first-order variables of the same length as ḡ, and
+where y[ḡ/ȳ] stands for the formula obtained from y by replacing all occurrences of
+a symbol in ḡ with its counterpart in ȳ. This rule allows us to abstract any part of the
+state with a location-wise granularity.
+Performing value-based abstraction becomes thus simply the replacement of an
+update by a weaker update. In particular, we do not perform abstraction on the
+program level, but on the symbolic state level. Thus abstraction needs to be defined
+only on symbolic states (updates) and not on programs.
+
+6.3 Loop Invariant Generation
+In this section we describe how to use update weakening to automatically infer
+loop invariants that allow us to verify unbounded loops without the need for a user
+provided loop invariant. To describe the approach we restrict ourselves to simple
+program variables of integer type. We discuss extensions for objects and in particular
+arrays in a later section.
+As indicated earlier we intend to perform abstraction on demand when reaching a
+loop (or recursive method call), as those cases require user interaction in the form of
+loop specification or method contracts. Our aim is to avoid this tedious work. We
+solve this by two steps (i) an adapted loop invariant rule which allows one to integrate
+value abstraction as part of the anonymizing update, and (ii) a method to compute
+the abstracted state.
+Assume a proof situation in which we encounter a loop. To reason about the loop’s
+effect, we use the following rule:
+
+170
+
+6
+
+Abstract Interpretation
+
+invariantUpdate
+
+.
+.
+0 (x̄ =
+G , U (x̄ = c̄) =) 9ḡ.Umod
+c̄), D
+.
+.
+0 g, U 0 [p](x̄ = c̄) =) 9ḡ.U 0 (x̄ =
+G , Umod
+c̄), D
+mod
+mod
+0 ¬g =) U 0 [r]j, D
+G , Umod
+mod
+G =) U [while (g) {p}; r]j, D
+
+With its three premisses and its basic structure, the invariantUpdate rule still
+resembles the classical loop invariant rule. The role of the loop invariant is taken
+0 . The idea is to be smarter when anonymizing
+over by the anonymizing update Umod
+locations that might possibly be changed by the loop. Instead of anonymizing these
+locations by fresh Skolem constants, losing all information about their value and
+retroactively adding some knowledge back using a loop invariant, we use fresh ga,Z
+symbols. This way we keep some information about the value of these locations,
+namely, that their value remains within the concretization g(a) of the abstract element
+a. As we no longer have a traditional loop invariant, the lower bound of precision
+loss for the anonymized locations is given by the granularity of our abstract domain.
+The rule’s third premiss is the use case and represents the case where we have
+just exited the loop. The reachable states after the loop are contained in the set of all
+0
+states reachable by update Umod
+strengthened by the fact that only those states need
+to be considered where the loop’s guard evaluates to false. For all those states we
+have to show that after symbolic execution of the remaining program the property to
+0
+prove holds. The second premise ensures that Umod
+is a sound approximation of all
+states reachable by any loop iteration. The first premiss ensures that the entry state is
+0 .
+also contained in Umod
+Example 6.4. Given the following sequent
+i
+
+.
+0 =) {n := 0} [while (i>0) {i--; n++;}](i = 0 ^ n
+
+0)
+
+0 . Intuitively, we see that the
+To apply rule updateInvariant we need to provide Umod
+loop modifies both variables i and n. About n we know that it is initially 0 and
+afterwards only increased. In case of i we know that its initial value is nonnegative
+and decreased by one with each loop iteration. Hence, we can conclude that both i
+and n are always covered by abstraction . This gives us the following anonymizing
+0
+update Umod
+i := g ,1 || n := g ,2
+
+The resulting proof goals after the rule application are: For the initial case
+i
+
+.
+.
+0, {n := 0}(i = c1 ^ n = c2 ) =)
+.
+.
+9y1 , y2 . c (y1 ) ^ c (y2 ) ^ {i := y1 || n := y2 }(i = c1 ^ n = c2 )
+
+which can easily be proven valid by choosing i for y1 and 0 for y2 as instantiations
+of the existential formula on the right sequent side. The second branch proving that
+the update describes all possible values of i and n after any loop iteration is
+
+6.3. Loop Invariant Generation
+
+i
+
+171
+
+0, {i := g ,1 || n := g ,2 }(i > 0),
+.
+.
+{i := g ,1 || n := g ,2 }[i--;n++;](i = c1 ^ n = c2 ) =)
+.
+.
+9y1 , y2 . c (y1 ) ^ c (y2 ) ^ {i := y1 || n := y2 }(i = c1 ^ n = c2 )
+
+.
+
+This sequent can also be proven directly. After executing the loop body, applying the
+updates and some simplifications the above sequent becomes
+i
+
+.
+.
+0, g ,1 > 0, g ,1 1 = c1 , g ,2 + 1 = c2 =)
+.
+.
+9y1 , y2 . c (y1 ) ^ c (y2 ) ^ {i := y1 || n := y2 }(i = c1 ^ n = c2 )
+
+by choosing g ,1 1 for y1 and g ,2 + 1 for y2 we can prove the sequent as c (g ,2 +
+1) is obviously true and the truth of c (g ,1 1) follows from the formula g ,1 > 0
+which is part of the antecedent (obtained from the knowledge that the loop guard is
+true).
+Finally the last proof goal to be shown valid is
+.
+{i := g ,1 || n := g ,2 }(¬i > 0) =) {i := g ,1 || n := g ,2 }[](i = 0 ^ n
+
+0)
+
+which, once we derive that i is 0 from the antecedent, is trivial.
+0
+The question remains how to find a good candidate for Umod
+automatically. The
+solution is to start a side proof which unwinds the loop; once the loop body has been
+symbolically executed, we join the updates of all open branches by assigning each
+changed location the smallest abstract domain element that encompasses all of its
+potential values on the different branches. Repeat unwinding the loop until the update
+created by the join does not change any longer. The such obtained update is a sound
+0 .
+candidate for Umod
+
+Definition 6.5 (Joining Updates). The update join operation is defined as
+ṫ : (2Fml ⇥ Upd) ⇥ (2Fml ⇥ Upd) ! (2Fml ⇥ Upd)
+and is defined by the property: Let U1 and U2 be arbitrary updates in a proof P and
+let C1 ,C2 be formula sets representing constraints on the update values. Then for
+(C, U ) = (C1 , U1 ) ṫ (C2 , U2 ) the following holds for i 2 {1, 2}:
+1. U is (P, Ci )-weaker
+than Ui , and
+V
+2. Ci =) {Ui } C
+
+A concrete implementation tabs of ṫ for values can be computed as follows: For
+.
+each update x := v in U1 or U2 the generated update is x := v, if {U1 }x = {U2 }x.
+Otherwise it is x := gai , j for some ai where cai ({U1 }x) and cai ({U2 }x).
+Example 6.6. We illustrate the described algorithm along the previous example: The
+sequent to prove was
+i
+
+.
+0 =) {n := 0} [while (i>0) {i--; n++;}](i = 0 ^ n
+
+0)
+
+instead of ‘guessing’ the correct update, we sketch now how to find it automatically:
+Unrolling the loop once ends in two branches: one where the loop guard does not
+
+172
+
+6
+
+Abstract Interpretation
+
+hold and the loop is exited (which we can ignore) and the second one where the loop
+body is executed. After finishing the symbolic execution of the loop body the sequent
+is
+i > 0 =) {i := i
+
+.
+1 || n := 1} [while (i>0) {i--; n++;}](i = 0 ^ n
+
+0) .
+
+We now compare the two sequents and observe that i and n has changed. Finding the
+minimal abstract element for n which covers both values 0 and 1 returns the abstract
+element . For i we know that the previous value was greater-or-equal than the 0,
+after this iteration we know it has been decreased by one, but we also learned from
+the loop guard that on this branch the initial value of i was actually strictly greater
+than 0, hence, i 1 is at least 0 and thus the abstract element covering both values is
+also . We continue with the sequent
+.
+i > 0 =) {i := g ,1 || n := g ,2 } [while (i>0) {i--; n++;}](i = 0 ^ n
+
+0)
+
+where the update has been replaced by the ‘abstracted’ one. The result of unrolling
+the loop once more results in the sequent
+g ,1 > 0 =) {i := g ,1
+
+.
+1 || n := g ,2 +1} [while (i>0) {...}](i = 0^n
+
+0) .
+
+Joining this update with the previous one results in the update i := g ,4 || n := g ,4
+which is (except for the numbering) identical to the previous one. This means we
+have reached a fixed point and we can use this update as the anonymizing update.
+The approach of finding the update is sound, but we want to stress that this
+is actually not essential as the invariantUpdate rule checks the soundness of the
+provided updated.
+
+6.4 Abstract Domains for Heaps
+In KeY the program heap is modeled by the program variable heap of type Heap.
+Therefore any changes to the program heap will be expressed as an update to the
+program variable heap. Furthermore, the program rules, i.e., those calculus rules
+for dealing with program fragments, can only ever modify heap by extension. By
+this we mean that given an initial update heap := h the application of a program rule
+can produce an update heap := h0 only if h is a subterm of h0 and h0 extends h only
+with anon, create, and/or store operations. Heap simplification rules, however, may
+reduce the heap term.
+Our intentions for abstraction are to join multiple program states originating from
+a single source program state, such as the program state before execution of a loop,
+method call, if- or switch-statement. Therefore we can assume an initial value old
+for the program heap at the originating program point and based on this create the
+abstract domain as follows:
+
+6.4. Abstract Domains for Heaps
+
+173
+
+We define LS ⇢ DLocSet to contain all object/field pairs not containing the created
+field, i.e.:
+LS = DObject ⇥ (DField \ {createdM })
+
+Heap
+We define the family of abstract domains Aold
+= (AHeap
+old , vold , told ) for all
+initial well-formed heaps old as
+LS
+AHeap
+old = {?, >} [ 2
+8
+>
+x
+, if y = ?
+>
+>
+>
+>
+>
+y
+, if x = ?
+<
+x told y = >
+, if y = >
+>
+>
+>
+>
+, if x = >
+>
+>
+>
+:x [ y , otherwise
+
+x vold y = (y = x told y)
+
+Abstraction and concretization functions are given as:
+Heap
+
+! AHeap
+old
+8
+? , if heaps = /0
+>
+>
+>
+<a , if 8h 2 heaps, o 2 DObject .
+heaps 7!
+>
+wellFormedM (h) ^ (old(o, createdM ) ! h(o, createdM ))
+>
+>
+:
+> , otherwise
+
+aold : 2D
+
+where a = {(o, f ) 2 DLS | 9h 2 heaps. h(o, f ) 6= old(o, f )}
+
+D
+gold : AHeap
+old ! 2
+
+Heap
+
+? 7! /0
+
+> 7! DHeap
+
+ls ✓ LS 7! {h | (8o 2 DObject . old(o, createdM ) ! h(o, createdM )) ^
+(8(o, f ) 2 DLS\ls . h(o, f ) = old(o, f )}
+
+Heap
+As Aold
+contains infinite ascending chains due to both Object and Field being
+infinite, we require either a weakening or a subset of AHeap
+old for which no infinite
+ascending chains exist. We could, for example, reduce the set of available location
+sets from LS to the subset thereof for which no location set contains more than n
+elements, for some n 2 N. Anytime a larger location set were required, we would
+instead return >. This works, but has the distinct disadvantage that the following
+infinite ascending chain hxi i will wind up overapproximating not only for the cause
+of the infinite ascension (the field f ), but also for all other fields as well:
+
+174
+
+6
+
+Abstract Interpretation
+
+x0 = 0/
+xi+1 = xi [ {(oi , f )}
+
+(6.1)
+(6.2)
+
+In order to keep the overapproximation as localized as possible, we consider the
+following points:
+• Field can be separated into array indices Arr = {arrM (x) | x 2 N} and non array
+indices Field \ Arr.
+• For any Java program there is a finite subset fs ⇢ (Field \ Arr) in a closed world
+determinable a priori which contains all non array index fields modifiable by the
+program.
+Heap
+We therefore introduce the family of abstract domains Aold,fs,n,m,k
+for all finite
+sets fs ⇢ (Field \ Arr) and integers n, m, k 2 N, which contain no infinite ascending
+chains:
+
+Heap
+Aold,fs,n,m,k
+= (AHeap
+old,fs,n,m,k , vold,fs,n,m,k , told,fs,n,m,k )
+
+AHeap
+old,fs,n,m,k = {?, >} [ {Wfs,n,m,k (ls) | ls ✓ LS}
+8
+>
+, if x = > or y = >
+>
+>
+>
+<x
+, if y = ?
+x told,fs,n,m,k y =
+>
+y
+, if x = ?
+>
+>
+:
+Wfs,n,m,k (x [ y) , otherwise
+
+x vold,fs,n,m,k y = (y = x told,fs,n,m,k y)
+
+where Wfs,n,m,k : 2LS ! 2LS is defined as:
+(
+LS
+, if 9(o0 , f 0 ) 2 ls. f 0 62 (fs [ Arr)
+ls 7!
+N
+M
+K
+ls [Wfs,n (ls) [Wm (ls) [Wk (ls) , otherwise
+N ,W M ,W K defined as:
+with Wfs,n
+m
+k
+N
+Wfs,n
+(ls) = {(o, f ) | f 2 fs ^ |{o0 | (o0 , f ) 2 ls}| > n}
+
+WmM (ls) = {(o, f ) | f 2 Arr ^ |{ f 0 2 Arr | (o, f 0 ) 2 ls}| > m}
+(
+DObject ⇥ Arr , if |{o | 9 f 2 Arr. (o, f ) 2 ls}| > k
+K
+Wk (ls) =
+/0
+, otherwise
+
+The function Wfs,n,m,k is the identity on any location set which:
+• contains only pairs (o, f ) where f is in fs or is an array index,
+• contains no more than n pairs (o, f ) for any fixed f 2 fs,
+• contains no more than m pairs (o, arrM (x)) for any fixed o 2 DObject , and
+• contains pairs (o, arrM (x)) for no more than k different objects o 2 DObject .
+
+6.4. Abstract Domains for Heaps
+
+175
+>
+LS
+DObject ⇥ (Arr [ { f })
+
+(DObject ⇥ Arr) [ {(o1 , f )}
+
+DObject ⇥ Arr
+
+(DObject ⇥ Arr) [ {(o2 , f )}
+
+...
+DObject ⇥ { f }
+
+...
+
+{(o2 , f )}
+
+{(o1 , f )}
+/0
+
+Heap
+Figure 6.3 Abstract Domain Aheap,{
+f },1,0,0
+
+?
+
+>
+LS
+DObject ⇥ Arr
+{o1 } ⇥ Arr
+
+{(o1 , arr(0))}
+
+{(o1 , arr(1))}
+
+{o2 } ⇥ Arr
+
+{(o2 , arr(0))}
+
+{(o1 , arr(2))}
+/0
+
+Heap
+Figure 6.4 Abstract Domain Aheap,
+/0,0,1,1
+
+?
+
+...
+
+{(o2 , arr(1))}
+
+...
+
+176
+
+6
+
+Abstract Interpretation
+
+For location sets outside of this scope, Wfs,n,m,k extends the set by completion of
+those pairs which violate the above rules, i.e.:
+• Full extension to LS for any location set containing a field not in fs or Arr.
+• Inclusion of all pairs (o, f ) for each f 2 fs which had more than n occurrences.
+• Inclusion of all pairs (o, arrM (x)) for each o 2 DObject which had more than m
+index references.
+• Inclusion of all pairs (o, arrM (x)) for all objects and indices if there were more
+than k different objects containing index references.
+The above treatment limits overapproximation, while still ensuring that no infinite
+ascending chains are possible.
+Example 6.7 (Two Small Heap Abstractions). To demonstrate these finite height
+Heap
+abstract domains for heaps, we look at the two heap abstractions Aheap,{
+f },1,0,0 and
+
+Heap
+Aheap,
+/0,0,1,1 in Figure 6.3 and Figure 6.4. Here the nodes marked as “. . .” represent
+an infinite number of nodes, full lines from or to such infinite nodes represent edges
+from or to each actual node, while dotted lines from such nodes represent edges from
+an infinite subset of these nodes to the corresponding connecting node. In general,
+of course, there will be many more available fields in fs, as well as n, m and k being
+greater than 1.
+
+6.5 Abstract Domains for Objects
+In addition to an abstraction for the heap variable, there also exist local variables for
+objects which must be abstracted as well, therefore we require an abstract domain
+for DObject . Most of the information about an object is actually only representable if
+the heap on which the object resides is also known. From an abstract domain point
+of view this would require a relational abstract domain linking objects and heaps.
+As our approach does not use relational abstract domains (at least not directly), our
+abstract domain for objects can only express the knowledge directly obtainable from
+only the object itself. The following attributes of an object can be obtained without
+knowledge of the heap:
+• Reference equality of this object with any other object, in particular null.
+• The length of this object (used only by arrays).
+• The type of this object.
+We therefore first introduce abstract domains for objects based on each of these
+points separately and can then combine them into one abstract domain for objects A Object .
+
+6.5. Abstract Domains for Objects
+
+177
+
+6.5.1 Null/Not-null Abstract Domain
+Object
+The abstract domain Anull
+for objects based on reference equality to null is quite
+simple and at the same time incredibly useful, in that it can be used to check for
+possible NullPointerExceptions or prove the lack thereof in a piece of Java code.
+Object
+Anull
+is shown in Figure 6.5 with abstraction and concretization functions.
+
+>
+null
+
+not-null
+?
+
+8
+?
+, if X = /0
+>
+>
+>
+<null
+, if X = {nullM }
+aA Object (X) =
+>
+null
+not-null
+, if nullM 62 X
+>
+>
+:
+>
+, otherwise
+8
+/0
+, if x = ?
+>
+>
+>
+<{null}
+, if x = null
+gA Object (x) =
+>
+null
+DObject \ {null} , if x = not-null
+>
+>
+: Object
+D
+, if x = >
+
+Ob ject
+Figure 6.5 Abstract Domain Anull
+
+6.5.2 Length Abstract Domain
+An abstract domain for objects based on their length is useful only for arrays. For all
+other object types the length is some arbitrary number which has no meaning. For
+arrays, however, abstracting these to their length can be quite helpful, for example
+one could conclude based on this abstraction whether a loop iterating over an array
+should be unrolled completely or a loop invariant generated for it.
+We require an abstract domain A Z for the concrete domain Z and map each
+object’s length to said abstract domain. We can then define the abstract domain for
+Object
+objects based on their length as Alength
+:= A Z with abstraction and concretization
+functions as follows:
+aA Object (X) = aA Z ({lengthM (x) | x 2 X})
+length
+
+gA Object (x) = {o 2 DObject | lengthM (o) 2 gA Z (x)}
+length
+
+We can use any abstract domain for Z, for example the simple sign domain
+in Figure 6.2. However, using this abstract domain would not be very clever as
+the abstract elements neg and  will never abstract valid array lengths, while the
+abstraction of both 1 and 10000 to the same abstract element pos is not very helpful.
+Instead, let us consider the following:
+
+178
+
+6
+
+Abstract Interpretation
+
+>
+0
+0..10
+0..5
+0..3
+0..1
+0
+
+2..3
+1
+
+2
+
+4..5
+3
+
+4
+
+Ob ject
+Figure 6.6 An Abstract Domain Alength
+
+6..10
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+> 10
+
+?
+
+1. Iterating over an array of length 0 is trivial (do not enter loop) and therefore full
+precision should be kept, rather than abstracting by applying a loop invariant.
+2. Iterating over an array of length 1 is similarly trivial (execute the loop body
+once) and therefore full precision should also be kept here by unrolling the loop,
+rather than applying a loop invariant. The loop invariant rule must still prove that
+the loop body preserves the invariant, thus execution of the loop body is always
+required once, even when applying a loop invariant.
+3. Iterating over an array of length 2 or 3 can usually be done reasonably quickly
+by unrolling the loop a sufficient number of times, therefore unrolling should be
+favored over applying a loop invariant except in cases where symbolic execution
+of the loop body is extremely costly.
+4. Iterating over an array of length 4 or 5 can often be done reasonably quickly
+by loop unrolling, therefore applying a loop invariant should only be done for
+somewhat complex loop bodies.
+5. Iterating over an array of length 6 to 10, applying a loop invariant should be
+favored, except in cases where the loop body is trivial.
+6. Iterating over an array of length greater than 10 should almost always be solved
+by applying a loop invariant.
+The above are reasonable guidelines (or in the case of lengths 0 and 1 simple fact),
+such that we can present the abstract domain in Figure 6.6 for the concrete domain Z
+and therefore also for objects based on their length.
+
+6.5. Abstract Domains for Objects
+
+179
+
+6.5.2.1 Type Abstract Domain
+Abstracting on object type requires knowledge of the type hierarchy. However, due
+to logical consequence of a formula requiring that the formula hold in all extensions
+of the type hierarchy, we must in essence create an abstract domain based on not just
+the type hierarchy given directly by the program, but any extension thereof.
+For a set of objects X we offer abstractions for their types based on which exact
+types are present in X, i.e., a set of types such that each element in X is an exact
+instance of one of those types.
+For any given type hierarchy T we must create an abstract domain, such that
+there exist abstraction and concretization functions for all type hierarchies T 0 which
+extend T .
+For a given type hierarchy T = (T Sym, v) we first define the set of all dynamic
+object types Od = {d 2 T Sym | d v Object and d is not marked abstract} and based
+on this define the abstract domain AOObject
+, as shown in Figure 6.7. Then for any
+d
+type hierarchy extension T 0 = (T Sym0 , v0 ) of T the abstraction and concretization
+functions are given in Figure 6.8.
+
+AOObject
+= (AObject
+, vObject
+, tObject
+)
+Od
+Od
+Od
+d
+
+AObject
+= {>} [ (2Od \ Od )
+Od
+(
+>
+, if X = > or Y = > or X [Y = Od
+Object
+X tOd Y =
+X [Y , otherwise
+8
+>
+, if Y = >
+<tt
+X vObject
+Y
+=
+ff
+, if X = > and Y 6= >
+T
+>
+:X ✓ Y , otherwise
+
+Figure 6.7 Family of Abstract Domains AOObject
+d
+
+8
+>
+<>
+
+aOObject
+0 (X) =
+d ,T
+>
+
+, if 9x 2 X. d 0 (x) 62 Od
+or {d 2 Td | 9x 2 X. d 0 (x) = d} = Od
+, otherwise
+
+:{d 2 T | 9x 2 X. d 0 (x) = d}
+d
+(
+0 | d 0 (o) v0 Object} , if X = >
+{o
+2
+D
+gOObject
+W
+0 (X) =
+d ,T
+{o 2 D0 | d2X d 0 (o) = d} , otherwise
+
+Figure 6.8 Galois connection between AOObject
+and the Concrete Object Domain from T 0
+d
+
+180
+
+6
+
+Abstract Interpretation
+
+Example 6.8. We can consider a simplified Java program containing only the types
+declared in Listing 6.1. Based on this we have the set of concrete object types
+class Object {...}
+abstract class A {...}
+interface I {...}
+class B extends A implements I {...}
+Listing 6.1 Type declarations
+
+Object
+{Object, B, Null} and the abstract domain A{Object,B,Null}
+as shown in Figure 6.9.
+
+>
+{Object, B}
+
+{Object, Null}
+
+{B, Null}
+
+{Object}
+
+{B}
+
+{Null}
+
+/0
+Object
+Figure 6.9 Abstract Domain A{Object,B,Null}
+
+The abstract domains AOObject
+can be used, for example, to:
+d
+• prove that casting of an object does not cause a ClassCastException to be
+thrown,
+• prove that no ArrayStoreException is thrown when inserting an object into
+an array,
+• prove that an instanceof check will be successful,
+• prove that an instanceof check will be unsuccessful, and/or
+• narrow the list of possible method body instantiations down which is created
+when unfolding a method call.
+It is important to point out that although AOObject
+always has abstract elements
+d
+
+Object
+{Null} and Od \ {Null}, it is not inherently stronger than the abstract domain Anull
+.
+0
+This is because given a type hierarchy extension T which introduces a new dynamic type d 0 @ Object, for which it holds for some o that d 0 (o) = d 0 the following
+abstractions exist:
+
+aOObject
+,T 0 ({o}) = >
+d
+
+Object
+anull
+({o}) = not-null
+
+6.5. Abstract Domains for Objects
+
+181
+
+6.5.2.2 Combining the Object Abstract Domains Into One
+Of course, we would like just one abstract domain for objects encompassing all of
+the abstractions discussed in the previous subsections. The abstract domain A Object
+for a given type hierarchy T is a partial cartesian product of the abstract domains
+Object
+Object
+Anull
+, Alength
+and AOObject
+such that the abstraction and concretization functions
+d
+for any type hierarchy extension T 0 can be given as in Figure 6.10. The reason why
+only a subset of the cartesian product is required is due to the following: As it must
+hold that a(g(a)) = a for all abstract elements a, there can never be more than one
+abstract element representing the same set. We therefore cannot have both (?, y, z)
+and (x, ?, z) as separate abstract elements, as intuitively both of these would have to
+represent the empty set. Additionally, while the abstraction for length is orthogonal
+to the abstractions for null and exact type (due to the function length being defined
+for all objects, including null and nonarray types), the abstractions for null and
+exact type are not. While it is true that in one abstraction we may know that null
+does not appear, while in the other abstraction we do not, it is nonetheless impossible
+for certain abstract elements to be combined without representing the empty set, for
+example the abstract elements null and {Object}.
+The abstract domain A Object is defined in Figure 6.11.
+
+Object
+Object
+a Object (X) = (anull
+(X), alength
+(X), aOObject
+,T 0 (X))
+d
+
+Object
+Object
+g Object ((a, b, c)) = gnull
+(a) \ glength
+(b) \ gOObject
+,T 0 (c)
+d
+
+Figure 6.10 Abstraction and concretization Functions between A Object and concrete objects in T 0
+
+A Object = (AObject , vObject , tObject )
+
+Object
+Object
+AObject ⇢ AObject
+null ⇥ Alength ⇥ AOd
+
+Object
+Object
+(a, b, c) vObject (x, y, z) = a vObject
+z
+null x ^ b vlength y ^ c vOd
+Object
+Object
+(a, b, c) tObject (x, y, z) = (a tObject
+z)
+null x, b tlength y, c tOd
+
+Figure 6.11 Abstract Domain A Object
+
+182
+
+6
+
+Abstract Interpretation
+
+6.6 Extensions
+In this section we briefly sketch how to add additional precision for arrays while
+staying fully automatic. For sake of presentation we use a simplified abstract domain
+for arrays (but which is included in the abstraction given in Section 6.4) and define a
+more specific notion to join heap values. Based on this we can then sketch how to
+automatically generate loop invariants for arrays that maintain a reasonable level of
+precision for many use cases. This section is basically a shortened version of [Hähnle
+et al., 2016] to which we refer the reader for details.
+
+6.6.1 Abstractions for Arrays
+We extend the abstract domain of the array elements to a range within the array.
+Given a set of indexes R, an abstract domain A for array elements can be extended to
+an abstract domain AR for arrays by copying the structure of A and renaming each ai
+to aR,i . The aR,i are such that gaR,i , j 2 {arrOb j 2 int[] | 8k 2 R.cai (arrOb j[k])}.
+Example 6.9. As abstract domain A we use the sign domain for integers, producing
+for each R ✓ N an abstract domain AR :
+g(>R ) = int[]
+
+>R
+R
+negR
+
+g(R ) = {arrOb j 2 int[] | 8k 2 R.arrOb j[k]  0}
+g(
+
+R
+
+0R
+/0R
+
+posR
+
+R ) = {arrOb j 2 int[] | 8k 2 R.arrOb j[k]
+
+0}
+
+g(negR ) = {arrOb j 2 int[] | 8k 2 R.arrOb j[k] < 0}
+g(posR ) = {arrOb j 2 int[] | 8k 2 R.arrOb j[k] > 0}
+.
+g(0R ) = {arrOb j 2 int[] | 8k 2 R.arrOb j[k] = 0}
+g( /0R ) = {}
+
+With R = {0, 2}, we get g( {0,2}) = {arrOb j 2 int[] | arrOb j[0] 0^arrOb j[2]
+0}. Importantly, the array length itself is irrelevant, provided arrOb j[0] and arrOb j[2]
+have the required values. Therefore the arrays (we deviate from Java’s array literal
+syntax for clarity) [0, 3, 6, 9] and [5, 5, 0] are both elements of g( {0,2}).
+Of particular interest are the ranges containing all elements modified within a
+loop. One such range is [0..arrOb j.length). This range can always be taken as a
+fallback option if no more precise range can be found.
+
+6.6.2 Loop Invariant Rule with Value and Array Abstraction
+To be able to deal with arrays we extend the updateInvariant rule:
+
+6.6. Extensions
+
+183
+
+invariantUpdate
+
+.
+.
+G , U (x̄ = c̄) =) 9ḡ.{U 0 }(x̄ = c̄), D
+.
+G , old = U heap =) U Inv, D
+.
+.
+0 (g ^ Inv), U 0 [p](x̄ =
+G , old = U heap, Umod
+c̄) =)
+mod
+.
+0 (x̄ =
+9 ḡ; Umod
+c̄), D
+.
+0
+0
+G , old = U heap, Umod (g ^ Inv) =) Umod [p]Inv, D
+.
+0 (¬g ^ Inv) =) U 0 [r]j, D
+G , old = U heap, Umod
+mod
+G =) U [while (g) {p}; r]j, D
+
+0 := (U 0 k V heap ) with U 0 being the U 0
+where Umod
+mod from the previous sections and
+mod
+heap
+Vmod denotes the abstraction of the heap stored in program variable heap. The x̄, c̄, ḡ
+and 9 ḡ; j are defined as previously. In addition to heap abstraction, we reintroduce
+the loop invariant formula Inv, which is subsequently used to express properties
+about the content of the heap. This includes explicit heap invariants of the form
+8i 2 S. C ! P(selectint (heap, arrObj, arr(i))) as well as invariants which further
+specify S or C. The program variable and old is a fresh constant used in Inv to refer
+to the heap before loop execution.
+
+i = 0; j = 0;
+while(i < a.length) {
+if (a[j] > 0) j++;
+b[i] = j;
+c[2*i] = 0;
+i++;
+}
+Listing 6.2 Example program for array abstraction
+
+Most branches serve a similar approach as those in the previous version. The
+second and the third branch are new ensuring that the loop invariant formula is
+initially valid as well as preserved by the loop body. Given program p in Listing 6.2,
+applying the assignment rule to G =) U [p]j, D leads to G =) {U k i := 0 k j :=
+0}[while...]j, D . Now the invariantUpdate rule is applied with, e.g., the following values:
+
+184
+
+6
+
+Abstract Interpretation
+
+U 0 = (U k i := g ,1 k j := g ,2 )
+
+heap
+Vmod
+=
+
+heap := anon(anon(heap, b[0..i], anonHeap1 ), c[0..c.length], anonHeap2 )
+
+Inv = 8k 2 [0..j); c> (selectint (heap, a, arr(k)))
+^ 8k 2 [0..i); c (selectint (heap, b, k))
+
+^ (8m 2 [0..c.length);
+.
+(m < 2 ⇤ i ^ m%2 = 0) ! c0 (selectint (heap, c, arr(2 ⇤ m))))
+.
+^ 8m 2 [0..c.length); ¬(m < 2 ⇤ i ^ m%2 = 0)
+.
+! (selectint (heap, c, arr(m)) = selectint (old, c, arr(m)))
+0
+The update Umod
+is equal to the original update U except for the values of i and j
+which can both be any nonnegative number. The arrays b and c have (partial) ranges
+anonymized. We use arrOb j[lower..upper] to express the set of locations consisting
+of all array elements of array arrOb j from lower (included) to upper (excluded).
+Array a is not changed by the loop and thus not anonymized. The invariants in
+Inv express that
+
+1. a contains positive values at all positions prior to the current value of j,
+heap
+2. the anonymized values in b (cf. Vmod
+) are all nonnegative, and
+3. the anonymized values in c are equal to their original values (if the loop does
+not or has not yet modified them) or are equal to 0.
+
+6.6.3 Computation of the Abstract Update and Invariants
+heap
+We generate U 0 , Vmod
+and Inv automatically in a side proof, by symbolic execution
+of single loop iterations until a fixed-point is found. The computation of U 0 is as
+heap
+in Section 6.3, but ignores the heap variable heap. We generate Vmod
+and Inv by
+1
+examining each array modification and anonymizing the entire range within the
+heap
+array (expressed in Vmod
+) while adding a partial invariant to the set Inv. Once a
+heap
+0
+fixed-point for U is reached, we can refine Vmod
+and Inv by performing in essence
+a second fixed-point iteration, this time anonymizing possibly smaller ranges and
+potentially adding more invariants.
+To perform this we need to generalize our notion of joining updates to include
+heaps.
+
+Definition 6.10 (Joining Heaps). Any operator with the signature
+t̂ : (2Fml ⇥ DLTrmHeap ) ⇥ (2Fml ⇥ DLTrmHeap ) ! (2Fml ⇥ DLTrmHeap )
+1 Later we also examine each array access (read or write) in if-conditions to gain invariants such as
+
+8k 2 [0..j). c> (select(heap, a, arr(k))) in the example above.
+
+6.6. Extensions
+
+185
+
+is a heap join operator if it satisfies the properties: Let h1 , h2 be arbitrary heaps
+in a proof P, C1 ,C2 be formula sets representing constraints on the heaps (and
+possibly also on other update values) and let U be an arbitrary update. Then for
+(C, h) = (C1 , h1 ) t̂ (C2 , h2 ) the following holds for i 2 {1, 2}:
+1. (U k heap := h) is (P, Ci )-weaker
+than (U k heap := hi ),
+V
+2. Ci =) {U k heap := hi } C, and
+3. t̂ is associative and commutative up to first-order reasoning.
+
+We define the set of normal form heaps HeapNF ⇢ DLTrmheap to be those heap terms
+that extend heap with an arbitrary number of preceding stores or anonymizations.
+For a heap term h 2 HeapNF we define
+8
+>
+if h = heap
+< /0
+0
+writes(h) := {h} [ writes(h ) if h = store(h0 , a, arr(idx), v) or
+>
+:
+h = anon(h0 , a[l..r], h00 )
+
+A concrete implementation t̂heap of t̂ is given as follows: We reduce the signature to
+t̂heap : (2Fml ⇥ HeapNF ) ⇥ (2Fml ⇥ HeapNF ) ! (2Fml ⇥ HeapNF ). This ensures that
+all heaps we examine are based on heap and is a valid assumption when taking the
+program rules into account, as these maintain this normal form. As both heaps are in
+normal form, they must share a common subheap (at least heap). The largest common
+subheap of h1 , h2 is defined as lcs(h1 , h2 ) and all writes performed on this subheap can
+be given as writeslcs (h1 , h2 ) := writes(h1 ) [ writes(h2 ) \ (writes(h1 ) \ writes(h2 )).
+For the interested reader, the actual algorithms to compute the update abstractions
+are shown in [Hähnle et al., 2016].
+
+6.6.4 Symbolic Pivots
+Finally, we sketch briefly how to generate the loop invariant formula Inv capturing
+knowledge about the modified content of an array. In the previous section we computed the update Umod , which provides us the abstraction for primitive types as well
+as the heap, in particular, arrays. For the latter this information is relatively weak as
+it assumes any update to an array element could cause a change at any array index.
+heap
+With the generated U 0 , however, we can now refine Vmod
+and Inv. We try to keep
+heap
+the anonymizations in Vmod to a minimum, while producing stronger invariants Inv.
+Consider the starting sequent
+G =) U [while (g) {p}; r]j, D .
+As U 0 is weaker than U , the update (U 0 k heap := U heap) remains weaker than
+U . For the sequent
+G =) {U 0 k heap := U heap}[while (g) {p}; r]j, D
+
+186
+
+6
+
+Abstract Interpretation
+
+while computing the heap join (by unrolling the loop) we reach open branches
+Gi =) {Ui }[while (g) {p}; r]j, Di .
+Aside from the values for heap, U 0 is weaker than Ui , as U 0 is a fixed-point. We
+therefore do not have to join any nonheap variables when computing (U ⇤ , Inv).
+When joining constraint/heap pairs we distinguish between three types of fm,n :
+1. anonymizations, which are kept, as well as any invariants generated for them
+occurring in the constraints,
+2. stores to concrete indexes, for which we create a store to the index either of the
+explicit value (if equal in both heaps) or of a fresh gi, j of appropriate type, and
+3. stores to variable indexes, for which we anonymize a (partial) range in the array
+and give stronger invariants.
+Given a store to a variable index store(h, a, arr(idx), v), the index idx is expressible as a function index(gi0 , j0 , . . . , gin , jn ). These gix , jx can be linked to program variables in the update U 0 , which contains updates pvx := gix , jx .We can therefore express
+idx as the function sp(. . . pvx . . .).
+We call idx = sp(. . . pvx . . .) a symbolic pivot, as it expresses what elements of the
+array can be changed based on which program variables and allows us to partition the
+array similar to pivot elements in array algorithms. Symbolic pivots split the array
+into an already modified partition and an unmodified partition, where (parts of) the
+unmodified partition may yet be modified in later iterations of the loop.
+If P(W ) = 8k 2 [U sp..W sp). W ca j (selectint (heap, arrObj, arr(k)), for a symbolic pivot sp, P(U ) is trivially true, as we are quantifying over an empty set.
+Likewise, it is easy to show that the instance Q(U ) of the following is valid:
+Q(W ) =
+8k 62 [U sp..W sp);
+.
+selectint (W heap, W arrObj, arr(k)) =
+selectint (U heap, W arrObj, arr(k))
+Therefore, anonymizing an array arrObj with
+anon(h, arrObj[0..arrObj.length], anonHeap)
+and adding invariants P(U ⇤ ) and Q(U ⇤ ) for the contiguous range [U sp..{U ⇤ }sp)
+is inductively sound, if P(U 0 ) =) P(Ui ) and Q(U 0 ) =) Q(Ui ).
+Definition 6.11 (Iteration affine). Given a sequent G =) U [p]j, D where p starts
+with while, a term t is iteration affine, if there exists some step 2 Z such that
+for any n 2 N, if we unroll and symbolically execute the loop n times, for each
+branch with sequent Gi =) Ui [p]j, Di it holds that there is some value v, such that
+.
+.
+Gi [!Di =) Uit = v and G [!D =) U t + n ⇤ step = v.
+If the symbolic pivot is iteration affine, we know the exact elements that may be
+modified. We could anonymize only this range. However, as expressing the affine
+
+6.7. Conclusions
+
+187
+
+range as a location set is nontrivial, we anonymize the entire array and create the
+following invariants for the modified and unmodified partitions (using the symbols
+of Definition 6.11):
+.
+U sp)%step = 0) ! P(k),
+.
+and 8k 2 [0..arrObj.length). ¬(k U sp ^ k < sp ^ (k U sp)%step = 0)
+.
+! selectint (heap, arrObj, arr(k)) = selectint (U heap, arrObj, arr(k))
+
+8k 2 [0..arrObj.length). (k
+
+U sp ^ k < sp ^ (k
+
+Finally, we can also add invariants (without anonymizations) for array accesses which influence control flow. For each open branch with a condition
+C(selectint (h, arrObj, arr(idx))) not already present in the sequent leading to it, we
+determine the symbolic pivot for idx and create an iteration affine or contiguous
+invariant for it.
+
+6.7 Conclusions
+In this section we outlined how to integrate abstraction into JavaDL. We looked first
+into cases without a heap to explain the basic idea. We sketched then our approach to
+extend the approach to arrays. We explained the necessary extensions to maintain a
+reasonable amount of precision when abstracting arrays. The presented approach has
+also been used to cover method contracts and recursion [Wasser, 2015]. It has been
+applied in an eVoting case study [Do et al., 2016] to achieve full automation for the
+purpose of detecting information leaks.
+
+

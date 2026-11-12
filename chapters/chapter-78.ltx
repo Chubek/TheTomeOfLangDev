@@ -1,0 +1,456 @@
+%%
+%% chapter-78.ltx — Register Allocation
+%%
+
+\section{Introduction}\label{sec:register-allocation-intro}
+
+\emph{Register allocation} is the problem of assigning the symbolic temporaries of a program to a finite set of physical registers. It is one of the most important and well-studied problems in compiler design. A good register allocator can improve program performance by 20--50\%, while a poor one can degrade performance by an order of magnitude.
+
+The register allocation problem is NP-complete in general, but effective heuristic algorithms exist that produce good results in practice. The two dominant approaches are \emph{graph coloring} (Chaitin's algorithm) and \emph{linear scan} (used in JIT compilers). This chapter develops both approaches in detail, along with modern extensions like SSA-based allocation and register coalescing.
+
+\section{Register Allocation as Graph Coloring}\label{sec:graph-coloring}
+
+\subsection{Interference Graph}\label{sec:interference-graph}
+
+\begin{definition}[Interference Graph]\label{def:interference-graph}
+The \textbf{interference graph} $G = (V, E)$ for a program is defined as:
+\begin{itemize}
+  \item $V$ is the set of temporaries (virtual registers) in the program.
+  \item $(u, v) \in E$ if there exists a program point where both $u$ and $v$ are \emph{live} simultaneously.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Graph Coloring]\label{def:graph-coloring}
+A \textbf{$k$-coloring} of a graph $G = (V, E)$ is an assignment $c : V \to \{1, 2, \ldots, k\}$ such that $(u, v) \in E \implies c(u) \neq c(v)$. The \textbf{chromatic number} $\chi(G)$ is the minimum $k$ for which a $k$-coloring exists.
+\end{definition}
+
+\begin{theorem}[Register Allocation = Graph Coloring]\label{thm:ra-gc}
+Register allocation with $k$ physical registers is equivalent to $k$-coloring the interference graph. If the interference graph is $k$-colorable, the program can be executed using $k$ registers without any spills.
+\end{theorem}
+
+\begin{proof}
+Each color represents a physical register. Two temporaries that interfere (are simultaneously live) must be assigned different colors (registers). If the graph is $k$-colorable, each temporary gets a register, and no two interfering temporaries share a register.
+\end{proof}
+
+Since graph coloring is NP-complete for $k \geq 3$, and register allocation is equivalent to graph coloring, register allocation is NP-complete. In practice, heuristic algorithms are used.
+
+\section{Chaitin's Algorithm}\label{sec:chaitin}
+
+\emph{Chaitin's algorithm}~\cite{chaitin1982register} (1982) is the classic graph-coloring register allocator. It uses a \emph{simplify-spill} iterative approach: try to color the graph, and if it fails, \emph{spill} the least-costly temporary (replace it with a memory location) and try again.
+
+\subsection{The Algorithm}\label{sec:chaitin-algorithm}
+
+\begin{algorithm}[H]
+\caption{Chaitin's Graph-Coloring Register Allocator}
+\label{alg:chaitin}
+\begin{algorithmic}[1]
+\Require Program, $k$ physical registers
+\Ensure Register assignment or spill code
+\State Build interference graph $G$
+\State Compute spill costs for each temporary
+\Loop
+  \State Attempt to $k$-color $G$ using simplification heuristics
+  \If{coloring succeeds}
+    \State \Return register assignment
+  \Else
+    \State Select temporary $t$ with lowest spill cost / degree ratio
+    \State Insert spill code for $t$ (store after def, load before use)
+    \State Rebuild interference graph $G$
+  \EndIf
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Simplification Heuristics}\label{sec:simplification}
+
+The graph coloring step uses several heuristics to simplify the graph:
+
+\begin{definition}[Simplify Rules]\label{def:simplify}
+\begin{itemize}
+  \item \textbf{Remove self-interference}: If $(v, v) \in E$, remove it.
+  \item \textbf{Low-degree removal}: If $\mathit{degree}(v) < k$, $v$ can always be colored. Remove $v$ and its edges.
+  \item \textbf{Coalescing}: If $(u, v) \in E$ and $u, v$ are connected by a move instruction, merge $u$ and $v$ (if safe).
+\end{itemize}
+\end{definition}
+
+\subsection{Spill Cost Estimation}\label{sec:spill-cost}
+
+\begin{definition}[Spill Cost]\label{def:spill-cost}
+The \textbf{spill cost} of a temporary $t$ estimates the cost of spilling $t$ to memory:
+\[
+\mathit{cost}(t) = \sum_{\text{uses } u \text{ of } t} \mathit{freq}(u) + \sum_{\text{defs } d \text{ of } t} \mathit{freq}(d)
+\]
+where $\mathit{freq}$ is the estimated execution frequency of the program point.
+\end{definition}
+
+\section{Graph Coloring Heuristics}\label{sec:coloring-heuristics}
+
+\subsection{Briggs' Conservative Coalescing}\label{sec:briggs}
+
+\emph{Briggs' coalescing}~\cite{briggs1994register} (1994) improves on Chaitin's algorithm by being more conservative about which moves to coalesce.
+
+\begin{definition}[Briggs' Criterion]\label{def:briggs-criterion}
+A move between $u$ and $v$ can be coalesced if, after merging, the resulting node has fewer than $k$ neighbors with degree $\geq k$ (\textbf{Briggs' criterion}). This ensures the merged node is still colorable.
+\end{definition}
+
+\subsection{George's Conservative Coalescing}\label{sec:george}
+
+\begin{definition}[George's Criterion]\label{def:george-criterion}
+A move between $u$ and $v$ can be coalesced if every significant-degree neighbor of $u$ is also a neighbor of $v$, or vice versa (\textbf{George's criterion}). This is more conservative than Briggs' but avoids some bad coalescing decisions.
+\end{definition}
+
+\section{Linear Scan Register Allocation}\label{sec:linear-scan}
+
+\emph{Linear scan} register allocation~\cite{poletto1999linear} (1999) is a fast, simple algorithm that is widely used in JIT compilers (Java HotSpot, WebAssembly, etc.).
+
+\subsection{The Algorithm}\label{sec:linear-scan-algorithm}
+
+\begin{algorithm}[H]
+\caption{Linear Scan Register Allocation}
+\label{alg:linear-scan}
+\begin{algorithmic}[1]
+\Require Live intervals for all temporaries, $k$ physical registers
+\Ensure Register assignment
+\State Sort live intervals by start point
+\State $\mathit{active} \gets \emptyset$ (sorted by end point)
+\State $\mathit{free\_regs} \gets \{r_1, r_2, \ldots, r_k\}$
+\ForAll{intervals $i$ in order of start point}
+  \State $\mathit{expireOldIntervals}(i)$ \Comment{Free registers of expired intervals}
+  \If{$\mathit{free\_regs} \neq \emptyset$}
+    \State Assign a free register to $i$
+    \State Add $i$ to $\mathit{active}$
+  \Else
+    \State $\mathit{spill} \gets$ interval in $\mathit{active}$ with latest end point
+    \If{$\mathit{end}(\mathit{spill}) > \mathit{end}(i)$}
+      \State Assign $\mathit{spill}$'s register to $i$
+      \State Spill $\mathit{spill}$
+    \Else
+      \State Spill $i$
+    \EndIf
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity and Quality}\label{sec:linear-scan-quality}
+
+\begin{theorem}[Linear Scan Complexity]\label{thm:linear-scan-complexity}
+Linear scan register allocation runs in $O(n)$ time, where $n$ is the number of live intervals. This is optimal (each interval must be processed at least once).
+\end{theorem}
+
+Linear scan produces code that is typically 5--15\% slower than graph coloring, but runs 5--10$\times$ faster. This tradeoff makes it ideal for JIT compilation where compilation speed is critical.
+
+\section{SSA-Based Register Allocation}\label{sec:ssa-ra}
+
+\emph{SSA-based register allocation}~\cite{hack2006register} exploits the properties of SSA form to simplify the register allocation problem.
+
+\begin{definition}[SSA Register Allocation]\label{def:ssa-ra}
+In SSA form, each variable is defined exactly once. The interference graph of an SSA program is a \textbf{chordal graph} (if the live ranges are properly ordered), and chordal graphs can be colored optimally in polynomial time.
+\end{definition}
+
+\begin{theorem}[SSA Interference Graph]\label{thm:ssa-interference}
+The interference graph of a program in SSA form, with live ranges ordered by their definition points, is a chordal graph. Chordal graphs can be $k$-colored optimally in $O(n + m)$ time using a perfect elimination ordering.
+\end{theorem}
+
+\subsection{Coalescing in SSA Form}\label{sec:ssa-coalescing}
+
+In SSA form, a $\phi$-function $x = \phi(x_1, x_2, \ldots, x_k)$ represents a set of copies. Register coalescing in SSA form merges the operands of $\phi$-functions with the result, eliminating the copies.
+
+\begin{definition}[SSA Coalescing]\label{def:ssa-coalescing}
+\textbf{SSA coalescing} merges variables connected by $\phi$-functions and copies. After coalescing, the program may no longer be in SSA form, but the number of required move instructions is minimized.
+\end{definition}
+
+\section{Register Allocation with Coalescing}\label{sec:ra-coalescing}
+
+\emph{Register coalescing} eliminates copy instructions by assigning the source and destination of a copy to the same register.
+
+\begin{definition}[Coalescing Problem]\label{def:coalescing}
+Given an interference graph $G$ and a set of \emph{affinity edges} $A$ (copies that should be coalesced), find a $k$-coloring of $G$ that maximizes the number of affinity edges whose endpoints receive the same color.
+\end{definition}
+
+Coalescing is important because copy instructions are pure overhead: they consume execution time but do not perform useful computation. A good coalescing strategy can eliminate 30--50\% of all move instructions.
+
+\begin{historical}
+Register allocation has been a central topic in compiler research since Chaitin's seminal 1982 paper~\cite{chaitin1982register}. Briggs' improvement~\cite{briggs1994register} (1994) introduced conservative coalescing, significantly improving the quality of the allocator. Linear scan allocation was developed by Poletto and Sarkar~\cite{poletto1999linear} (1999) for JIT compilers. The SSA-based approach of Hack et al.~\cite{hack2006register} (2006) showed that SSA form simplifies register allocation by making the interference graph chordal. Modern allocators like the one in LLVM combine graph coloring with SSA-based techniques and aggressive coalescing.
+\end{historical}
+
+\section{Rematerialization}\label{sec:rematerialization}
+
+\emph{Rematerialization} is an alternative to spilling: instead of storing a value to memory and loading it back, the value is recomputed when needed.
+
+\begin{definition}[Rematerialization]\label{def:rematerialization}
+\textbf{Rematerialization} replaces a spilled value with a recomputation when the value is needed again. This is beneficial when:
+\begin{itemize}
+  \item The value is cheap to compute (e.g., a constant or a simple expression).
+  \item The value has a short live range (recomputation is needed only a few times).
+\end{itemize}
+\end{definition}
+
+\begin{example}[Rematerialization]\label{ex:remat}
+\begin{verbatim}
+  // If x = 5 is spilled:
+  // Instead of: store x to memory, load x from memory
+  // Rematerialize: x = 5 (just re-assign the constant)
+\end{verbatim}
+\end{example}
+
+\section{Register Allocation for Specific Architectures}\label{sec:arch-specific}
+
+\subsection{x86 Register Allocation}\label{sec:x86-ra}
+
+x86 presents unique challenges for register allocation:
+\begin{itemize}
+  \item Only 16 general-purpose registers (in 64-bit mode).
+  \item Some instructions implicitly use specific registers (e.g., \texttt{div} uses \texttt{rax}/\texttt{rdx}).
+  \item The \texttt{x87} floating-point unit uses a register stack, not random-access registers.
+\end{itemize}
+
+\subsection{ARM Register Allocation}\label{sec:arm-ra}
+
+ARM has 16 registers (R0--R15), with some reserved:
+\begin{itemize}
+  \item R13 is the stack pointer.
+  \item R14 is the link register (return address).
+  \item R15 is the program counter.
+  \item R0--R12 are available for allocation (13 registers).
+\end{itemize}
+
+\section{Global Register Allocation}\label{sec:global-ra}
+
+\emph{Global register allocation} assigns registers across procedure boundaries, keeping frequently used values in registers across calls.
+
+\begin{definition}[Global Register Allocation]\label{def:global-ra}
+\textbf{Global register allocation} assigns certain registers as \emph{callee-saved} (the callee must preserve them) and others as \emph{caller-saved} (the caller must save them if needed across calls). Values that are live across calls should be in callee-saved registers.
+\end{definition}
+
+\section{Summary}\label{sec:register-allocation-summary}
+
+Register allocation assigns program temporaries to physical registers. The problem is equivalent to graph coloring, which is NP-complete. Chaitin's algorithm uses iterative simplify-spill with graph coloring heuristics. Linear scan provides a fast, $O(n)$ alternative suitable for JIT compilation. SSA-based allocation exploits the chordal structure of SSA interference graphs for optimal coloring. Coalescing eliminates copy instructions by assigning source and destination to the same register. Rematerialization avoids spilling by recomputing cheap values. The choice of algorithm depends on the compilation context: graph coloring for ahead-of-time compilers (best quality), linear scan for JIT compilers (best speed). Architecture-specific considerations (x86 register constraints, ARM calling conventions) must be handled by the allocator.
+
+\section{Graph Coloring Register Allocation}\label{sec:graph-coloring-detail}
+
+\emph{Graph coloring} register allocation models the problem as coloring an interference graph: each node is a variable, edges connect variables that are simultaneously live, and colors are physical registers.
+
+\begin{definition}[Interference Graph]\label{def:interference-graph}
+The \textbf{interference graph} $G = (V, E)$ has:
+\begin{itemize}
+  \item $V$: one node per program variable (or live range)
+  \item $E$: an edge $(u, v)$ if $u$ and $v$ are simultaneously live at some program point
+\end{itemize}
+\end{definition}
+
+\begin{definition}[$k$-Coloring]\label{def:k-coloring}
+A \textbf{$k$-coloring} of a graph assigns one of $k$ colors to each node such that no two adjacent nodes share a color. Register allocation with $k$ physical registers is equivalent to $k$-coloring the interference graph.
+\end{definition}
+
+\subsection{Chaitin's Algorithm}\label{sec:chaitin-detail}
+
+\begin{algorithm}[H]
+\caption{Chaitin's Graph Coloring Register Allocation}
+\label{alg:chaitin}
+\begin{algorithmic}[1]
+\Require Interference graph $G = (V, E)$, $k$ physical registers
+\ensure Register assignment or spill decisions
+\State Build interference graph from liveness analysis
+\State Compute priorities: $priority(v) = \frac{cost(v)}{degree(v)}$
+\Repeat
+  \State \textbf{Simplify}: Remove low-degree nodes ($degree < k$), assign colors
+  \State \textbf{Coalesce}: Merge non-interfering copy-related nodes
+  \State \textbf{Freeze}: If no more simplification or coalescing, freeze low-priority nodes
+  \State \textbf{Spill}: If stuck, select highest-cost node to spill
+  \State Remove spilled node from graph, add spill code
+  \State Rebuild interference graph
+\Until{all nodes colored}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{definition}[Briggs Coalescing Criterion]\label{def:briggs-coalesce}
+Two nodes $u, v$ connected by a copy can be \textbf{coalesced} (merged) if the merged node has fewer than $k$ neighbors with degree $\geq k$ (the \emph{Briggs criterion}). This ensures the merged node is still colorable.
+\end{definition}
+
+\begin{definition}[George Coalescing Criterion]\label{def:george-coalesce}
+Two nodes $u, v$ can be coalesced if for every significant neighbor $t$ of $v$ (where $degree(t) \geq k$), either $t$ interferes with $u$ or $degree(t) < k$ (the \emph{George criterion}). This is more conservative than Briggs.
+\end{definition}
+
+\subsection{Iterated Register Coalescing}\label{sec:iterated-coalescing}
+
+\begin{algorithm}[H]
+\caption{Iterated Register Coalescing (IRC)}
+\label{alg:irc}
+\begin{algorithmic}[1]
+\Require Interference graph $G$, copy edges $C$, $k$ registers
+\ensure Colored graph with coalesced copies
+\Repeat
+  \State \textbf{Simplify}: Pop nodes with $degree < k$ onto \texttt{selectStack}
+  \State \textbf{Coalesce}: For each copy edge $(u, v)$:
+  \If{Briggs (or George) criterion satisfied}
+    \State Merge $u$ and $v$; update adjacency
+  \EndIf
+  \State \textbf{Freeze}: If no simplify/coalesce, freeze a low-degree node
+  \State \textbf{Spill}: If stuck, spill highest-priority node
+\Until{only colored/spilled nodes remain}
+\State Pop \texttt{selectStack}, assigning colors
+\end{algorithmic}
+\end{algorithm}
+
+\section{Linear Scan Register Allocation}\label{sec:linear-scan-detail}
+
+\emph{Linear scan} register allocation is a fast, greedy algorithm that processes live intervals in order of start point.
+
+\begin{definition}[Live Interval]\label{def:live-interval}
+A \textbf{live interval} for variable $v$ is $[start(v), end(v)]$, the range of program positions where $v$ is live.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Linear Scan Register Allocation}
+\label{alg:linear-scan}
+\begin{algorithmic}[1]
+\Require Live intervals $L$ sorted by start position, $k$ registers
+\ensure Register assignment or spill decisions
+\State $active \gets$ empty list (sorted by end position)
+\State $freeRegs \gets \{R_1, R_2, \ldots, R_k\}$
+\ForAll{intervals $i \in L$ in start order}
+  \State \textbf{ExpireOldIntervals}($i$):
+  \ForAll{$j \in active$ with $end(j) < start(i)$}
+    \State Remove $j$ from $active$
+    \State Add $reg(j)$ to $freeRegs$
+  \EndFor
+  \If{$freeRegs \neq \emptyset$}
+    \State $reg(i) \gets$ pop from $freeRegs$
+    \State Add $i$ to $active$
+  \Else
+    \State \textbf{SpillAtInterval}($i$):
+    \State $spill \gets$ interval in $active$ with latest end
+    \If{$end(spill) > end(i)$}
+      \State $reg(i) \gets reg(spill)$; spill $spill$ to memory
+      \State Replace $spill$ with $i$ in $active$
+    \Else
+      \State Spill $i$ to memory
+    \EndIf
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Linear Scan Complexity]\label{thm:linear-scan-complexity}
+Linear scan runs in $O(n)$ time where $n$ is the number of live intervals (assuming sorted input). This makes it suitable for JIT compilation where compilation speed is critical.
+\end{theorem}
+
+\section{SSA-Based Register Allocation}\label{sec:ssa-ra-detail}
+
+SSA form provides structural properties that simplify register allocation.
+
+\begin{definition}[Chordal Interference Graph]\label{def:chordal}
+An interference graph from SSA form is \textbf{chordal}: every cycle of length $\geq 4$ has a chord (an edge connecting non-adjacent nodes in the cycle). Chordal graphs can be optimally colored in polynomial time.
+\end{definition}
+
+\begin{theorem}[SSA Optimal Coloring]\label{thm:ssa-optimal}
+For programs in SSA form, the interference graph is chordal, and the chromatic number equals the maximum clique size (the maximum number of simultaneously live variables). This can be found in $O(n \log n)$ time.
+\end{theorem}
+
+\begin{definition}[SSA Deconstruction for RA]\label{def:ssa-decon}
+Before register allocation, $\phi$-functions must be resolved by inserting copy instructions at the edges of the CFG. The copies must be ordered to avoid incorrect overwriting:
+\begin{itemize}
+  \item \textbf{Parallel copy semantics}: All $\phi$-sources are read before any $\phi$-destination is written.
+  \item \textbf{Sequential copy resolution}: Break parallel copies into a sequence of swaps and moves.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{SSA Deconstruction (Copy Resolution)}
+\label{alg:ssa-decon}
+\begin{algorithmic}[1]
+\Require $\phi$-functions at block $B$ from predecessors $P_1, \ldots, P_k$
+\ensure Copy instructions inserted on CFG edges
+\ForAll{predecessors $P_j$}
+  \State Compute copy set: $C_j = \{(v_i, v_{\phi_i,j}) \mid v_{\phi_i} = \phi(\ldots, v_{\phi_i,j} \text{ from } P_j, \ldots)\}$
+  \State Build copy graph: edge from $a$ to $b$ if $(a, b) \in C_j$
+  \State Find cycles in copy graph
+  \ForAll{cycles}
+    \State Insert a swap instruction to break the cycle
+  \EndFor
+  \State Topologically sort remaining copies
+  \State Insert copy instructions on edge $P_j \to B$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Register Allocation with Rematerialization}\label{sec:rematerialization}
+
+\begin{definition}[Rematerialization]\label{def:rematerialization}
+\textbf{Rematerialization} avoids spilling a value by recomputing it when needed instead of loading it from the stack. A value is rematerializable if:
+\begin{itemize}
+  \item It is defined by a single instruction with constant operands.
+  \item The recomputation cost is less than or equal to the load-from-stack cost.
+\end{itemize}
+\end{definition}
+
+\begin{example}[Rematerialization]\label{ex:rematerialization}
+\begin{verbatim}
+  // Original:
+  r1 = 42         // Cheap to rematerialize (constant load)
+  ...             // r1 not used, register needed for other values
+  r2 = r1 + r3    // Use r1
+  
+  // With spilling:
+  r1 = 42
+  [spill] = r1    // Cost: 1 store
+  ...
+  r1 = [spill]    // Cost: 1 load
+  r2 = r1 + r3
+  
+  // With rematerialization:
+  r1 = 42
+  ...             // No spill needed
+  r1 = 42         // Rematerialize: 1 constant load (cheaper than memory load)
+  r2 = r1 + r3
+\end{verbatim}
+\end{example}
+
+\section{Register Allocation for Modern Architectures}\label{sec:ra-modern-arch}
+
+\subsection{Register Aliasing}\label{sec:ra-aliasing}
+
+On some architectures, physical registers overlap (e.g., x86 \texttt{rax}, \texttt{eax}, \texttt{ax}, \texttt{al} all refer to parts of the same register):
+
+\begin{definition}[Register Aliasing Graph]\label{def:ra-aliasing}
+The \textbf{register aliasing graph} has an edge between two physical registers if writing to one affects the value of the other. The interference graph must account for these aliases: if variable $u$ is in \texttt{eax} and variable $v$ is in \texttt{rax}, they interfere even though they are different registers.
+\end{definition}
+
+\subsection{Register Classes and Constraints}\label{sec:ra-classes}
+
+\begin{definition}[Register Class]\label{def:reg-class}
+A \textbf{register class} is a set of physical registers that can hold a particular type of value. Examples:
+\begin{itemize}
+  \item x86-64: \texttt{GPR} (general purpose), \texttt{XMM} (SSE/AVX), \texttt{ZMM} (AVX-512)
+  \item ARM: \texttt{GPR} (R0-R12), \texttt{VFP} (S/D registers), \texttt{NEON} (Q registers)
+\end{itemize}
+Variables must be assigned to registers in their required class.
+\end{definition}
+
+\begin{definition}[Register Class Constraints]\label{def:reg-class-constraints}
+Some instructions require operands in specific registers:
+\begin{itemize}
+  \item x86 \texttt{div}: dividend in \texttt{rax}, quotient in \texttt{rax}, remainder in \texttt{rdx}
+  \item x86 \texttt{mul}: implicit \texttt{rax}/\texttt{rdx} usage
+  \item ARM \texttt{MLA}: accumulator must differ from destination (ARMv5)
+\end{itemize}
+These constraints add forced edges to the interference graph.
+\end{definition}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcccc}
+\hline
+\textbf{Algorithm} & \textbf{Time} & \textbf{Quality} & \textbf{Use Case} & \textbf{SSA} \\
+\hline
+Chaitin/Briggs & $O(n^2)$ & Best & AOT compilers & No \\
+IRC & $O(n^2)$ & Best & AOT compilers & No \\
+Linear scan & $O(n)$ & Good & JIT compilers & No \\
+SSA-based & $O(n \log n)$ & Optimal & SSA-based compilers & Yes \\
+PBQP & $O(n^3)$ & Near-optimal & Complex constraints & No \\
+\hline
+\end{tabular}
+\caption{Comparison of register allocation algorithms.}
+\label{tab:ra-comparison}
+\end{table}

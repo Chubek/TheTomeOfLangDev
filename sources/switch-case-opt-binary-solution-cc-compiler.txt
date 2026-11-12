@@ -1,0 +1,1585 @@
+VU Research Portal
+
+JTR: A binary solution for switch-case recovery
+Cojocar, L.; Kroes, Taddeus; Bos, Herbert
+
+published in
+Engineering Secure Software and Systems
+2017
+DOI (link to publisher)
+10.1007/978-3-319-62105-0_12
+document version
+Publisher's PDF, also known as Version of record
+document license
+Article 25fa Dutch Copyright Act
+Link to publication in VU Research Portal
+
+citation for published version (APA)
+Cojocar, L., Kroes, T., & Bos, H. (2017). JTR: A binary solution for switch-case recovery. In E. Bodden, M.
+Payer, & E. Athanasopoulos (Eds.), Engineering Secure Software and Systems : 9th International Symposium,
+ESSoS 2017, Bonn, Germany, July 3-5, 2017, Proceedings (pp. 177-195). (Lecture Notes in Computer Science
+(including subseries Lecture Notes in Artificial Intelligence and Lecture Notes in Bioinformatics); Vol. 10379
+LNCS). Springer/Verlag. https://doi.org/10.1007/978-3-319-62105-0_12
+
+General rights
+Copyright and moral rights for the publications made accessible in the public portal are retained by the authors and/or other copyright owners
+and it is a condition of accessing publications that users recognise and abide by the legal requirements associated with these rights.
+• Users may download and print one copy of any publication from the public portal for the purpose of private study or research.
+• You may not further distribute the material or use it for any profit-making activity or commercial gain
+• You may freely distribute the URL identifying the publication in the public portal
+Take down policy
+If you believe that this document breaches copyright please contact us providing details, and we will remove access to the work immediately
+and investigate your claim.
+E-mail address:
+vuresearchportal.ub@vu.nl
+
+Download date: 20. Dec. 2025
+
+JTR: A Binary Solution for Switch-Case
+Recovery
+Lucian Cojocar(B) , Taddeus Kroes, and Herbert Bos
+Vrije Universiteit Amsterdam, Amsterdam, Netherlands
+{l.cojocar,t.kroes}@vu.nl, herbertb@cs.vu.nl
+
+Abstract. Most security solutions that rely on binary rewriting assume
+a clean separation between code and data. Unfortunately, jump tables
+violate this assumption. In particular, switch statements in binary
+code often appear as indirect jumps with jump tables that interleave
+with executable code—especially on ARM architectures. Most existing
+rewriters and disassemblers handle jump tables in a crude manner, by
+means of pattern matching. However, any deviation from the pattern
+(e.g. slightly diﬀerent instructions) leads to a mismatch.
+Instead, we propose a complementary approach to “solve” jump tables
+and automatically ﬁnd the right target addresses of the indirect jump by
+means of a tailored Value Set Analysis (VSA). Our approach is generic
+and applies to binary code without any need for source, debug symbols,
+or compiler generated patterns.
+We benchmark our technique on a large corpus of ARM binaries,
+including malware and ﬁrmware. For gcc binaries, our results approach
+those of IDA Pro when IDA has symbols (which is generally not the case),
+while for clang binaries we outperform IDA Pro with debug symbols by
+orders of magnitude: IDA ﬁnds 11 of 828 switch statements implemented
+as jump tables in SPEC, while we ﬁnd 763.
+
+1
+
+Introduction
+
+Solving indirect control ﬂow transfers such as jump tables in a disassembler is
+important for many applications—from binary rewriting to reverse engineering,
+and from malware analysis to code complexity metrics [21,37,47]—because it
+is essential to ﬁnd some parts of the Control Flow Graph (CFG) of a program.
+Unfortunately, it is also very diﬃcult and modern disassemblers frequently get it
+wrong in cases where code does not follow common, easy-to-ﬁngerprint patterns,
+such as handwritten assembly or malware.
+Extracting a reliable CFG requires the ability to distinguish between data
+and code and to solve the indirect control transfers—in the sense of ﬁnding the
+possible targets for such transfers. Any over-approximation adds spurious edges
+to the CFG, while under-approximations remove legitimate edges.
+Unless they can extract the CFG reliably, many binary analysis techniques
+either no longer work at all, or with reduced accuracy. Besides reverse engineering
+in general, this includes the analysis of code complexity [21,37,47] and binary
+c
+ Springer International Publishing AG 2017
+E. Bodden et al. (Eds.): ESSoS 2017, LNCS 10379, pp. 177–195, 2017.
+DOI: 10.1007/978-3-319-62105-0 12
+
+178
+
+L. Cojocar et al.
+
+control ﬂow testing [6,58]. Moreover, a reliable solution for jump tables also
+serves to detect the presence of custom protocol parsers [21].
+If incorrect CFGs are a nuisance for software testers and reverse engineers, they can be downright catastrophic for binary rewriting solutions. Many
+software hardening approaches rely on binary rewriting [42] to oﬀer security
+guarantees. Examples include control ﬂow integrity (CFI) [6,22,26,50,52,58],
+sandboxing [18,25,27,36,38,45,55,57], static taint tracking [9,19,28,41,54]. An
+incomplete or incorrect CFG can void the security guarantees or even break
+legitimate software. Most binary rewriting solutions [8,12,42,49,51] are conservative when the CFG is incomplete, trading security guarantees for the overhead
+of the binary solution.
+State-of-the-art disassemblers use pattern matching to solve complicated
+indirect control ﬂow transfers. For instance, if a speciﬁc compiler generates a
+jump table to implement a switch statement in C, IDA Pro should know the
+precise template that the compiler will use a priori, so that it can search for
+exactly this pattern in the binary. Getting it right is important, as IDA uses
+the resulting jump targets to continue disassembly. Changing the code, however
+slightly, to not ﬁt the template, results in a misclassiﬁcation of the code. In
+practice, we found such cases in both benign and malicious software.
+In this paper, we present a generic technique to solve indirect control transfers without pattern matching, to handle complicated cases—malware and handwritten code—for which templates are not available. We do not necessarily aim
+to outperform solutions based on pattern matching for “easy” cases (although
+we show that our solution is very competitive even for those). By means of a
+compiler-independent context-sensitive Value Set Analysis (VSA) tailored specifically to complicated indirect control transfers, we instead aim to help disassemblers handle complex and malicious code.
+We compare our work against IDA Pro, a state-of-the-art pattern matching disassembler, and show that our analysis results are good and very robust.
+For instance, since IDA does not have good patterns for clang, our results are
+orders of magnitude better for clang and comparable for gcc even though we
+never embedded any compiler knowledge. In summary, our contributions are the
+following:
+– We systematize how modern compilers implement switch statements by
+means of jump tables.
+– We show that jump table detection by pattern matching is limited.
+– We describe a context sensitive VSA suitable for recovering indirect jumps
+from binary code that outperforms powerful tools like IDA Pro and is
+compiler-independent.
+– We evaluate our approach and show that it recovers complicated jump tables
+in binary code without access to source code or debug symbols.
+
+2
+
+The Problem with Patterns
+
+Modern disassemblers commonly classify all sorts of code fragments by way of
+pattern matching—scanning the binary code for templates of known language
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+179
+
+constructs. For example, solutions like Jakstab and IDA Pro use well-known
+patterns for a variety of compilers to identify function entry points, function
+parameters, C++ virtual calls, switch statements, and many other constructs [1,
+30,32,35]. Unfortunately, the eﬀectiveness of pattern matching depends on the
+completeness and soundness of the templating for the code under analysis. For
+instance, Bao et al. [13] demonstrated the ineﬀectiveness of pattern matching for
+detecting function entry points. In general, pattern matching does not work well
+if the code deviates from the templates—a common phenomenon in hand-written
+assembly or malware.
+In this section, we systematize how modern compilers implement switch statements by means of jump tables. We then show the limitations of pattern matching for identifying these jump tables.
+2.1
+
+Jump Tables in Practice
+
+Instead of a straightforward if-then-else implementation, modern compilers frequently opt for jump tables to implement switch statements [44]1 . In practice,
+compilers generate three diﬀerent types of jump table instances in terms of
+the control ﬂow. These types are orthogonal to Cifuentes and Van Emmerik’s
+expressions [20] and cover all jump tables that implement switch statements in
+compiler-generated code that we encountered, across hundreds of applications,
+a wide range of compilers, and various architectures.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+// compare r3 with 10
+cmp
+r3, #10
+// if less or same, load pc
+// with pc + value in jump
+// table, using r3<<2 as index
+ldrls pc, [pc, r3, lsl #2]
+b
+default
+.word 0x20
+.word 0x40
+.word 0x80
+.word 0x40
+...
+
+Listing
+1.1.
+jumpSIMPL: gcc
+implementation
+of
+switching.
+An
+alternative implementation replaces line
+1 with subs r4, r3, #10 which changes
+the pattern so that IDA cannot detect it.
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+add
+and
+cmp
+mov
+strb
+addls
+b
+b
+b
+b
+...
+---
+
+r1, r1, #1
+r3, r1, #0xff
+r3, #0xB // 12 cases
+r1, #6
+r3, [r4,#4]
+pc, pc, r3, lsl #2
+loc_7d0c //default case
+loc_7d0c //default case
+loc_7c9c //case 1
+loc_7ccc //case 2-9
+
+Listing 1.2. jump2JUMP case. Line 7
+computes he value of the target. Unlike
+jumpSIMPL, it uses unconditional relative
+jumps instead of jump tables (lines 7–11).
+
+jumpSIMPL is the most common form of jump table. It uses a register as an index
+in the table and computes the value of that register using the switch input value.
+It then loads the value of an oﬀset from the jump table, adjusts it and adds it
+to the program counter. An example of this idiom is shown in Listing 1.1.
+jump2JUMP represents an implementation that is slightly less common, but still
+widely used. It ﬁrst adds an oﬀset based on the switched value to the current
+1
+
+23% of switch statements are lowered to jump tables by gcc. When compiling SPEC
+CPU 2006 with clang (for ARM), 21% of the switch statements are lowered to jump
+tables.
+
+180
+
+L. Cojocar et al.
+1
+2
+3
+
+ldrb
+adds
+bl
+
+r3, [r4, #7]
+r0, #0x49
+rt_switch_stub
+
+// r3 is the index
+// switch 7 cases
+
+4
+5
+6
+7
+
+.byte 6
+.byte 0x4, 0x8, 0xd, 0x12, 0x17, 0x20
+.byte 0x1d
+
+// item count
+
+rt_switch_stub:
+ldrb
+r12, [lr, #-1]
+cmp
+r3, r12
+ldrccb r3, [lr, r3]
+ldrcsb r3, [lr, r12]
+add
+r12, lr, r3, lsl#1
+bx
+r12
+
+// jt width = 8 bits
+// load the item count
+// compare the index
+// load case offset
+// load default offset
+// add the offset
+// jump to target
+
+// default offset
+
+8
+9
+10
+11
+12
+13
+14
+15
+
+Listing 1.3. jump2STUB case. The stub uses the link register (lr) to access the jump
+table. The jump table contains the number of cases as the ﬁrst entry. The default case
+is the last item in the jump table.
+
+Program Counter (PC). The new PC will target another jump (forward) instruction. The oﬀsets are not stored in code, but in the branch forward instructions.
+Even though it uses no jump table in the strict sense of the word, we still consider
+this case for our experiments, since the computation of PC represents a signiﬁcant and similar hurdle for static disassemblers. Listing 1.2 shows an example of
+the jump2JUMP idiom.
+jump2STUB, a less common implementation, makes the code to jump to a stub
+that takes as parameters the switched value and the jump table. The jump
+table is stored after the unconditional jump instruction. Listing 1.3 shows an
+example. While less common, we did encounter this switch statement implementation on multiple occasions in ARM Thumb code, in position independent
+code, and in ﬁrmware. The advantage of jump2STUB is its space eﬃciency—the
+rt switch stub is present only once in the binary regardless of the number of
+switch statements.
+JTR is generic enough to recover all three cases even though we do not
+embed any logic that models these three types. As we shall see, we do use them
+for evaluation.
+2.2
+
+Pattern Matching Limitations
+
+Disassemblers try very hard to detect switch statements (so they know which
+bytes to disassemble), by matching the bytes in binary code to well-known patterns that compilers are known to generate. Any deviation from the known
+patterns confuses the detection. Unfortunately, it is hard to ﬁnd patterns that
+allow jump table detection to be both sound and complete. As a result, disassemblers can easily get it wrong. Consider Listing 1.1, which shows one of the
+idioms generated by gcc to implement switch statements. A mere replacement
+of the cmp compare instruction with any semantically similar instruction such as
+sub breaks the pattern recognition even though the program semantics remain
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+181
+
+unchanged. State-of-the-art disassemblers such as IDA miss the modiﬁed jump
+table entirely and interpret all the data in lines 6–10 as instructions instead.
+As shown in Table 1, it is quite easy to fool modern disassemblers and decompilers by deviating from such well-known patterns, but the question is whether
+such cases also occur in real-world code. Unfortunately, they do. For instance,
+the last column of Table 1 contains code that is generated by clang. Moreover,
+Listing 1.4 displays a real-world (hand optimized) implementation of the memcpy
+function in glibc. Note that link-time optimisation (LTO) may easily inline such
+highly optimized code in several places in a program. As explained in the ﬁgure,
+state of the art disassemblers cannot compute the target address at line 5 and
+line 10, because they expect the calculation of jump targets immediately before
+the jump itself.
+As a result, the analysis generates an incomplete CFG which renders subsequent analysis techniques less eﬀective—hurting, for instance, the strength of
+security measures that rely on binary rewriting. Likewise, reverse engineering the
+code now requires signiﬁcant manual annotation and analysis. In the remainder
+of this paper, we show that JTR can complement pattern matching approaches
+and solve these cases.
+Table 1. JTR Pattern matching failures. In all cases except the baseline, IDA fails to
+detect the switch statement (“IDA sw”). Often, this leads to an incomplete CFG also
+(“IDA CFG”). JTR always recovers the correct targets of the switch statement. The
+last and ﬁrst column of the table is code generated by compilers.
+
+3
+
+Tailored Value Set Analysis for Solving Indirect Jumps
+
+As shown in Fig. 1, our analysis starts by lifting the binary to LLVM intermediate
+code using a home-grown translator2 , much like PIE [21] and LLBT [46], but
+slightly more advanced. As we do not consider it a contribution of this paper,
+will not discuss it further. Next, in Step 2, we apply a variety of optimizations,
+in particular aggressive inlining. As we will discuss later, without it LLVM does
+2
+
+https://github.com/cojocar/bin2llvm.
+
+182
+
+L. Cojocar et al.
+1
+
+2:
+
+2
+3
+
+5:
+
+4
+5
+6
+7
+
+6:
+
+8
+9
+10
+11
+12
+13
+14
+15
+
+subs
+[...]
+ands
+rsb
+addne
+b
+nop
+ldr
+[...]
+add
+nop
+nop
+str
+[...]
+bcs
+
+r2, r2, #96
+ip, r2, #28
+ip, ip, #32
+pc, pc, ip
+7f
+
+// set flags
+// no flag change
+// flags are tested
+
+r3, [r1], #4 // r3=*r1; r1 += 4
+// load 6 more regs
+pc, pc, ip
+// ip from line 5
+
+r3, [r0], #4 // [r0]=r3; r0 += 4
+// store 6 more regs
+2b
+// jump to loop entry
+
+Listing 1.4. Code snippet of the implementation of memcpy in glibc. Note that
+(a) both conditional and unconditional instructions compute the targets (lines 5
+and 10), (b) the condition of the add on line 5 is determined by the and instruction
+on line 3), and (c) the target computed on line 10 depends on a value computed
+11 instructions earlier. Since most disassemblers assume locality (the calculation of
+jump targets right before the jump), they fail to recover this case. In contrast, JTR
+successfully computes the possible values written to the PC on lines 5 and 10.
+
+not inline some of the more intricate examples of jump2STUB. We now describe
+the main analysis steps of JTR—Steps 3–5 in Fig. 1. Analogous to how bounded
+address tracking [32,33,43] targets VSA [10] at binaries, we compute a list of all
+possible values a register may contain at speciﬁc points in any program—with
+an emphasis on indirect control transfers.
+
+*p1 --> SMT formula 1
+*p2 --> SMT formula 2
+*p3 --> SMT formula 3
+...
+
+de fi ne i32 @foo(i32 %a) {
+%1 = mul i32 %a, %a
+ret i32 %1
+}
+
+1
+
+Lift to
+LLVM
+
+10110010011001011001
+01001110110001001011
+
+2
+
+inlining +
+optimizations
+
+3
+
+SMT formula
+for every ptr
+
+SOLVE!
+4
+
+Data dependency
+DAG (per ptr)
+
+5
+
+VSA
+
+Fig. 1. High-level overview of the approach
+
+To analyse all the indirect control transfers of interest (i.e., jump tables and
+complex arithmetic computations on the PC), we need only consider a program’s
+non-constant writes to the program counter. In Step 3 in Fig. 1, after identifying
+all such indirect writes (stores) to PC, JTR goes through every function containing them to determine all possible paths from the store instruction back to
+the start of the function. For each path, we build a set C that represents the
+speciﬁc path constraints in SMT expressions form. Speciﬁcally, we go back along
+the paths to discover where this value originated and stop when we encounter a
+memory read or the start of the function. If the memory access itself depends on
+an indirect memory access, we recursively trace that back also, ensuring that we
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+183
+
+handle cases where, say, the program computes a pointer p by adding pointer q
+and index i.
+To do so, JTR computes a data dependency Directed Acyclic Graph (DAG)
+to capture the relation between the memory pointers:
+1. A node in the graph corresponds to a memory pointer access in its SMT
+expression form. Because the SMT formula stops when we encounter a memory read, the expression kept in non-root nodes always contains a memory
+read. The SMT expression captures any complex expression between nodes.
+2. An edge in the graph captures the dependency between nodes. Given two
+nodes p and q, an edge from p to q means that p depends on the value
+pointed by q. In other words, to solve pointer p, we must compute the value
+pointed by q. In this way, the expression of p can easily emulate (but is not
+limited to) an indirect memory load with a base (node q) and an oﬀset which
+can be a constant or another node.
+3. The root of the dependency graph represents the pointer used in the targeted
+indirect write and the root expression will give us the possible values of PC.
+For the ﬁnal step, solving the DAG, the naive approach is to invoke the
+Satisﬁability Modulo Theories (SMT) solver for the expression of the leaves,
+constrained by C . Using the obtained values, we can then subsequently load the
+values pointed to and solve the rest of the tree. Doing so always gives results
+that are an overapproximation of the real jump targets, but with a high false
+positive rate in case of translation imprecision.
+The key observation for improving the naive solution is that the possible values of a pointer are a limited subset of all possible memory addresses and C and
+some expressions of the nodes from the DAG must have a common expression.
+Let N be the set of the expressions of all nodes in the DAG. We denote M the
+set of common non-constant expressions between C and N . We now construct
+M ← [m0 , ..., mk ] as a sorted set, with m0 the largest expression in the set. We
+deﬁne the size of an expression as the number of nodes needed to represent the
+expression as a tree.
+We now ask the Z3 [40] SMT solver for concrete values for m0 while obeying
+the path constraints (see Algorithm 1). Using the concrete values, we recursively
+solve the DAG by temporarily expanding C with constraints that capture the
+concrete values. In the second part of Algorithm 1, we start from the leaves of the
+DAG and we simplify each node expression using the accumulated constraints. If
+a node’s expression becomes constant, we load its corresponding memory pointer,
+otherwise we continue with the simpliﬁed expression. If the memory pointer is
+invalid, we abandon mi and we move to mi+1 and restart the process. If the
+expression of the root node becomes constant then we successfully solved the
+DAG for one value. We continue the process until all the values of m0 are tested.
+If we explored all paths but found no solution, our analysis fails. In Sect. 4,
+we will see that despite its simplicity this method is quite eﬀective in solving
+jump tables (and other indirect jumps).
+
+184
+
+L. Cojocar et al.
+
+Algorithm 1. DAG solving
+Require: C , M
+1: procedure Solve DAG
+2: for m ∈ M do
+ M is an ordered set
+3:
+for value∈ SMTSolve(m, C ) do
+4:
+constraint←m≡value
+5:
+C ← C ∪constraint
+6:
+rootExpr←RecursiveDAGSolve(DAG.root, C )
+7:
+if isConstant(rootExpr) then
+8:
+appendSolution(rootExpr )
+9:
+
+C ← C constraint
+
+1: procedure RecursiveDAGSolve(Node, C )
+2: expressions = {}
+3: for child←Node.children do
+4:
+childExpr←RecursiveDAGSolve(child, C )
+5:
+expressions←expressions∪(child, childExpr)
+6:
+7:
+8:
+9:
+10:
+11:
+
+for child, childExpr←expressions do
+if isConstantAndLoadable(childExpr) then
+value←LoadPointer(childExpr)
+constraint←childExpr≡value
+C ← C ∪constraint
+return simplifyExpression(Node.expr, C )
+
+Recovered Code Preparation. As LLVM optimizations may inﬂuence our
+results, we evaluated the eﬀect of important optimizations that we applied to
+the lifted LLVM code. As a baseline, we used the same level of optimization as
+in PIE [21] which already provides common optimizations such as memory to
+register promotion, global value numbering, and dead code elimination. Next,
+we added a custom pass to replace the intricate control ﬂow of the select
+instruction with a simpler if-then-else sequence. Finally, we turned on aggressive
+inlining.
+In practice, presumably because the select instructions does not aﬀect the
+control ﬂow of the code of interest, we could not observe any change in the
+solving capabilities of JTR. Becuase JTR analysis is intra-procedural, aggressive
+inlining, improved our results overall as subtler jump2STUB were inlined and, in
+consequence, analyzed. We therefore turn on aggressive inlining in Step (2) of
+Fig. 1 and in all experiments in Sect. 4.
+
+4
+
+Evaluation
+
+We evaluate our solution on 109 coreutils programs compiled for ARM,
+4 ﬁrmwares, 17 malware samples, a synthetic set of 210 binaries, and the SPEC
+CPU 2006 test suite. We believe that this is a meaningful set to evaluate JTR, as
+it is large-scale, contains binaries generated with diﬀerent (known and unkwon)
+compilers, while SPEC is commonly used by the security community for benchmarking. We summarize the results in Table 2 and discuss them in detail below.
+Coreutils Binaries. It is a clear that if accurate patterns are available, we
+cannot beat pattern matching, but we show that we are competitive still with
+the most important state-of-the-art dissambler. As mentioned, we intend JTR
+to complement rather than compete with traditional jump target detectors—to
+resolve the complicated cases that pattern matching cannot handle. Nevertheless,
+it is interesting to evaluate our solution by itself. To show the limitations of
+pattern matching and the genericity of JTR, we use two diﬀerent compilers,
+namely Clang (version 3.5) and GCC (version 4.9.2). We use the debug symbols
+in combination with IDA to generate a “ground truth”.
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+185
+
+In the absence of debug information, IDA recovers 77% of all the switch
+statements. The missing 23% are either due to failed function detection, or misinterpretation of jump tables as instructions (as is the case for each of our synthetic test programs). In contrast, JTR recovers 98%. However, we will compare
+JTR solely with our ground truth, so as to measure against the best of what
+IDA could do (when IDA has the debug symbols). We believe that comparing
+IDA’s results on stripped binaries, even though the results look better, is less
+meaningful. We run our analysis on an Intel(R) i7-3770 CPU based machine
+with 20 GB of RAM on which JTR took 7 s on average per input binary and 755
+seconds in total.
+The results in Table 2 show that regardless of the compiler in use, JTR yields
+good results. JTR outperforms IDA when the Clang compiler is used. This is
+mainly because IDA uses a pattern that is usually generated by gcc. Speciﬁcally,
+the code commonly generated by clang for a jumptable is ldr pc, [rX, rY],
+which is diﬀerent from Listing 1.1. Moreover, rX and rY can be any general
+purpose register and the index value can reside in either. Coming up with a
+pattern that matches Clang’s behavior and has a low false positive rates is
+diﬃcult, demonstrating the beneﬁts of JTR’s generic technique.
+Table 2. JTR results for diﬀerent test sets. The ratios in the last rows relate to the
+ground truth when available, and to the “IDA + symbols” row otherwise.
+Compiler
+
+Coreutils
+gcc
+
+SPEC
+clang gcc
+
+clang
+
+Firmware Malware
+
+Synthetic
+
+unknown unknown
+
+various
+
+Input binaries
+
+109
+
+109
+
+12
+
+16
+
+4
+
+17
+
+210
+
+Ground truth
+
+–
+
+–
+
+–
+
+828
+
+–
+
+–
+
+80
+
+0
+
+655
+
+11
+
+66
+
+205
+
+80
+
+IDA + symbols 642
+JTR
+
+629 (97.98%) 295
+
+573 (87.48%) 763 (92.14%) 65 (98%) 166 (81%) 80 (100%)
+
+Results on SPEC CPU Test Suite. We again compiled SPEC with both
+clang and gcc. The missing cases from the SPEC benchmark are either due to
+compilation errors (perlbench, omnetpp and dealII with clang), or to translation errors. We instrument the clang compiler to generate the ground truth.
+However, due to code inlining after the instrumentation, this ground truth is an
+underapproximation of the number of switch statements actually generated. For
+the testcases compiled with gcc, we rely on IDA’s output for the ground truth
+(given the debug symbols).
+We observe the same behavior as in the case of coreutils: JTR succeeds both
+on clang and on gcc and pattern matching yields poor results on SPEC with
+clang.
+To show the impact of our analysis on the quality of the CFG, for the clang
+test set, we incorporate the recovered switch statements in IDA. Due to the 9097
+new edges in the CFG discovered by JTR, we add a cumulated 2523 basic blocks
+to the CFGs. The detailed results are given in Table 4 (Appendix 1).
+
+186
+
+L. Cojocar et al.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+10
+11
+12
+13
+14
+
+memset:
+mov
+r3, r0
+cmp
+r2, #8
+blt
+2f:
+// branch if < signed
+...
+2:
+movs
+r2, r2
+moveq
+pc, lr
+rsb
+r2, r2, #7
+add
+pc, pc, r2,lsl#2
+// IDA dissasembler stops here
+nop
+strb
+r1, [r3],#1 // repeated 8 times
+...
+
+Listing 1.5. A real-world bug found by JTR. This code is handcoded assembly and
+part of the memset function in uClibc. It treats the length parameter (r2) as a signed
+value. If r2 is interpreted as a negative number, the value written to the PC is outside
+of the mapped memory.
+
+Firmware. Next, we evaluate JTR on the ﬁrmware of four diﬀerent devices: a
+smart meter, a boot-ROM used by LPC214, a GPS stick and a GSM modem. The
+ﬁrmwares were manually reverse engineered in IDA, no symbols were available
+for this test. The ground truth is represented by the manual reverse engineering
+process. Our translator covered 66 switch statements that were implemented
+with jump tables, of which JTR identiﬁed all but one in the unoptimised LLVM
+bitcode. The missing jump table is recovered when aggressive inlining is enabled.
+We found 4 jump2STUB switch statement implementations in this set.
+Malware. In this experiment, we used 17 malware binaries from 7 diﬀerent families: AESddos, GoARM, PnScan, Taidra, Tsunami, Elknot and LightTaidra. We
+manually unpacked each of the samples and then fed them to JTR. In practice,
+none of the malware samples seemed to use control ﬂow obfuscation.
+Out of the 205 switch statements identiﬁed by IDA in the translated functions, the translator JTR recovered 166 (81%). The main cause for this modest
+result is the translator: several indirect jumps are wrongly translated or completely missed, therefore the input LLVM code for JTR is inaccurate. Interestingly, while investigating the results on this set, we also found the bug listed in
+Listing 1.5. The bug was conﬁrmed by the developers of the uClibc library3 .
+Synthetic Binaries. In our next experiment, we again demonstrate that our
+solution is compiler agnostic by running JTR on 210 binaries generated from
+10 C source code ﬁles that contain switch statements or control ﬂow based on
+jump table. We generate the binaries using 20 diﬀerent compilers and compiler
+optimization levels from 6 diﬀerent toolchains and IDEs.
+In addition, we evaluated 10 cases of hand-coded assembly, which are not
+reported in Table 2 all of which were successfully recovered. JTR successfully
+recovers all of the 70 switch statements generated by the various compilers and
+reproduced by the translator.
+3
+
+“bugﬁx: ARM: memset.S: use unsigned comparisons”–http://goo.gl/5NiXJq.
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+4.1
+
+187
+
+Detailed Analysis Results
+
+Jump table types distribution. We show the distribution of the diﬀerent types of
+jump table, as identiﬁed by IDA, in Table 3. The jumpSIMPLE type is the one
+that is by far the most popular on ARM, regardless of the test set. jump2STUB is
+rare on normal binaries but much less so in the ﬁrmware test set. In the synthetic
+set, we generated the jump2STUB cases by selecting Thumb mode and Cortex-M0
+as the target platform. This CPU is often used in embedded devices, therefore
+compiler ﬂags play an important role in evaluation of tools alike JTR. Table 3
+shows that the performance of JTR is similar, regardless of the jump table type.
+Table 3. Results of JTR on diﬀerent jump table types. IDA is used to categorize the
+jump tables whenever possible.
+Test set
+
+Total jumpSIMPLE jump2JUMP jump2STUB
+
+Coreutils-gcc IDA
+
+642
+
+642
+
+0
+
+0
+
+Coreutils-gcc JTR
+
+629
+
+629
+
+0
+
+0
+
+Coreutils-clang IDA
+
+0
+
+0
+
+0
+
+0
+
+Coreuitls-clang JTR
+
+295
+
+N/A
+
+N/A
+
+N/A
+
+SPEC-gcc IDA
+
+655
+
+655
+
+0
+
+0
+
+SPEC-gcc JTR
+
+573
+
+573
+
+0
+
+0
+
+SPEC-clang IDA
+
+11
+
+11
+
+0
+
+0
+
+SPEC-clang JTR
+
+763
+
+>11
+
+N/A
+
+N/A
+
+Firmware IDA (translated)
+
+66
+
+58
+
+4
+
+4
+
+Firmware JTR
+
+65
+
+58
+
+3
+
+4
+
+Malware IDA
+
+205
+
+152
+
+53
+
+0
+
+Malware JTR
+
+166
+
+120
+
+46
+
+0
+
+Synthetic binaries IDA
+
+80
+
+59
+
+21
+
+20
+
+Synthetic binaries JTR
+
+77
+
+56
+
+21
+
+20
+
+Completeness and bug finding. On the ARM processor architecture, the code
+transitions between ARM mode and Thumb mode by means of a jump to an odd
+address with a speciﬁc instruction. Depending on the path, the address computed
+at runtime can be odd or even. When JTR computes the possible address value,
+the reported value can therefore also be either odd or even, depending on the
+path. The two results are essentially the same (modulo the mode) and we ignore
+the last bit. The computation is not ARM speciﬁc, but rather arises from the
+generality of the solution, as JTR explores both paths (ARM and Thumb).
+As shown in Listing 1.5, JTR helps to ﬁnd memory access violations. However, this is not its main objective and care must be taken when applying it
+naively. Speciﬁcally, because our method is (a) conservative – any pointer that
+
+188
+
+L. Cojocar et al.
+
+fails to load on a speciﬁc path invalidates that path, and (b) intra-procedural,
+the false positive rate for a bug ﬁnding strategy that uses JTR naively will be
+high. However, one may augment JTR with model checking techniques (e.g.,
+specify a range of values that one register can have) to reduce the false positive
+rate or target only a speciﬁc family of bugs, such as stack-based buﬀer overﬂows.
+4.2
+
+Comparing JTR with Other Solutions
+
+We tried to compare JTR with a variety of other solutions.
+Angr. The Angr framework [48] supports ARM architecture and uses static
+analysis to solve some jump table. Its public version (48998c5) does not work
+with switch statements implemented with jump tables [2]. Again, Angr generates
+an incomplete CFG, as the jump table targets are missing.
+Jakstab. While JakStab [32] does not support ARM, we tried to compare JTR
+with JakStab’s public version by adapting our examples to the x86 architecture.
+Instead of using a switch statement, we used a table of pointer to functions.
+With optimizations turned oﬀ, Jakstab recovers the targeted functions. When
+we turn on optimizations (−O2 or −O3), its analysis fails to recover the targets.
+RetDec. The Retargetable decompiler [5,24,34] which does not use any VSA
+techniques, fails to retrieve targets in the absence of debug symbols. The decompiler either interprets the jump table as code or it does not reference it at all.
+Radare2. Radare2’s [4] support for switch statement implemented with jump
+tables is work in progress [3]. Note, however, that the implementation is based
+on pattern matching and therefore will have similar issues as IDA Pro.
+REV.NG. Concurrent work from Di Federico et al. [23] use VSA to analyze LLVM code to recover a complete CFG. Even so, on ARM architectures,
+IDA’s Jackard index on CFG matching consistently outperforms REV.NG’s. The
+results on SPEC show that JTR improves the quality of the CFG generated by
+IDA. In our experience, REV.NG performed well on simple ﬁles, but none of the
+conﬁgurations4 of SPEC binaries could currently be handled by REV.NG.
+
+5
+
+Related Work
+
+Jump Tables and Switch Statements. Cifuentes and Van Emmerik [20] propose a solution based on lifting the binary code to Register Transfer List (RTL)
+expressions. Code slicing is used to extract the expression. Next the expression
+4
+
+We compiled SPEC with Clang and with GCC. We tried static and dynamic linking.
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+189
+
+are substituted until any of three known patterns are reached. The summarised
+patterns give enough information for recovering the possible targets of the jump
+table. However, the recovery of jump table’s targets fails when the expression
+does not match one of the known patterns. Holsti [31] shows how to recover
+switch-case tables’ targets when a Read-Only Memory (ROM) table is present.
+They use partial evaluation (e.g. run the program snippet with concrete input) to
+generate possible outputs. For this the state of the registers is modeled and loops
+are unrolled. This solution does not take into account the content of the memory
+and is dependant on detecting switch statement implementation patterns.
+Meng and Miller [39] observe the diﬃculty of recovering an accurate CFG
+because of jump tables. They deﬁne three models for jump tables usage and
+populate these models by means of static analysis. We believe that these models
+are a form of pattern matching and that are not eﬀective on ARM architecture,
+for example the jump2STUB case would require information about the where in
+the code the stub is. Gedich and Lazdin [29] uses the linearity property of jump
+tables’ contents to detect them. Their solution assumes that the position of the
+jump table is roughly known. Once few targets are discovered, JTR can make
+use of this heuristic to accelerate the full jump table discovery.
+Wang et al. [53] propose a solution to ﬁnd data to code references. Their
+solution is working only when pointers to functions are stored in the jump table,
+in a data section. The compiler stores oﬀsets rather than function pointer in the
+jump tables used by switch statements.
+CFG Recovery. Reinbacher and Brauer [43] introduce a method based on SMT
+for generic control ﬂow graph recovery. They leverage forward and backward
+abstract program interpretation to recover indirect jump targets. As opposed to
+JTR, they do not take advantage of the program’s memory contents but rather
+use pre- and post-conditions for program’s registers which are further reﬁned
+by the algorithm process. JakStab [32] uses code inlining, abstract interpretation and local constant propagation to solve jump targets. It does not work on
+ARM. JakStab uses Bounded Address Tracking [43] and tracks every memory
+access and register assignment. Updates in the abstract domain are explicitly
+propagated. JakStab makes a distinction between memory regions. JTR relies
+on expressions and it does not need this tracking. Moreover, in JTR the case
+when a pointer points to an unknown region is captured by the SMT expressions
+rather than being explicitly accounted for.
+Brumley et al. [17] proposes a decompiler that uses BAP’s [16] VSA to recover
+the CFG from the tested binary. Their focus is diﬀerent that JTR. JTR focuses in
+recovering the target of indirect control ﬂows while Phoenix focuses on recovering
+high level semantics (e.g. switch statments) once the CFG is known.
+Value Set Analysis. Balakrishnan and Reps [11] introduce a binary static
+analysis technique called VSA. They show both limitations and strengths of
+VSA when applied to binary reverse engineering. The method used by JTR
+extends their VSA by means of the SMT solving technique.
+
+190
+
+L. Cojocar et al.
+
+Brauer et al. [15] argues that SMT solving is eﬀective to do VSA but they do
+not leverage the memory contents’. To achieve good performance they perform
+liveness analysis of the Intermediate Representation (IR). This is not required
+by JTR as the expression set contains at any time the optimal set. Bounded
+values and k-set analysis were previously used by Bardin et al. [14] to recover
+indirect jumps. They exploit the locality of the indirect target computation.
+
+6
+
+Limitations
+
+Path Explosion. A large number of paths may exist from the targeted pointer
+to the start of the function. Building a dependency graph for each of them and
+subsequently solving it could lead to resource exhaustion. The deeper into the
+function’s CFG the program uses the pointer, the higher the chances of running
+into this problem. We ﬁnd that in practice, limiting the size of each path to 5
+LLVM basic blocks yields good results. To further optimize the running time,
+JTR solves the paths in ascending order: from the shortest to the longest.
+Code Discovery. The accuracy of the translator, although not a real contribution of this paper, directly inﬂuences the results of JTR. For instance, because
+the translator currently uses a static view of the program, it misses jump tables
+that the program populates at runtime. This is not a fundamental limitation
+and in future work, we will ﬁx it by feeding back the JTR results. Note that
+dynamic jump tables are not common in benign software, but it is not hard to
+imagine that future malware will make use of it, as an additional defense.
+Memory Layout and Program Correctness. JTR assumes that the input
+code is correct and that a memory map is available. While we can extract
+the memory map automatically using heuristics (e.g., read/write ordering [56]),
+guaranteeing the correctness of the program is hard. Conversely, JTR can be
+instructed to ﬁnd bugs. For instance, in Listing 1.5 we show one example in
+which JTR ﬁnds a previousely unreported bug (see also Sect. 4). We are conﬁdent that we can extend JTR to ﬁnd good candidates for memory violation
+errors.
+During the analysis, we should take special care when loading pointers that
+point to Input/Output (IO) memory. We cannot predict the value returned by
+load from an IO memory. The naive solution is to ignore the memory accesses
+to IO memory and treat them as invalid accesses. However, doing so may have
+a negative impact on the true positive rate of JTR in case an IO value is used
+to index a jump table.
+Memory Aliasing. Finally, the memory accesses generated by the LLVM
+translator can alias. When this happens the accuracy of the expressions stored
+in the nodes of the graph and of the path constraints decreases. The underlying
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+191
+
+reason is that JTR does not capture the aliasing information in SMT expressions. As future work, we will leverage the alias analysis already provided by
+LLVM to detect these cases.
+LLVM Translator. Like SecondWrite [7] and PIE [21], JTR builds on top of a
+binary-to-LLVM translator. The translator lifts the code to LLVM in a straightforward manner and JTR then analyzes the resulting code together with the
+memory image of the binary. Speciﬁcally, it uses weak heuristics for determining
+whether a function is in ARM mode or Thumb mode and occasionally misclassiﬁes them. In addition, the translator does not itself resolve the indirect jump
+targets and its recursive descent disassembly therefore misses code fragments.
+The solution for the latter problem would be to feed the results of the JTR
+analysis back to the translator to discover the targeted code, but doing so is a
+major engineering task, and we leave this for future work.
+Misclassifying a fragment’s mode (ARM or Thumb) and missing code fragments in the recursive descent both cause JTR to miss indirect jumps and hence
+the appropriate targets. We stress that these issues are a problem of the translator only and not of the JTR analysis. By construction, JTR will generate a
+solution for the targets of every indirect jump in its input.
+
+7
+
+Conclusion
+
+Jump tables on RISC architectures lead to frequent interleavings of (jump table)
+data and code in binaries. Most disassembler use pattern matching to detect such
+jump tables in binary code, which easily fails for complicated indirect control
+transfers. We argue that in speciﬁc security-relevant domains (handwritten code,
+ﬁrmware and malware), we need a more generic technique to handle the cases
+that elude common pattern matching. This paper proposed such a technique
+for “solving” jump targets for indirect control transfers. By transforming the
+targets to formulas that we solve in an SMT solver, we remove dependencies
+on templates, compilers, and processor architectures. The results show that our
+technique approaches and sometimes improves that of popular disassemblers
+that use pattern matching. JTR is available as an open source project: https://
+github.com/cojocar/jtr.
+Acknowledgments. We thank the anonymous reviewers for their feedback. This
+work was supported by the Netherlands Organisation for Scientiﬁc Research through
+the grant NWO 628.001.005 CYBSEC “OpenSesame” and through the grant NWO
+639.023.309 VICI “Dowsing”.
+
+192
+
+1
+
+L. Cojocar et al.
+
+SPEC Result Details
+
+Table 4. IDA results on SPEC binaries compiled with clang are depicted in the ﬁrst
+5 columns. The ﬁrst column represents the number of switch statement as reported
+by clang. We instrumented clang to tell if a switch statement was lowered to a jump
+table before code inlining takes place, thus the above 100% success rate on some cases
+for JTR. IDA misses most of the jump tables on clang. Column 3 and 4 show how the
+CFG beneﬁts from the newly discovered targets. The percentages are relative to the
+total number of edges and basic blocks. The results for SPEC when compiled with gcc
+are shown in the last two columns. Here JTR performs better than IDA on soplex.
+Testcase
+
+Clang IDA JTR
+
+Edges added
+
+BBs added
+
+IDA JTR
+
+namd
+
+1
+
+0
+
+0 (0.00%)
+
+0 (0.000%)
+
+0 (0.000%)
+
+1
+
+1 (100.00%)
+
+sphinx3
+
+2
+
+0
+
+2 (100.00%)
+
+9 (0.139%)
+
+0 (0.000%)
+
+2
+
+2 (100.00%)
+
+bzip2
+
+5
+
+0
+
+7 (140.00%)
+
+17 (0.502%)
+
+2 (0.084%)
+
+3
+
+3 (100.00%)
+
+milc
+
+2
+
+0
+
+3 (150.00%)
+
+23 (0.675%)
+
+3 (0.113%)
+
+4
+
+4 (100.00%)
+
+sjeng
+
+13
+
+0
+
+10 (76.92%)
+
+262 (4.248%)
+
+126 (3.000%)
+
+–
+
+–
+
+h264ref
+
+26
+
+0
+
+25 (96.15%)
+
+142 (0.794%)
+
+10 (0.079%)
+
+17
+
+17 (100.00%)
+
+soplex
+
+27
+
+0
+
+40 (148.15%)
+
+241 (1.641%)
+
+20 (0.183%)
+
+36
+
+40 (111.11%)
+
+cactusADM 36
+
+0
+
+34 (94.44%)
+
+1399 (6.819%) 766 (5.116%)
+
+34
+
+29 (85.29%)
+
+gromacs
+
+40
+
+0
+
+40 (100.00%)
+
+367 (1.685%)
+
+30 (0.192%)
+
+43
+
+41 (95.35%)
+
+calculix
+
+8
+
+1
+
+12 (150.00%)
+
+72 (0.141%)
+
+0 (0.000%)
+
+–
+
+–
+
+hmmer
+
+41
+
+0
+
+39 (95.12%)
+
+298 (2.327%)
+
+60 (0.658%)
+
+30
+
+26 (86.67%)
+
+wrf
+
+10
+
+10
+
+74 (740.00%)
+
+355 (0.433%)
+
+1 (0.002%)
+
+–
+
+–
+
+povray
+
+126
+
+0
+
+97 (76.98%)
+
+767 (2.153%)
+
+17 (0.064%)
+
+95
+
+75 (78.95%)
+
+gcc
+
+361
+
+0
+
+320 (88.64%)
+
+3467 (2.045%) 1038 (0.928%) 484 419 (86.57%)
+
+xalancbmk
+
+111
+
+0
+
+140 (126.13%) 1459 (1.265%) 414 (0.444%)
+
+–
+
+–
+
+gobmk
+
+19
+
+0
+
+17 (89.47%)
+
+219 (0.666%)
+
+36 (0.151%)
+
+–
+
+–
+
+omnetpp
+
+–
+
+–
+
+–
+
+–
+
+–
+
+15
+
+10 (66.67%)
+
+References
+1. IDA F.L.I.R.T. Technology: Overview
+2. Angr, Switch Statement Analysis 106, June 2016. https://github.com/angr/angr/
+issues/106
+3. Radare2, Analyze jump tables 3201, June 2016. https://github.com/radare/
+radare2/issues/3201
+4. Radare2, Portable reversing framework, June 2016. https://radare.org
+5. Retargetable Decompiler, June 2016. https://retdec.com/decompilation-run/
+6. Abadi, M., Budiu, M., Erlingsson, U., and Ligatti, J. Control-ﬂow integrity. In:
+CCS12 (2005)
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+193
+
+7. Anand, K., Smithson, M., Elwazeer, K., Kotha, A., Gruen, J., Giles, N., Barua, R.:
+A compiler-level intermediate representation based binary analysis and rewriting
+system. In: ECCS8, pp. 295–308 (2013)
+8. Anand, K., Smithson, M., Kotha, A., Elwazeer, K., Barua, R.: Decompilation to
+compiler high IR in a binary rewriter. Technical report, University of Maryland
+(2010)
+9. Arzt, S., Rasthofer, S., Fritz, C., Bodden, E., Bartel, A., Klein, J., Le Traon, Y.,
+Octeau, D., McDaniel, P.: Flowdroid: Precise context, ﬂow, ﬁeld, object-sensitive
+and lifecycle-aware taint analysis for android apps. In: ACM SIGPLAN (2014)
+10. Balakrishnan, G., Reps, T.: Analyzing memory accesses in x86 executables. In:
+Duesterwald, E. (ed.) CC 2004. LNCS, vol. 2985, pp. 5–23. Springer, Heidelberg
+(2004). doi:10.1007/978-3-540-24723-4 2
+11. Balakrishnan, G., Reps, T.: What you see is not what you execute. ACM Trans.
+Program. Lang. Syst. 32(6), 23:1–23:84 (2010)
+12. Bansal, S., Aiken, A.: Binary translation using peephole super optimizers. In: OSDI
+2008 (2008)
+13. Bao, T., Burket, J., Woo, M., Turner, R., Brumley, D. Byteweight: learning to
+recognize functions in binary code. In: USENIX Security 2014 (2014)
+14. Bardin, S., Herrmann, P., Védrine, F.: Reﬁnement-based CFG reconstruction from
+unstructured programs. In: Jhala, R., Schmidt, D. (eds.) VMCAI 2011. LNCS, vol.
+6538, pp. 54–69. Springer, Heidelberg (2011). doi:10.1007/978-3-642-18275-4 6
+15. Brauer, J., Hansen, R.R., Kowalewski, S., Larsen, K.G., Olesen, M.C.: Adaptable
+value-set analysis for low-level code. In: SSV 2012 (2012)
+16. Brumley, D., Jager, I., Avgerinos, T., Schwartz, E.J.: BAP: a binary analysis platform. In: Gopalakrishnan, G., Qadeer, S. (eds.) CAV 2011. LNCS, vol. 6806, pp.
+463–469. Springer, Heidelberg (2011). doi:10.1007/978-3-642-22110-1 37
+17. Brumley, D., Lee, J., Schwartz, E.J., Woo, M.: Native x86 decompilation using
+semantics-preserving structural analysis and iterative control-ﬂow structuring. In:
+USENIX SEC 2013 (2013)
+18. Castro, M., Costa, M., Martin, J.-P., Peinado, M., Akritidis, P., Donnelly, A.,
+Barham, P., Black, R.: Fast byte-granularity software fault isolation. In: SIGOPS
+2009 (2009)
+19. Cha, S.K., Woo, M., Brumley, D.: Program-adaptive mutational fuzzing. In: S&P
+2015 (2015)
+20. Cifuentes, C., Van Emmerik, M.: Recovery of jump table case statements from
+binary code. In: Program Comprehension (1999)
+21. Cojocar, L., Zaddach, J., Verdult, R., Bos, H., Francillon, A., Balzarotti, D.: Parser
+identiﬁcation in embedded systems. In: ACSAC 2015 (2015)
+22. Davi, L., Lehmann, D., Sadeghi, A.-R., Monrose, F.: Stitching the gadgets: on the
+ineﬀectiveness of coarse-grained control-ﬂow integrity protection. In: USENIX SEC
+2014 (2014)
+23. Di Federico, A., Payer, M., Agosta, G.: Rev.Ng: a uniﬁed binary analysis framework
+to recover CFGs and function boundaries. In: Proceedings of the 26th International
+Conference on Compiler Construction, CC 2017, pp. 131–141. ACM (2017)
+24. Durﬁna, L., Křoustek, J., Zemek, P., Kolávr, D., Hruska, T., Masarı́k, K., Meduna,
+A.: Design of a retargetable decompiler for a static platform-independent malware
+analysis. Int. J. Secur. Its Appl. 5(4), 91–106 (2011)
+25. Erlingsson, U., Abadi, M., Vrable, M., Budiu, M., Necula, G.: Software guards for
+system address spaces. In: OSDI 2006 (2006)
+
+194
+
+L. Cojocar et al.
+
+26. Evans, I., Long, F., Otgonbaatar, U., Shrobe, H., Rinard, M., Okhravi, H.,
+Sidiroglou-Douskos, S.: Control jujutsu: on the weaknesses of ﬁne-grained control
+ﬂow integrity. In: CCS 2015 (2015)
+27. Ford, B., Cox, R.: Vx32: lightweight user-level sandboxing on the x86. In: USENIX
+Annual Technical Conference
+28. Ganesh, V., Leek, T., Rinard, M.: Taint-based directed whitebox fuzzing. In: ICSE
+2009 (2009)
+29. Gedich, A., Lazdin, A.: Improved algorithm for identiﬁcation of switch tables in
+executable code. In: FRUCT 2015 (2015)
+30. Harris, L.C., Miller, B.P.: Practical analysis of stripped binary code. ACM
+SIGARCH Comput. Archit. News 33(5), 63–68 (2005)
+31. Holsti, N.: Analysing switch-case tables by partial evaluation. In: WCET (2007)
+32. Kinder, J., Veith, H.: Jakstab: a static analysis platform for binaries. In: Gupta,
+A., Malik, S. (eds.) CAV 2008. LNCS, vol. 5123, pp. 423–427. Springer, Heidelberg
+(2008). doi:10.1007/978-3-540-70545-1 40
+33. Kinder, J., Veith, H.: Precise static analysis of untrusted driver binaries. In:
+FMCAD 2010 (2010)
+34. Křoustek, J.: Retargetable Analysis of Machine Code. PhD thesis, Faculty of Information Technology, Brno University of Technology, CZ (2015)
+35. Kästner, D., Wilhelm, S.: Generic Control Flow Reconstruction from Assembly
+Code
+36. Li, Y., McCune, J., Newsome, J., Perrig, A., Baker, B., Drewry, W.: Minibox : a
+two-way sandbox for x86 native code. In: USENIX ATC 2014 (2014)
+37. McCabe, T.J.: A complexity measure. IEEE Softw. Eng. (1976)
+38. McCamant, S., Morrisett, G.: Evaluating SFI for a CISC architecture. In: USENIXSS 2006 (2006)
+39. Meng, X., Miller, B.: Binary code is not easy. In: ISSTA 2016 (2016)
+40. Microsoft. The Z3 Theorem Prover, February 2016. https://github.com/Z3Prover/
+z3
+41. Ming, J., Wu, D., Xiao, G., Wang, J., Liu, P. TaintPipe: pipelined symbolic taint
+analysis. In: USENIX SEC 2015 (2015)
+42. O’Sullivan, P., Anand, K., Kotha, A.: Retroﬁtting security in COTS software with
+binary rewriting. In: IFP SEC 2011 (2011)
+43. Reinbacher, T., Brauer, J.: Precise control ﬂow reconstruction using boolean logic.
+In: EMSOFT 2011 (2011)
+44. Sayle, R.A.: A superoptimizer analysis of multiway branch code generation. In:
+Proceedings of the GCC Developers Summit (2008)
+45. Sehr, D., Muth, R., Biﬄe, C. L., Khimenko, V., Pasko, E., Yee, B., Schimpf, K.,
+Chen, B.: Adapting software fault isolation to contemporary CPU architectures.
+In: USENIX SEC 2010 (2010)
+46. Shen, B.-Y., Chen, J.-Y., Hsu, W.-C., Yang, W.: An LLVM-based static binary
+translator. In: Proceedings of the 2012 International Conference on Compilers,
+Architectures and Synthesis for Embedded Systems, CASES 2012, pp. 51–60.
+ACM, New York (2012)
+47. Shin, Y., Williams, L.: An empirical model to predict security vulnerabilities using
+code complexity metrics. In: ESEM 2008 (2008)
+48. Shoshitaishvili, Y., Wang, R., Salls, C., Stephens, N., Polino, M., Dutcher, A.,
+Grosen, J., Feng, S., Hauser, C., Kruegel, C., Vigna, G.: SoK: (State of) the art of
+war: oﬀensive techniques in binary analysis. In: S&P 2016 (2016)
+49. Smithson, M., Anand, K., Kotha, A.: Binary rewriting without relocation information. Technical report. University of Maryland, November 2010
+
+JTR: A Binary Solution for Switch-Case Recovery
+
+195
+
+50. Tice, C., Roeder, T., Collingbourne, P., Checkoway, S., Erlingsson, U., Lozano,
+L., Pike, G.: Enforcing forward-edge control-ﬂow integrity in GCC & LLVM. In:
+USENIX SEC 2014 (2014)
+51. Tikir, M. M., Laurenzano, M., Carrington, L., Snavely, A.: PMaC binary instrumentation library for PowerPC/AIX. In: Workshop on Bin. Inst. and App. (2006)
+52. van der Veen, V., Andriesse, D., Göktaş, E., Gras, B., Sambuc, L., Slowinska, A.,
+Bos, H., Giuﬀrida, C.: Practical context-sensitive cﬁ. In: CCS 2015 (2015)
+53. Wang, S., Wang, P., Wu, D.: Reassembleable disassembling. In: USENIX SEC 2015
+(2015)
+54. Wang, X., Jhi, Y.-C., Zhu, S., Liu, P. Still : Exploit code detection via static taint
+and initialization analyses. In: ACSAC 2008 (2008)
+55. Yee, B., Sehr, D., Dardyk, G., Chen, J., Muth, R., Ormandy, T., Okasaka, S.,
+Narula, N., Fullagar, N.: Native client: a sandbox for portable, untrusted x86 native
+code. In: S&P 2009 (2009)
+56. Zaddach, J., Bruno, L., Francillon, A., Balzarotti, D.: A framework to support
+dynamic security analysis of embedded systems’ ﬁrmwares. In: NDSS 2014 (2014)
+57. Zeng, B., Tan, G., Morrisett, G.: Combining control-ﬂow integrity and static analysis for eﬃcient and validated data sandboxing. In: CCS18, pp. 29–40. ACM (2011)
+58. Zhang, M., Sekar, R.: Control ﬂow integrity for COTS binaries. In: USENIX SEC
+2013 (2013)
+
+

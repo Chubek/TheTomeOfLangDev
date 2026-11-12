@@ -1,0 +1,410 @@
+%%
+%% chapter-112.ltx — Causal Profiling and Performance Analysis
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:causal-intro}
+
+Performance profiling is one of the most important tools in the compiler
+developer's and systems programmer's arsenal.  By measuring where a program
+spends its time, profiling guides optimization decisions: which functions to
+inline, which loops to vectorize, which data structures to restructure.
+
+Traditional profiling tools---sampling profilers, call-graph profilers, and
+hardware performance counters---tell us \emph{where} a program spends its time.
+But they do not tell us \emph{how much it would help} to optimize a given
+location.  A function that consumes 30\% of the execution time might seem like
+an attractive optimization target, but if optimizing it would cause other parts
+of the program to become the bottleneck, the actual speedup may be far less than
+expected.
+
+\emph{Causal profiling}~\cite{curtsinger2013codepet} answers a different
+question: \emph{``What would be the effect of speeding up this specific piece of
+code by $x$\%?''}  By performing virtual speedup experiments---artificially
+slowing down all other code to simulate the effect of speeding up the target
+code---causal profiling reveals the \emph{causal} relationship between
+optimization efforts and performance improvements.
+
+This chapter develops the theory and practice of causal profiling
+(\cref{sec:causal-concept}), its implementation (\cref{sec:causal-impl}), its
+application to what-if analysis (\cref{sec:causal-whatif}), and its integration
+with compiler optimization (\cref{sec:causal-integration}).
+
+% ============================================================
+% Traditional Profiling Limitations
+% ============================================================
+\section{Traditional Profiling Limitations}\label{sec:causal-traditional}
+
+\subsection{Sampling Profilers}\label{sec:causal-sampling}
+
+\emph{Sampling profilers} periodically interrupt the program and record the
+current program counter.  The resulting profile shows the distribution of time
+across functions and code locations.
+
+\begin{definition}[Sampling Profile]\label{def:sampling-profile}
+A \emph{sampling profile} is a mapping $P : \mathit{Loc} \to \mathbb{N}$ where
+$P(l)$ is the number of samples that landed at location $l$.  The \emph{self
+time} of $l$ is $P(l) / N$ where $N$ is the total number of samples.
+\end{definition}
+
+\subsection{The Attribution Problem}\label{sec:causal-attribution}
+
+Traditional profiles suffer from the \emph{attribution problem}: the time
+attributed to a function may not reflect the potential benefit of optimizing it.
+
+\begin{example}[Attribution Problem]\label{ex:attribution}
+Consider a program with two phases: initialization (10\% of time) and
+computation (90\% of time).  Within computation, function $A$ takes 50\% and
+function $B$ takes 40\%.  A traditional profile shows $A$ as the hottest
+function.  But if $A$ is memory-bound (waiting for data) and $B$ is
+compute-bound, optimizing $B$ may yield a larger speedup than optimizing $A$.
+\end{example}
+
+\subsection{Amdahl's Law and Its Limitations}\label{sec:causal-amdahl}
+
+\emph{Amdahl's law} provides a theoretical upper bound on speedup:
+\[
+S(N) = \frac{1}{(1 - p) + p/N}
+\]
+where $p$ is the fraction of execution time that can be parallelized (or
+optimized) and $N$ is the speedup factor for that fraction.
+
+While Amdahl's law is correct, it requires knowing $p$---the fraction of time
+that would actually benefit from the optimization.  Traditional profilers do not
+directly provide this information.
+
+% ============================================================
+% Causal Profiling: Concept and Implementation
+% ============================================================
+\section{Causal Profiling: Concept and Implementation}\label{sec:causal-concept}
+
+\subsection{The Causal Profiling Idea}\label{sec:causal-idea}
+
+Causal profiling~\cite{curtsinger2013codepet} measures the \emph{causal effect}
+of optimizing a specific code location.  The key insight is that the effect of
+\emph{speeding up} code at location $l$ by factor $s$ is equivalent to
+\emph{slowing down} all other code by a compensating factor.
+
+\begin{definition}[Virtual Speedup]\label{def:virtual-speedup}
+A \emph{virtual speedup} of $s\%$ at location $l$ is achieved by inserting
+delays in all code \emph{except} at $l$, such that the program's total execution
+time increases by the amount that would be saved by speeding up $l$ by $s\%$.
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+  \begin{axis}[
+    xlabel={Virtual Speedup (\%)},
+    ylabel={Program Speedup (\%)},
+    xmin=0, xmax=100,
+    ymin=0, ymax=50,
+    width=10cm, height=7cm,
+    grid=both,
+    legend pos=north west,
+  ]
+    \addplot[thick, TomeInk, mark=*, mark size=1.5] coordinates {
+      (0, 0) (10, 3) (20, 6) (30, 9) (40, 12) (50, 15) (60, 18) (70, 21) (80, 24) (90, 27) (100, 30)
+    };
+    \addlegendentry{Function A (compute-bound)}
+    \addplot[thick, TomeGold, mark=square*, mark size=1.5] coordinates {
+      (0, 0) (10, 1) (20, 1.5) (30, 2) (40, 2.5) (50, 3) (60, 3.5) (70, 4) (80, 4.5) (90, 5) (100, 5)
+    };
+    \addlegendentry{Function B (memory-bound)}
+  \end{axis}
+\end{tikzpicture}
+\caption{Causal profile showing different optimization potential for two functions}\label{fig:causal-profile}
+\end{figure}
+
+\subsection{Implementation}\label{sec:causal-impl}
+
+Causal profiling is implemented by:
+
+\begin{enumerate}
+\item \textbf{Identifying the target:} Select a code location $l$ (e.g., a
+      function or a call site).
+\item \textbf{Inserting delays:} At every \emph{other} code location, insert
+      delays that slow execution.  The delay at each location is proportional to
+      the time spent there.
+\item \textbf{Measuring:} Run the program with the delays and measure the total
+      execution time.  The difference from the baseline gives the causal effect.
+\item \textbf{Varying the speedup:} Repeat for different virtual speedup
+      percentages (10\%, 20\%, \ldots, 100\%) to produce a curve.
+\end{enumerate}
+
+\subsection{Delay Injection}\label{sec:causal-delay}
+
+The key implementation challenge is injecting delays without significantly
+distorting the program's behavior.  \textsc{CodePet}~\cite{curtsinger2013codepet}
+uses two approaches:
+
+\begin{itemize}
+\item \textbf{Thread-based delays:} For multi-threaded programs, delay threads
+      that are not executing the target code.  This works because threads that
+      are not making progress do not affect the program's critical path.
+\item \textbf{Signal-based delays:} For single-threaded programs, use timer
+      signals to periodically pause execution outside the target code.
+\end{itemize}
+
+\subsection{Correctness of Causal Profiling}\label{sec:causal-correctness}
+
+\begin{theorem}[Causal Profiling Correctness]\label{thm:causal-correct}
+If a virtual speedup of $s\%$ at location $l$ results in a measured program
+speedup of $r\%$, then actually speeding up $l$ by $s\%$ would result in a
+program speedup of approximately $r\%$, assuming:
+\begin{enumerate}
+\item The program's behavior is deterministic.
+\item The delays do not change the program's scheduling or synchronization
+      behavior.
+\item The speedup at $l$ does not change the program's control flow.
+\end{enumerate}
+\end{theorem}
+
+\begin{caution}
+Causal profiling makes assumptions that may not hold for all programs.
+Non-deterministic programs, programs with complex synchronization, and programs
+where optimization changes control flow may produce misleading causal profiles.
+The results should be interpreted as \emph{estimates} rather than guarantees.
+\end{caution}
+
+% ============================================================
+% Performance Experiments
+% ============================================================
+\section{Performance Experiments}\label{sec:causal-experiments}
+
+\subsection{Designing Experiments}\label{sec:causal-design}
+
+A causal profiling experiment consists of:
+\begin{itemize}
+\item \textbf{Target selection:} Which code locations to profile.
+\item \textbf{Speedup range:} The range of virtual speedups to test (typically
+      0--100\%).
+\item \textbf{Workload:} The input(s) to the program.
+\item \textbf{Measurement:} How to measure the program's performance
+      (throughput, latency, etc.).
+\end{itemize}
+
+\subsection{Interpreting Results}\label{sec:causal-interpret}
+
+The output of causal profiling is a set of curves, one per code location,
+showing the program speedup as a function of the virtual speedup at that
+location.
+
+\begin{itemize}
+\item \textbf{Steep curve:} Optimizing this location yields large benefits.
+      This is a good optimization target.
+\item \textbf{Flat curve:} Optimizing this location yields little benefit.
+      The bottleneck is elsewhere.
+\item \textbf{Concave curve:} The benefit decreases as the speedup increases,
+      indicating that other bottlenecks emerge.
+\item \textbf{Linear curve:} The benefit scales proportionally with the speedup.
+\end{itemize}
+
+\subsection{Comparison with Traditional Profiling}\label{sec:causal-comparison}
+
+\begin{table}[htbp]
+\caption{Traditional vs.\ Causal Profiling}\label{tab:causal-compare}
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Aspect} & \textbf{Traditional} & \textbf{Causal} \\
+\hline
+Question answered & Where is time spent? & What should I optimize? \\
+Output & Hot spots & Speedup curves \\
+Overhead & Low (sampling) & Higher (delay injection) \\
+Handles bottlenecks & Indirectly & Directly \\
+Applicable to & All programs & Programs with measurable workloads \\
+\hline
+\end{tabular}
+\end{table}
+
+% ============================================================
+% What-If Analysis
+% ============================================================
+\section{What-If Analysis}\label{sec:causal-whatif}
+
+\subsection{Hypothetical Optimizations}\label{sec:causal-hypothetical}
+
+Causal profiling enables \emph{what-if analysis}: asking ``what if I could make
+this code $x$\% faster?'' without actually implementing the optimization.  This
+is valuable for prioritizing optimization efforts:
+
+\begin{itemize}
+\item ``What if I could vectorize this loop?'' (virtual speedup: 4--8$\times$)
+\item ``What if I could eliminate this lock?'' (virtual speedup: 100\% for the
+      critical section)
+\item ``What if I could improve cache hit rate by 50\%?'' (virtual speedup
+      proportional to memory latency reduction)
+\end{itemize}
+
+\subsection{Cost--Benefit Analysis}\label{sec:causal-cost-benefit}
+
+By combining causal profiling with estimates of optimization cost, developers
+can perform \emph{cost--benefit analysis}:
+
+\[
+\mathit{ROI} = \frac{\mathit{expected\_speedup} \times \mathit{usage\_frequency}}{\mathit{optimization\_cost}}
+\]
+
+Causal profiling provides the $\mathit{expected\_speedup}$ component; the
+developer estimates the cost and usage frequency.
+
+% ============================================================
+% Integration with Compiler Optimization
+% ============================================================
+\section{Integration with Compiler Optimization}\label{sec:causal-integration}
+
+\subsection{Profile-Guided Optimization with Causal Profiles}\label{sec:causal-pgo}
+
+Causal profiles can guide compiler optimization decisions:
+
+\begin{itemize}
+\item \textbf{Inlining decisions:} Prioritize inlining functions with steep
+      causal profiles (high optimization potential).
+\item \textbf{Loop optimization:} Prioritize optimizing loops with steep causal
+      profiles.
+\item \textbf{Code layout:} Place code with high causal impact in hot code
+      regions.
+\end{itemize}
+
+\subsection{Feedback-Directed Causal Profiling}\label{sec:causal-feedback}
+
+An iterative approach combines causal profiling with optimization:
+\begin{enumerate}
+\item Run causal profiling to identify the best optimization target.
+\item Apply the optimization.
+\item Re-run causal profiling on the optimized program.
+\item Repeat until no significant optimization opportunities remain.
+\end{enumerate}
+
+\subsection{Automated Optimization Selection}\label{sec:causal-auto}
+
+In principle, causal profiling can be used to automatically select
+optimizations:
+\begin{enumerate}
+\item For each available optimization, estimate its virtual speedup at the
+      affected code locations.
+\item Use the causal profile to predict the program speedup.
+\item Apply the optimization with the highest predicted benefit.
+\end{enumerate}
+
+This approach requires a cost model that maps optimizations to virtual speedups,
+which is challenging but feasible for certain classes of optimizations (e.g.,
+vectorization, where the speedup can be estimated from the instruction mix).
+
+\begin{insight}
+Causal profiling shifts the focus of performance analysis from \emph{observation}
+(where does the program spend time?) to \emph{intervention} (what happens if I
+change this?).  This causal perspective is more aligned with the goals of
+optimization: we do not just want to know where time is spent; we want to know
+where time \emph{can be saved}.  The connection to causal inference in
+statistics and the potential for integrating causal profiling with machine
+learning-based optimization are exciting directions for future research.
+\end{insight}
+
+% ============================================================
+% Tools and Methodologies
+% ============================================================
+\section{Tools and Methodologies}\label{sec:causal-tools}
+
+\subsection{CodePet}\label{sec:causal-codepet}
+
+\textsc{CodePet}~\cite{curtsinger2013codepet} is the original causal profiling
+tool.  It works with multi-threaded C/C++ programs, using thread-based delay
+injection to perform virtual speedup experiments.
+
+\subsection{Other Approaches}\label{sec:causal-other}
+
+\begin{itemize}
+\item \textbf{Perf} (Linux): Traditional sampling profiler; can be combined
+      with causal analysis.
+\item \textbf{Intel VTune}: Hardware performance counter profiling; provides
+      detailed micro-architectural analysis.
+\item \textbf{Coz}~\cite{curtsinger2015coz}: An improved causal profiler that
+      uses causal invariants to reduce the overhead of delay injection.
+\end{itemize}
+
+\begin{historical}
+Causal profiling was introduced by Curtsinger and Berger~\cite{curtsinger2013codepet}
+in 2013 with the \textsc{CodePet} tool.  The follow-up work \textsc{Coz}
+(Causal Profiler)~\cite{curtsinger2015coz} improved the technique by using
+\emph{causal invariants}---program points whose execution count is invariant
+under the virtual speedup---to reduce the overhead and improve the accuracy of
+causal profiles.  Causal profiling represents a shift in performance analysis
+from observational to interventional methods, drawing on ideas from causal
+inference in statistics and the potential outcomes framework.
+\end{historical}
+
+% ============================================================
+% Theoretical Foundations
+% ============================================================
+\section{Theoretical Foundations}\label{sec:causal-theory}
+
+\subsection{Causal Inference and Performance}\label{sec:causal-inference}
+
+Causal profiling draws on the framework of \emph{causal inference} from
+statistics and epidemiology.  The key concept is the \emph{potential outcomes}
+framework (also known as the Rubin causal model):
+
+\begin{definition}[Potential Outcomes]\label{def:potential-outcomes}
+For a program $P$ and a code location $l$, let $T(P, l, s)$ be the execution
+time of $P$ when $l$ is sped up by $s\%$.  The \emph{causal effect} of
+optimizing $l$ by $s\%$ is:
+\[
+\Delta(P, l, s) = T(P, l, 0) - T(P, l, s)
+\]
+The \emph{fundamental problem of causal inference} is that we can never observe
+both $T(P, l, 0)$ and $T(P, l, s)$ for the same execution---we must estimate
+the counterfactual.
+\end{definition}
+
+Causal profiling estimates the counterfactual by using virtual speedup: slowing
+down all other code to simulate the effect of speeding up $l$.
+
+\subsection{Connection to Amdahl's Law}\label{sec:causal-amdahl-connection}
+
+The causal profile curve for a location $l$ is related to Amdahl's law.  If $p$
+is the fraction of execution time that is truly dependent on $l$, then the
+causal profile follows:
+\[
+\mathit{speedup}(s) = \frac{1}{(1 - p) + p / (1 + s/100)}
+\]
+Fitting this curve to the observed causal profile yields an estimate of $p$,
+the \emph{optimization potential} of location $l$.
+
+\subsection{Limitations}\label{sec:causal-limitations}
+
+Causal profiling has several theoretical limitations:
+\begin{itemize}
+\item \textbf{Non-compositionality:} The combined effect of optimizing two
+      locations may differ from the sum of their individual effects (due to
+      interactions and shifting bottlenecks).
+\item \textbf{Scheduling sensitivity:} The results may depend on the OS
+      scheduler, especially for multi-threaded programs.
+\item \textbf{Phase behavior:} Programs with distinct phases may have different
+      causal profiles in different phases.
+\end{itemize}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:causal-summary}
+
+Causal profiling provides a principled approach to performance analysis that
+directly answers the question developers care about: ``What should I optimize?''
+By performing virtual speedup experiments, causal profiling reveals the causal
+relationship between local optimizations and global performance improvements.
+
+Key open challenges include:
+\begin{itemize}
+\item \textbf{Scalability:} Reducing the overhead of causal profiling for large
+      programs.
+\item \textbf{Non-determinism:} Handling programs with non-deterministic behavior.
+\item \textbf{Compiler integration:} Automatically using causal profiles to
+      guide optimization decisions.
+\item \textbf{Multi-dimensional optimization:} Extending causal profiling to
+      handle trade-offs between multiple objectives (time, energy, memory).
+\end{itemize}

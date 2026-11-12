@@ -1,0 +1,722 @@
+%%
+%% chapter-57.ltx — Graph-Based IR and Sea of Nodes
+%%
+
+\label{ch:graph-ir}
+
+Graph-based intermediate representations abandon the linear instruction sequence in favor of an unordered graph where nodes represent operations and edges represent data and control dependencies. The most prominent variant is the \emph{sea of nodes}, where all operations---including control flow---float freely in a graph, scheduled only when needed. This chapter develops the theory and practice of graph-based IRs, from value graphs to full sea-of-nodes implementations.
+
+%% ============================================================
+%% Section 57.1
+%% ============================================================
+\section{Value Graphs and Data-Flow Graphs}\label{sec:value-graphs}
+
+A \emph{value graph} (or \emph{data-flow graph}) represents a program as a directed graph where nodes are operations and edges carry values.
+
+\subsection{Structure}\label{sec:value-graph-structure}
+
+\begin{definition}[Value Graph]\label{def:value-graph}
+A \emph{value graph} is a directed graph $G = (N, E)$ where:
+\begin{itemize}
+  \item Each node $n \in N$ represents an operation (addition, load, call, etc.) or a constant.
+  \item Each edge $(u, v) \in E$ represents a data dependency: $v$ uses the result of $u$.
+  \item Each edge is labeled with an operand position (first argument, second argument, etc.).
+\end{itemize}
+\end{definition}
+
+\begin{verbatim}
+  // Source:
+  x = a + b
+  y = x * 2
+  z = y - a
+
+  // Value graph:
+  // a ----\
+  //        +---> [x: +] ---> [y: *] ---> [z: -]
+  // b ----/          |          |             ^
+  //                  |    2 ---/              |
+  //                  |                        |
+  //                  +---- a ----------------/
+\end{verbatim}
+
+\subsection{Advantages over Linear IR}\label{sec:value-graph-advantages}
+
+\begin{itemize}
+  \item \textbf{Explicit dependencies.} Data dependencies are represented as edges, not implicit in instruction ordering.
+  \item \textbf{Common subexpression elimination.} Identical operations can be merged (shared nodes).
+  \item \textbf{Dead code elimination.} Nodes with no consumers (except side-effecting nodes) can be removed.
+  \item \textbf{Reordering freedom.} Operations can be reordered freely as long as dependencies are respected.
+\end{itemize}
+
+\subsection{Limitations}\label{sec:value-graph-limits}
+
+Pure value graphs cannot represent:
+\begin{itemize}
+  \item \textbf{Control flow.} Conditional branches, loops, and exceptions require additional structure.
+  \item \textbf{Side effects.} Operations with side effects (stores, calls) require ordering constraints.
+  \item \textbf{Memory.} Memory operations require alias information to determine dependencies.
+\end{itemize}
+
+%% ============================================================
+%% Section 57.2
+%% ============================================================
+\section{Sea of Nodes Representation}\label{sec:sea-of-nodes}
+
+The \emph{sea of nodes} extends value graphs to include control flow and side effects in a single graph.
+
+\subsection{Core Idea}\label{sec:sea-core}
+
+In a sea of nodes, \emph{all} operations are nodes in a single graph. There is no distinction between ``instructions'' and ``control flow''---both are nodes connected by edges.
+
+\begin{itemize}
+  \item \textbf{Data nodes.} Arithmetic operations, loads, constants.
+  \item \textbf{Control nodes.} If, loop, return, region (merge point).
+  \item \textbf{Phi nodes.} Merge data values at control-flow join points.
+  \item \textbf{Projection nodes.} Extract results from multi-output operations (e.g., the value from a load that also produces a memory state).
+\end{itemize}
+
+\subsection{Control and Data Edges}\label{sec:control-data-edges}
+
+The sea of nodes uses two kinds of edges:
+\begin{itemize}
+  \item \textbf{Data edges.} Represent value dependencies. A data edge from $u$ to $v$ means $v$ uses the value produced by $u$.
+  \item \textbf{Control edges.} Represent control dependencies. A control edge from $u$ to $v$ means $v$ executes after $u$.
+\end{itemize}
+
+\begin{verbatim}
+  // Source:
+  if (cond) {
+    x = a + b;
+  } else {
+    x = a - b;
+  }
+  return x;
+
+  // Sea of nodes:
+  // [Start] --control--> [If: cond]
+  // [If] --true--> [TrueRegion]
+  // [If] --false--> [FalseRegion]
+  // [TrueRegion] --control--> [Add: a, b]
+  // [FalseRegion] --control--> [Sub: a, b]
+  // [TrueRegion] --data--> [Phi]
+  // [FalseRegion] --data--> [Phi]
+  // [Phi] --data--> [Return]
+\end{verbatim}
+
+\subsection{Regions and Phi Nodes}\label{sec:regions-phi}
+
+\emph{Region} nodes represent control-flow merge points (analogous to basic blocks in a CFG). \emph{Phi} nodes select data values based on which control path was taken.
+
+\begin{verbatim}
+  // Region node: merges control from two predecessors
+  Region(pred1, pred2)
+
+  // Phi node: selects data based on control path
+  Phi(region, value_from_pred1, value_from_pred2)
+\end{verbatim}
+
+A phi node is associated with a region node. When control arrives at the region from predecessor $i$, the phi node produces the value from predecessor $i$.
+
+%% ============================================================
+%% Section 57.3
+%% ============================================================
+\section{Phi Nodes in Sea of Nodes}\label{sec:phi-sea}
+
+In the sea of nodes, phi nodes are first-class nodes, just like arithmetic operations.
+
+\subsection{Phi Node Semantics}\label{sec:phi-sea-sem}
+
+A phi node $p = \phi(r, v_1, v_2)$ is associated with a region $r$ that has two control inputs. If the region was entered from its first control input, $p$ produces $v_1$; if from the second, $p$ produces $v_2$.
+
+\subsection{Phi Node Optimization}\label{sec:phi-sea-opt}
+
+Phi nodes in the sea of nodes can be optimized:
+\begin{itemize}
+  \item \textbf{Phi identity.} If all data inputs are the same, the phi node is replaced by that value.
+  \item \textbf{Phi cycle.} If a phi node references itself (through a loop), it represents a loop-carried value.
+  \item \textbf{Phi hoisting.} If a phi node's inputs are loop-invariant, the phi can be moved out of the loop.
+\end{itemize}
+
+%% ============================================================
+%% Section 57.4
+%% ============================================================
+\section{Scheduling from Unordered Graphs}\label{sec:scheduling}
+
+The sea of nodes is unordered: operations can be scheduled in any order that respects dependencies. \emph{Scheduling} assigns each node to a position in a linear instruction sequence.
+
+\subsection{Global Code Motion}\label{sec:global-code-motion}
+
+Click's \emph{global code motion} algorithm~\cite{click1995} schedules nodes by:
+\begin{enumerate}
+  \item \textbf{Earliest placement.} Move each node as early as possible (to the beginning of its earliest dominating region).
+  \item \textbf{Latest placement.} Move each node as late as possible (to the end of its latest dominated region, just before its first use).
+  \item \textbf{Block assignment.} Assign each node to a basic block based on its scheduled position.
+\end{enumerate}
+
+\subsection{List Scheduling}\label{sec:list-scheduling}
+
+\emph{List scheduling} is a simpler approach:
+\begin{enumerate}
+  \item Start from the entry node.
+  \item At each step, select a node whose dependencies are all satisfied.
+  \item Use a heuristic (e.g., longest path to exit) to break ties.
+  \item Emit the node and update the set of ready nodes.
+\end{enumerate}
+
+\subsection{Scheduling with Resource Constraints}\label{sec:scheduling-resources}
+
+Real processors have resource constraints (limited functional units, instruction issue width). Scheduling must respect these constraints:
+
+\begin{itemize}
+  \item \textbf{Latency.} Operations have different latencies; the scheduler must respect them.
+  \item \textbf{Throughput.} The processor can issue only a limited number of instructions per cycle.
+  \item \textbf{Functional units.} Different operations require different functional units (ALU, FPU, load/store).
+\end{itemize}
+
+%% ============================================================
+%% Section 57.5
+%% ============================================================
+\section{Advantages for Optimization}\label{sec:sea-advantages}
+
+The sea of nodes offers several advantages for optimization:
+
+\subsection{Global Value Numbering}\label{sec:gvn}
+
+\emph{Global value numbering} (GVN) identifies computations that produce the same value, even across basic blocks. In the sea of nodes, this is natural: two nodes with the same operation and the same inputs are the same computation and can be merged.
+
+\subsection{Redundant Load Elimination}\label{sec:load-elimination}
+
+If a load is dominated by another load with the same address and no intervening store, the second load can be replaced by the first. In the sea of nodes, this is a simple pattern match on the graph.
+
+\subsection{Partial Redundancy Elimination}\label{sec:pre}
+
+\emph{Partial redundancy elimination} (PRE) moves computations to avoid redundant execution. In the sea of nodes, PRE is implemented by \emph{lazy code motion}: operations float to their optimal position in the graph.
+
+\subsection{Speculative Optimization}\label{sec:speculative}
+
+The sea of nodes supports speculative optimization: operations can be moved speculatively (before the check that makes them safe) and the check can be used to deoptimize if the speculation fails.
+
+\begin{insight}
+The sea of nodes' key insight is that the distinction between ``instructions'' and ``control flow'' is an artifact of linear representations. By representing everything as nodes in a graph, the optimizer can reason about the program's semantics without being constrained by the instruction ordering. The cost is complexity: the graph must be maintained carefully, and scheduling must be performed before code generation.
+\end{insight}
+
+%% ============================================================
+%% Section 57.6
+%% ============================================================
+\section{Implementations: Clip, Graal, V8}\label{sec:sea-implementations}
+
+\subsection{Clip (Click's Compiler)}\label{sec:clip}
+
+Cliff Click's Clip compiler~\cite{click1995} was the first to use a sea-of-nodes IR for a Java compiler. It demonstrated that the sea of nodes enables aggressive global optimizations, including GVN and PRE, that are difficult to implement in linear IRs.
+
+\subsection{Graal}\label{sec:graal}
+
+Graal (now GraalVM) uses a sea-of-nodes IR called the \emph{Graal IR}. Key features:
+\begin{itemize}
+  \item \textbf{Floating nodes.} Most operations float freely in the graph.
+  \item \textbf{Fixed nodes.} Side-effecting operations (stores, calls) are fixed to specific positions.
+  \item \textbf{Guard nodes.} Speculative checks (type checks, null checks) are represented as guard nodes that can be replaced by deoptimization.
+  \item \textbf{Partial escape analysis.} Objects that do not escape the method can be allocated on the stack or scalar-replaced.
+\end{itemize}
+
+\subsection{V8 TurboFan}\label{sec:turbofan}
+
+V8's TurboFan optimizing compiler uses a sea-of-nodes IR for JavaScript optimization. Key features:
+\begin{itemize}
+  \item \textbf{Speculative inlining.} Function calls are inlined speculatively, with deoptimization if the callee changes.
+  \item \textbf{Hidden class optimization.} Object property accesses are optimized based on the object's hidden class (shape).
+  \item \textbf{Typed IR.} Nodes carry type information (e.g., \texttt{Number}, \texttt{String}) that enables type-specialized code generation.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm and 1.5cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=TomeBg, font=\small},
+  arrow/.style={->, >=latex, thick, color=TomeInk}
+]
+  \node[block] (src) {Source (JS/Java)};
+  \node[block, below=of src] (sea) {Sea of Nodes};
+  \node[block, below left=1.2cm of sea] (opt) {Optimizations};
+  \node[block, below right=1.2cm of sea] (sched) {Scheduling};
+  \node[block, below=1.2cm of opt] (lir) {Linear IR};
+  \node[block, below=1.2cm of sched] (codegen) {Code Generation};
+
+  \draw[arrow] (src) -- (sea);
+  \draw[arrow] (sea) -- (opt);
+  \draw[arrow] (sea) -- (sched);
+  \draw[arrow] (opt) -- (lir);
+  \draw[arrow] (sched) -- (codegen);
+  \draw[arrow] (lir) -- (codegen);
+\end{tikzpicture}
+\caption{Sea-of-nodes compilation pipeline: the source is translated to a sea of nodes; optimizations transform the graph; scheduling linearizes it; code generation produces machine code.}\label{fig:sea-pipeline}
+\end{figure}
+
+\begin{historical}
+The sea of nodes was introduced by Cliff Click in his 1995 PhD thesis~\cite{click1995}, building on earlier work on value graphs and global code motion. The approach was adopted by the Java HotSpot compiler (C2) and later by Graal and V8 TurboFan. The sea of nodes' ability to unify data and control flow in a single graph, and to support aggressive global optimizations, has made it the preferred IR for high-performance just-in-time compilers.
+\end{historical}
+
+%% ============================================================
+%% Section 57.7
+%% ============================================================
+\section{Graph Maintenance and Incremental Updates}\label{sec:graph-maintenance}
+
+The sea of nodes requires careful maintenance of the graph structure as optimizations are applied. Each transformation must preserve the graph's invariants.
+
+\subsection{Graph Invariants}\label{sec:graph-invariants}
+
+The sea of nodes maintains several invariants:
+\begin{itemize}
+  \item \textbf{Dominance.} Each node is dominated by its control inputs. A node can only execute in a region that is dominated by its control predecessor.
+  \item \textbf{Single use of phi inputs.} Each phi node's input from a given predecessor is used exactly once.
+  \item \textbf{Type consistency.} Each node's inputs have types compatible with the node's requirements.
+  \item \textbf{No cycles (except loops).} The data dependency graph is acyclic, except for loop-carried dependencies through phi nodes.
+\end{itemize}
+
+\subsection{Node Replacement}\label{sec:node-replacement}
+
+When a node is optimized (e.g., constant-folded), it is replaced by its result. The replacement must update all uses of the old node:
+
+\begin{algorithm}[H]
+\caption{Node Replacement in Sea of Nodes}\label{alg:node-replacement}
+\begin{algorithmic}[1]
+\Function{Replace}{$old, new$}
+  \For{each use $u$ of $old$}
+    \State Replace the input of $u$ that references $old$ with $new$
+  \EndFor
+  \If{$old$ has no remaining uses}
+    \State Remove $old$ from the graph
+    \State \Comment{Recursively remove dead nodes}
+  \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Peephole Optimization on Graphs}\label{sec:graph-peephole}
+
+Graph peephole optimizations match patterns in the graph and replace them with simpler equivalents:
+
+\begin{verbatim}
+  // Pattern: add(x, 0) -> x
+  if (node is Add && node.right is Const(0)) {
+    replace(node, node.left);
+  }
+
+  // Pattern: mul(x, 1) -> x
+  if (node is Mul && node.right is Const(1)) {
+    replace(node, node.left);
+  }
+
+  // Pattern: load(store(addr, val), addr) -> val (if no aliasing)
+  if (node is Load && node.input is Store && node.addr == store.addr) {
+    replace(node, store.value);
+  }
+\end{verbatim}
+
+\subsection{Iterative Optimization}\label{sec:iterative-optimization}
+
+Optimizations are applied iteratively until a fixed point is reached:
+
+\begin{algorithm}[H]
+\caption{Iterative Graph Optimization}\label{alg:iterative-opt}
+\begin{algorithmic}[1]
+\Function{OptimizeGraph}{$G$}
+  \Repeat
+    \State $\mathrm{changed} \gets \mathrm{false}$
+    \For{each node $n$ in $G$}
+      \State $\mathrm{result} \gets \mathrm{try\_optimize}(n)$
+      \If{$\mathrm{result} \neq \mathrm{none}$}
+        \State $\mathrm{Replace}(n, \mathrm{result})$
+        \State $\mathrm{changed} \gets \mathrm{true}$
+      \EndIf
+    \EndFor
+  \Until{$\neg \mathrm{changed}$}
+  \State \Return $G$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+The iterative approach ensures that optimizations cascade: an early optimization may enable a later one that was not applicable before.
+
+\subsection{Worklist-Based Optimization}\label{sec:worklist-optimization}
+
+A more efficient approach uses a worklist to track nodes that need re-examination:
+
+\begin{itemize}
+  \item When a node is modified, add its uses to the worklist.
+  \item Process nodes from the worklist until it is empty.
+  \item This avoids re-examining nodes that have not changed.
+\end{itemize}
+
+%% ============================================================
+%% Section 57.8
+%% ============================================================
+\section{Comparison with SSA-Based IRs}\label{sec:sea-vs-ssa}
+
+The sea of nodes and SSA-based IRs represent two different approaches to the same problem.
+
+\begin{table}[htbp]
+\centering
+\caption{Sea of nodes vs. SSA-based IRs}\label{tab:sea-vs-ssa}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\hline
+\textbf{Property} & \textbf{Sea of Nodes} & \textbf{SSA-Based IR} \\
+\hline
+Structure & Unordered graph & Linear blocks + phi functions \\
+Scheduling & Deferred until code generation & Fixed by block ordering \\
+Optimization style & Graph rewriting & Pattern matching on linear code \\
+Global optimizations & Natural (GVN, PRE) & Require dataflow analysis \\
+Complexity & Higher (graph maintenance) & Lower (linear traversal) \\
+Adoption & JIT compilers (Graal, V8) & Static compilers (LLVM, GCC) \\
+\hline
+\end{tabular}
+\end{table}
+
+The sea of nodes excels at global optimizations because it represents the program as a single graph, free from the artificial constraints of block ordering. SSA-based IRs are simpler to implement and reason about, making them preferred for static compilation.
+
+\begin{insight}
+The choice between sea-of-nodes and SSA-based IRs often reflects the compilation context. JIT compilers, which must optimize quickly and aggressively, benefit from the sea of nodes' ability to perform global optimizations in a single pass. Static compilers, which can afford multiple optimization passes, prefer the simplicity and predictability of SSA-based IRs. The trend in modern compilers is toward hybrid approaches that combine the strengths of both.
+\end{insight}
+
+%% ============================================================
+%% Section 57.9 — Advanced Scheduling Algorithms
+%% ============================================================
+\section{Advanced Scheduling Algorithms}\label{sec:advanced-scheduling}
+
+Scheduling in the sea of nodes is the process of assigning each floating node to a concrete position in a linear instruction sequence while respecting data and control dependencies. The quality of the schedule directly affects the performance of the generated code: a good schedule minimizes register pressure, maximizes instruction-level parallelism, and respects the processor's resource constraints.
+
+\subsection{Earliest--Latest Scheduling Bounds}\label{sec:earliest-latest}
+
+For each node $n$ in the sea of nodes, we define two bounds on its legal placement:
+
+\begin{definition}[Scheduling Bounds]\label{def:sched-bounds}
+Given a sea-of-nodes graph $G$:
+\begin{itemize}
+  \item The \emph{earliest legal position} of $n$, denoted $\mathrm{earliest}(n)$, is the earliest region in the dominator tree where $n$ can be placed such that all of $n$'s inputs are available.
+  \item The \emph{latest legal position} of $n$, denoted $\mathrm{latest}(n)$, is the latest region where $n$ can be placed such that all of $n$'s uses are dominated by $n$'s placement.
+\end{itemize}
+The \emph{scheduling range} of $n$ is the interval $[\mathrm{earliest}(n), \mathrm{latest}(n)]$ in the dominator tree.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Compute Earliest Position}\label{alg:earliest}
+\begin{algorithmic}[1]
+\Function{ComputeEarliest}{$n$}
+  \If{$n$ is a control node (Region, If, Loop)}
+    \State \Return the region of $n$'s control input
+  \EndIf
+  \State $e \gets \mathrm{Start}$ \Comment{The entry region}
+  \For{each data input $d$ of $n$}
+    \State $e_d \gets \mathrm{region}(\mathrm{def}(d))$
+    \State $e \gets \mathrm{LCA}(e, e_d)$ \Comment{Lowest common ancestor in dominator tree}
+  \EndFor
+  \State \Return $e$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+The latest position is computed symmetrically by walking upward from the uses:
+
+\begin{algorithm}[H]
+\caption{Compute Latest Position}\label{alg:latest}
+\begin{algorithmic}[1]
+\Function{ComputeLatest}{$n$}
+  \If{$n$ has no uses}
+    \State \Return the region of $n$'s control input
+  \EndIf
+  \State $l \gets \mathrm{region}(\mathrm{first\_use}(n))$
+  \For{each use $u$ of $n$}
+    \State $r_u \gets \mathrm{region}(u)$
+    \State $l \gets \mathrm{LCA}(l, r_u)$
+  \EndFor
+  \State \Return $l$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Global Code Motion in Detail}\label{sec:gcm-detail}
+
+Click's global code motion algorithm~\cite{click1995} proceeds in three phases:
+
+\begin{enumerate}
+  \item \textbf{Phase 1: Compute earliest positions.} For each node, compute the earliest region where it can be legally placed. This is done bottom-up in the dominator tree.
+  \item \textbf{Phase 2: Compute latest positions.} For each node, compute the latest region. This is done top-down.
+  \item \textbf{Phase 3: Select positions.} For each node, choose a position within $[\mathrm{earliest}, \mathrm{latest}]$ using a heuristic.
+\end{enumerate}
+
+The position selection heuristic can optimize for different objectives:
+
+\begin{table}[htbp]
+\centering
+\caption{Scheduling heuristics and their objectives}
+\label{tab:sched-heuristics}
+\begin{tabular}{lp{5cm}p{4cm}}
+\hline
+\textbf{Heuristic} & \textbf{Strategy} & \textbf{Objective} \\
+\hline
+Earliest & Place at $\mathrm{earliest}(n)$ & Maximize parallelism \\
+Latest & Place at $\mathrm{latest}(n)$ & Minimize register pressure \\
+Balanced & Place at midpoint & Trade-off \\
+Speculative & Place before guard & Enable speculative execution \\
+Profile-guided & Use execution frequency & Minimize expected cost \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Schedule Selection with Cost Models}\label{sec:cost-models}
+
+Modern schedulers use cost models to select the best position for each node:
+
+\begin{definition}[Schedule Cost Model]\label{def:cost-model}
+A \emph{schedule cost model} assigns a cost to each legal placement of a node. The total schedule cost is the sum of individual node costs:
+\[
+  C(S) = \sum_{n \in G} c(n, \mathrm{pos}(n))
+\]
+where $c(n, p)$ is the cost of placing node $n$ at position $p$.
+\end{definition}
+
+Cost factors include:
+\begin{itemize}
+  \item \textbf{Register pressure.} Placing a node far from its uses increases the number of simultaneously live values, increasing register pressure.
+  \item \textbf{Loop-invariant code motion.} Placing a node outside a loop (when possible) reduces execution frequency.
+  \item \textbf{Speculation.} Placing a node before a guard enables speculative execution but requires deoptimization on guard failure.
+  \item \textbf{Instruction latency.} Placing a node early allows its result to be ready when needed, hiding latency.
+\end{itemize}
+
+\subsection{Trace Scheduling}\label{sec:trace-scheduling}
+
+\emph{Trace scheduling} is a technique for scheduling the sea of nodes along the most likely execution path (the \emph{hot trace}):
+
+\begin{enumerate}
+  \item Identify the hot trace (the most frequently executed path through the graph).
+  \item Schedule nodes along the trace first, optimizing for the trace's execution.
+  \item For nodes not on the trace, insert compensation code at the trace's entry and exit points.
+  \item Schedule the remaining nodes for the cold paths.
+\end{enumerate}
+
+\begin{verbatim}
+  // Hot trace: entry -> A -> B -> C -> exit
+  // Cold path: entry -> A -> D -> exit
+  
+  // Schedule for hot trace:
+  //   [entry] -> [A] -> [B] -> [C] -> [exit]
+  //   (nodes scheduled to minimize latency on this path)
+  
+  // Compensation at D:
+  //   [D] needs a value computed in B (on hot trace)
+  //   Insert compensation code: recompute the value
+\end{verbatim}
+
+\subsection{Software Pipelining from the Sea of Nodes}\label{sec:software-pipelining}
+
+The sea of nodes enables \emph{software pipelining}: overlapping iterations of a loop to hide latencies. The scheduler can:
+\begin{itemize}
+  \item Identify loop-carried dependencies through phi nodes.
+  \item Determine the minimum initiation interval (MII) based on resource and recurrence constraints.
+  \item Schedule operations from different iterations in the same loop body.
+  \item Generate prologue and epilogue code for the pipelined loop.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.6cm and 0.8cm,
+  stage/.style={draw, fill=TomeBg, minimum width=1.2cm, minimum height=0.6cm, font=\tiny, align=center},
+  arr/.style={->, thick, >=stealth}
+]
+  % Iteration rows
+  \node[stage, fill=TomeExBg] (i0L) at (0, 2) {Load};
+  \node[stage, fill=TomeExBg] (i0A) at (1.5, 2) {Add};
+  \node[stage, fill=TomeExBg] (i0S) at (3, 2) {Store};
+  \node[stage, fill=TomeDefBg] (i1L) at (1.5, 1) {Load};
+  \node[stage, fill=TomeDefBg] (i1A) at (3, 1) {Add};
+  \node[stage, fill=TomeDefBg] (i1S) at (4.5, 1) {Store};
+  \node[stage, fill=TomeWarnBg] (i2L) at (3, 0) {Load};
+  \node[stage, fill=TomeWarnBg] (i2A) at (4.5, 0) {Add};
+  \node[stage, fill=TomeWarnBg] (i2S) at (6, 0) {Store};
+
+  \node[left=0.2cm of i0L, font=\tiny] {Iter 0};
+  \node[left=0.2cm of i1L, font=\tiny] {Iter 1};
+  \node[left=0.2cm of i2L, font=\tiny] {Iter 2};
+
+  \draw[arr, dashed, red] (i0L) -- (i1A);
+  \draw[arr, dashed, red] (i1L) -- (i2A);
+\end{tikzpicture}
+\caption{Software pipelining: operations from different iterations overlap in the scheduled loop body. Dashed red arrows show loop-carried dependencies.}
+\label{fig:software-pipelining}
+\end{figure}
+
+%% ============================================================
+%% Section 57.10 — Phi Node Handling in Depth
+%% ============================================================
+\section{Phi Node Handling in Depth}\label{sec:phi-depth}
+
+Phi nodes are the most subtle aspect of the sea of nodes. They represent the merging of data values at control-flow join points and must be handled carefully during optimization and scheduling.
+
+\subsection{Phi Node Classification}\label{sec:phi-classification}
+
+Phi nodes in the sea of nodes can be classified by their role:
+
+\begin{definition}[Phi Node Types]\label{def:phi-types}
+\begin{itemize}
+  \item \emph{Loop phi}: a phi node whose region is a loop header. One input comes from outside the loop (the initial value), and the other from inside the loop (the loop-carried value).
+  \item \emph{Join phi}: a phi node at a control-flow merge point (if-then-else). Each input comes from a different branch.
+  \item \emph{Trivial phi}: a phi node where all inputs are the same value. Can be replaced by that value.
+  \item \emph{Copy phi}: a phi node where one input is the phi itself (a self-loop). Represents a variable that is unchanged on one path.
+\end{itemize}
+\end{definition}
+
+\subsection{Phi Node Optimization Rules}\label{sec:phi-rules}
+
+The following optimization rules apply to phi nodes in the sea of nodes:
+
+\begin{table}[htbp]
+\centering
+\caption{Phi node optimization rules}
+\label{tab:phi-rules}
+\begin{tabular}{lp{5cm}p{4cm}}
+\hline
+\textbf{Rule} & \textbf{Pattern} & \textbf{Replacement} \\
+\hline
+Identity & $\phi(r, v, v, \ldots, v)$ & $v$ \\
+Copy & $\phi(r, v, \phi(r, v, \ldots))$ & $v$ \\
+Cycle & $\phi(r, v, \phi(r, \ldots, \phi))$ & Loop-carried value analysis \\
+Unused & $\phi$ with no data uses & Remove (if region is live) \\
+Redundant & $\phi_1 = \phi_2$ (same inputs) & Merge $\phi_1$ and $\phi_2$ \\
+Hoist & $\phi$ with loop-invariant inputs & Move phi before the loop \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Phi Resolution During Scheduling}\label{sec:phi-resolution}
+
+When the sea of nodes is scheduled into basic blocks, phi nodes must be resolved into copy instructions. This is the \emph{copy coalescing} problem:
+
+\begin{enumerate}
+  \item For each phi node $\phi(r, v_1, v_2)$ in region $r$:
+  \begin{itemize}
+    \item Insert a copy of $v_1$ to the phi's destination at the end of predecessor 1.
+    \item Insert a copy of $v_2$ to the phi's destination at the end of predecessor 2.
+  \end{itemize}
+  \item Use register allocation to coalesce the copies with the phi's destination, eliminating moves where possible.
+  \item Handle the \emph{swap problem}: when two phi nodes exchange values, insert swap sequences using temporary registers.
+\end{enumerate}
+
+\begin{verbatim}
+  // Before scheduling:
+  // Region R:
+  //   x = phi(R, a, b)    // x = a from pred1, b from pred2
+  //   y = phi(R, b, a)    // y = b from pred1, a from pred2
+  
+  // After scheduling (with copies):
+  // pred1:
+  //   tmp = x; x = a; y = tmp   // swap needed!
+  // pred2:
+  //   tmp = x; x = b; y = tmp   // swap needed!
+\end{verbatim}
+
+\subsection{Parallel Copy Resolution}\label{sec:parallel-copy}
+
+The phi resolution problem is equivalent to decomposing a \emph{parallel copy} into a sequence of sequential copies:
+
+\begin{definition}[Parallel Copy]\label{def:parallel-copy}
+A \emph{parallel copy} is a simultaneous assignment $(d_1, \ldots, d_n) \leftarrow (s_1, \ldots, s_n)$ where all reads happen before any writes. It must be decomposed into sequential copies using at most one temporary register.
+\end{definition}
+
+The decomposition algorithm constructs a \emph{copy graph} where each edge $s_i \to d_i$ represents a required copy. The graph decomposes into:
+\begin{itemize}
+  \item \textbf{Trees} (acyclic components): copies can be sequenced in topological order.
+  \item \textbf{Cycles}: require a temporary register to break the cycle.
+\end{itemize}
+
+%% ============================================================
+%% Section 57.11 — Detailed Comparison with SSA
+%% ============================================================
+\section{Detailed Comparison with SSA-Based IRs}\label{sec:detailed-ssa-comparison}
+
+While the sea of nodes and SSA-based IRs are often presented as alternatives, they share deep structural similarities. Understanding these similarities and differences is essential for compiler designers.
+
+\subsection{Structural Correspondence}\label{sec:structural-correspondence}
+
+\begin{theorem}[Sea-of-Nodes / SSA Correspondence]\label{thm:sea-ssa}
+Every sea-of-nodes graph can be converted to an equivalent SSA-form program by scheduling the graph into basic blocks and inserting phi nodes at join points. Conversely, every SSA-form program can be represented as a sea-of-nodes graph by ``floating'' the instructions out of their blocks.
+\end{theorem}
+
+The conversion from sea of nodes to SSA proceeds as follows:
+\begin{enumerate}
+  \item Schedule each node to a basic block.
+  \item For each phi node in the sea of nodes, generate a corresponding SSA phi function.
+  \item For each data edge crossing a block boundary, ensure the value is available (possibly through an SSA phi).
+\end{enumerate}
+
+\subsection{Optimization Power Comparison}\label{sec:opt-power}
+
+The key difference between the two representations lies in their optimization power:
+
+\begin{table}[htbp]
+\centering
+\caption{Optimization capabilities: sea of nodes vs.\ SSA}
+\label{tab:opt-power}
+\begin{tabular}{lcc}
+\hline
+\textbf{Optimization} & \textbf{Sea of Nodes} & \textbf{SSA IR} \\
+\hline
+Global value numbering & Natural (node identity) & Requires hash-based value numbering \\
+Partial redundancy elim. & Lazy code motion (automatic) & Requires PRE algorithm \\
+Loop-invariant code motion & Floating (automatic) & Requires LICM pass \\
+Speculative optimization & Guard nodes (natural) & Requires explicit checks \\
+Dead code elimination & Reachability (trivial) & Requires liveness analysis \\
+Common subexpression elim. & Node sharing (automatic) & Requires CSE pass \\
+Strength reduction & Graph rewriting & Requires pattern matching \\
+Induction variable elim. & Phi analysis & Requires IV recognition \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Hybrid Approaches}\label{sec:hybrid-approaches}
+
+Several modern compilers use hybrid approaches that combine elements of both:
+
+\begin{itemize}
+  \item \textbf{LLVM with sea-of-nodes extensions.} Some LLVM passes (e.g., NewGVN) use graph-based reasoning on top of the linear SSA IR.
+  \item \textbf{Graal's schedule-late approach.} Graal keeps nodes floating until late in the pipeline, then schedules them into a CFG for the final code generation.
+  \item \textbf{V8's Maglev.} V8's mid-tier compiler uses a CFG-based IR but with sea-of-nodes-inspired optimizations.
+  \item \textbf{Swift's SIL.} Swift Intermediate Language uses a hybrid representation with both SSA values and instruction-level operations.
+\end{itemize}
+
+\begin{insight}
+The fundamental insight is that the sea of nodes and SSA are not truly different representations---they are different points on a spectrum of ``floatingness.'' In SSA, instructions are fixed to basic blocks; in the sea of nodes, they float freely. The optimal point on this spectrum depends on the compilation context: JIT compilers benefit from maximum floatingness (to enable aggressive optimization in a single pass), while static compilers benefit from partial floatingness (to enable incremental optimization across multiple passes).
+\end{insight}
+
+\subsection{Converting Between Representations}\label{sec:converting-reps}
+
+The conversion between sea of nodes and SSA is not merely theoretical---it occurs in practice at the boundary between optimization and code generation:
+
+\begin{algorithm}[H]
+\caption{Sea of Nodes to SSA Conversion}\label{alg:sea-to-ssa}
+\begin{algorithmic}[1]
+\Function{SeaOfNodesToSSA}{$G$}
+  \State Schedule all nodes to basic blocks (Section~\ref{sec:scheduling})
+  \State Build the CFG from the scheduled blocks
+  \State Compute dominance frontiers
+  \For{each data edge $(u, v)$ crossing a block boundary}
+    \If{$u$'s block does not dominate $v$'s block}
+      \State Insert SSA phi functions at dominance frontiers
+    \EndIf
+  \EndFor
+  \State Rename variables to SSA form
+  \State \Return the SSA program
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+%% ============================================================
+%% Section 57.12
+%% ============================================================
+\section{Summary and Further Reading}\label{sec:summary-57}
+
+Graph-based IRs, particularly the sea of nodes, represent a fundamentally different approach to intermediate representation. By abandoning the linear instruction sequence in favor of an unordered graph, they enable optimizations that are difficult or impossible in linear IRs. The cost is complexity: the graph must be maintained, scheduled, and lowered to a linear form before code generation.
+
+Graph maintenance requires careful attention to invariants (dominance, type consistency, acyclicity). Iterative optimization with worklists enables cascading optimizations. The comparison with SSA-based IRs reveals a fundamental trade-off between optimization power and implementation simplicity.
+
+For further reading, we recommend Click's thesis~\cite{click1995}, the Graal compiler documentation~\cite{graal2024}, and the V8 TurboFan design document~\cite{turbofan2024}. The paper by Click and Cooper~\cite{click1995b} on global code motion provides the algorithmic foundation for scheduling in sea-of-nodes IRs.

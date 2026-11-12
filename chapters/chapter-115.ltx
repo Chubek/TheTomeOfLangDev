@@ -1,0 +1,445 @@
+%%
+%% chapter-115.ltx — Adaptive ABI Negotiation
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:abi-intro}
+
+The \emph{Application Binary Interface} (ABI) is the contract between separately
+compiled program components.  It defines the calling convention (how arguments
+are passed, how return values are returned), the memory layout of data types,
+the system call interface, and the object file format.  ABIs are the invisible
+infrastructure that makes it possible to link together code compiled by different
+compilers, at different times, possibly in different languages.
+
+Traditionally, ABIs are \emph{fixed}: once an ABI is defined for a platform, it
+cannot be changed without breaking binary compatibility with existing compiled
+code.  This rigidity has profound consequences:
+\begin{itemize}
+\item New features (e.g., new register usage, new calling conventions) cannot be
+      adopted without a transition period.
+\item Performance improvements that require ABI changes are delayed or abandoned.
+\item Different components of a system may be compiled with different
+      assumptions, leading to subtle incompatibilities.
+\end{itemize}
+
+\emph{Adaptive ABI negotiation} proposes a radical alternative: treat the ABI
+not as a fixed contract but as a \emph{negotiation} between the caller and the
+callee.  At each function call, the caller and callee discover each other's
+capabilities and agree on a mutually beneficial calling convention.  This
+enables:
+\begin{itemize}
+\item \textbf{Forward compatibility:} New calling conventions can be adopted
+      incrementally, without breaking old code.
+\item \textbf{Performance optimization:} Each call site can use the most
+      efficient calling convention available.
+\item \textbf{Feature detection:} Components can discover the capabilities of
+      their partners and adapt accordingly.
+\end{itemize}
+
+This chapter develops the theory and practice of adaptive ABI negotiation,
+from the conceptual framework (\cref{sec:abi-negotiation}) through runtime
+selection (\cref{sec:abi-runtime}) and feature detection (\cref{sec:abi-feature})
+to applications in library versioning and dynamic optimization
+(\cref{sec:abi-applications}).
+
+% ============================================================
+% ABI as a Negotiation
+% ============================================================
+\section{ABI as a Negotiation}\label{sec:abi-negotiation}
+
+\subsection{The Traditional ABI Model}\label{sec:abi-traditional}
+
+In the traditional model, the ABI is a fixed specification:
+
+\begin{definition}[Traditional ABI]\label{def:traditional-abi}
+An \emph{ABI} is a specification $A$ that defines:
+\begin{itemize}
+\item The \emph{calling convention}: which registers are used for arguments,
+      return values, and caller-saved/callee-saved values.
+\item The \emph{data layout}: the size, alignment, and field offsets of data
+      types.
+\item The \emph{object format}: the format of object files, symbol tables, and
+      relocation records.
+\item The \emph{system call interface}: the mechanism for invoking OS services.
+\end{itemize}
+All compiled code must conform to $A$; code compiled with different ABIs cannot
+be linked together.
+\end{definition}
+
+\subsection{Limitations of Fixed ABIs}\label{sec:abi-limitations}
+
+Fixed ABIs create several problems:
+
+\begin{itemize}
+\item \textbf{Inflexibility:} Once deployed, the ABI cannot be changed.
+      Performance improvements that require ABI changes must wait for the next
+      platform generation.
+\item \textbf{One-size-fits-all:} The same ABI is used for all call sites, even
+      when different calling conventions would be more efficient.
+\item \textbf{Version lock-in:} Libraries compiled with an old ABI cannot take
+      advantage of new features.
+\end{itemize}
+
+\subsection{The Negotiation Model}\label{sec:abi-negotiation-model}
+
+In the negotiation model, the ABI is a \emph{protocol} rather than a fixed
+specification:
+
+\begin{definition}[ABI Negotiation]\label{def:abi-negotiation}
+\emph{ABI negotiation} is a protocol by which a caller $C$ and a callee $D$
+agree on a calling convention at each call site.  The negotiation produces a
+\emph{call convention} $cc$ that specifies:
+\begin{itemize}
+\item How arguments are passed (registers, stack, or a combination).
+\item How return values are returned.
+\item Which registers are caller-saved and callee-saved.
+\item Any additional conventions (e.g., vector register usage, tag propagation).
+\end{itemize}
+\end{definition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, draw=TomeInk, fill=TomeBg, thick, minimum width=2.5cm, minimum height=1cm, align=center, rounded corners=2pt},
+  arr/.style={->, thick, TomeInk},
+  darr/.style={<->, thick, TomeGold},
+]
+  \node[box] (caller) {Caller\\(supports v2 ABI)};
+  \node[box, right=3cm of caller] (callee) {Callee\\(supports v3 ABI)};
+  \draw[darr] (caller) -- node[above, align=center] {Negotiate\\(agree on v2)} (callee);
+  \node[box, right=3cm of callee] (result) {Call using\\v2 convention};
+  \draw[arr] (callee) -- (result);
+\end{tikzpicture}
+\caption{ABI negotiation between caller and callee}\label{fig:abi-negotiation}
+\end{figure}
+
+% ============================================================
+% Runtime ABI Selection
+% ============================================================
+\section{Runtime ABI Selection}\label{sec:abi-runtime}
+
+\subsection{Multi-Version Functions}\label{sec:abi-multiversion}
+
+A \emph{multi-version function} is a function compiled in multiple variants, each
+using a different calling convention.  At run time, the appropriate variant is
+selected based on the caller's capabilities.
+
+\begin{definition}[Multi-Version Function]\label{def:multiversion}
+A \emph{multi-version function} $f$ is a set of implementations
+$\{f_1, f_2, \ldots, f_n\}$ where each $f_i$ uses calling convention $cc_i$.
+A \emph{dispatcher} selects the appropriate variant at each call site.
+\end{definition}
+
+\begin{example}[Multi-Version Function]\label{ex:multiversion}
+Consider a function \texttt{dot\_product} compiled in three variants:
+\begin{itemize}
+\item $f_1$: Standard ABI (arguments on stack).
+\item $f_2$: Extended ABI (arguments in registers, including vector registers).
+\item $f_3$: Capability ABI (arguments as capabilities with bounds).
+\end{itemize}
+A caller using the standard ABI calls $f_1$; a caller using the extended ABI
+calls $f_2$; and so on.
+\end{example}
+
+\subsection{Dispatch Mechanisms}\label{sec:abi-dispatch}
+
+Several mechanisms can implement the dispatch:
+
+\begin{itemize}
+\item \textbf{Indirect calls through a dispatch table:} Each function has a
+      table of entry points, one per calling convention.  The caller selects the
+      appropriate entry point.
+\item \textbf{PLT-based dispatch:} The Procedure Linkage Table (PLT) entry for
+      the function performs the dispatch based on the caller's ABI version.
+\item \textbf{Inline dispatch:} The compiler inlines the dispatch logic at each
+      call site, using compile-time knowledge of the caller's ABI version.
+\item \textbf{Tag-based dispatch:} The caller's ABI version is encoded in a tag
+      (e.g., a special register or a thread-local variable) that the callee
+      reads on entry.
+\end{itemize}
+
+\subsection{Overhead of Dispatch}\label{sec:abi-overhead}
+
+The overhead of ABI negotiation must be minimized:
+
+\begin{itemize}
+\item \textbf{Direct calls:} If the caller and callee are known at compile time
+      to use the same ABI, no dispatch is needed.
+\item \textbf{Cached dispatch:} The result of the first dispatch is cached, so
+      subsequent calls to the same callee use the cached convention.
+\item \textbf{Profile-guided dispatch:} The most common calling convention is
+      placed first in the dispatch table, minimizing branch mispredictions.
+\end{itemize}
+
+% ============================================================
+% Feature Detection and Dispatch
+% ============================================================
+\section{Feature Detection and Dispatch}\label{sec:abi-feature}
+
+\subsection{CPU Feature Detection}\label{sec:abi-cpu-feature}
+
+Modern processors support optional features (SIMD instruction sets, atomic
+instructions, cryptographic extensions).  The ABI negotiation can incorporate
+feature detection to select the best implementation:
+
+\begin{itemize}
+\item \textbf{Compile-time detection:} The compiler knows the target
+      architecture and generates code for the appropriate feature set.
+\item \textbf{Run-time detection:} The program queries the CPU at run time
+      (e.g., using \texttt{CPUID} on x86 or \texttt{getauxval} on Linux) to
+      discover available features.
+\item \textbf{OS-assisted detection:} The operating system provides feature
+      information through auxiliary vectors or capability registers.
+\end{itemize}
+
+\subsection{IFUNC: Indirect Functions}\label{sec:abi-ifunc}
+
+The GNU \texttt{IFUNC} (indirect function) mechanism allows a function's
+implementation to be selected at load time:
+
+\begin{verbatim}
+  // Resolver function: selects the implementation
+  void *resolve_dot_product(void) {
+    if (has_avx512()) return dot_product_avx512;
+    if (has_avx2())   return dot_product_avx2;
+    return dot_product_generic;
+  }
+
+  // IFUNC declaration
+  double dot_product(double *a, double *b, int n)
+    __attribute__((ifunc("resolve_dot_product")));
+\end{verbatim}
+
+IFUNC provides a form of ABI negotiation at load time, but the selection is
+fixed after loading---it cannot adapt to changing conditions.
+
+\subsection{Dynamic Feature Dispatch}\label{sec:abi-dynamic-dispatch}
+
+More flexible dispatch selects the implementation at each call, based on the
+current state:
+
+\begin{algorithm}[htbp]
+\caption{Dynamic Feature Dispatch}\label{alg:abi-dispatch}
+\begin{algorithmic}[1]
+\Require Function $f$ with variants $\{f_1, \ldots, f_n\}$, caller context $C$
+\Ensure Selected variant $f_i$
+\For{each $f_i$ in preference order}
+  \If{$C.\mathit{supports}(f_i.\mathit{requirements})$}
+    \State \Return $f_i$
+  \EndIf
+\EndFor
+\State \Return $f_{\mathit{fallback}}$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% Binary Compatibility
+% ============================================================
+\section{Binary Compatibility}\label{sec:abi-compat}
+
+\subsection{Compatibility Rules}\label{sec:abi-compat-rules}
+
+For ABI negotiation to work, the system must maintain \emph{binary
+compatibility}: old code must continue to work with new code.
+
+\begin{definition}[Binary Compatibility]\label{def:binary-compat}
+A new ABI version $A'$ is \emph{binary compatible} with an old version $A$ if:
+\begin{enumerate}
+\item Every calling convention in $A$ is also available in $A'$.
+\item Every data layout in $A$ is also valid in $A'$.
+\item Code compiled with $A$ can call code compiled with $A'$ and vice versa.
+\end{enumerate}
+\end{definition}
+
+\subsection{Extension, Not Modification}\label{sec:abi-extension}
+
+The key principle for maintaining binary compatibility is \emph{extension, not
+modification}: new ABI versions add new calling conventions and data layouts
+without removing or changing existing ones.
+
+\begin{itemize}
+\item \textbf{New registers:} New ABI versions may use additional registers for
+      argument passing, but must not change the usage of existing registers.
+\item \textbf{New data types:} New ABI versions may add new data types, but
+      must not change the layout of existing types.
+\item \textbf{New conventions:} New ABI versions may add new conventions (e.g.,
+      capability passing), but must support the old conventions.
+\end{itemize}
+
+\subsection{Compatibility Matrices}\label{sec:abi-matrix}
+
+A \emph{compatibility matrix} records which ABI versions can interoperate:
+
+\begin{table}[htbp]
+\caption{ABI Compatibility Matrix}\label{tab:abi-compat}
+\centering
+\begin{tabular}{lccc}
+\hline
+ & \textbf{v1} & \textbf{v2} & \textbf{v3} \\
+\hline
+\textbf{v1} & \checkmark & \checkmark & \checkmark \\
+\textbf{v2} & \checkmark & \checkmark & \checkmark \\
+\textbf{v3} & \checkmark & \checkmark & \checkmark \\
+\hline
+\end{tabular}
+\end{table}
+
+In this example, all versions are mutually compatible (each version supports
+all older calling conventions).
+
+% ============================================================
+% Forward-Compatible ABIs
+% ============================================================
+\section{Forward-Compatible ABIs}\label{sec:abi-forward}
+
+\subsection{Designing for the Future}\label{sec:abi-forward-design}
+
+A \emph{forward-compatible} ABI is designed to accommodate future extensions
+without breaking compatibility.  Key design principles include:
+
+\begin{itemize}
+\item \textbf{Reserved fields:} Include reserved fields in data structures that
+      can be used for future extensions.
+\item \textbf{Version tags:} Include version tags in function entry points and
+      data structures, allowing the runtime to detect the version.
+\item \textbf{Extensible calling conventions:} Define the calling convention in
+      a way that allows new argument types and return conventions to be added.
+\item \textbf{Negotiation protocols:} Include a negotiation protocol in the ABI
+      itself, so that new versions can be discovered and used automatically.
+\end{itemize}
+
+\subsection{The Role of Metadata}\label{sec:abi-metadata}
+
+ABI metadata---information about the calling convention, data layout, and
+feature requirements attached to each function and data type---is essential for
+adaptive negotiation:
+
+\begin{itemize}
+\item \textbf{Function metadata:} Records the calling conventions supported by
+      each function variant.
+\item \textbf{Type metadata:} Records the layout of each data type in each ABI
+      version.
+\item \textbf{Module metadata:} Records the ABI versions supported by each
+      compiled module.
+\end{itemize}
+
+\subsection{Negotiation Protocol}\label{sec:abi-protocol}
+
+A simple negotiation protocol:
+
+\begin{enumerate}
+\item The caller sends its ABI version and feature set to the callee.
+\item The callee selects the highest mutually supported version.
+\item The callee returns its selected version.
+\item The caller and callee use the negotiated convention for subsequent calls.
+\end{enumerate}
+
+This protocol can be implemented efficiently using a single register or a
+thread-local variable to carry the version information.
+
+% ============================================================
+% Applications
+% ============================================================
+\section{Applications}\label{sec:abi-applications}
+
+\subsection{Library Versioning}\label{sec:abi-versioning}
+
+Adaptive ABI negotiation enables \emph{fine-grained library versioning}:
+different versions of a library can coexist in the same process, and each call
+site uses the most appropriate version.
+
+\begin{example}[Library Versioning]\label{ex:lib-version}
+A process loads two versions of a math library:
+\begin{itemize}
+\item \texttt{libmath-v1.so}: Compiled with the standard ABI.
+\item \texttt{libmath-v2.so}: Compiled with an extended ABI that uses vector
+      registers for floating-point arguments.
+\end{itemize}
+Call sites compiled with the extended ABI call \texttt{libmath-v2.so} using
+vector registers; call sites compiled with the standard ABI call
+\texttt{libmath-v1.so} using the standard convention.  Both versions coexist
+in the same process.
+\end{example}
+
+\subsection{Dynamic Optimization}\label{sec:abi-dynamic-opt}
+
+Adaptive ABI negotiation enables \emph{dynamic optimization}: the calling
+convention can be changed at run time to adapt to changing conditions.
+
+\begin{itemize}
+\item \textbf{Hot-path optimization:} If a call site is identified as hot
+      (frequently executed), the system can recompile the caller and callee to
+      use a more efficient calling convention.
+\item \textbf{Context-sensitive optimization:} Different call sites can use
+      different calling conventions based on their specific needs (e.g., a call
+      inside a tight loop uses registers; a rare call uses the stack).
+\item \textbf{Adaptive optimization:} As the program's behavior changes (e.g.,
+      different inputs trigger different code paths), the calling conventions
+      can be adapted.
+\end{itemize}
+
+\subsection{Heterogeneous Systems}\label{sec:abi-heterogeneous}
+
+In heterogeneous systems (CPU + GPU, big.LITTLE, accelerators), different
+processing elements may have different ABIs.  Adaptive negotiation enables
+seamless communication between heterogeneous components:
+
+\begin{itemize}
+\item \textbf{CPU--GPU calls:} The calling convention for GPU offload is
+      negotiated based on the data layout and transfer mechanism.
+\item \textbf{big.LITTLE:} Calls between big and LITTLE cores may use different
+      calling conventions optimized for each core's register file.
+\item \textbf{Accelerator offload:} Calls to specialized accelerators (TPUs,
+      FPGAs) use conventions optimized for the accelerator's interface.
+\end{itemize}
+
+\begin{insight}
+Adaptive ABI negotiation represents a fundamental shift in how we think about
+the boundary between compiled components.  Rather than a rigid, fixed contract,
+the ABI becomes a flexible protocol that adapts to the capabilities and needs
+of the communicating components.  This is analogous to the way that network
+protocols negotiate parameters (e.g., TLS version negotiation, HTTP content
+negotiation).  The result is a more flexible, more efficient, and more
+forward-compatible system.
+\end{insight}
+
+\begin{historical}
+The idea of multiple calling conventions within a single system is not new:
+x86 has long supported multiple calling conventions (\texttt{cdecl},
+\texttt{stdcall}, \texttt{fastcall}, \texttt{vectorcall}), and compilers like
+GCC support function-specific calling conventions through attributes.  The
+GNU IFUNC mechanism~\cite{gnu-ifunc} provides load-time dispatch.  More recent
+work on \emph{multi-version functions} in LLVM and the \emph{capability ABI}
+in CHERI~\cite{watson2020cheri} push toward more flexible, negotiable ABIs.
+The concept of adaptive ABI negotiation as a unified framework is emerging from
+these individual efforts.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:abi-summary}
+
+Adaptive ABI negotiation transforms the ABI from a fixed contract into a
+flexible protocol, enabling forward compatibility, performance optimization, and
+heterogeneous computing.  By treating the calling convention as a negotiation
+rather than a mandate, the system can adapt to the capabilities of each
+component and the needs of each call site.
+
+Key open challenges include:
+\begin{itemize}
+\item \textbf{Overhead:} Minimizing the cost of dispatch and negotiation.
+\item \textbf{Complexity:} Managing the complexity of multiple calling
+      conventions and ABI versions.
+\item \textbf{Toolchain support:} Extending compilers, linkers, and debuggers
+      to support adaptive ABIs.
+\item \textbf{Standardization:} Developing standards for ABI negotiation
+      protocols.
+\item \textbf{Security:} Ensuring that ABI negotiation does not introduce
+      security vulnerabilities (e.g., through type confusion between ABI
+      versions).
+\end{itemize}

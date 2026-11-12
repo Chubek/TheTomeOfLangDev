@@ -1,0 +1,527 @@
+%%
+%% chapter-75.ltx — Loop Optimization
+%%
+
+\section{Introduction}\label{sec:loop-optimization-intro}
+
+Loops are the most performance-critical constructs in most programs. Profiling studies consistently show that 90\% or more of a program's execution time is spent in a small number of loops. Consequently, loop optimizations---transformations that improve the performance of loops---are among the most important optimizations a compiler can perform.
+
+This chapter covers the major loop optimization techniques: loop detection, loop-invariant code motion, induction variable elimination, loop unrolling, loop unswitching, loop fusion and fission, and software pipelining. These transformations exploit the regular structure of loops to improve instruction-level parallelism, reduce overhead, and enhance cache utilization.
+
+\section{Loop Detection and Classification}\label{sec:loop-detection}
+
+\subsection{Natural Loops}\label{sec:natural-loops}
+
+\begin{definition}[Natural Loop]\label{def:natural-loop}
+A \textbf{natural loop} is a set of nodes $N$ in a CFG with a \emph{header} node $h$ such that:
+\begin{enumerate}
+  \item $h$ dominates all nodes in $N$.
+  \item There is a back edge $n \to h$ for some $n \in N$.
+  \item $N$ is the smallest set satisfying these conditions.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Back Edge]\label{def:back-edge}
+An edge $n \to h$ is a \textbf{back edge} if $h$ dominates $n$. Back edges identify the loop headers.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Natural Loop Construction}
+\label{alg:natural-loop}
+\begin{algorithmic}[1]
+\Require CFG with dominator tree, back edge $n \to h$
+\Ensure Natural loop $L$ with header $h$
+\State $L \gets \{h, n\}$
+\State $\mathit{stack} \gets [n]$
+\While{$\mathit{stack} \neq \emptyset$}
+  \State $m \gets$ pop from $\mathit{stack}$
+  \ForAll{$p \in \mathit{pred}(m)$}
+    \If{$p \notin L$}
+      \State Add $p$ to $L$
+      \State Push $p$ onto $\mathit{stack}$
+    \EndIf
+  \EndFor
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Loop Nesting Forest}\label{sec:loop-nesting}
+
+\begin{definition}[Loop Nesting Forest]\label{def:loop-nesting-forest}
+The \textbf{loop nesting forest} represents the hierarchical containment of loops. If loop $L_1$ contains the header of loop $L_2$, then $L_2$ is nested inside $L_1$. The forest captures this containment structure.
+\end{definition}
+
+\subsection{Loop Classification}\label{sec:loop-classification}
+
+\begin{definition}[Loop Types]\label{def:loop-types}
+Loops can be classified by their structure:
+\begin{itemize}
+  \item \textbf{Reducible loop}: A natural loop with a single entry point (the header).
+  \item \textbf{Irreducible loop}: A loop with multiple entry points (requires edge splitting to reduce).
+  \item \textbf{Single-entry single-exit (SESE) region}: A region with one entry and one exit, suitable for many transformations.
+\end{itemize}
+\end{definition}
+
+\section{Loop-Invariant Code Motion}\label{sec:loop-licm}
+
+(See Section~\ref{sec:licm} for the detailed treatment.) Loop-invariant code motion moves computations that produce the same value in every iteration to before the loop, reducing redundant computation.
+
+\section{Induction Variable Elimination}\label{sec:induction-variable}
+
+\subsection{Basic Induction Variables}\label{sec:basic-iv}
+
+\begin{definition}[Induction Variable]\label{def:induction-var}
+A variable $x$ is an \textbf{induction variable} of a loop if it changes by a constant amount (or a loop-invariant amount) in each iteration. A \textbf{basic induction variable} is one that is modified only by assignments of the form $x = x + c$ or $x = x - c$ where $c$ is loop-invariant.
+\end{definition}
+
+\begin{definition}[Derived Induction Variable]\label{def:derived-iv}
+A variable $y$ is a \textbf{derived induction variable} if $y = a \cdot x + b$ where $x$ is an induction variable and $a, b$ are loop-invariant.
+\end{definition}
+
+\subsection{Strength Reduction of Induction Variables}\label{sec:iv-strength-reduction}
+
+\emph{Induction variable strength reduction} replaces expensive computations involving induction variables with cheaper incremental updates.
+
+\begin{example}[Induction Variable Strength Reduction]\label{ex:iv-sr}
+\begin{verbatim}
+  // Before:
+  i = 0;
+  while (i < n) {
+    a[i * 8] = 0;    // expensive: multiply in every iteration
+    i = i + 1;
+  }
+  
+  // After strength reduction:
+  i = 0;
+  t = 0;              // t = i * 8
+  while (i < n) {
+    a[t] = 0;         // cheap: use t directly
+    i = i + 1;
+    t = t + 8;        // cheap: increment instead of multiply
+  }
+\end{verbatim}
+\end{example}
+
+\subsection{Induction Variable Elimination}\label{sec:iv-elimination}
+
+If two induction variables have the same linear relationship throughout the loop, one can be eliminated:
+
+\begin{example}[IV Elimination]\label{ex:iv-elim}
+\begin{verbatim}
+  // Before:
+  i = 0; j = 0;
+  while (i < n) {
+    a[i] = b[j];
+    i = i + 1;
+    j = j + 1;
+  }
+  
+  // After: j is always equal to i, so eliminate j
+  i = 0;
+  while (i < n) {
+    a[i] = b[i];
+    i = i + 1;
+  }
+\end{verbatim}
+\end{example}
+
+\section{Loop Unrolling}\label{sec:loop-unrolling}
+
+\subsection{Overview}\label{sec:unrolling-overview}
+
+\emph{Loop unrolling} replicates the loop body multiple times, reducing the loop overhead (branch, counter update) and exposing more opportunities for instruction-level parallelism.
+
+\begin{definition}[Loop Unrolling]\label{def:loop-unrolling}
+\textbf{Loop unrolling} with factor $k$ replaces a loop with $n$ iterations by a loop with $\lceil n/k \rceil$ iterations, each executing $k$ copies of the original body.
+\end{definition}
+
+\begin{example}[Loop Unrolling by 4]\label{ex:unroll-4}
+\begin{verbatim}
+  // Before:
+  for (i = 0; i < n; i++) {
+    a[i] = b[i] + c[i];
+  }
+  
+  // After unrolling by 4:
+  for (i = 0; i < n - 3; i += 4) {
+    a[i]   = b[i]   + c[i];
+    a[i+1] = b[i+1] + c[i+1];
+    a[i+2] = b[i+2] + c[i+2];
+    a[i+3] = b[i+3] + c[i+3];
+  }
+  for (; i < n; i++) {   // cleanup loop for remaining iterations
+    a[i] = b[i] + c[i];
+  }
+\end{verbatim}
+\end{example}
+
+\subsection{Benefits and Costs}\label{sec:unrolling-tradeoffs}
+
+\begin{itemize}
+  \item \textbf{Benefits}: Reduced loop overhead, increased ILP, better instruction cache utilization (sometimes), more opportunities for further optimization.
+  \item \textbf{Costs}: Increased code size, potential instruction cache pressure, register pressure (more temporaries needed).
+\end{itemize}
+
+\section{Loop Unswitching}\label{sec:loop-unswitching}
+
+\emph{Loop unswitching} moves a loop-invariant conditional from inside a loop to outside, creating two copies of the loop.
+
+\begin{definition}[Loop Unswitching]\label{def:loop-unswitching}
+\textbf{Loop unswitching} transforms:
+\begin{verbatim}
+  while (cond1) {
+    if (cond2) {  // loop-invariant
+      S1;
+    } else {
+      S2;
+    }
+  }
+\end{verbatim}
+into:
+\begin{verbatim}
+  if (cond2) {
+    while (cond1) { S1; }
+  } else {
+    while (cond1) { S2; }
+  }
+\end{verbatim}
+\end{definition}
+
+This eliminates the branch from inside the loop, improving branch prediction and enabling further optimization of each loop body.
+
+\section{Loop Fusion and Fission}\label{sec:loop-fusion-fission}
+
+\subsection{Loop Fusion}\label{sec:loop-fusion}
+
+\begin{definition}[Loop Fusion]\label{def:loop-fusion}
+\textbf{Loop fusion} (or \textbf{loop jamming}) combines two adjacent loops with the same bounds into a single loop:
+\begin{verbatim}
+  // Before:
+  for (i = 0; i < n; i++) a[i] = b[i] + 1;
+  for (i = 0; i < n; i++) c[i] = a[i] * 2;
+  
+  // After fusion:
+  for (i = 0; i < n; i++) {
+    a[i] = b[i] + 1;
+    c[i] = a[i] * 2;
+  }
+\end{verbatim}
+\end{definition}
+
+Benefits: Reduced loop overhead, improved cache locality (data accessed in the same iteration stays in cache).
+
+\subsection{Loop Fission}\label{sec:loop-fission}
+
+\begin{definition}[Loop Fission]\label{def:loop-fission}
+\textbf{Loop fission} (or \textbf{loop distribution}) splits a single loop into multiple loops:
+\begin{verbatim}
+  // Before:
+  for (i = 0; i < n; i++) {
+    a[i] = b[i] + 1;
+    c[i] = d[i] * 2;
+  }
+  
+  // After fission:
+  for (i = 0; i < n; i++) a[i] = b[i] + 1;
+  for (i = 0; i < n; i++) c[i] = d[i] * 2;
+\end{verbatim}
+\end{definition}
+
+Benefits: Reduced register pressure, enables vectorization of each loop independently, improves cache behavior when arrays are large.
+
+\section{Software Pipelining}\label{sec:software-pipelining}
+
+\subsection{Overview}\label{sec:pipelining-overview}
+
+\emph{Software pipelining} overlaps the execution of successive loop iterations to maximize instruction-level parallelism. It is analogous to hardware pipelining but performed by the compiler.
+
+\begin{definition}[Software Pipelining]\label{def:software-pipelining}
+\textbf{Software pipelining} reorganizes a loop so that instructions from different iterations execute concurrently. The loop body is reorganized into a \emph{prologue} (ramp-up), a \emph{steady state} (pipelined execution), and an \emph{epilogue} (drain).
+\end{definition}
+
+\begin{example}[Software Pipelining]\label{ex:sw-pipeline}
+Consider:
+\begin{verbatim}
+  for (i = 0; i < n; i++) {
+    load R1, a[i]      // latency 3
+    add R2, R1, R1     // latency 1
+    store a[i], R2     // latency 1
+  }
+\end{verbatim}
+Without pipelining, each iteration takes 5 cycles. With software pipelining (initiation interval 3):
+\begin{verbatim}
+  // Steady state (executed every 3 cycles):
+  load R1_i, a[i]       // from iteration i
+  add R2_{i-1}, R1_{i-1}, R1_{i-1}  // from iteration i-1
+  store a[i-2], R2_{i-2}  // from iteration i-2
+\end{verbatim}
+Three iterations overlap, achieving an initiation interval of 3 cycles.
+\end{example}
+
+\subsection{Modulo Scheduling}\label{sec:modulo-scheduling}
+
+\emph{Modulo scheduling} is the most common form of software pipelining. It assigns each instruction an issue time modulo the \emph{initiation interval} (II).
+
+\begin{definition}[Initiation Interval]\label{def:ii}
+The \textbf{initiation interval} (II) is the number of cycles between the start of successive iterations in the pipelined loop. The minimum II is determined by:
+\begin{itemize}
+  \item \textbf{Resource II}: Limited by the functional units available.
+  \item \textbf{Recurrence II}: Limited by dependence cycles in the loop.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Modulo Scheduling]\label{def:modulo-sched}
+\textbf{Modulo scheduling} assigns each instruction $i$ a cycle offset $c(i)$ and a stage $s(i)$ such that:
+\begin{itemize}
+  \item All dependence constraints are satisfied: for each dependence $i \to j$ with latency $\delta$, $c(j) - c(i) + II \cdot (s(j) - s(i)) \geq \delta$.
+  \item No resource conflicts: no two instructions in the same cycle use the same functional unit.
+\end{itemize}
+\end{definition}
+
+\begin{historical}
+Loop optimization has been a central topic in compiler research since the 1970s. Allen and Cocke~\cite{allen1972comparative} (1972) established the theoretical foundations of loop analysis. Loop-invariant code motion and induction variable elimination were part of the earliest optimizing compilers. Software pipelining was developed by Lam~\cite{lam1988software} (1988) and others for VLIW architectures. The polyhedral model (Chapter~\ref{sec:polyhedral-model}) provides a more general framework for loop transformations, subsuming many of the techniques described here.
+\end{historical}
+
+\section{Loop Vectorization}\label{sec:loop-vectorization}
+
+\emph{Loop vectorization} transforms a scalar loop into a vector loop that processes multiple elements per iteration using SIMD (Single Instruction, Multiple Data) instructions.
+
+\begin{definition}[Loop Vectorization]\label{def:loop-vectorization}
+\textbf{Loop vectorization} transforms:
+\begin{verbatim}
+  for (i = 0; i < n; i++)
+    a[i] = b[i] + c[i];
+\end{verbatim}
+into:
+\begin{verbatim}
+  for (i = 0; i < n; i += 4)
+    a[i:i+3] = b[i:i+3] + c[i:i+3];  // SIMD add
+\end{verbatim}
+\end{definition}
+
+\subsection{Vectorization Legality}\label{sec:vectorization-legal}
+
+Vectorization is legal only if:
+\begin{itemize}
+  \item There are no loop-carried dependences (no iteration depends on a previous iteration).
+  \item Memory accesses do not overlap in conflicting ways.
+  \item The loop count is a multiple of the vector width (or a cleanup loop handles the remainder).
+\end{itemize}
+
+\subsection{Auto-Vectorization in Modern Compilers}\label{sec:auto-vectorization}
+
+Modern compilers (GCC, LLVM/Clang) perform automatic vectorization:
+\begin{itemize}
+  \item \textbf{SLP vectorization}: Superword-Level Parallelism---vectorize straight-line code within a basic block.
+  \item \textbf{Loop vectorization}: Vectorize loop bodies.
+  \item \textbf{Cost model}: Estimate the speedup of vectorization vs.\ the cost of setup/cleanup.
+\end{itemize}
+
+\section{Dependence Analysis for Loops}\label{sec:loop-dependence-analysis}
+
+\begin{definition}[Loop Dependence Analysis]\label{def:loop-dep-analysis}
+\textbf{Loop dependence analysis} determines whether two array accesses in a loop may refer to the same element in different iterations. This is essential for determining whether loop transformations (parallelization, vectorization, interchange) are legal.
+\end{definition}
+
+\subsection{The GCD Test}\label{sec:gcd-test}
+
+\begin{definition}[GCD Test]\label{def:gcd-test}
+For a single-index loop with accesses $a[c_1 \cdot i + d_1]$ and $a[c_2 \cdot i + d_2]$, a dependence exists only if $\gcd(c_1, c_2)$ divides $(d_2 - d_1)$.
+\end{definition}
+
+\section{Summary}\label{sec:loop-optimization-summary}
+
+Loop optimizations are essential for high-performance code generation. Loop detection identifies the natural loops in the program. Loop-invariant code motion eliminates redundant computation. Induction variable strength reduction replaces expensive operations with incremental updates. Loop unrolling reduces overhead and increases ILP. Loop unswitching eliminates invariant branches. Loop fusion and fission restructure loops for better cache behavior and register utilization. Software pipelining overlaps iterations for maximum throughput. Loop vectorization exploits SIMD hardware for data parallelism. Dependence analysis determines which transformations are legal. Together, these transformations can improve loop performance by factors of 2--10 or more.
+
+\section{Software Pipelining in Detail}\label{sec:software-pipelining-detail}
+
+\emph{Software pipelining} (also called \emph{modulo scheduling}) overlaps the execution of different loop iterations to maximize instruction-level parallelism.
+
+\begin{definition}[Software Pipelining]\label{def:software-pipelining}
+\textbf{Software pipelining} reorganizes a loop body so that instructions from different iterations execute simultaneously. Each iteration is split into \emph{stages}, and the pipeline is filled by issuing instructions from successive iterations in successive cycles.
+\end{definition}
+
+\begin{definition}[Initiation Interval]\label{def:initiation-interval}
+The \textbf{initiation interval} (II) is the number of cycles between the start of consecutive iterations. The minimum II is determined by:
+\begin{itemize}
+  \item \textbf{RecMII}: The recurrence-constrained II (longest dependence cycle divided by the number of iterations it spans).
+  \item \textbf{ResMII}: The resource-constrained II (total resources needed per iteration divided by available resources).
+  \item $MII = \max(\text{RecMII}, \text{ResMII})$
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Modulo Scheduling Algorithm}
+\label{alg:modulo-scheduling}
+\begin{algorithmic}[1]
+\Require Loop body dependence graph, resource constraints, target II
+\Ensure Modulo schedule: $(time_i, stage_i)$ for each instruction $i$
+\State $II \gets MII$
+\Loop
+  \State Build priority list of instructions (by depth in dependence graph)
+  \State Schedule $\gets$ empty
+  \State success $\gets$ true
+  \ForAll{instructions $i$ in priority order}
+    \State Find earliest slot $t$ satisfying:
+    \State \quad (a) All predecessors of $i$ are scheduled respecting dependences
+    \State \quad (b) Resources at time $t \mod II$ are available
+    \If{no valid slot found}
+      \State success $\gets$ false; \textbf{break}
+    \EndIf
+    \State Schedule $i$ at time $t$
+  \EndFor
+  \If{success}
+    \State \Return Schedule with $II$
+  \EndIf
+  \State $II \gets II + 1$ \Comment{Try larger II}
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Software Pipelining Example]\label{ex:sw-pipeline}
+\begin{verbatim}
+  // Original loop:
+  for (i = 0; i < N; i++) {
+    a: r1 = A[i]       // Load
+    b: r2 = r1 * 2     // Multiply
+    c: B[i] = r2       // Store
+  }
+  
+  // Dependences: a → b (data, latency 1), b → c (data, latency 1)
+  // RecMII = 1, ResMII = 1, MII = 1
+  
+  // Software-pipelined (II = 1):
+  // Cycle 1: a₁
+  // Cycle 2: b₁  a₂
+  // Cycle 3: c₁  b₂  a₃
+  // Cycle 4: c₂  b₃  a₄
+  // ... steady state: 3 ops per cycle, 1 iteration per cycle
+\end{verbatim}
+\end{example}
+
+\subsection{Epilogue and Prologue Generation}\label{sec:prologue-epilogue}
+
+Software-pipelined loops need special handling for the pipeline fill and drain phases:
+
+\begin{definition}[Pipeline Prologue/Epilogue]\label{def:pipeline-phases}
+A software-pipelined loop has three phases:
+\begin{itemize}
+  \item \textbf{Prologue}: Pipeline fill---ramp up from zero to full pipeline occupancy.
+  \item \textbf{Steady state}: All pipeline stages active, one iteration completed per II cycles.
+  \item \textbf{Epilogue}: Pipeline drain---ramp down from full occupancy to zero.
+\end{itemize}
+\end{definition}
+
+\section{Loop Fusion in Detail}\label{sec:loop-fusion-detail}
+
+\emph{Loop fusion} combines two or more loops with the same iteration count into a single loop, reducing loop overhead and enabling further optimizations.
+
+\begin{definition}[Loop Fusion Legality]\label{def:fusion-legal}
+Two loops can be fused if:
+\begin{enumerate}
+  \item They have the same iteration count (or the intersection of iteration counts is used).
+  \item There are no \emph{fusion-preventing dependences}: no dependence from the second loop to the first that would be violated by fusion.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Loop Fusion}
+\label{alg:loop-fusion}
+\begin{algorithmic}[1]
+\Require Adjacent loops $L_1$ and $L_2$ with same bounds
+\Ensure Fused loop or report that fusion is illegal
+\State Compute dependence graph $D$ for $L_1 \cup L_2$
+\ForAll{dependences $d$ from $L_2$ to $L_1$}
+  \If{$d$ is a true dependence (flow dependence)}
+    \State \Return fusion is illegal
+  \EndIf
+\EndFor
+\State Merge loop bodies: $L_{fused} = L_1 ; L_2$
+\State Remove duplicate loop control (one header, one back-edge)
+\State \Return $L_{fused}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Loop Fusion]\label{ex:loop-fusion}
+\begin{verbatim}
+  // Before fusion:
+  for (i = 0; i < N; i++) A[i] = B[i] + 1;   // Loop 1
+  for (i = 0; i < N; i++) C[i] = A[i] * 2;   // Loop 2
+  
+  // After fusion (legal: A[i] produced in L1, consumed in L2, same iteration):
+  for (i = 0; i < N; i++) {
+    A[i] = B[i] + 1;
+    C[i] = A[i] * 2;
+  }
+  // Benefit: A[i] stays in register, no memory traffic
+\end{verbatim}
+\end{example}
+
+\section{Loop Tiling for Cache Optimization}\label{sec:loop-tiling}
+
+\begin{definition}[Loop Tiling]\label{def:loop-tiling}
+\textbf{Loop tiling} (or \emph{blocking}) partitions the iteration space into rectangular tiles that fit in cache. Each tile is processed completely before moving to the next, improving temporal locality.
+\end{definition}
+
+\begin{verbatim}
+  // Before tiling (poor cache behavior for large N):
+  for (i = 0; i < N; i++)
+    for (j = 0; j < N; j++)
+      C[i][j] += A[i][k] * B[k][j];
+  
+  // After tiling (tile size T × T):
+  for (ii = 0; ii < N; ii += T)
+    for (jj = 0; jj < N; jj += T)
+      for (i = ii; i < min(ii+T, N); i++)
+        for (j = jj; j < min(jj+T, N); j++)
+          C[i][j] += A[i][k] * B[k][j];
+\end{verbatim}
+
+\begin{definition}[Optimal Tile Size]\label{def:tile-size}
+The \textbf{optimal tile size} $T$ is chosen so that the working set of one tile fits in the cache:
+\[
+T^2 \cdot s \leq C_{size}
+\]
+where $s$ is the size of each element and $C_{size}$ is the cache size. For matrix multiplication with three arrays: $3 T^2 \cdot s \leq C_{size}$.
+\end{definition}
+
+\section{Loop Distribution (Fission)}\label{sec:loop-distribution}
+
+\begin{definition}[Loop Distribution]\label{def:loop-distribution}
+\textbf{Loop distribution} (or \emph{loop fission}) splits a single loop into multiple loops, each containing a subset of the original statements. This can improve register pressure and enable vectorization of individual sub-loops.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Loop Distribution}
+\label{alg:loop-distribution}
+\begin{algorithmic}[1]
+\Require Loop $L$ with statements $S_1, S_2, \ldots, S_k$
+\Ensure Distributed loops or report that distribution is not beneficial
+\State Build dependence graph $D$ for statements in $L$
+\State Find connected components $C_1, C_2, \ldots, C_m$ of $D$
+\If{$m = 1$}
+  \State \Return no distribution possible (all statements are dependent)
+\EndIf
+\For{$j = 1$ to $m$}
+  \State Create loop $L_j$ with statements in $C_j$
+  \State $L_j$ has same bounds as $L$
+\EndFor
+\State Replace $L$ with $L_1; L_2; \ldots; L_m$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{example}[Loop Distribution for Vectorization]\label{ex:loop-dist-vec}
+\begin{verbatim}
+  // Before distribution (cannot vectorize due to scalar dependence):
+  for (i = 0; i < N; i++) {
+    s = s + A[i];       // Scalar accumulation (serial dependence)
+    B[i] = A[i] * 2;   // Independent (vectorizable)
+  }
+  
+  // After distribution:
+  for (i = 0; i < N; i++)     // Scalar loop
+    s = s + A[i];
+  for (i = 0; i < N; i++)     // Vectorizable loop!
+    B[i] = A[i] * 2;
+\end{verbatim}
+\end{example}

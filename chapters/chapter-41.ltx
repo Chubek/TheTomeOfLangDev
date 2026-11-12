@@ -1,0 +1,568 @@
+%% Chapter 41: Error Recovery in Parsing
+\label{ch:error-recovery}
+
+\section{Introduction to Error Recovery}
+\label{sec:error-recovery-intro}
+
+No parser, no matter how well-designed, can avoid encountering syntax errors. Real-world source code contains errors---from incomplete edits to typos to fundamental misunderstandings of the language syntax. A production-quality parser must not only detect errors but also \emph{recover} from them, allowing the compiler to continue parsing and report multiple errors in a single compilation.
+
+Error recovery is one of the most challenging aspects of parser design. The fundamental tension is between \emph{accuracy} (correctly identifying the location and nature of the error) and \emph{robustness} (continuing to parse after the error without producing spurious error messages). Good error recovery is essential for compiler usability, IDE support, and language tooling.
+
+\begin{historical}
+Error recovery in parsers has been studied since the early days of compiler construction. The panic mode recovery strategy was described by earlier practitioners and formalized in textbooks by Aho, Sethi, and Ullman (1986). Phrase-level recovery was developed by Fischer (1973) and further refined by Burke and Fisher (1984). The work on error-correcting parsers by Hendrix (1979) and later by van Zaanen (2003) explored the idea of finding the nearest valid program. Modern work on error-tolerant parsing for IDEs, particularly the DMS Software Reengineering Toolkit (Schwarz, 1990s) and the Tree-sitter parser (Max Brunsfeld, 2015), has pushed the state of the art in practical error recovery.
+\end{historical}
+
+\section{Panic Mode Recovery}
+\label{sec:panic-mode}
+
+\subsection{Basic Panic Mode}
+\label{sec:basic-panic}
+
+\emph{Panic mode} is the simplest error recovery strategy. When an error is detected, the parser discards input tokens until it finds a \emph{synchronizing token}---a token that is likely to begin a new syntactic construct.
+
+\begin{definition}[Panic Mode Recovery]
+\label{def:panic-mode}
+When an error is detected:
+\begin{enumerate}
+  \item Report the error
+  \item Discard input tokens until a \emph{synchronizing token} is found
+  \item Resume parsing from the synchronizing token
+\end{enumerate}
+\end{definition}
+
+\subsection{Choosing Synchronizing Tokens}
+\label{sec:sync-tokens}
+
+The choice of synchronizing tokens is crucial for effective panic mode recovery:
+
+\begin{itemize}
+  \item \textbf{Statement boundaries}: Semicolons, closing braces, and keywords that begin statements (\texttt{if}, \texttt{while}, \texttt{return}) are good synchronizing tokens.
+  \item \textbf{Follow sets}: The Follow set of the nonterminal on top of the stack provides a set of tokens that can legally follow it.
+  \item \textbf{Language-specific heuristics}: For C-like languages, \texttt{\}}, \texttt{;}, and statement keywords are effective synchronizers.
+\end{itemize}
+
+\begin{example}[Panic Mode in Action]
+\label{ex:panic-mode}
+Consider the input:
+\begin{verbatim}
+  int x = 5
+  if (x > 3) {
+    y = x + 1;
+  }
+\end{verbatim}
+
+Missing semicolon after \texttt{5}. The parser detects an error at \texttt{if}. Using \texttt{if} as a synchronizing token, the parser:
+\begin{enumerate}
+  \item Reports: ``error: expected ';' before 'if'``
+  \item Resumes parsing from \texttt{if}
+  \item Successfully parses the rest of the program
+\end{enumerate}
+\end{example}
+
+\subsection{Limitations of Panic Mode}
+\label{sec:panic-limits}
+
+Panic mode has several limitations:
+\begin{itemize}
+  \item \textbf{Lost tokens}: Discarded tokens are not analyzed, so errors within them are missed.
+  \item \textbf{Cascading errors}: If the synchronizing token is not found quickly, large portions of the input may be skipped.
+  \item \textbf{Inaccurate error location}: The reported error location may be far from the actual error.
+\end{itemize}
+
+\section{Phrase-Level Recovery}
+\label{sec:phrase-level}
+
+\subsection{Basic Idea}
+\label{sec:phrase-level-idea}
+
+\emph{Phrase-level recovery} attempts to make minimal changes to the input or the parser state to continue parsing. Instead of discarding tokens, it inserts, deletes, or replaces tokens to ``fix'' the input.
+
+\begin{definition}[Phrase-Level Recovery]
+\label{def:phrase-level}
+When an error is detected in state $s$ with lookahead $a$:
+\begin{enumerate}
+  \item Design a a set of recovery functions for state $s$, each specifying:
+    \begin{itemize}
+      \item Which tokens to insert, delete, or replace
+      \item How to modify the parser state
+    \end{itemize}
+  \item Apply the recovery function that makes the smallest change
+  \item Continue parsing
+\end{enumerate}
+\end{definition}
+
+\subsection{Token Insertion}
+\label{sec:token-insertion}
+
+\emph{Token insertion} adds a missing token to the input stream. For example, if the parser expects a semicolon but finds a keyword, it can insert a semicolon:
+
+\begin{verbatim}
+  State: expecting ';'
+  Lookahead: 'if'
+  Recovery: insert ';' before 'if'
+\end{verbatim}
+
+\subsection{Token Deletion}
+\label{sec:token-deletion}
+
+\emph{Token deletion} removes an unexpected token from the input stream. For example, if the parser finds an extra closing parenthesis:
+
+\begin{verbatim}
+  State: expecting expression
+  Lookahead: ')'
+  Recovery: delete ')' and continue
+\end{verbatim}
+
+\subsection{Token Replacement}
+\label{sec:token-replacement}
+
+\emph{Token replacement} substitutes one token for another. For example, replacing \texttt{=} with \texttt{==} in a conditional expression:
+
+\begin{verbatim}
+  State: expecting '=='
+  Lookahead: '='
+  Recovery: replace '=' with '=='
+\end{verbatim}
+
+\subsection{The Burke--Fisher Algorithm}
+\label{sec:burke-fisher}
+
+Burke and Fisher (1984) developed a sophisticated phrase-level recovery algorithm for LR parsers that:
+\begin{enumerate}
+  \item Maintains a stack of parser states
+  \item At each error, tries a set of local fixes (insertions and deletions)
+  \item Evaluates each fix by simulating the parser for a fixed number of steps
+  \item Selects the fix that allows the parser to advance the farthest without error
+\end{enumerate}
+
+\begin{algorithm}[htbp]
+\caption{Phrase-level recovery for LR parser}
+\begin{algorithmic}[1]
+\State Let $s$ be the current state and $a$ the lookahead
+\For{each candidate fix $f$ (insert token, delete token)}
+  \State Simulate parser with fix $f$ for $k$ steps
+  \State Record the number of successful steps
+\EndFor
+\State Select the fix $f^*$ that maximizes successful steps
+\If{$f^*$ achieves at least $k$ successful steps}
+  \State Apply $f^*$ and continue parsing
+\Else
+  \State Fall back to panic mode
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\section{Error Productions}
+\label{sec:error-productions}
+
+\subsection{Explicit Error Handling in Grammars}
+\label{sec:explicit-error}
+
+\emph{Error productions} are grammar rules that explicitly handle common error patterns. The special terminal \texttt{error} matches any token and is used to specify recovery behavior.
+
+\begin{grammar}{Error Productions}
+  stmt & \longrightarrow \textbf{error} ; \mid \textbf{error} \} \\
+       & \mid \textbf{if} ( \textbf{error} ) stmt \\
+       & \mid \textbf{while} ( \textbf{error} ) stmt
+\end{grammar}
+
+\subsection{How Error Productions Work}
+\label{sec:error-prod-work}
+
+When the parser encounters an error:
+\begin{enumerate}
+  \item It checks if an error production can be applied in the current state
+  \item If so, it shifts the \texttt{error} token, consuming input tokens until a token is found that can follow the error production
+  \item The parser then continues normally from the state after the error production
+\end{enumerate}
+
+\subsection{Advantages and Disadvantages}
+\label{sec:error-prod-pros-cons}
+
+\begin{itemize}
+  \item \textbf{Advantages}: Precise control over error recovery; can handle specific error patterns; integrates naturally with LR parsing.
+  \item \textbf{Disadvantages}: Requires anticipating common errors; can make the grammar harder to read; may not cover all error cases.
+\end{itemize}
+
+\section{Automatic Error Recovery in LR Parsers}
+\label{sec:auto-recovery}
+
+\subsection{Minimum Distance Recovery}
+\label{sec:min-distance}
+
+The \emph{minimum distance} criterion selects the recovery that requires the fewest changes to the input:
+
+\begin{definition}[Minimum Distance Recovery]
+\label{def:min-distance}
+Among all possible recoveries (insertions, deletions, replacements), select the one that minimizes the total number of changes to the input string.
+\end{definition}
+
+\subsection{Local Error Correction}
+\label{sec:local-correction}
+
+\emph{Local error correction} tries all possible single-token changes (insert, delete, replace) and selects the one that allows the parser to advance the farthest:
+
+\begin{algorithmic}[1]
+\For{each token $t$ in the alphabet}
+  \State Try inserting $t$ before the current position
+  \State Simulate parsing; record distance
+\EndFor
+\State Try deleting the current token
+\State Simulate parsing; record distance
+\For{each token $t$ in the alphabet}
+  \State Try replacing current token with $t$
+  \State Simulate parsing; record distance
+\EndFor
+\State Select the change with maximum distance
+\end{algorithmic}
+
+\section{Error-Correcting Parsers}
+\label{sec:error-correcting}
+
+\subsection{The Idea of Error Correction}
+\label{sec:ec-idea}
+
+An \emph{error-correcting parser} treats parsing as a search problem: find the ``nearest'' valid program to the input and parse that. The distance between the input and the corrected program is measured by the number of insertions, deletions, and replacements.
+
+\begin{definition}[Error-Correcting Parser]
+\label{def:ec-parser}
+An \textbf{error-correcting parser} for a grammar $G$ takes an input string $w$ and produces a parse tree for the string $w'$ that minimizes the edit distance $d(w, w')$ subject to $w' \in L(G)$.
+\end{definition}
+
+\subsection{Complexity of Error Correction}
+\label{sec:ec-complexity}
+
+\begin{theorem}[Complexity of Error Correction]
+\label{thm:ec-complexity}
+Finding the minimum-distance correction for a general CFG is NP-hard in the worst case. However, for a fixed maximum correction distance $k$, the problem can be solved in $O(n \cdot |G|^{O(k)})$ time.
+\end{theorem}
+
+\subsection{Practical Error-Correcting Parsers}
+\label{sec:ec-practical}
+
+Several practical error-correcting parsers have been developed:
+
+\begin{itemize}
+  \item \textbf{DMS Error Recovery} (Schwarz): Uses a combination of local correction and global analysis.
+  \item \textbf{Adaptive LR} (Grune and Sellier): Extends LR parsing with on-the-fly grammar modification.
+  \item \textbf{Error-Recovery GLR} (van Zaanen): Extends GLR parsing with error correction.
+\end{itemize}
+
+\section{Modern Approaches: Error-Tolerant Parsing for IDEs}
+\label{sec:modern-approaches}
+
+\subsection{Requirements for IDE Parsing}
+\label{sec:ide-requirements}
+
+IDEs have different parsing requirements than compilers:
+\begin{itemize}
+  \item \textbf{Incremental parsing}: The parser must handle small edits efficiently, re-parsing only the changed portion.
+  \item \textbf{Error tolerance}: The parser must produce a useful syntax tree even when the code contains errors.
+  \item \textbf{Speed}: Parsing must be fast enough for real-time feedback (typically under 100ms).
+  \item \textbf{Partial results}: The parser must produce results for the portions of the file that are valid, even if other portions have errors.
+\end{itemize}
+
+\subsection{Tree-sitter}
+\label{sec:tree-sitter}
+
+\emph{Tree-sitter} (Brunsfeld, 2015) is a modern parser generator designed for IDE use. Its key innovations include:
+
+\begin{itemize}
+  \item \textbf{GLR-based parsing}: Uses GLR parsing to handle ambiguous grammars.
+  \item \textbf{Error recovery by insertion}: When an error is encountered, Tree-sitter inserts an \texttt{ERROR} node and attempts to continue parsing.
+  \item \textbf{Incremental parsing}: Maintains a concrete syntax tree that can be updated incrementally as the user edits the source.
+  \item \textbf{Automatic token recovery}: Automatically tries inserting or deleting tokens to continue parsing.
+\end{itemize}
+
+\begin{definition}[Tree-sitter Error Node]
+\label{def:tree-sitter-error}
+An \textbf{ERROR node} in a Tree-sitter syntax tree represents a portion of the input that could not be parsed. The ERROR node contains the tokens that could not be incorporated into the tree, allowing the rest of the tree to remain valid.
+\end{definition}
+
+\subsection{Comparison of Error Recovery Strategies}
+\label{sec:comparison}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{3cm}p{3cm}p{3cm}p{3cm}}
+\hline
+\textbf{Strategy} & \textbf{Accuracy} & \textbf{Speed} & \textbf{Complexity} \\
+\hline
+Panic mode & Low & High & Simple \\
+Phrase-level & Medium & Medium & Moderate \\
+Error productions & High & High & Manual \\
+Error-correcting & High & Low & Complex \\
+Tree-sitter & High & High & Automatic \\
+\hline
+\end{tabular}
+\caption{Comparison of error recovery strategies}
+\label{tab:error-recovery-comparison}
+\end{table}
+
+\subsection{Best Practices for Error Recovery}
+\label{sec:best-practices}
+
+Based on experience with production compilers and IDEs, the following best practices have emerged:
+
+\begin{itemize}
+  \item \textbf{Use multiple strategies}: Combine panic mode (for gross errors) with phrase-level recovery (for local errors).
+  \item \textbf{Limit recovery scope}: Don't try to recover too aggressively; sometimes it's better to skip to the next statement.
+  \item \textbf{Provide good error messages}: Include the expected tokens, the actual token, and the source location.
+  \item \textbf{Avoid cascading errors}: After an error, suppress related errors that are likely consequences of the first error.
+  \item \textbf{Test with real error patterns}: Error recovery should be tested with realistic error patterns from actual users.
+\end{itemize}
+
+\section{Summary}
+\label{sec:error-recovery-summary}
+
+Error recovery is a critical component of production-quality parsers. The key approaches include:
+
+\begin{itemize}
+  \item Panic mode recovery: Simple but limited; discards tokens until a synchronizing token is found
+  \item Phrase-level recovery: More precise; makes minimal changes to the input or parser state
+  \item Error productions: Explicit grammar rules for handling common error patterns
+  \item Error-correcting parsers: Find the nearest valid program to the input
+  \item Modern IDE-oriented approaches: Tree-sitter and similar tools that combine GLR parsing with incremental, error-tolerant parsing
+\end{itemize}
+
+\begin{historical}
+Error recovery has evolved from simple panic mode strategies to sophisticated, IDE-oriented approaches. Key milestones include: panic mode recovery (1960s--1970s); phrase-level recovery (Fischer, 1973); Burke--Fisher algorithm (1984); error-correcting parsers (Hendrix, 1979); DMS error recovery (Schwarz, 1990s); Tree-sitter (Brunsfeld, 2015); and ongoing work on error-tolerant parsing for language servers and IDEs. The development of Tree-sitter has been particularly influential, demonstrating that high-quality error recovery can be achieved automatically through GLR parsing and incremental tree updates.
+\end{historical}
+
+%% ------------------------------------------------------------------
+%% Expanded sections for Chapter 41
+%% ------------------------------------------------------------------
+
+\section{Error-Correcting Parsers: Advanced Topics}
+\label{sec:error-correcting-advanced}
+
+\subsection{Edit Distance Metrics for Parsing}
+\label{sec:edit-distance-parsing}
+
+The error-correcting parser finds the nearest valid program by minimizing an edit distance. Different distance metrics lead to different corrections:
+
+\begin{definition}[Edit Distance for Parsing]
+\label{def:edit-distance}
+Given an input string $w$ and a grammar $G$, the \textbf{edit distance} $d(w, L(G))$ is:
+\[
+d(w, L(G)) = \min_{w' \in L(G)} d(w, w')
+\]
+where $d(w, w')$ is the Levenshtein edit distance (minimum number of insertions, deletions, and substitutions to transform $w$ into $w'$).
+\end{definition}
+
+\begin{definition}[Weighted Edit Distance]
+\label{def:weighted-edit}
+A \textbf{weighted edit distance} assigns different costs to different operations:
+\begin{itemize}
+  \item Insertion of token $t$: cost $c_i(t)$
+  \item Deletion of token $t$: cost $c_d(t)$
+  \item Substitution of $t_1$ for $t_2$: cost $c_s(t_1, t_2)$
+\end{itemize}
+This allows the parser to prefer likely corrections (e.g., inserting a missing semicolon is cheaper than deleting an entire statement).
+\end{definition}
+
+\subsection{Earley-Based Error Correction}
+\label{sec:earley-correction}
+
+The Earley parser can be extended to support error correction by allowing \emph{error transitions} in the parsing automaton:
+
+\begin{algorithm}[htbp]
+\caption{Parse with error correction}
+\begin{algorithmic}[1]
+\State Initialize Earley sets $S_0, S_1, \ldots$
+\For{each input position $i$}
+  \State \textbf{Prediction}: Add predicted items as usual
+  \State \textbf{Scanning}: For each active item expecting token $a$:
+    \If{$\text{input}[i] = a$}
+      \State Complete the scan normally
+    \Else
+      \State \textbf{Error transitions}:
+      \For{each token $t$ in the alphabet}
+        \State Try \emph{inserting} $t$ before position $i$ (cost $c_i(t)$)
+        \State Try \emph{substituting} $t$ for $\text{input}[i]$ (cost $c_s(t, \text{input}[i])$)
+      \EndFor
+      \State Try \emph{deleting} $\text{input}[i]$ (cost $c_d(\text{input}[i])$)
+    \EndIf
+  \State \textbf{Completion}: Complete items as usual
+  \State Select the parse with minimum total correction cost
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Complexity of Error-Correcting Earley]
+\label{thm:ec-earley}
+The error-correcting Earley parser runs in $O(n^3 \cdot |\Sigma|)$ time for a single-error correction at each position, where $|\Sigma|$ is the alphabet size. For a maximum correction distance $k$, the complexity is $O(n^3 \cdot |\Sigma|^k)$.
+\end{theorem}
+
+\subsection{Practical Error-Correcting Parsers}
+\label{sec:ec-practical-advanced}
+
+Several practical systems implement error-correcting parsing:
+
+\begin{itemize}
+  \item \textbf{DMS Error Recovery}: Uses a combination of local correction (trying single-token changes) and global analysis (checking that the correction leads to a valid parse). The DMS system can handle arbitrary CFGs and provides guaranteed error correction within a configurable distance bound.
+  \item \textbf{Napier's Error-Correcting Parser}: Uses a priority queue to explore corrections in order of increasing cost, ensuring that the minimum-cost correction is found first.
+  \item \textbf{Hutton's Approach}: Extends parser combinators with error correction by wrapping each parser with a recovery combinator that tries insertions and deletions.
+\end{itemize}
+
+\section{IDE Integration: Detailed Treatment}
+\label{sec:ide-integration-detailed}
+
+\subsection{Incremental Parsing Architecture}
+\label{sec:incremental-architecture}
+
+Modern IDEs require parsers that can handle continuous editing. The architecture typically involves:
+
+\begin{definition}[Incremental Parse Tree]
+\label{def:incremental-tree}
+An \textbf{incremental parse tree} is a concrete syntax tree that supports:
+\begin{itemize}
+  \item \textbf{Edit application}: Given a text edit (insert, delete, replace at position $p$), update the tree efficiently.
+  \item \textbf{Re-parsing}: Re-parse only the portion of the tree affected by the edit.
+  \item \textbf{Stable node identity}: Nodes that are not affected by the edit retain their identity, allowing IDE features (selection, highlighting) to remain stable.
+\end{itemize}
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Update parse tree after an edit}
+\begin{algorithmic}[1]
+\State Apply text edit to the source buffer
+\State Identify the \emph{edit region} $[p, p + \Delta]$
+\State Find the deepest tree node that fully contains the edit region
+\State \textbf{Invalidate} this node and all its ancestors' cached parse state
+\State Re-lex the edit region (and a small context window)
+\State Re-parse from the start of the invalidated node
+\State Stop when the parser reaches a \emph{recovery point}:
+  \begin{itemize}
+    \item A position where the new parse matches the old parse's state
+    \item A position beyond the edit region where the old tree is still valid
+  \end{itemize}
+\State Splice the new subtree into the old tree at the recovery point
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Incremental Parsing Efficiency]
+\label{thm:incremental-parse}
+For a local edit (changing $k$ characters), incremental parsing takes $O(k + d)$ time, where $d$ is the distance to the recovery point. In the common case, $d$ is small (a few tokens), making the update effectively $O(k)$.
+\end{theorem}
+
+\subsection{Tree-sitter's Error Recovery in Detail}
+\label{sec:tree-sitter-detail}
+
+Tree-sitter's error recovery combines several strategies:
+
+\begin{enumerate}
+  \item \textbf{Error node insertion}: When the parser cannot match any token, it creates an \texttt{ERROR} node containing the unmatched token.
+  \item \textbf{Token insertion}: The parser tries inserting expected tokens (based on the current grammar state) to see if parsing can continue.
+  \item \textbf{Token deletion}: The parser tries skipping the current token to see if the next token can be matched.
+  \item \textbf{Token replacement}: The parser tries replacing the current token with an expected token.
+  \item \textbf{Best recovery selection}: Among all possible recoveries, the parser selects the one that allows it to consume the most tokens before the next error.
+\end{enumerate}
+
+\begin{definition}[Tree-sitter Recovery Score]
+\label{def:recovery-score}
+The \textbf{recovery score} of a recovery action is the number of tokens successfully consumed after the recovery. The parser selects the recovery with the highest score. Ties are broken by preferring insertions over deletions over replacements.
+\end{definition}
+
+\subsection{Language Server Protocol Integration}
+\label{sec:lsp-integration}
+
+The Language Server Protocol (LSP) defines a standard interface between IDEs and language tools. Error-tolerant parsers are essential for LSP implementations:
+
+\begin{itemize}
+  \item \textbf{Diagnostics}: The parser produces error diagnostics (position, message, severity) for display in the IDE.
+  \item \textbf{Semantic tokens}: The parser produces a syntax tree that enables semantic highlighting even in the presence of errors.
+  \item \textbf{Code completion}: The parser provides the context (current scope, expected tokens) for code completion suggestions.
+  \item \textbf{Go to definition}: The parser resolves name references to their declarations, even in partially valid code.
+  \item \textbf{Refactoring}: The parser provides a syntax tree that can be transformed, even when parts of the code have errors.
+\end{itemize}
+
+\begin{example}[Error-Tolerant Code Completion]
+\label{ex:error-tolerant-completion}
+Consider the following incomplete code:
+\begin{verbatim}
+  function calculateTotal(items: Item[]): number {
+    let total = 0;
+    for (const item of items) {
+      total += item.  // cursor here
+    }
+    return total;
+  }
+\end{verbatim}
+The parser encounters an incomplete expression (\texttt{item.}) but can still:
+\begin{itemize}
+  \item Determine that the cursor is inside a member access expression
+  \item Resolve \texttt{item} to the loop variable of type \texttt{Item}
+  \item Provide completion suggestions for members of \texttt{Item}
+\end{itemize}
+This requires the parser to produce a meaningful tree even with the incomplete expression.
+\end{example}
+
+\subsection{Fuzzy Parsing}
+\label{sec:fuzzy-parsing}
+
+\emph{Fuzzy parsing} goes beyond error recovery by attempting to extract structure from severely malformed input:
+
+\begin{definition}[Fuzzy Parsing]
+\label{def:fuzzy-parsing}
+\textbf{Fuzzy parsing} attempts to identify syntactic constructs in input that is not valid according to the grammar, using heuristics and approximate matching. It produces a ``best effort'' parse tree that captures as much structure as possible.
+\end{definition}
+
+Fuzzy parsing is used in:
+\begin{itemize}
+  \item \textbf{Code search tools}: Finding code patterns across large codebases, even in partially valid files.
+  \item \textbf{Refactoring tools}: Identifying code structure for transformation, even when the code has errors.
+  \item \textbf{Documentation generators}: Extracting function signatures and types from source code for documentation.
+\end{itemize}
+
+\section{Formal Properties of Error Recovery}
+\label{sec:formal-error-recovery}
+
+\subsection{Correctness Criteria}
+\label{sec:correctness-criteria}
+
+\begin{definition}[Error Recovery Correctness]
+\label{def:er-correctness}
+An error recovery strategy is \textbf{correct} if:
+\begin{enumerate}
+  \item \textbf{Soundness}: Every token in the recovered parse tree corresponds to a token in the original input (no spurious tokens are introduced, except through explicit insertion).
+  \item \textbf{Completeness}: Every non-error node in the parse tree is a valid subtree according to the grammar.
+  \item \textbf{Minimality}: The number of error nodes is minimized (or bounded by the edit distance to the nearest valid program).
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Tree-sitter Correctness]
+\label{thm:tree-sitter-correct}
+Tree-sitter's error recovery satisfies soundness and completeness. Minimality is approximated by the recovery score heuristic but is not guaranteed in general.
+\end{theorem}
+
+\subsection{Cascading Error Suppression}
+\label{sec:cascading-suppression}
+
+A major challenge in error recovery is \emph{cascading errors}: a single error can cause many spurious error messages as the parser struggles to resynchronize.
+
+\begin{definition}[Error Recovery Region]
+\label{def:error-region}
+An \textbf{error recovery region} is a contiguous portion of the input where the parser is in recovery mode. Within a recovery region, additional errors are suppressed (or reported at a lower severity) to avoid cascading error messages.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Suppress cascading errors}
+\begin{algorithmic}[1]
+\State $\text{in\_recovery} \gets \text{false}$
+\State $\text{recovery\_start} \gets -1$
+\For{each parse event}
+  \If{error detected}
+    \If{$\text{in\_recovery}$}
+      \State Suppress error (already in recovery region)
+    \Else
+      \State Report error
+      \State $\text{in\_recovery} \gets \text{true}$
+      \State $\text{recovery\_start} \gets \text{current position}$
+    \EndIf
+  \ElsIf{$\text{in\_recovery}$ and parser has advanced $k$ tokens without error}
+    \State $\text{in\_recovery} \gets \text{false}$ \Comment{Recovery succeeded}
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}

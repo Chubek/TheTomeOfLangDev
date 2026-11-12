@@ -1,0 +1,417 @@
+%%
+%% chapter-111.ltx — Transactional Compiler Transformations
+%% Part XI: Advanced Analysis and Verification
+%%
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}\label{sec:txn-intro}
+
+Modern compiler optimization pipelines consist of dozens---sometimes
+hundreds---of transformation passes, each of which modifies the intermediate
+representation in some way.  These passes are typically executed in a fixed
+order, and each pass assumes that the IR is in a consistent state when it
+begins.  If a pass encounters an error (an assertion failure, an internal
+compiler error, or a verification failure), the entire compilation is typically
+abandoned.
+
+\emph{Transactional compiler transformations} apply the principles of database
+transactions to compiler optimization.  Each transformation is executed as a
+\emph{transaction}: an atomic, consistent, isolated, and durable unit of work.
+If the transformation succeeds, its effects are committed.  If it fails, its
+effects are rolled back, and the IR is restored to its pre-transformation state.
+
+This approach enables several powerful capabilities:
+\begin{itemize}
+\item \textbf{Speculative optimization:} Try an optimization and roll back if
+      it does not improve the program.
+\item \textbf{Concurrent optimization:} Run multiple transformations in parallel
+      on different parts of the IR, using transactional conflict detection to
+      ensure correctness.
+\item \textbf{Incremental compilation:} Roll back and re-apply transformations
+      when the source program changes.
+\item \textbf{Fault tolerance:} Recover from transformation failures without
+      losing the work of previous passes.
+\end{itemize}
+
+In this chapter, we develop the theory and practice of transactional compiler
+transformations, from the basic concepts (\cref{sec:txn-concepts}) through
+conflict detection (\cref{sec:txn-conflict}) and rollback (\cref{sec:txn-rollback})
+to applications in concurrent and incremental compilation
+(\cref{sec:txn-concurrent}, \cref{sec:txn-incremental}).
+
+% ============================================================
+% Optimizations as Transactions
+% ============================================================
+\section{Optimizations as Transactions}\label{sec:txn-concepts}
+
+\subsection{The Transactional Model}\label{sec:txn-model}
+
+\begin{definition}[Compiler Transaction]\label{def:txn}
+A \emph{compiler transaction} is a transformation $T : \mathit{IR} \to \mathit{IR}$
+that satisfies the ACID properties:
+\begin{itemize}
+\item \textbf{Atomicity:} Either all changes made by $T$ are applied, or none
+      are.
+\item \textbf{Consistency:} If the IR is valid before $T$, it is valid after $T$
+      (assuming $T$ is a semantics-preserving transformation).
+\item \textbf{Isolation:} Concurrent transactions do not interfere with each
+      other.
+\item \textbf{Durability:} Once a transaction is committed, its effects persist.
+\end{itemize}
+\end{definition}
+
+\subsection{Transactional Pass Structure}\label{sec:txn-pass}
+
+A transactional optimization pass has three phases:
+
+\begin{enumerate}
+\item \textbf{Begin:} Record the current state of the IR (or the parts that
+      will be modified).
+\item \textbf{Execute:} Perform the transformation, recording all changes in a
+      \emph{write set}.
+\item \textbf{Commit or abort:} If the transformation succeeds, commit the
+      changes.  If it fails, abort and restore the IR from the saved state.
+\end{enumerate}
+
+\begin{algorithm}[htbp]
+\caption{Transactional Optimization Pass}\label{alg:txn-pass}
+\begin{algorithmic}[1]
+\Require IR state $S$, transformation $T$
+\Ensure Updated IR state or original $S$
+\State $S_{\mathit{saved}} \gets \mathit{snapshot}(S)$
+\State $\mathit{writes} \gets \emptyset$
+\State $\mathit{begin\_txn}()$
+\State $S' \gets T(S, \mathit{writes})$
+\If{$T$ succeeded}
+  \State $\mathit{commit\_txn}(\mathit{writes})$
+  \State \Return $S'$
+\Else
+  \State $\mathit{abort\_txn}(S_{\mathit{saved}})$
+  \State \Return $S$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% Conflict Detection
+% ============================================================
+\section{Conflict Detection}\label{sec:txn-conflict}
+
+\subsection{The Conflict Problem}\label{sec:txn-conflict-problem}
+
+When multiple transactions run concurrently, they may conflict: two transactions
+may attempt to modify the same part of the IR.  Conflict detection ensures that
+such conflicts are identified and resolved.
+
+\begin{definition}[Conflict]\label{def:conflict}
+Two transactions $T_1$ and $T_2$ \emph{conflict} if they both access the same
+IR element and at least one access is a write.  Formally, a conflict exists if:
+\[
+\mathit{writes}(T_1) \cap (\mathit{reads}(T_2) \cup \mathit{writes}(T_2)) \neq \emptyset
+\]
+or symmetrically for $T_2$.
+\end{definition}
+
+\subsection{Granularity of Conflicts}\label{sec:txn-granularity}
+
+The granularity at which conflicts are detected affects both correctness and
+performance:
+
+\begin{itemize}
+\item \textbf{Function-level:} Conflicts are detected at the level of entire
+      functions.  Two transactions conflict if they modify the same function.
+      Simple but coarse-grained.
+\item \textbf{Basic-block-level:} Conflicts are detected at the level of basic
+      blocks.  More fine-grained but more overhead.
+\item \textbf{Instruction-level:} Conflicts are detected at the level of
+      individual instructions.  Most fine-grained but highest overhead.
+\item \textbf{SSA-value-level:} Conflicts are detected at the level of SSA
+      values (definitions).  Natural for SSA-based IRs.
+\end{itemize}
+
+\subsection{Optimistic Concurrency Control}\label{sec:txn-occ}
+
+\emph{Optimistic concurrency control} (OCC) allows transactions to proceed
+without locking, checking for conflicts only at commit time.
+
+\begin{algorithm}[htbp]
+\caption{Optimistic Concurrency Control}\label{alg:occ}
+\begin{algorithmic}[1]
+\Require Transaction $T$ with read set $R$ and write set $W$
+\Ensure Committed or aborted
+\State \Comment{Execution phase: execute $T$ without locking}
+\State Execute $T$, recording $R$ and $W$
+\State \Comment{Validation phase: check for conflicts}
+\For{each $w \in W$}
+  \If{$w$ was modified by another committed transaction since $T$ began}
+    \State \Return \textsc{Abort}
+  \EndIf
+\EndFor
+\State \Comment{Commit phase: apply writes}
+\State Apply $W$ to the IR
+\State \Return \textsc{Commit}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Conflict Resolution}\label{sec:txn-resolution}
+
+When a conflict is detected, the transaction must be resolved:
+\begin{itemize}
+\item \textbf{Abort and retry:} Abort the conflicting transaction and retry it.
+\item \textbf{Priority-based:} The transaction with higher priority (e.g., the
+      one that has done more work) wins; the other aborts.
+\item \textbf{Merge:} If the conflicting modifications are compatible (e.g.,
+      they modify different parts of the same function), merge them.
+\end{itemize}
+
+% ============================================================
+% Rollback and Recovery
+% ============================================================
+\section{Rollback and Recovery}\label{sec:txn-rollback}
+
+\subsection{Snapshot-Based Rollback}\label{sec:txn-snapshot}
+
+The simplest rollback mechanism is to take a full snapshot of the IR before the
+transaction and restore it on abort.  This is simple but expensive for large IRs.
+
+\subsection{Undo-Log-Based Rollback}\label{sec:txn-undolog}
+
+A more efficient approach is to maintain an \emph{undo log}: a record of all
+changes made by the transaction, in reverse order.  On abort, the undo log is
+played in reverse to restore the IR.
+
+\begin{definition}[Undo Log Entry]\label{def:undo-log}
+An undo log entry is a tuple $(\mathit{loc}, \mathit{old\_val})$ recording that
+the IR element at location $\mathit{loc}$ was changed from $\mathit{old\_val}$
+to a new value.
+\end{definition}
+
+\begin{algorithm}[htbp]
+\caption{Undo-Log Rollback}\label{alg:undo-log}
+\begin{algorithmic}[1]
+\Require Undo log $L = [(l_1, v_1), \ldots, (l_n, v_n)]$
+\Ensure IR restored to pre-transaction state
+\For{$i = n$ down to $1$}
+  \State Restore $l_i$ to value $v_i$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Persistent Transactions}\label{sec:txn-persistent}
+
+For incremental compilation, transactions must be \emph{persistent}: their
+effects must survive across compiler invocations.  This requires writing the
+committed changes to disk (or to a persistent data structure) and maintaining
+the undo log for potential future rollback.
+
+% ============================================================
+% Atomicity of Transformations
+% ============================================================
+\section{Atomicity of Transformations}\label{sec:txn-atomicity}
+
+\subsection{What Makes a Transformation Atomic?}\label{sec:txn-atomic-def}
+
+A transformation is \emph{atomic} if it appears to execute instantaneously:
+other transactions see either the pre-transformation state or the
+post-transformation state, never an intermediate state.
+
+Ensuring atomicity requires careful handling of the IR's data structures:
+\begin{itemize}
+\item \textbf{Consistent snapshots:} The snapshot must capture a consistent
+      state of the IR (not a partially modified state).
+\item \textbf{Atomic commit:} The commit must apply all changes atomically
+      (or at least ensure that other transactions cannot observe partial
+      changes).
+\item \textbf{Isolation levels:} Different transactions may require different
+      isolation levels (read-committed, serializable, etc.).
+\end{itemize}
+
+\subsection{Nested Transactions}\label{sec:txn-nested}
+
+Complex transformations may consist of multiple sub-transformations, each of
+which should be atomic.  \emph{Nested transactions} allow a transaction to
+contain sub-transactions that can be committed or aborted independently.
+
+\begin{definition}[Nested Transaction]\label{def:nested-txn}
+A \emph{nested transaction} $T_n$ within a parent transaction $T_p$ has the
+following semantics:
+\begin{itemize}
+\item If $T_n$ commits, its changes become part of $T_p$'s write set.
+\item If $T_n$ aborts, its changes are rolled back within $T_p$, but $T_p$
+      continues.
+\item If $T_p$ aborts, all changes (including those from committed
+      sub-transactions) are rolled back.
+\end{itemize}
+\end{definition}
+
+% ============================================================
+% Concurrent Optimization
+% ============================================================
+\section{Concurrent Optimization}\label{sec:txn-concurrent}
+
+\subsection{Parallelizing the Optimization Pipeline}\label{sec:txn-parallel}
+
+Traditional compiler optimization pipelines execute passes sequentially.
+Transactional transformations enable \emph{concurrent optimization}: running
+multiple passes in parallel on different parts of the program.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, draw=TomeInk, fill=TomeBg, thick, minimum width=2cm, minimum height=0.7cm, align=center, rounded corners=2pt},
+  arr/.style={->, thick, TomeInk},
+]
+  \node[box] (ir) {IR};
+  \node[box, right=1.5cm of ir] (split) {Split by\\ Function};
+  \node[box, right=1.5cm of split] (t1) {Pass on $f_1$};
+  \node[box, right=1.5cm of split, below=0.3cm of t1] (t2) {Pass on $f_2$};
+  \node[box, right=1.5cm of split, below=0.3cm of t2] (t3) {Pass on $f_n$};
+  \node[box, right=1.5cm of t2] (merge) {Merge\\ Results};
+
+  \draw[arr] (ir) -- (split);
+  \draw[arr] (split) -- (t1);
+  \draw[arr] (split) -- (t2);
+  \draw[arr] (split) -- (t3);
+  \draw[arr] (t1) -- (merge);
+  \draw[arr] (t2) -- (merge);
+  \draw[arr] (t3) -- (merge);
+\end{tikzpicture}
+\caption{Concurrent optimization with transactional isolation}\label{fig:txn-concurrent}
+\end{figure}
+
+\subsection{Inter-Procedural Conflicts}\label{sec:txn-ip-conflicts}
+
+Some optimization passes are inherently inter-procedural (e.g., inlining,
+inter-procedural constant propagation).  These passes cannot be trivially
+parallelized by function.  Transactional conflict detection handles this by
+tracking which functions are read and written by each pass:
+
+\begin{itemize}
+\item An inlining pass that inlines $f$ into $g$ reads $f$ and writes $g$.
+\item If another pass is simultaneously modifying $f$ or $g$, a conflict is
+      detected and one transaction must abort.
+\end{itemize}
+
+\subsection{Work Stealing}\label{sec:txn-work-stealing}
+
+For load balancing, a work-stealing scheduler can be used: each worker thread
+has a queue of functions to optimize.  When a worker's queue is empty, it
+\emph{steals} work from another worker's queue.  Transactions ensure that
+stolen work is not duplicated.
+
+% ============================================================
+% Applications to Incremental Compilation
+% ============================================================
+\section{Applications to Incremental Compilation}\label{sec:txn-incremental}
+
+\subsection{Incremental Compilation as Transaction Replay}\label{sec:txn-incremental}
+
+Incremental compilation recompiles only the parts of a program that have
+changed.  Transactional transformations provide a natural framework for
+incremental compilation:
+
+\begin{enumerate}
+\item Each compilation pass is a transaction that transforms the IR.
+\item When the source changes, the transactions for the affected functions are
+      rolled back.
+\item The affected functions are recompiled, and the transactions are re-applied.
+\item Transactions for unaffected functions are not re-executed.
+\end{enumerate}
+
+\subsection{Dependency Tracking}\label{sec:txn-deps}
+
+To determine which transactions must be rolled back when the source changes, the
+compiler must track \emph{dependencies} between transactions:
+
+\begin{itemize}
+\item \textbf{Source dependencies:} A transaction depends on the source code it
+      read.  If the source changes, the transaction must be re-executed.
+\item \textbf{IR dependencies:} A transaction depends on the IR state produced
+      by previous transactions.  If a previous transaction is rolled back, all
+      dependent transactions must also be rolled back.
+\item \textbf{Analysis dependencies:} A transaction depends on analysis results
+      (e.g., points-to information).  If the analysis is invalidated, the
+      transaction must be re-executed.
+\end{itemize}
+
+\begin{definition}[Dependency Graph]\label{def:dep-graph}
+The \emph{dependency graph} is a DAG where nodes are transactions and edges
+represent dependencies.  When a source change invalidates a transaction $T$,
+all transactions reachable from $T$ in the dependency graph must be rolled back
+and re-executed.
+\end{definition}
+
+\subsection{Selective Re-Optimization}\label{sec:txn-selective}
+
+Not all transactions need to be re-executed after a source change.  If the
+change is small (e.g., modifying a constant), only transactions that depend on
+the changed value need to be re-executed.  The dependency graph enables
+\emph{selective re-optimization}: re-executing only the minimum set of
+transactions needed to bring the IR up to date.
+
+\begin{insight}
+The transactional model unifies several seemingly different compiler
+capabilities: speculative optimization, concurrent optimization, incremental
+compilation, and fault tolerance.  In each case, the key idea is the same:
+treat each transformation as an atomic unit of work that can be committed or
+rolled back.  This abstraction enables the compiler to be more flexible, more
+robust, and more efficient.
+\end{insight}
+
+\begin{historical}
+The idea of applying transactional concepts to compilers has appeared in several
+contexts.  The concept of \emph{optimistic optimization}---trying an
+optimization and rolling back if it fails---dates to the early 2000s in the
+context of Java JIT compilation.  The \emph{Equality Saturation} framework
+(\cref{ch:equality-saturation}) can be viewed as a form of transactional
+optimization, where each rewrite is a transaction that is committed only if it
+improves the program.  The application of transactional concepts to incremental
+compilation is more recent, driven by the need for fast build times in large
+codebases.
+\end{historical}
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:txn-summary}
+
+Transactional compiler transformations bring the power and flexibility of
+database transactions to compiler optimization.  By treating each transformation
+as an atomic, rollbackable unit of work, the compiler can speculate, parallelize,
+and recover from failures in ways that are impossible with traditional
+pass-based pipelines.
+
+\subsection{Relationship to Equality Saturation}\label{sec:txn-equality}
+
+The equality saturation framework (\cref{ch:equality-saturation}) can be viewed
+as a form of transactional optimization.  Each rewrite rule application is a
+transaction that adds an equivalent expression to the e-graph.  The extraction
+phase selects the best expression, effectively committing the best transaction.
+The key difference is that equality saturation maintains all equivalent forms
+simultaneously, while transactional optimization commits or rolls back each
+transformation independently.
+
+% ============================================================
+% Summary
+% ============================================================
+\section{Summary and Further Reading}\label{sec:txn-summary}
+
+Transactional compiler transformations bring the power and flexibility of
+database transactions to compiler optimization.  By treating each transformation
+as an atomic, rollbackable unit of work, the compiler can speculate, parallelize,
+and recover from failures in ways that are impossible with traditional
+pass-based pipelines.
+
+Key open challenges include:
+\begin{itemize}
+\item \textbf{Overhead:} The cost of snapshotting, logging, and conflict
+      detection must be kept low relative to the optimization work.
+\item \textbf{Granularity:} Choosing the right granularity for transactions
+      (too coarse limits parallelism; too fine increases overhead).
+\item \textbf{Integration:} Retrofitting existing compiler pipelines with
+      transactional support.
+\item \textbf{Verification:} Proving that concurrent transactions preserve
+      program semantics.
+\end{itemize}
