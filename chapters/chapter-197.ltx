@@ -16,6 +16,56 @@ Suppose a program computes an intermediate array \(T\) from an input \(A\), then
 
 The invariant is that a runnable \(Q_j\) has acquired a completion event covering each element it reads and that the associated writes are visible at its execution site. Removing the edge from \(P_{j+1}\) lets \(Q_j\) read an unfilled right-hand halo at its last output index. A test can delay that producer and compare the boundary element with a sequential evaluation. Completion here is stronger than ``the host enqueued the kernel.'' Across devices it may need to include a transfer to the consumer's address space. A shared-host schedule could implement the same dependency with a release by the producer and a corresponding acquire by the consumer.
 
+% Annotated walkthrough
+\section{Derive Halo Dependencies from Read Sets}
+
+Rather than teaching the task builder that a stencil always reads its
+immediate neighbors, give it an output interval and a set of read offsets.
+Use inclusive intervals and assume every intermediate index belongs to
+exactly one nonempty producer tile. The consumer has no other reads of the
+intermediate and never writes it. Its output domain has already been
+restricted to points for which every specified read is in bounds. The
+builder must return exactly one dependency per producer whose tile
+intersects a required read interval. Each event denotes completion and
+visibility in the consumer's address space, not just submission.
+
+\begin{sudocode}
+\Require Output interval $[l,h]$, offsets $D$, producer tiles $T$
+\Let{E}{\varnothing}
+\If{$l>h$}
+  \State \Return $E$
+\EndIf
+\ForAll{$d\in D$}
+  \To{Translate the entire output interval.}
+  \Let{R}{[l+d,h+d]}
+  \ForAll{$t\in T$ intersecting $R$}
+    \To{Several reads may wait for the same event.}
+    \Let{E}{E\cup\{\operatorname{ready}(t)\}}
+  \EndFor
+\EndFor
+\State \Return $E$
+\end{sudocode}
+
+For tiles $[0,2]$, $[3,5]$, $[6,8]$ and output interval $[3,5]$,
+offsets $-1,0,1$ yield read intervals $[2,4]$, $[3,5]$, $[4,6]$.
+The first interval touches the first two producers; the last adds the
+third. For a smaller consumer $[4,4]$, all three reads belong to the
+middle tile and only one event remains. If $T_i=2i$, the latter consumer
+must produce $6+8+10=24$. Delay both outer producers in this test: the
+smaller consumer should still run as soon as its own event arrives.
+For the full $[3,5]$ consumer, delay the third producer and check
+that the task waits; its last result needs $T_6=12$ and must be $30$.
+
+After processing any prefix of offsets, the event set covers exactly the
+union of tiles touched by that prefix. Keeping this invariant prevents two
+opposite mistakes: omitting a boundary read and adding a global barrier
+where it is not needed. With sorted intervals, each overlap query can start
+with a binary search and then walk the touched tiles. Looking only at
+neighboring tile numbers is unsafe for larger offsets or irregular tile
+widths. A boundary rule such as periodic wraparound must first split a
+wrapped read range into in-domain pieces; clipping it would silently drop
+a producer.
+
 \section{Mapping the Same Dependencies to Hardware}
 
 Budiu and Goldstein's \textit{Pegasus} uses a representation suitable for predication and speculation in a compiler that translates C into hardware. Here the backend can turn dependence into ready signals, buffering, or scheduled wires rather than software task records. Predication is useful at stencil boundaries: the backend can suppress an out-of-bounds memory access. Executing the access and then masking only its result would not be equivalent if the access can fault or has observable effects. A hardware implementation may additionally constrain throughput by using a limited number of memory ports; those resource constraints are not source-level dependences.

@@ -38,6 +38,51 @@ In \emph{Tracing the Meta-Level: PyPy's Tracing JIT Compiler}, Bolz, Cuni, Fija{
 
 Bolz and Tratt's \emph{The Impact of Meta-Tracing on VM Design and Implementation} explains why annotations and VM design still matter. Promoting a value specializes to the recorded value by inserting a guard. An elidable helper may be folded for known inputs under the documented dependency conditions; an object lookup is not elidable merely because it usually yields the same result. An explicit version token can turn a mutable lookup into a query tied to one version. Promoting every observed receiver instead would cause needless exits and code growth.
 
+% Annotated walkthrough
+\subsection{Give a Side Trace Its Own Entry Contract}
+
+A repeatedly taken guard exit can recruit a specialized bridge,
+but a guard must continue to work before a bridge is available
+and for states the bridge does not accept. Consider a toy trace
+of a loop whose body adds a tagged signed delta, then emits the
+sum. The root path handles nonnegative deltas; a negative-delta
+bridge is compiled only after observing that exit. Assume the
+example's arithmetic fits its scalar range, and that no emission
+has yet occurred for the current iteration when the guard fails.
+The snapshot supplies the current accumulator and the original
+tagged delta. A reference continuation handles any other tag and
+reports a type error for Booleans.
+
+\begin{sudocode}[Dispatch a guard exit to a compatible bridge]
+\State $S\gets$ describe state before addition at the failed guard
+\State $b\gets$ published bridge for this root and guard
+\If{$b$ exists and its entry contract accepts $S$}
+  \State $d\gets$ unbox delta from $S$
+    \Comment{Bridge already checked tag and sign}
+  \State $s\gets S.sum+d$
+  \State emit $s$ and continue at the next iteration
+\Else
+  \State record an exit hit for $S$ \Comment{Count guard, not loop}
+  \State resume reference addition from $S$
+\EndIf
+\end{sudocode}
+
+Start at sum 10 and run deltas $(4,-3,-2,\mathsf{true})$.
+Arrange publication of the negative bridge after the first
+negative exit. The root emits 14, reference recovery emits 11,
+and the bridge emits 9. The Boolean goes through reference
+recovery and traps before an emission. Repeat with no bridge:
+the same observations must appear, but the second negative
+delta also uses reference recovery. Log which path ran; the
+result alone cannot demonstrate that the bridge was entered.
+
+The invariant is exactly one semantic continuation per exit,
+with the prefix of observations already committed when the
+guard failed. A bridge specialized for one exit cannot be
+reused by PC alone: a different guard can deliver different
+live values or representations at that same PC. Count bridge
+bytes against a per-root budget.
+
 \section{Choose a useful recording boundary}
 
 Dossier Chapters~12 and~14 explore specialization in interpreters and sharing semantics among engines. A self-specializing add node rewrites local dispatch; a meta-trace can remove dispatch across several such nodes. Dossier Chapter~41 proposes varying the granularity further. Under the blueprint's separation of exploration from assurance, a prototype can cap trace length and bridges per root, interpret upon exhausting the cap, and compare against block versioning (Chapter~\ref{ch:ext-254}). Measure not only the time of a stable loop but also total bytes, exit frequency and completed work on a loop with irregular branches. A trace that wins for one observed path is not evidence that enlarging the compilation region will win for the workload.

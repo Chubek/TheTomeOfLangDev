@@ -27,3 +27,55 @@ Use a forward analysis with abstract values drawn from the powerset of $\{\maths
 Certify the checked value, not merely a location with the same spelling. The check elimination invariant is that each erased check has a dominating proof for its exact operand, or that the required fact is established on every predecessor of its defining phi. Facts about memory also require an appropriate no-clobber proof. Unknown calls, callbacks, and volatile reads need conservative transfer rules. Under concurrency even apparently identical reloads may differ; a verifier must use the guarantees of the memory model rather than assume that no visible assignment implies no change. Markdown Dossier Chapter~17 explains how explicit IR memory can expose these dependencies to a pass.
 
 Satish Chandra and Thomas Reps's \emph{Physical Type Checking for C} illustrates a distinct low-level obligation: when typed field accesses survive pointer casts, safety depends on correspondence between the layouts of the actual and advertised objects at the offsets they use. A flow proof that excludes null cannot justify an access at an offset absent in the actual object, and identical offsets on one target do not show that a conversion is portable or valid for arbitrary C accesses. Track semantic properties and layout obligations separately in a typed IR. This also sharpens testing: a branch that removes null, a call that may clobber a field, and a nonnull pointer with insufficient layout evidence must produce three different checker outcomes.
+% Annotated walkthrough
+\section{Merging Phi Operands With Edge-Local Evidence}
+
+The compiler can prove that a merged value is nonnull even when
+neither of its possible operands is globally nonnull. The key is
+to ask about each operand on the edge where the phi selects it.
+Assume a forward SSA analysis has already computed sound edge
+facts at a fixed point. Each edge is marked reachable or
+unreachable, and each reachable edge maps value identities to
+nullness sets. An absent entry means both null and nonnull are
+possible. Given a phi with one operand per incoming edge, produce
+the output qualifier and, when useful, the per-edge witnesses for
+an independent verifier. No inference about the underlying heap
+is needed for this calculation.
+
+\begin{sudocode}
+  \Input phi arguments $A$, incoming edge facts $F$
+  \Output merged fact and per-edge evidence
+  \State $N\gets\varnothing$; $W\gets$ empty map
+  \ForAll{$(e,v)$ in $A$}
+    \If{$F[e]$ is unreachable}
+      \State skip this edge \Comment{Not an unknown value}
+    \Else
+      \State $S\gets\Call{FactOrUnknown}{F[e],v}$
+      \Comment{Look up the exact phi operand}
+      \State $N\gets N\cup S$
+      \State $W[e]\gets(v,S)$
+    \EndIf
+  \EndFor
+  \State \Return $(N,W)$
+\end{sudocode}
+
+Let incoming edge $e_1$ come from the true arm of a test
+\texttt{left != null}, and $e_2$ from the true arm of
+\texttt{right != null}. In the merge, $p$ selects \texttt{left}
+on $e_1$ and \texttt{right} on $e_2$. Even when \texttt{right}
+is unknown on $e_1$ and \texttt{left} unknown on $e_2$, the
+two lookups return $\{\mathsf{nonnull}\}$ and the union does
+too. A check of $p$ can be removed under the stated assumptions.
+Add a reachable $e_3$ passing a literal null: the result now
+contains both possibilities, and the check remains. If $e_3$
+is instead unreachable, it contributes nothing.
+
+For any execution that reaches the merge, the concrete phi value
+is contained in the operand set for its actual predecessor, and
+therefore in the union. If no edge is reachable, the empty result
+means that no runtime value was observed, not that the phi is
+known nonnull. Track edge identities, not just predecessor block
+labels, in IRs with multiple edges from one block. This query
+is linear in the number of incoming edges with constant-time
+fact lookups. Recompute the witnesses after edge rewrites; they
+certify the current operand mapping only.

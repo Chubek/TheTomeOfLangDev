@@ -397,6 +397,34 @@ A \emph{multi-level arena} consists of a chain of memory blocks. When the curren
 \end{algorithmic}
 \end{algorithm}
 
+% Annotated walkthrough
+\subsection{Rolling an Arena Back to a Checkpoint}
+
+Full arena reset is too coarse for speculative work. A parser, for example, may retain earlier nodes while dropping the objects created by a failed alternative. A checkpoint must record more than the bump pointer when blocks can grow and allocations can own resources that need explicit destruction.
+
+\textbf{Inputs and assumptions.} Use a thread-confined arena with an active block chain and a stack of nonthrowing cleanup actions. Destroyed objects must not be reachable from surviving objects; undo any writes that installed such pointers before rolling back. A cleanup may use still-live dependencies but cannot allocate from or mutate the arena's checkpoint state. Checkpoints are consumed in last-in, first-out order.
+
+\begin{sudocode}[Rewind a failed allocation scope]
+\Require Top checkpoint $(b,o,k)$, active arena
+\Ensure Restore block $b$, offset $o$, and cleanup depth $k$
+\If{checkpoint is not the valid top token}
+  \State \Return invalid checkpoint
+\EndIf
+\While{cleanup depth exceeds $k$}
+  \State Pop and invoke the top cleanup
+  \State \Comment{Storage is still available during cleanup}
+\EndWhile
+\While{last active block differs from $b$}
+  \State Remove and release the last block
+\EndWhile
+\State Restore the offset of $b$ to $o$
+\State Consume the checkpoint \Comment{Cannot replay a rollback}
+\end{sudocode}
+
+\textbf{Example.} A checkpoint records block 0 at offset 40 and cleanup depth 2. A failed parse allocates one object in its remaining space and a second object in block 1, registering a cleanup for each. Rollback runs cleanups 4 then 3, releases block 1, and restores offset 40 with two older cleanup entries intact. The next allocation may reuse bytes from the failed alternative.
+
+\textbf{Invariant.} Storage reserved before the checkpoint is never reclaimed by this operation. Rollback takes time proportional to the number of cleanup actions and blocks discarded, plus cleanup work, not the number of plain bump allocations. A raw pointer into discarded memory remains invalid even if an allocation later reuses the same address. Keeping emptied blocks on a separate free list can reduce allocation overhead on the next attempt.
+
 \subsection{Hierarchical Arenas}\label{sec:hierarchical-arenas}
 
 A \emph{hierarchical arena} system allows arenas to be nested, creating a tree of memory regions:

@@ -21,6 +21,52 @@ Suppose an embedder starts a native job that returns on a foreign worker. On sub
 
 Cancellation and completion need a shared ownership protocol. Marking a job cancelled before delivery has begun suppresses delivery but does not mean the library stopped accessing its buffers. Serialize the change to closing state with callback admission: an executor can check and begin callbacks on the same VM thread that begins teardown, or admission can claim a counted in-flight slot under a lock. Teardown prevents new submissions and admissions, then cancels or drains outstanding work and waits for producers and admitted callbacks to finish before destroying the handle table. Only one finalizer frees each buffer and releases its reference. Force collection between submission and delivery, then force teardown with completion already queued and again with the library still running. Assert one release per allocation and no new delivery after closing.
 
+% Annotated walkthrough
+\subsection{Specify Copy-Back on Success for an Out Parameter}
+
+Native libraries often return a status but write a result through
+a separate pointer. Describe what the guest observes if those writes
+are partial. In this example a synchronous C function fills a byte
+buffer and returns a status plus a logical count. The binding
+commits exactly that prefix on success and no bytes on failure.
+Assume the library respects the passed capacity, does not retain
+the pointer, and has no other observable effects in this binding.
+Use zero-initialized native scratch under a fixed capacity limit and
+hold the guest destination through a local root. Assume no guest
+reentry or concurrent mutation of that destination and use the
+VM's array-copy API when committing.
+
+\begin{sudocode}[Commit a checked native result]
+\State $cap\gets$ checked, bounded length of destination
+\State $h\gets$ root of managed destination
+\State $buf\gets$ zeroed native storage of capacity $cap$
+\State arrange cleanup of $buf$ and $h$ on every exit
+\State $(status,n)\gets\Call{ForeignFill}{buf,cap}$
+  \Comment{No raw managed pointer crosses the call}
+\If{$status$ indicates failure}
+  \State \Return translated error
+\EndIf
+\If{$n<0$ or $n>cap$}
+  \State \Return binding error \Comment{Do not copy partial output}
+\EndIf
+\State copy $buf[0:n]$ into destination resolved from $h$
+\State \Return $n$
+\end{sudocode}
+
+Start the guest array at $(9,9,9,9)$. Have the native fixture
+write 2 and 3 and return success with count 2. The guest gets count
+2 and array $(2,3,9,9)$. Force a moving collection while the thread
+is outside managed code; the result must be copied into the moved
+array. When the fixture instead returns failure after its first write,
+the guest sees an error and the original contents. A successful status
+with count 5 is also an error and must leave all four cells untouched.
+
+The invariant is that native writes are unobservable in the guest
+until checked commit, and only the declared prefix changes at commit.
+This does not sandbox arbitrary C code: checking the reported count
+cannot undo an actual write past the scratch capacity. The copy and
+initialization costs belong in benchmarks against a pinning design.
+
 \section{Keep the public convention stable}
 
 Do not unwind guest exceptions across arbitrary host frames; translate them into a status and, when appropriate, an error handle with a documented lifetime. Decide whether host code may reenter the same instance and which threads may attach. Document that policy along with the signature. Chapter~42 of the Modern Compiler Dossier, \emph{Adaptive ABI Negotiation}, explores changing private calling conventions between cooperating units. A published foreign entry point instead needs a stable adapter, including across changes to tagging, collector strategy, or internal register use.

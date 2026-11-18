@@ -377,6 +377,33 @@ A critical optimization in reactive compilation is \emph{changed-value tracking}
 
 This optimization is crucial because many changes (e.g., modifying a comment or renaming a local variable) do not change the results of downstream queries (e.g., type checking of other functions).
 
+% Annotated walkthrough
+\subsection{Replacing Dependencies When a Query Changes Branches}
+
+An unchanged query result does not imply an unchanged dependency list. A configuration change can send a query down a different branch that happens to produce the same answer. Keeping the old list can cause both wasted invalidation and missed changes. Keep the result's change stamp separate from the read set that justifies it.
+
+\textbf{Inputs and assumptions.} Execute deterministic queries against an immutable revision $r$ and record every tracked read along the executed branch. Process revisions in order for each query key, or keep a separate memo per revision. The query engine already provides verification of dependencies. Observational equality must include all parts of a result visible to consumers, including diagnostics if they are part of the interface. Publishing a memo and replacing reverse dependencies must be atomic with respect to later verification.
+
+\begin{sudocode}[Refresh reads even if the value is equal]
+\Require Query $q$, revision $r$, old memo $M$
+\Ensure A valid memo with the new dependency set
+\State Start an empty per-execution read log
+\State Execute $q$ at $r$, yielding value $v$ and read set $D$
+\If{execution was cancelled}
+  \State \Return without publishing
+\EndIf
+\Let{c}{r}
+\If{$v$ equals the old result}
+  \Let{c}{M.\mathit{changedAt}} \Comment{Backdate only the value}
+\EndIf
+\State Atomically publish $(v,D,c,r)$
+\State \Comment{Replace old reverse edges in the same operation}
+\end{sudocode}
+
+\textbf{Example.} A query chooses either $A$ or $B$ according to a flag. At revision 7 the flag selects $A$, whose value is 10. At revision 8 it selects $B$, also 10. The memo is verified at 8, retains change stamp 7, and now depends on the flag and $B$. If $B$ becomes 11 at revision 9, recomputation yields 11 and change stamp 9. An edit to $A$ alone no longer invalidates the memo.
+
+\textbf{Invariant.} A memo's read set belongs to the execution that justified its last publication. Preserving the value stamp spares consumers work but does not authorize reusing the old read set. Publication cost includes updating the changed dependency edges; a cancelled computation must not expose a partially recorded set.
+
 \subsection{Garbage Collection of Cached Results}\label{sec:cache-gc}
 
 As the program evolves, cached query results accumulate. The system must garbage-collect results that are no longer needed:

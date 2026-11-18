@@ -32,3 +32,62 @@ After the outer lambda finishes, its frame remains live through the top-level sl
 \section{Bootstrapping without losing a baseline}
 
 Load list helpers and derived operations from Scheme source after installing the primitives. Run the same library tests once in the minimal interpreter and again if a bytecode engine is introduced. Check the fixed test results and record peak pending control frames for an allocation-free tail loop. Also keep a test for shadowing a primitive with a local procedure; the initial environment is not a keyword table. These tests cover separate layers and make failures local enough to diagnose. The dossier's meta-circular compiler discussion (Chapter~\ref{ch:meta-circular}) takes this layering farther: self-hosting is valuable, but it does not remove the need to identify what the original loader and executable supply.
+% Annotated walkthrough
+\section{Saving the First Operand in a Pending Addition Frame}
+
+An evaluator loop is easiest to debug if one can see exactly
+where intermediate values live. Implement addition for a small
+core with integer literals, binary addition, and an input
+primitive \texttt{read-int}. This teaching mode evaluates
+operands left to right, a permitted choice when the source
+does not fix order. Each addition uses a frame with either a
+right-hand expression and its environment or an evaluated
+left-hand value. The distinction matters in a complete
+evaluator: in the first case the saved environment may contain
+roots, and in the second case the saved value may itself
+have a heap representation. Given an expression and an
+input stream, return the result and the unconsumed stream.
+
+\begin{sudocode}
+  \Input expression $e$, environment $E$, stream $I$
+  \Output integer result and remaining input
+  \State $K\gets$ empty stack
+  \Loop
+    \If{$e$ is $\mathsf{Add}(l,r)$}
+      \State push $\mathsf{NeedRight}(r,E)$ onto $K$
+      \State $e\gets l$ \Comment{Begin with the left operand}
+    \Else
+      \State $v\gets\Call{AtomOrRead}{e,I}$
+      \While{top of $K$ is $\mathsf{Combine}(u)$}
+        \State pop $K$; $v\gets u+v$
+      \EndWhile
+      \If{$K$ is empty}
+        \State \Return $(v,I)$
+      \EndIf
+      \State pop $\mathsf{NeedRight}(e,E)$ from $K$
+      \State push $\mathsf{Combine}(v)$ onto $K$
+      \Comment{Keep the left value while evaluating the right}
+    \EndIf
+  \EndLoop
+\end{sudocode}
+
+For \verb|(+ (read-int) (+ 2 (read-int)))| and input
+$[5,8,11]$, first push the outer right expression and read
+$5$. The outer frame becomes $\mathsf{Combine}(5)$.
+Entering the inner addition puts another awaiting frame
+above it. The literal $2$ turns that frame into
+$\mathsf{Combine}(2)$, and the second read yields $8$.
+The loop pops the inner frame to get $10$, then the outer
+frame to get $15$. The stream still contains $11$.
+Reversing the evaluation order would not change the sum in
+this example, so also record the source position associated
+with each read during a regression test.
+
+The frames always describe unfinished computations ordered
+from innermost down to outermost. A read on an empty stream
+reports failure without executing another frame. The loop
+uses space proportional to the maximum number of pending
+additions, not necessarily the full tree size. In a moving
+collector, register all heap-valued fields of those records
+as roots and update their slots after relocation; knowing
+only the current expression is insufficient.

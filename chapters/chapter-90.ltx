@@ -321,6 +321,34 @@ The runtime provides:
   \item \textbf{Waker}: a handle that allows the reactor to notify the executor that a task is ready to make progress.
 \end{itemize}
 
+% Annotated walkthrough
+\subsection{Registering a Waker Without Losing a Completion}
+
+The executor and reactor interface needs more than a way to store a callback. If a task checks for readiness and registers a waker in separate operations, a completion arriving between them may find nobody to wake. The task then suspends even though its result is available. Protecting both operations with the same lock gives a simple reference implementation.
+
+\textbf{Inputs and assumptions.} The future has one consumer and one completion, with no cancellation in this example. A shared mutex protects an optional result and an optional waker, both initially absent. The executor never polls the task concurrently with itself and honors a wake during a poll by scheduling another poll if needed. Waker callbacks can invoke executor code, so run them outside the lock.
+
+\begin{sudocode}[Serialize poll and completion]
+\Require Shared result $r$, waker $w$, mutex $m$
+\Ensure A pending poll cannot miss the completion
+\State \textbf{poll} $(\mathit{newWaker})$:
+\State Lock $m$
+\If{$r$ is present}
+  \State Take $r$; unlock $m$; \Return ready result
+\EndIf
+\State $w\gets\mathit{newWaker}$ \Comment{Same lock as readiness check}
+\State Unlock $m$; \Return pending
+\State \textbf{complete} $(v)$:
+\State Lock $m$
+\State Store $v$ in $r$ and take $w$ into a local
+\State Unlock $m$
+\State If a waker was present, invoke it \Comment{No lock held}
+\end{sudocode}
+
+\textbf{Example.} A poll stores waker $W$ and releases the lock. Completion immediately stores 42 and invokes $W$, potentially before the first poll returns pending. The executor schedules a second poll, which returns 42. If completion acquires the lock first, it stores 42 and finds no waker; the first poll then returns 42 without suspending.
+
+\textbf{Invariant.} A completion either precedes the readiness check or sees the waker installed by the pending poll. There is no gap between the check and registration. If the executor polls again before completion, registration replaces the earlier callback with the most recent one. Multiple waiters, cancellation, and repeated consumption require additional states or registration lists.
+
 \subsection{Stackless vs.\ Stackful Async}\label{sec:stackless-stackful}
 
 \begin{table}[htbp]

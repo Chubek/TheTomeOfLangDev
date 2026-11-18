@@ -30,6 +30,57 @@ Do not classify aggregates by counting source-level arguments. In System V, smal
 
 Lower argument shuffles as parallel assignments. For instance, a System V caller adapting four integer arguments to Windows needs \texttt{rdx} from \texttt{rsi} and \texttt{r8} from the incoming \texttt{rdx}. Writing the new \texttt{rdx} too soon corrupts the third argument. Respect the live sources when ordering copies, or use a temporary to break cycles. This issue comes after ABI classification: an accurate table of locations still does not tell the emitter how to get the values into them safely.
 
+% Annotated walkthrough
+\section{Compute the Windows Outgoing Area From the Current Stack}
+
+The same argument list can need different stack adjustments
+depending on preceding saves. Restrict the calculation to
+fixed-prototype Windows x64 calls with scalar arguments that
+each occupy at most one eight-byte slot and no stronger
+alignment requirement. The input is the current stack-pointer
+residue modulo $16$, after all preceding saves, and the number
+of already classified stack argument slots. Reserve home space
+and the argument slots, then place any padding beyond the last
+argument. The stack pointer immediately before the call must
+be aligned, and the caller must later restore its old value.
+
+\begin{sudocode}
+\Require Current residue $r$, number of stack slots $n$
+\Let{H}{32}
+\Let{B}{H+8n}
+\To{Subtracting this much gives the required residue.}
+\Let{p}{(r-B)\bmod 16}
+\Let{A}{B+p}
+\State Subtract $A$ from the stack pointer
+\For{$j\gets 0$ to $n-1$}
+  \To{Padding does not shift any argument slot.}
+  \State Store argument $j$ at offset $H+8j$
+\EndFor
+\State Call after placing register arguments
+\State Add $A$ to the stack pointer
+\end{sudocode}
+
+At entry with residue $8$, a call needing one stack slot
+uses $B=40$, padding $0$, and adjustment $40$.
+If a prior eight-byte register save changes the residue
+to $0$, the same call needs padding $8$ and adjustment
+$48$. With the current pointer at \texttt{0x1000}
+after the save, subtraction gives \texttt{0x0FD0}.
+The stack argument goes at \texttt{0x0FF0}; the
+callee sees it at offset $40$ from its entry pointer
+\texttt{0x0FC8}. Restoring $48$ after return brings
+the pointer back to \texttt{0x1000}, where the previous
+save can be handled by the enclosing epilogue.
+
+The invariant is that the adjusted pointer is aligned and
+the argument offsets are fixed independently of padding.
+For $n=0$, home space is still $32$ bytes. A production
+prologue must also account for existing outgoing areas,
+unwind rules, frame size, and stack probing where required.
+This arithmetic does not establish callee-save register
+preservation or assign aggregate arguments. Test those
+contracts separately from the stack residues.
+
 \section{Verify at the Call Boundary}
 
 A thunk's preservation obligation comes from its incoming convention, even if its outgoing call uses a different preserved set. For example, a Windows-facing thunk calling a System V routine cannot expect that routine to preserve \texttt{rdi}, \texttt{rsi}, or the low 128 bits of \texttt{xmm6} through \texttt{xmm15}. Generate the enclosing platform's unwind information for the actual saves and stack adjustment. Test both call directions against independently compiled callees that return a checksum of distinct sentinels, clobber permitted volatile registers, and verify preserved registers and stack restoration. The dossier's \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/42-adaptive-abi-negotiation.md}{Adaptive ABI Negotiation} considers where such adapters fit in a negotiated interface.

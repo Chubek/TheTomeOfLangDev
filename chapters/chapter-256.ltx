@@ -28,6 +28,55 @@ D:
 
 Allocate one rooted shell per virtual ID, then fill fields using the rooted ID table. This preserves sharing and cycles; allocating once per reference would make the identity tests false. The interpreter receives both logical frames, including the outer return continuation, and the device stays advanced by one read. Take \texttt{convert(t)=t} in the reference test. Force the guard to fail with token 42; assert result \texttt{(true,true,46)} and a device-read count of one. Force GC between allocations in a two-object version of the test to check that the rooted table tracks moved objects. A descriptor for PC 0 would duplicate the read even if it reconstructed every local correctly.
 
+% Annotated walkthrough
+\subsection{Share Recipes without Reading Overwritten Homes}
+
+A descriptor can store a graph of scalar computations rather
+than one independent expression per local. This saves metadata
+when several reconstructed values depend on the same optimized
+temporary. Assume the scalar graph is acyclic, uses exact or
+explicitly wrapping arithmetic as declared, and cannot fault.
+Native inputs are literals or saved machine homes; those inputs
+must be captured before allocating or writing the destination
+frame. Here input homes hold only scalars, so no collector
+participation is needed to capture them. Object materialization
+still uses the distinct shell-and-fill procedure above.
+
+\begin{sudocode}[Evaluate scalar nodes before entering the new frame]
+\State validate graph, types and required input homes
+\State $capture\gets$ copy of all referenced scalar homes
+  \Comment{Native and destination storage may overlap}
+\ForAll{scalar recipe nodes $v$ in dependency order}
+  \If{$v$ denotes a home or constant}
+    \State $result[v]\gets$ captured value or literal
+  \Else
+    \State $result[v]\gets$ evaluate using operand results
+      \Comment{One evaluation per node}
+  \EndIf
+\EndFor
+\State populate canonical scalar slots from $result$
+\State resume at descriptor's PC
+\end{sudocode}
+
+Suppose native homes $r_0=6,r_1=4$ survive an optimized
+branch. A recipe computes $t=r_0+r_1$ and restores local
+0 to $t$, local 1 to $2t$, and local 2 to the original
+$r_0$. The canonical values are $(10,20,6)$. If the
+runtime reuses the memory cell holding saved $r_0$ for local
+0, writing that slot early and then reading the old home
+would yield $(10,20,10)$. A fixture can deliberately arrange
+the overlap. Add a self-dependent scalar recipe as a negative
+test: reject it even though cycles in the virtual object graph
+are legal.
+
+The invariant is that each scalar result denotes the recipe's
+value on the machine state at the exit, not on a partly
+rebuilt frame. Dependency-ordered evaluation takes linear
+work in nodes and edges. Stateful loads and effects are not
+scalar recipes; recovery must use a previously saved result
+or choose another valid continuation. Bound the graph size so
+an uncommon exit does not conceal unexpectedly expensive recovery.
+
 \section{Replay needs more than deoptimization}
 
 Dossier Chapter~04 proposes explicit deoptimization operations, and the system blueprint checks their recipes before publication. Dossier Chapter~35 proposes extending recovery to checkpointed deterministic replay. This is additional machinery, not a property of ordinary deoptimization or of dispatched specialized continuations in Fl\"uckiger and colleagues' \emph{Deoptless}~\cite{fluckiger2022deoptless}. The latter provides a faster kind of forward continuation under appropriate contexts, not a time machine.

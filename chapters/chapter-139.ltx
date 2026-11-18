@@ -23,3 +23,62 @@ That example assumes the reference is to an immutable value and the language has
 When several rules match, a refactoring tool should choose a documented strategy or offer alternatives. A pair of inverse transformations can loop if both are installed as unconditional simplifications. Two matches in overlapping spans can each be valid on the original tree yet incompatible together. Compute candidates on a fixed revision, reject overlaps or re-evaluate after the first change, and report why a guard prevented a candidate if the user explicitly requested it.
 
 To produce a patch, use syntax origins to keep comments and whitespace outside the edit intact. Then reparse the changed text. Re-resolve touched references and compare their identities against the rule's declared binding changes. Rechecking types and selected examples is useful but does not replace effect or evaluation-order guards. For an IDE, make the revision check part of publishing the patch: a proposed rewrite must not silently overwrite a more recent user edit. \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/29-proof-carrying-ir-and-certified-rewrite-contracts.md}{Markdown Dossier Chapter~29} applies the same distinction between a proposed rewrite and its validation to intermediate representations. For source, the validator also needs to know which token ranges and binding relationships the patch is meant to preserve.
+
+% Annotated walkthrough
+\section{Extracting a Helper With Explicit Free Variables}
+
+A match can select an expression to extract into a named helper.
+The interface of the helper must account for the bindings that
+the original expression used. Consider a lexically scoped,
+strict Lisp subset with immutable variables, left-to-right calls,
+and no observations of stack depth or allocation identity.
+Choose an expression $e$ and a legal insertion scope for a fresh
+helper with no captures. Resolve free references before moving
+anything. The output is a helper definition, a replacement call
+at the original location, and a map between original binding
+identities and introduced formals. Include references in nested
+lambdas when computing the free variables of the selection.
+
+\begin{sudocode}
+  \Input resolved expression $e$, helper scope $H$
+  \Output helper and replacement, or refusal
+  \State $B\gets\Call{FreeBindings}{e}$
+  \Comment{Set of identities, not spellings}
+  \State order $B$ by first reference in $e$
+  \State $f\gets\Call{FreshHelper}{H}$
+  \State $\rho\gets$ empty binding map
+  \ForAll{$b$ in $B$}
+    \If{$b$ is not an immutable value binding}
+      \State \Return refusal
+    \EndIf
+    \State $\rho[b]\gets\Call{FreshFormal}{}$
+  \EndFor
+  \State $e'\gets\Call{RenameFree}{e,\rho}$
+  \Comment{Do not rewrite local binders}
+  \State $d\gets\Call{Define}{f,\rho[B],e'}$
+  \State $A\gets\Call{References}{B}$
+  \State $c\gets\Call{Apply}{f,A}$
+  \State \Return $(d,c,\rho)$
+\end{sudocode}
+
+In a scope with $x=4$, select the body
+\verb|(add x ((lambda (x) (mul x 2)) 3))|.
+Treat \texttt{add} and \texttt{mul} as immutable procedure
+bindings. The free set in first-use order is \texttt{add},
+outer \texttt{x}, and \texttt{mul}; the inner \texttt{x}
+is bound within the expression. The helper receives three
+arguments. With formals named \texttt{a}, \texttt{v}, and
+\texttt{m}, its body is
+\verb|(a v ((lambda (x) (m x 2)) 3))|.
+Calling it with the three original bindings computes $4+6=10$.
+A spelling-based rename of both occurrences of \texttt{x}
+could instead compute $4+8=12$.
+
+The invariant is that each external reference reads the same value
+through its formal, and each local reference still targets the
+original local binder within the copied tree. Parameter reads can
+move ahead of the body only because they are total, effect-free
+reads of already initialized immutable bindings. Mutable, special,
+or uninitialized bindings require a different rule. If the helper
+has no parameters, still emit a call at the original evaluation
+point; hoisting the body itself could run its effects prematurely.

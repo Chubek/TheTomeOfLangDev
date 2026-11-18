@@ -32,3 +32,31 @@ Xavier Leroy's \emph{From Krivine's machine to the Caml implementations} explain
 Suppose a strict push-enter machine compiles \(f=\lambda x.\lambda y.\lambda z.\,x+y+z\) with an entry that can consume three values before computing the sum. Calling \(f\) with just \(2\) must return a function retaining that argument; the partial-application entry reinstates \(2\) before consuming new arguments. Applying the result to \(3\) and \(4\) must yield \(9\), just as a saturated call does. In a saturated call the machine may enter the body without building the two intermediate function values. For an overapplication, use \(g=\lambda x.\,\mathit{id}\) with entry arity one and call \(g\,2\,3\). The body returns \(\mathit{id}\), to which the machine must apply the remaining \(3\) before resuming the caller. Returning \(\mathit{id}\) directly would silently discard the second operand.
 
 Leroy contrasts push-enter with eval-apply: the latter checks or knows the closure's arity at the calling side and selects an appropriate application path. Test both protocols with unknown function values, not only direct calls whose arities were known at compile time. Include a closure returned by a function whose stack frame has already been reused, as in Chapter~\ref{ch:ext-171}. Such a closure needs persistent data even if the machine normally holds new argument bindings in stack slots. Separating tests for the argument protocol from tests for environment lifetime prevents a correct saturated call from hiding either a wrong resumption or an escaped stack reference.
+
+% Annotated walkthrough
+\section{Read Back a Suspended Argument Under the Right Binders}
+
+An interpreter debugger can display the term represented by a Krivine state without taking a single machine step. The input is a state for the pure lambda calculus with an acyclic closure graph and globally resolved binder identifiers. The display routine unfolds captured terms in their original environments, wraps the control term in the pending applications, and prints distinct binders with distinct names. For a well-scoped reachable state its output is a closed term, modulo alpha-renaming, representing the current head-reduction problem. This is a diagnostic routine, not a second evaluator.
+
+\begin{verbatim}
+readback(term, env, stack):
+  t = close(term, env)
+  # The top argument is the first pending application.
+  for (arg, saved) in stack from top to bottom:
+    t = App(t, close(arg, saved))
+  return print_with_distinct_names(t)
+close(term, env):
+  case term of
+    Var(id):
+      if id not in env: return term
+      (arg, saved) = env[id]
+      return close(arg, saved)
+    Lam(id, body):
+      # A bound occurrence stays under this lambda.
+      return Lam(id, close(body, env without id))
+    App(f, x): return App(close(f, env), close(x, env))
+\end{verbatim}
+
+Start with \((\lambda x.(\lambda y.y)\,x)\,(\lambda z.z)\). After the first lambda entry, the environment binds \(x\) to the identity closure. The displayed term is \((\lambda y.y)\,(\lambda z.z)\), which is also what the debugger prints after the next application transition, now with a pending stack entry for \(x\). After entering \(\lambda y.y\), the current control is \(y\) and its saved argument is \((x,\rho)\), where \(\rho\) binds \(x\). The display is \(\lambda z.z\), before lookup of \(y\) has executed. Forgetting the saved environment in readback can leave a misleading free \(x\) on the screen.
+
+The check is that application and variable-lookup transitions preserve the displayed term up to alpha-renaming, whereas a lambda entry with a pending operand accounts for one head beta step. Since readback can duplicate a shared closure at every use, its textual output can grow exponentially in the size of the machine state. A practical debugger can cap expansion and show references to previously displayed closures, marking abbreviated results as such.

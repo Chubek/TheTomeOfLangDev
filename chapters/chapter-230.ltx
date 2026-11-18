@@ -22,6 +22,50 @@ Suppose an independent sample conversion takes $4$ ns per element on a CPU. An a
 \]
 The device wins in this model at integer sizes $n\geq4546$. A resident input or a downstream accelerator consumer changes the transfer term; a device unable to hold the chosen batch needs tiling and may pay the launch cost several times. Measure below and above the predicted threshold, including format conversion, scheduling, and the final wait. A kernel-only benchmark cannot validate it.
 
+% Annotated walkthrough
+\subsection{Give Each Tile Slot a Reuse Dependency}
+
+The transfer break-even model does not specify when a staging buffer
+can be overwritten. Consider a conversion of independent samples, tiled
+in groups of at most four. The CPU reads the final array only after all
+tiles complete. Use two disjoint device slots, each with an input and an
+output area; the host input and output arrays are also disjoint and stay
+alive until the final wait. Assume the transfer primitives implement the
+platform's visibility rules at their completion tokens. A copy-out
+completion then suffices both to authorize reuse of the slot and to
+publish the corresponding host slice.
+
+\begin{sudocode}[Emit a bounded staging plan]
+\State $done[0],done[1]\gets$ already complete tokens
+\For{$j\gets 0$ to $\lceil n/4\rceil-1$}
+  \State $s\gets j\bmod 2$
+  \State $i\gets 4j$; $m\gets\min(4,n-i)$
+  \State $u\gets\Call{CopyIn}{s,i,m,done[s]}$
+    \Comment{Reuse waits for prior output}
+  \State $v\gets\Call{Convert}{s,m,u}$
+    \Comment{Respect the actual tail length}
+  \State $done[s]\gets\Call{CopyOut}{s,i,m,v}$
+\EndFor
+\State \Call{WaitBoth}{$done[0],done[1]$}
+\State \Return host output
+\end{sudocode}
+
+For $n=10$ and conversion $x\mapsto 2x$, feed the integers 1 through
+10. The slices have $(i,m)$ equal to $(0,4),(4,4),(8,2)$. Delay the
+first copy-out and let the second finish first; the third copy-in must
+still wait. The final array is $(2,4,6,8,10,12,14,16,18,20)$, with two
+tail writes rather than four. A fake device can independently poison the
+unused tail of each slot: none of those cells should reach the host.
+With $n=0$ there are no queued operations and both waits resolve
+immediately.
+
+The invariant is that two tiles assigned to the same slot cannot
+overlap between first write and last read of either device area. Holding
+the slot until copy-out completes is conservative: separately tracking
+the input and output lifetimes can allow more overlap. This plan bounds
+device storage, not queue size; a runtime whose command descriptors need
+bounded memory must also cap submissions in flight.
+
 \section{Validate Placement and Fallback Together}
 
 Require every consumer to see the producer's completed data in the expected address space and layout. A partitioner can check that each cross-device edge has a legal transfer and a completion dependency, that buffer deallocation occurs only after the last outstanding use, and that the fallback obeys the same observable contract. In numerical code, state in advance whether rounding order must match or whether a quantified error bound is part of the contract. Test an unavailable device, zero-length work, and a nonmultiple of the device tile size. The dossier's \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/25-heterogeneous-ir.md}{Heterogeneous IR} treats this explicit placement and synchronization as a design proposal for larger compiler pipelines.

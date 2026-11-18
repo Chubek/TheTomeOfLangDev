@@ -25,6 +25,56 @@ Youn and colleagues' \emph{Fast Graph-Based Instruction Selection for Multi-Outp
 
 In a cover represented by decisions over candidate matches, each retained use needs a compatible definition that dominates it or is available on its incoming edge. Cover equations must account for which nodes a candidate implements internally and which values it exports. A superficially complete set of matches can still be unschedulable: merging members of an acyclic dependence graph can create a cycle in the contracted graph. For instance, absorbing $a$ and $c$ into one tile across a dependency path $a\to b\to c$ leaves one edge in each direction if $b$ still needs $a$ externally and the tile still needs $b$.
 
+% Annotated walkthrough
+\section{Reject Covers That Cannot Be Scheduled}
+
+Check a proposed straight-line cover after matching and before
+emitting its instructions. Assume each IR operation belongs to
+one selected tile, and that legality checks already establish
+the tile's internal ordering and output bindings. Keep directed
+dependencies for all value uses and the required memory or
+ordering edges. Contract the internal dependencies of each
+tile and topologically sort the remaining edges. A cycle
+rejects this grouping; changing the order of independent
+instructions cannot make it legal under an atomic tile model.
+
+\begin{sudocode}
+\Require Operation dependencies $E$, tile map $T$
+\Let{G}{\operatorname{graphOfSelectedTiles}(T)}
+\ForAll{dependencies $u\to v$ in $E$}
+  \To{Internal dependencies are handled by the tile itself.}
+  \If{$T[u]\ne T[v]$}
+    \State Add edge $T[u]\to T[v]$ to $G$
+  \EndIf
+\EndFor
+\To{Only a tile with no unmet input can issue.}
+\Let{Q}{\operatorname{topologicalOrder}(G)}
+\If{$Q$ does not contain every tile}
+  \State \Return reject this cover
+\EndIf
+\State \Return schedule $Q$
+\end{sudocode}
+
+For input $4$, let $a=x+1=5$, $b=2a=10$, and
+$c=a+b=15$, with exact arithmetic on these values.
+Suppose a hypothetical instruction can produce both $a$
+and $c$ from $x$ and an already available $b$. Grouping
+$a$ with $c$ looks like it covers all uses because the tile
+exports $a$ and accepts $b$. Yet the instruction computing $b$
+needs the grouping's $a$, and the grouping needs that
+instruction's $b$. The search must reject this plan.
+Three separate tiles allow the order $a,b,c$ and yield $15$.
+
+Every prefix of the returned order has all of its incoming
+dependencies inside the prefix. This ensures a compatible
+schedule for the contracted dependencies in $O(V+E)$ time,
+provided edge bookkeeping handles duplicate dependencies
+consistently. The check does not replace type, operand,
+effect, or resource checks. If a tile expands into separable
+instructions which can expose an intermediate earlier, the
+contracted graph is too strong a model; expose those stages
+as distinct schedulable units instead.
+
 \section{Whole-Function Graphs}
 
 Ebner and colleagues' \emph{Generalized Instruction Selection using SSA-Graphs} models complex patterns and memory dependencies in a graph grammar with a discrete optimizer. Whole-function selection does not make loop-carried inputs available before the loop: a $\phi$ operand is a use on one incoming edge and is subject to that edge's dominance rules. Also, separate arithmetic matches may be reorderable while an apparent fused load-and-update match is not, owing to aliasing or memory ordering. Keep dependency and placement checks explicit, and compare a heuristic's result on small graphs with an exact, legality-constrained reference. The dossier's \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/37-compiler-as-a-constraint-solver.md}{Compiler as a Constraint Solver} extends this engineering approach beyond selection.

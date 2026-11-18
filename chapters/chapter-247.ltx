@@ -20,6 +20,54 @@ Consider awaiting a future whose poll operation returns \texttt{Pending}. If the
 
 Test with barriers on either side of registration, not a probabilistic \texttt{sleep}. Force both event orders and then race cancellation against completion. Assert one resumption, a valid outcome, and an empty wait-list at quiescence. Include a case where the producer runs before the waiting worker yields.
 
+% Annotated walkthrough
+\subsection{Bound the Number of Local Picks before Checking Arrivals}
+
+Work stealing balances uneven queues, but a busy worker can
+neglect globally submitted tasks even as it completes local
+work. Consider a single worker with a private deque, a shared
+FIFO for external arrivals, and a local-pick quota $Q>0$.
+The accounting unit here is a dispatched continuation slice,
+not an entire guest task. Queue removals are synchronized,
+each slice has one owner, and requeued tasks enter exactly one
+queue. Assume slices eventually return to dispatch. This rule
+provides a bound on how long the worker ignores the global
+queue, not a bound on the work already queued there.
+
+\begin{sudocode}[Choose one continuation at a dispatch boundary]
+\If{$streak\ge Q$ or local deque is empty}
+  \State $streak\gets 0$ \Comment{Start a new polling window}
+  \State $g\gets\Call{PopGlobalFIFO}{}$
+  \If{$g$ exists}
+    \State \Return $g$ \Comment{Oldest external arrival first}
+  \EndIf
+\EndIf
+\State $t\gets\Call{PopLocal}{}$
+\If{$t$ exists}
+  \State $streak\gets streak+1$
+  \State \Return $t$
+\EndIf
+\State \Return idle
+\end{sudocode}
+
+Set $Q=2$ and arrange for external task $G$ to arrive just
+after an empty global poll, while an unending supply of local
+slices is available. The next dispatches are $L_1,L_2,G$.
+Without the quota, the worker might pick a third local slice
+instead. Set each local slice to a synthetic $5\,\mathrm{ms}$
+and ignore dispatch overhead: $G$ starts after
+$10\,\mathrm{ms}$. If a task $F$ precedes it in the FIFO, then
+the sequence can be $L_1,L_2,F,L_3,L_4,G$; the quota does
+not skip existing arrivals.
+
+Between global polls there are at most $Q$ local dispatches.
+That invariant is independent of guest time spent per slice:
+one blocking native call can still violate any wall-time bound.
+An idle worker additionally needs a wakeup protocol on external
+enqueue. In a multiworker implementation, extend the accounting
+to stolen slices and test visibility and idle wakeups separately
+from this local preference rule.
+
 \section{Preemption, priority, and latency}
 
 Cooperative execution needs polls in code that can otherwise run indefinitely. Polling at backward branches bounds work in simple loops only if individual instructions and calls are themselves bounded. A GC request likewise needs a thread to reach a state in which its roots are visible, or a protocol for safely treating it as outside managed code. A priority runtime also faces inversion: Yi Qiu, Puxiang Xiong, and Tianlong Zhu's \emph{The Design and Implementation of the RT-Thread Operating System} illustrates priority inheritance for mutexes. Raising the lock owner's priority can limit preemption by intermediate-priority tasks while a high-priority task waits. It does not bound a critical section that can block indefinitely. Measure time to poll, ready-queue delay, and lock wait separately before attributing a missed deadline to the scheduler.

@@ -268,6 +268,58 @@ The compiler can optimize data transfers:
   \item \textbf{Pinning}: allocate memory that is accessible from multiple devices without copying.
 \end{itemize}
 
+% Annotated walkthrough
+\subsection{Scheduling Reads of Versioned Replicas}
+
+A placement plan says which device runs each operation, but not which copy
+of a value is current. A cached GPU copy can remain allocated even after a
+CPU operation has replaced its contents logically. Represent each logical
+write as a fresh version, and distinguish allocation from availability:
+an asynchronous copy is available to a reader only after its completion
+event.
+
+\textbf{Contract.} Given one logical buffer, a fixed topological order of
+reads and full-buffer writes, and an initial version on the CPU, emit an
+event graph in which each read observes the most recent preceding write.
+Assume operations on different versions use distinct physical storage,
+commands honor their dependency events, and no operation reads and writes
+the same storage. The model does not decide when to reclaim storage.
+
+\begin{sudocode}[Plan transfers for one buffer]
+\Let{v}{0}
+\Let{E[0,\mathrm{CPU}]}{\text{initial ready event}}
+\Let{h}{\mathrm{CPU}}
+\For{each operation on device $d$}
+  \If{operation writes the whole buffer}
+    \To{New storage keeps earlier readers independent.}
+    \Let{v}{v+1}
+    \Let{E[v,d]}{\Call{EmitWrite}{v,d}}
+    \Let{h}{d}
+  \Else
+    \If{$E[v,d]$ is absent}
+      \Let{E[v,d]}{\Call{CopyAfter}{v,h,d,E[v,h]}}
+    \EndIf
+    \To{An existing event may still be pending.}
+    \State \Call{EmitReadAfter}{$v,d,E[v,d]$}
+  \EndIf
+\EndFor
+\end{sudocode}
+
+\textbf{Trace.} The CPU starts with value \(3\). Two GPU reads share one
+CPU-to-GPU transfer event for version zero and both yield \(3\). A CPU
+write produces \(9\) as version one. The next GPU read schedules a second
+transfer, even though a GPU allocation for version zero still exists,
+and yields \(9\). Neither GPU read needs to wait for the other.
+
+Every populated entry names an event whose completion guarantees that the
+designated device holds the designated version. This invariant is
+initialized by the initial event and maintained by writes and dependent
+copies. For this single-buffer model, planning takes expected linear
+time in the operation count with a hash table. With subrange writes,
+whole-buffer versions alone cannot express which bytes remain valid.
+Storage reuse likewise needs an explicit dependency on every old user,
+not merely on the old version's producer.
+
 \section{Advanced GPU Compilation}\label{sec:advanced-gpu}
 
 \subsection{Thread Coarsening and Grid Stratification}\label{sec:thread-coarsening}

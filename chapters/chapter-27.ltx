@@ -299,6 +299,61 @@ First-class continuations provide a natural implementation of coroutines and gen
 A generator that produces the sequence of natural numbers can be implemented using continuations. Each call to the generator resumes the saved continuation, producing the next value in the sequence. The continuation captures the entire state of the generator's computation, including the current position in the iteration.
 \end{example}
 
+% Annotated walkthrough
+\subsection{Enforcing One-Shot Resumption in a Pull Generator}
+
+A generator's continuation represents work after a particular yield.
+The generator should normally resume that work once, even if its
+handle is aliased. In this model a suspended routine is a
+zero-argument thunk returning either $\mathrm{yield}(v,k)$,
+with $k$ a fresh continuation for the remainder, or
+$\mathrm{done}$. The generator's mutable cell holds a suspended
+thunk, a running marker, or a closed marker. Calls are
+single-threaded but may be reentrant through a callback.
+For this sketch the routine never throws; a richer implementation
+would need to specify how exceptions change the cell.
+
+\begin{sudocode}[Consume one suspension]
+\Function{Pull}{$G$}
+  \If{$G=\mathrm{closed}$}
+    \State \Return end
+  \ElsIf{$G=\mathrm{running}$}
+    \State \Return reentrant error
+  \EndIf
+  \State Read $G$ as $\mathrm{suspended}(k)$
+  \State $G\gets\mathrm{running}$ \Comment{Consume before calling}
+  \State $r\gets k()$
+  \If{$r=\mathrm{done}$}
+    \State $G\gets\mathrm{closed}$
+    \State \Return end
+  \EndIf
+  \State Read $r$ as $\mathrm{yield}(v,k')$
+  \State $G\gets\mathrm{suspended}(k')$ \Comment{Save the successor}
+  \State \Return item $v$
+\EndFunction
+\end{sudocode}
+
+\paragraph{Worked trace.}
+Start suspended at $k_0$, which yields $4$ and $k_1$.
+The first pull marks the slot running, invokes $k_0$, and
+returns item $4$ while installing $k_1$. Suppose $k_1$
+calls a callback that tries to pull from the same handle.
+The inner call reports a reentrant error because the outer
+one has already consumed $k_1$. The callback handles that
+result and $k_1$ yields $9$ with continuation $k_2$.
+The third pull runs $k_2$, which returns done, and closes
+the generator. A fourth pull returns end without invoking code.
+
+\paragraph{Invariant and scope.}
+While a continuation is executing, no continuation is accessible
+through the mutable slot. Once execution either yields or finishes,
+the consumed continuation is never reinstalled. Thus aliased
+handles share progress rather than restarting it. The protocol
+does not implement multi-shot continuation invocation or thread
+synchronization. If exceptions are allowed, unwinding must close
+or otherwise explicitly transition the slot; leaving it marked
+running would incorrectly reject all future calls as reentrant.
+
 \section{Continuation Semantics for Advanced Features}
 \label{sec:cont-advanced}
 

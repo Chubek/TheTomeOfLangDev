@@ -30,6 +30,55 @@ RET
 
 The stack code occupies nine bytes and dispatches six instructions; it needs at most two operand cells beyond its locals. The three register instructions occupy ten bytes and name a frame with four slots. The two variants need not differ in minimum storage: reusing register 2 as the destination of \texttt{ADD} is valid if the instruction reads both sources before writing. For $a=3,b=7$ both return 24; for $a=2^{32}-1,b=2$ both return $2^{32}-3$. That second test ensures the reference interpreter does not inherit the host language's signed-overflow rules.
 
+% Annotated walkthrough
+\subsection{Decode a Compact Branch into a Stable Target}
+
+Compact operands save bytes only if readers agree exactly where the
+next operation starts. Consider a toy external encoding with
+\texttt{PUSH8} followed by one unsigned byte, \texttt{JZ8} followed by
+one signed displacement byte, and one-byte \texttt{RET}. A branch uses
+the end of its own encoding as base and consumes one integer on
+either outcome. Decode the entire stream before resolving branch
+targets. The result is a vector whose branch operands name decoded
+operations, together with a reverse map for reporting external offsets.
+This is structural decoding; in particular it does not prove that
+the stack supplies an operand on every path.
+
+\begin{sudocode}[Translate a relative offset into an operation index]
+\State $p\gets 0$; $ops\gets []$; $index\gets\emptyset$
+\While{$p<|bytes|$}
+  \State $(op,a,w)\gets\Call{ReadComplete}{bytes,p}$ or reject
+  \State $index[p]\gets|ops|$ \Comment{Operands are not entries}
+  \State append $(op,a,p,w)$ to $ops$; $p\gets p+w$
+\EndWhile
+\ForAll{$(op,a,p,w)$ in $ops$ where $op$ is \texttt{JZ8}}
+  \State $t\gets p+w+\Call{SignExtend}{a}$ \Comment{End-relative}
+  \If{$t$ is not a key in $index$}
+    \State \Return invalid target at $p$
+  \EndIf
+  \State replace branch operand by $index[t]$
+\EndFor
+\State \Return $(ops,index)$
+\end{sudocode}
+
+Consider starts at offsets 0, 2, 4, 6, and 7, containing
+\texttt{PUSH8 7}, \texttt{PUSH8 0}, \texttt{JZ8 +1},
+\texttt{RET}, and \texttt{RET}. The branch base is 6 and target 7,
+which is decoded index 4 with zero-based indexing. It consumes the
+zero and returns 7 at offset 7. With condition 1 instead, execution
+returns 7 at offset 6; instrument the return position to distinguish
+the edges. A displacement of $-1$ points to byte 5, the operand of
+the branch, and decoding must reject it even if the condition is 1.
+
+The invariant is that every decoded control destination denotes a
+unique external start and can be mapped back without reparsing. Use
+nonwrapping arithmetic for target computation. With direct offset
+indexing, the two passes are linear in the stream length. A branch
+to the end of the byte stream is not a return and must fail this
+format's start check. Also test a final opcode missing its operand.
+Before execution, check fall-through edges and stack effects as well
+(Chapter~\ref{ch:ext-242}).
+
 \section{Keep portable code separate from execution code}
 
 Pick an external form using whole programs, not the shortest example. Compare bytes including branch operands, metadata, and constant pools, and count dispatched operations including moves, calls, and spills to virtual locals. Measure startup separately: decoding into a wider internal form can pay for long runs and still lose on short ones. A simple invariant for that translation is that every internal operation boundary at which the VM can stop has a mapping back to the corresponding external operation and its state. Use it to compare return values and exception locations under both interpreters, not just instruction counts. The Modern Compiler Dossier's Chapter~02, \emph{Multi-Level Interpreter}, develops the same distinction between a stable meaning and replaceable execution representations; Chapter~\ref{ch:ext-243} examines one reason to make that distinction even without a JIT.

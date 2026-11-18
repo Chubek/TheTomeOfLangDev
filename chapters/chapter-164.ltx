@@ -31,3 +31,61 @@ Run an output-language recognizer after the pass to detect illegal nested operan
 One later choice is whether normalized control should be kept as a tree. In \emph{Administrative Normal Form, Continued}, Luke Maurer, Paul Downen, Zena M.\ Ariola, and Simon Peyton Jones show how join points express shared control in direct style. If a downstream rewrite needs several branches to share a remainder, add a binding for the remainder and a restricted jump form rather than duplicating a large expression or expressing jumps as arbitrary functions. A join can have rules that ordinary functions do not, such as use only as a saturated tail transfer; tree recognizers and binding checks can enforce those separately. The dossier's semantic IR idea (Chapter~\ref{ch:semantic-ir}) names the general principle: make properties visible at the boundary where an optimization depends on them, and distinguish a property checked by syntax from one requiring a semantic argument.
 
 Not every compiler needs that boundary. Erik Hilsdale, J.\ Michael Ashley, R.\ Kent Dybvig, and Daniel P.\ Friedman's \emph{Compiler Construction Using Scheme} describes a teaching compiler that stays in direct style without A-normalizing. Naming every intermediate can make later analysis uniform, but it also creates temporaries that an unsophisticated backend might give needless locations. Their example is a reminder to choose a pass language by the invariants that subsequent passes actually exploit, not by the number of passes it permits.
+% Annotated walkthrough
+\section{Certifying Tail-Only Uses Before Lowering a Join}
+
+Before turning local join bindings into machine labels, check
+that a previous pass did not let a join escape as a value.
+Take a direct-style pass language in which each join has a
+unique binding identity, a fixed arity, and an owner function.
+Its sole legal occurrence is the target of an explicit jump
+in a tail position of that function. Tail position descends
+into conditional arms but not tests, and into a sequential
+binding's body but not its initializer. Assume ordinary
+scope and grammar checks have already verified that every
+reference resolves and operands have the required shape.
+Check each join body in tail position with the same owner.
+The output of this pass-language verifier is a diagnostic or
+permission to lower join transfers without allocating closures.
+
+\begin{sudocode}
+  \Input resolved tree $e$, table $J$ of join declarations
+  \Output valid tail transfers or first invalid use
+  \Procedure{Check}{$e,tail,owner$}
+    \If{$e$ references a join as a value}
+      \State reject \Comment{Join labels are not first-class}
+    \ElsIf{$e$ is $\mathsf{Jump}(j,A)$}
+      \If{not $tail$ or $owner\ne J[j].owner$}
+        \State reject \Comment{A jump does not return here}
+      \EndIf
+      \State require $|A|=J[j].arity$
+      \State check arguments in nontail positions
+    \ElsIf{$e$ starts a nested function}
+      \State check its body in tail position with its own owner
+    \Else
+      \State check children using the pass's tail-position rules
+    \EndIf
+  \EndProcedure
+  \State check initial function body in tail position
+\end{sudocode}
+
+Let join $j(z)$ return $z+1$. A tail conditional can jump
+to $j(4)$ in its true arm and $j(8)$ in its false arm.
+Each jump is saturated and in the owner's tail position:
+the verifier accepts and the two runs return $5$ and $9$.
+If the false arm instead adds $2$ to the result of
+$\mathsf{Jump}(j,8)$, that jump sits in a nontail position.
+Reject it rather than emit a label transfer that skips the
+addition. Passing $j$ to an ordinary function is also
+rejected even if that function happens to invoke its
+argument once.
+
+Every accepted use retains the join's owner and introduces
+no pending local continuation. A backend still has to
+place the block where its free values are available and
+implement parameter moves correctly. These are separate
+lowering obligations, not consequences of tail position.
+The check is linear in tree size with constant-time table
+lookup. Run it at the pass boundary where the stricter
+join language first appears, then after transformations
+that may move or duplicate its subtrees.

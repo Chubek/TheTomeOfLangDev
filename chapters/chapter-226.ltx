@@ -23,6 +23,55 @@ A reverse check assembles the displayed instruction in Intel syntax and compares
 
 An encoder chooses a concrete form after registers and operand widths are known. Some valid-looking combinations have no encoding: the high byte register \texttt{ah}, for example, cannot be named in an instruction with a REX prefix. A memory base of \texttt{rbp} or \texttt{r13} without an explicit displacement may require an encoded zero displacement; the otherwise tempting no-displacement ModR/M form has a special meaning. In long mode, a common symbolic operand is RIP-relative, and its base is the address of the \emph{next} instruction. The emitter should record a fixup for an unresolved symbol rather than guessing the displacement; Chapter~\ref{ch:ext-228} follows that record to the linker.
 
+% Annotated walkthrough
+\section{Make Optional Fields Consume Exactly Their Bytes}
+
+A decoder's field cursor is as important as its decoded
+operands. For the worked long-mode load, isolate the routine
+that runs after reading its legacy opcode and REX prefix.
+Handle only the memory form whose ModR/M selects a SIB
+and an eight-bit displacement. The caller supplies the start
+of this instruction and a cursor at its ModR/M position.
+Return the resulting address form and next cursor on success.
+Distinguish truncated, overlong, and unsupported outcomes on
+failure; no unsuccessful call advances the caller's cursor.
+
+\begin{sudocode}
+\Require Byte span $B$, instruction start $s$, field cursor $p$
+\Let{q}{p}
+\To{Each take checks both the span and the instruction limit.}
+\Let{(m,q)}{\operatorname{take}(B,s,q,1)}
+\If{$m$ does not select the supported memory form}
+  \State \Return unsupported
+\EndIf
+\Let{(b,q)}{\operatorname{take}(B,s,q,1)}
+\Let{(d,q)}{\operatorname{take}(B,s,q,1)}
+\To{Sign extension interprets the field, not its byte count.}
+\Let{A}{\operatorname{addressFromSIB}(b,\operatorname{sign8}(d))}
+\State \Return address $A$ and next cursor $q$
+\end{sudocode}
+
+For \texttt{4F 8B 4C A5 F0}, with start $0$ and
+field cursor $2$, the three takes read \texttt{4C},
+\texttt{A5}, and \texttt{F0}. The next cursor is $5$
+and the displacement is $-16$. With the same bytes
+followed by \texttt{90}, the cursor must still be $5$;
+that extra byte belongs to the next instruction.
+Remove \texttt{F0}, keeping only four bytes total.
+The last take returns truncated, and the caller still
+owns the old cursor. This tests byte consumption,
+independent of whether the printed register names are correct.
+
+The take helper propagates truncation when the requested
+bytes exceed the span, and reports an overlong form if they
+would go beyond byte fifteen of this instruction. Its
+invariant is that the local cursor measures the consumed
+prefix from the original start. The SIB interpretation must
+receive the earlier REX bits and any address-size information;
+these are implicit in the restricted routine. A full decoder
+needs separate cases for other modes, displacement sizes, and
+forms that do not contain a SIB.
+
 \section{Test Bytes and Meanings Separately}
 
 Some semantically equivalent instructions have different encodings. Even within a single mnemonic a canonical assembler may shorten a displacement or choose a different form than the one it decoded. Thus \emph{decode after encode} should preserve the typed instruction, up to documented aliases, and consume exactly the bytes emitted; \emph{encode after decode} need not preserve bytes unless the intermediate representation retains the selected form and enough raw details. For the worked load, construct a version with a four-byte sign-extended displacement and compare the decoded address expressions while expecting different lengths. The dossier's \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/39-semantic-fingerprints-and-metamorphic-compiler-testing.md}{Semantic Fingerprints and Metamorphic Compiler Testing} applies tests based on these kinds of relations more broadly.

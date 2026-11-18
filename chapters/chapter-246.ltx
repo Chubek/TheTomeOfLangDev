@@ -20,6 +20,55 @@ Suppose an application asks its runtime to fill 4,096 bytes of a managed array f
 
 A fake device test can return two short reads while a collection moves the managed array, then signal end-of-file. Assert the returned length, byte order, and lack of writes beyond the received range; the collection distinguishes proper root management from retaining a stale address. In a system VM this same host-facing path may involve both a guest syscall and a separate virtual device operation. Instrument the boundaries independently before attributing cost to the guest kernel or the monitor.
 
+% Annotated walkthrough
+\subsection{Account for Heap Growth in Whole OS Pages}
+
+A managed allocation frontier and the OS backing frontier
+have different units. Assume one thread owns a contiguous
+reserved interval, the page size is fixed, and a runtime-specific
+backing operation either makes every page in its requested
+range accessible or leaves the range unchanged on failure.
+This operation does not promise residency or that the first
+access will be cheap. For an append-only arena with no collection
+in this routine, maintain a byte cursor and a page-aligned
+backed limit, both offsets from the reserved base. Require
+positive request sizes and a power-of-two object alignment
+that divides the page size. Do all rounding and addition with
+checked arithmetic.
+
+\begin{sudocode}[Grow a reserved arena on demand]
+\State $a\gets\Call{AlignUp}{cursor,alignment}$
+\State $end\gets$ checked sum of $a$ and requested bytes
+\If{arithmetic failed or $end>reserved$}
+  \State \Return no space \Comment{Do not touch the OS mapping}
+\EndIf
+\If{$end>backed$}
+  \State $b\gets\Call{AlignUp}{end,pageSize}$
+  \If{\Call{BackRange}{$backed,b$} fails}
+    \State \Return no backing \Comment{Keep both frontiers unchanged}
+  \EndIf
+  \State $backed\gets b$
+\EndIf
+\State $cursor\gets end$
+\State \Return address at offset $a$
+\end{sudocode}
+
+With 4096-byte pages, 16,384 bytes reserved, 4096 backed, and a
+cursor at 4080, a 40-byte request aligned to 16 ends at 4120.
+The runtime backs $[4096,8192)$ and returns offset 4080, not
+4096. Inject backing failure: the cursor must stay 4080 and the
+backed limit 4096. A subsequent 16-byte request can succeed
+without another OS call, ending exactly at 4096.
+
+The invariant is $cursor\le backed\le reserved$, with the last
+two quantities page multiples. Backing errors need a precise
+platform adapter: not every OS API offers all-or-none failure
+or meaningful physical commitment reporting. Keep measured
+resident data separate from both cursors. In a system VM the
+guest's accessible pages may incur an additional mapping or fault
+at the hypervisor layer, which this accounting does not measure.
+Report the adapter's page size alongside the observed backing calls.
+
 \section{Where to put the isolation contract}
 
 In \emph{OSv---Optimizing the Operating System for Virtual Machines}, Avi Kivity and colleagues describe a guest OS that uses a single address space and leaves isolation between guests to the hypervisor. Its Linux ABI compatibility choices are possible because it does not try to provide the same internal process boundaries as a general-purpose system. This design illustrates a trade, not a recipe for making arbitrary native extensions safe in one process. Name the layer that enforces each boundary and the unit it protects: guest, process, VM instance, or task. Chapter~\ref{ch:ext-249} returns to the distinction between portable execution and authority.

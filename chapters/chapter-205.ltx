@@ -27,6 +27,54 @@ Diego Novillo's \emph{Tree SSA: A New Optimization Infrastructure for GCC} descr
 
 There is a choice of granularity. One state for all memory is simple, but a store to an unrelated object may appear in every subsequent load's state chain. Partitions by region or object can shorten the search when the compiler can justify the separation. Whether partitioned or not, a query for a reaching write must account for the byte ranges: it can skip a write proved disjoint, forward from a write proved to cover the loaded bytes with a compatible value, and stop or reason further at a possible clobber. Pointer inequality alone does not prove that two multi-byte accesses are disjoint. Unknown calls must conservatively clobber the regions they might modify unless their effect summaries justify skipping them.
 
+% Annotated walkthrough
+\section{Look Through a Memory Merge Only When Answers Agree}
+
+A load can have a known value even when different writes reach it
+on different paths. Consider a private array with whole-cell reads
+and writes, fixed in-bounds indices, and no interfering threads.
+For this restricted query the memory graph is acyclic, and its
+incoming states conservatively include all possible paths. Given a
+cell and a state, return a constant only if every represented path
+guarantees that constant; otherwise return \emph{unknown}. The
+pass must separately establish that the load itself has no observable
+effect and may be replaced.
+
+\begin{sudocode}
+\Require State $M$, queried cell $i$
+\If{$M$ is a store to cell $j$}
+  \If{$i=j$}
+    \State \Return constant of the stored value, or unknown
+  \EndIf
+  \To{A disjoint store leaves the queried cell untouched.}
+  \State \Return $\operatorname{query}(\operatorname{prior}(M),i)$
+\ElsIf{$M$ is a merge}
+  \To{One agreeing predecessor is not enough.}
+  \Let{V}{\{\operatorname{query}(p,i):p\in\operatorname{inputs}(M)\}}
+  \State \Return the sole constant if $V$ is a singleton constant
+\EndIf
+\State \Return unknown
+\end{sudocode}
+
+Suppose the left arm writes $A[2]=13$ and then $A[0]=99$.
+The right arm writes $A[2]=13$ and then $A[4]=7$.
+Querying cell $2$ at the merge skips the last write in each arm
+and gets $13$ from both inputs, so the answer is $13$. Neither
+of the two supplying writes dominates the load. Querying cell
+$0$ instead finds $99$ on the left and no known value on the
+right. That result must be unknown, even if a concrete test
+with an initial $A[0]=99$ happens to return $99$ on both paths.
+
+The inductive invariant is that a constant answer describes all
+concrete states represented by the queried graph node. Memoizing
+by state and cell visits each reachable dependency once per cell,
+including shared subgraphs. If the graph has a loop merge, simple
+recursive memoization is not a solver; either stop conservatively
+at recursion or solve appropriate dataflow equations. The disjointness
+test also depends on whole-cell access. On byte-addressed memory,
+stores of different widths can overlap, and an unmodeled call or
+partial overwrite must block the shortcut instead of being skipped.
+
 \section{Test the Clobber Contract}
 
 For every load the optimizer removes, ask what guarantees its replacement on every feasible incoming path. Compare disjoint, identical, and partially overlapping accesses; then put an opaque call between store and load. The forwarding should disappear when the call can change the location, even if none of the scalar def-use edges changed. Atomics, volatile access, and concurrent observation have additional ordering and effect rules; the reaching-write fact alone does not authorize their removal. The dossier's Chapter~17, \emph{Memory as an Explicit IR}, considers the architectural trade-off between making these dependencies explicit and burdening every transformation with memory-state maintenance.

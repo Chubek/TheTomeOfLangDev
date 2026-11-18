@@ -31,3 +31,58 @@ The attribute-grammar treatment in Ken Slonneger and Barry Kurtz's \textit{Forma
 For speculative or generalized parsing, use branch-local environments. A failed declaration branch must not leave a binding visible to the successful expression branch. For incremental parsing, reusing a decision requires more than unchanged bytes: either the incoming environment is unchanged or the particular lookups used by the decision still have the same outcomes. A cached unsuccessful lookup is a dependency too; inserting a declaration can turn it into a successful one.
 
 As a regression, edit \texttt{let T = 2;} to \texttt{let U = 2;} and verify that the second occurrence changes to a declaration while the surrounding decisions do not. Then undo the edit and compare with a fresh parse. The dependency boundary is the same issue developed in \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/22-incremental-compiler-as-a-reactive-system.md}{Markdown Dossier Chapter~22}, and Chapter~\ref{ch:ext-137} considers how to preserve it even when an edit leaves a declaration incomplete.
+
+% Annotated walkthrough
+\section{Validating a Cache Entry Across a Scope Edit}
+
+Consider a parser with a different contextual form, \texttt{open M;}.
+If the nearest binding of \texttt{M} is a module, the form becomes an
+import; if no binding exists, the language treats it as an ordinary
+command with an identifier argument. A parser cache can reuse the
+command even when some unrelated declaration changed. Assume immutable
+scope snapshots, a stable grammar, and that the decision procedure
+reads the environment only through an instrumented lookup. Give the
+cache a key containing the stable token slice and parser entry state.
+The output is a syntax choice and an unapplied declaration delta, not
+a mutation of the supplied scope. Source locations can be reattached
+to the stable token identities when the tree is reused.
+
+\begin{sudocode}
+  \Input key $k$, scope snapshot $E$, cache $C$
+  \Output node and declaration delta
+  \State $r \gets C[k]$
+  \If{$r$ exists}
+    \State $ok\gets\mathsf{true}$
+    \ForAll{$(q,v)$ in $r.reads$}
+      \Comment{Replay negative reads too}
+      \State $ok\gets ok \land (\Call{Lookup}{E,q}=v)$
+    \EndFor
+    \If{$ok$}
+      \State \Return $r.result$
+    \EndIf
+  \EndIf
+  \State $(result,reads)\gets\Call{ParseAndRecord}{k,E}$
+  \State $C[k]\gets(result,reads)$ \Comment{No scope mutation}
+  \State \Return $result$
+\end{sudocode}
+
+Start with a file containing only \texttt{open M;} in an empty scope.
+Parsing records the read $(M,\mathsf{missing})$ and returns a command
+with an empty delta. Add \texttt{let n = 3;} immediately before the
+form. The parser entry state and token slice for the form are unchanged;
+the lookup still says missing, so the same command is returned.
+Instead add a module declaration with identity $17$ for \texttt{M}.
+Replaying the read now returns $(\mathsf{module},17)$, so the parser
+replaces the cached command with an import of module $17$. The caller
+applies the returned delta only to the committed successor scope.
+
+The invariant is that every environment branch on the cached parse
+path would make the same decision in the new snapshot. Determinism
+then ensures that replay would not take a new path with additional
+reads. Compare full identities if the output contains resolved
+references, rather than merely comparing symbol kinds. If an import
+delta enumerates exports, the export list is another dependency;
+the module name alone cannot validate it. With $r$ recorded reads
+and maximum scope depth $d$, replay costs $O(rd)$ if each frame has
+constant-time lookup. Use complete reparse when the grammar version
+changes or a contextual operation has not been instrumented.

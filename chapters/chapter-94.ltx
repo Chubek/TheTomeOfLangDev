@@ -296,6 +296,34 @@ Escape analysis may have determined that an object does not escape the method an
 
 Materialization can be recursive: a scalar-replaced object may contain references to other scalar-replaced objects, all of which must be materialized.
 
+% Annotated walkthrough
+\subsection{Materializing Cycles Without Losing Object Identity}
+
+Recursively materializing a field as soon as it is read can loop on a cycle or allocate multiple physical objects for one virtual identity. Both behaviors violate deoptimization correctness. Allocate a shell for each identity before filling any virtual references, then read all aliases through the same mapping.
+
+\textbf{Inputs and assumptions.} The descriptor contains a finite, transitively closed set of live virtual identities with class and field recipes. The outgoing frame and any existing reference recipes remain visible to the collector. Objects permit zeroed shells that the collector can safely scan. Allocating a shell and registering its temporary root must not leave an unrooted reference across a safepoint; field writes use the required barriers.
+
+\begin{sudocode}[Allocate shells, then wire their fields]
+\Require Virtual descriptors $D$, frame recipes $F$
+\Ensure Rebuilt frame graph preserves virtual identity
+\State Validate the descriptors before changing frames
+\ForAll{virtual IDs $i$ in $D$}
+  \Let{H[i]}{\Call{AllocateRootedShell}{\mathrm{class}(i)}}
+  \State \Comment{One rooted handle per virtual identity}
+\EndFor
+\ForAll{$i$ in $D$ and fields $f$ of $i$}
+  \Let{v}{\Call{Resolve}{D[i,f],H}}
+  \State Store $v$ into field $f$ through $H[i]$
+  \State \Comment{References use shells; no recursive allocation}
+\EndFor
+\State Rebuild frames from $F$ using $H$
+\State Publish frames as roots before dropping $H$
+\end{sudocode}
+
+\textbf{Example.} A descriptor has $A.\mathrm{next}=B$, $B.\mathrm{next}=A$, and $B.\mathrm{count}=7$. Two frame slots both name $A$. Allocate two objects, then set both links and the integer field. The two slots compare equal by identity, and following \texttt{next} twice returns to the original object. Allocating independently per frame slot would break the identity comparison.
+
+\textbf{Invariant.} Every populated reference to a virtual object points to the unique shell for its recorded target. The work is linear in identities, field recipes, and recovered frame slots. In a moving collector, stores and frame reconstruction must dereference the updated handles instead of caching a raw address across a safepoint. An allocation failure must not resume with partially reconstructed frames; the runtime needs an explicit failure policy before it attempts publication.
+
 \subsection{Eliminating Redundant Materializations}\label{sec:elim-materialization}
 
 If the same virtual object is referenced from multiple deoptimization points, the system should materialize it only once and share the result:

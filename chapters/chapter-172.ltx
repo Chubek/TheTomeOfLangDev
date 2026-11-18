@@ -32,3 +32,32 @@ Do not confuse this runtime identity with the congruence classes in the equality
 Paul Hudak and David Kranz's \emph{A Combinator-based Compiler for a Functional Language} discusses both locating potentially shared computations in a macro-combinator graph and using strictness information to avoid unnecessary lazy treatment. Their example of a factorial depending on a captured variable illustrates a different scope of sharing. In a closure for \(\lambda n.\,\mathit{test}\,n\,(\mathit{fac}\,x)\), the factorial depends on the environment's \(x\), not on \(n\). A full-laziness transformation can place one suspended factorial computation in each such environment and reuse it across calls of that closure. It cannot place a single global result in the code block if distinct closure instances capture different values of \(x\).
 
 That optimization is a lifetime decision as well as an equation. Hoisting an expression out of a lambda can retain everything it captures, even when the result is rarely demanded. Hoisting it as an \emph{eager} computation can also introduce divergence at closure construction or on a branch that never uses it. Compare two retained closures with different captured values and alternate calls that do and do not demand the factorial. A useful performance record distinguishes the number of allocated suspension nodes, the number entered, and the peak live graph. A reduction-count improvement alone does not establish that wider sharing saves memory.
+
+% Annotated walkthrough
+\section{Reduce the Saturated Prefix of an Application Spine}
+
+In a graph reducer, excess arguments have already been attached to the application spine when the head redex is located. The implementation must distinguish the application node at which the combinator becomes saturated from the outermost node representing the whole demand. The following step takes a root in a well-formed graph of applications, positive-arity combinator heads, and literals. Assume that following indirections and walking the demanded left spine here both terminate; cyclic-demand handling is a separate mechanism. The step either recognizes weak head normal form, reports a nonfunction use in an untyped graph, or performs one graph contraction without dropping the remaining arguments.
+
+\begin{verbatim}
+head_step(root):
+  spine = empty stack
+  p = chase_indirections(root)
+  while p is App(f, x):
+    push (p, x) onto spine
+    p = chase_indirections(f)
+  if p is a literal:
+    if spine is empty: return WHNF
+    return NotCallable
+  n = arity(p)
+  if size(spine) < n: return WHNF
+  # Pops recover operands in source order.
+  used = pop n entries from spine
+  r = application_node(last(used))
+  # Overwrite the prefix, not the whole demand.
+  r := Indirection(contract(p, operands(used)))
+  return Reduced
+\end{verbatim}
+
+For \(((K\,I)\,99)\,7\), the outer-to-inner walk pushes entries for \(7,99,I\), in that order. The \(K\) contraction uses \(I\) and \(99\), and replaces only the node for \((K\,I)\,99\) by an indirection to \(I\). The outer application still passes \(7\); a second contraction yields the literal \(7\). Overwriting the outer root at the first step would stop at \(I\) instead. With input \(K\,I\) there is one operand for an arity-two head, so the step reports weak head normal form with zero contractions.
+
+The spine entries identify precisely the left-nested applications of the discovered head. Updating the saturated prefix also lets another edge pointing to that prefix observe the contraction; it was never necessary to duplicate its arguments. Starting over from the outer root after each contraction is simple but can revisit a long pending spine. A production evaluator can keep the unconsumed portion on its stack across contractions, while preserving the same operand order and update address.

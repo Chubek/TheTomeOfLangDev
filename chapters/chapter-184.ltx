@@ -21,3 +21,31 @@ Now start with \(N=1\), fill the only buffer, and cancel after the work send but
 Manuel F\"ahndrich and colleagues' \emph{Language Support for Fast and Reliable Message-based Communication in Singularity OS} describes pointer transfers that pass ownership and statically verified channel contracts that constrain valid interactions. A language with such contracts can say that a worker accepts a buffer in state \texttt{Ready}, owes a return in state \texttt{Busy}, and cannot accept another buffer through that endpoint before returning the first. A typed buffer channel alone does not impose that sequence, whether or not the message type is safe to move.
 
 Test the protocol with empty input, a worker error while holding a buffer, cancellation at each handoff, and enough work to fill every queue. Assert conservation of buffer identities until the documented teardown step, and separately assert that all stages reach a terminal state. A data-race detector is useful for the Go implementation, but a clean run does not prove eventual shutdown. See the \href{dossier-on-modern-cc-design/chapters/23-compiler-as-an-actor-system.md}{dossier's Compiler as an Actor System} for a proposed architecture where these coordination choices become compiler infrastructure.
+
+% Annotated walkthrough
+\section{Explore All Handoffs in a Two-Buffer Protocol Model}
+
+A shutdown test can exercise interleavings systematically before a runtime implementation exists. Build an illustrative finite model with two named buffers. Record the free list, work queue, worker's holdings, and retired set separately, so a faulty transition could leave the same buffer in two places. The input includes an initial configuration and a transition generator implementing queue limits, cancellation, and release. Let retirement be legal only after stop has been requested. A terminal configuration has both stages stopped and both buffers retired. The checker below either finds no reachable stuck nonterminal configuration or ownership violation, or returns a shortest recorded counterexample to one of those checks.
+
+\begin{verbatim}
+check(initial):
+  push initial into FIFO queue; seen = {initial}
+  while queue is not empty:
+    s = pop front of queue
+    if not exactly_one_owner_per_buffer(s):
+      return BadOwner(trace(s))
+    succ = enabled_transitions(s)
+    if succ is empty and not terminal(s):
+      return Stuck(trace(s))
+    for (event, t) in succ:
+      # Remember the first, thus shortest, path to t.
+      if t in seen: continue
+      # Store the event even if it moves no buffer.
+      parent[t] = (s, event)
+      add t to seen; push t into queue
+  return NoStuckState
+\end{verbatim}
+
+For a post-handoff fixture start with buffer \(A\) held by the worker and \(B\) free. Suppose the only transition is cancellation, which stops the producer and retires \(B\). If the worker's only release would be an unbuffered send back to the now stopped producer, nothing is enabled next. The checker returns \verb|Stuck([cancel])| even though \(A\) has exactly one owner. Add a worker transition that retires \(A\) after cancellation and stops the worker. With no other moves in this fixture, exploration reaches the terminal configuration and returns \texttt{NoStuckState}.
+
+The queue contains only reachable configurations and each unseen one is examined once. Breadth-first exploration costs space proportional to the number of distinct configurations, which grows quickly with real queue capacities and message contents. A cycle of enabled transitions in a model may still prevent eventual shutdown without yielding a stuck state. Checking that stronger property requires a progress argument or a cycle check under stated fairness assumptions.

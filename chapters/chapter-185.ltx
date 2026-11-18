@@ -22,3 +22,26 @@ Suppose a layout engine asks a script for a caption twice, once per document rev
 The implementation has a second lifetime problem. As Marcus Crestani explains in \emph{Foreign-Function Interfaces for Garbage-Collected Programming Languages}, values referenced from native code must remain visible to the collector, and a moving collector may have to update those references. A raw pointer to the guest string is not necessarily a stable handle. Keep a registered reference while conversion can trigger garbage collection, and copy through the runtime interface before releasing the reference. For an asynchronous callback, retain its registered handle until the last in-flight call finishes, not merely until unregister is requested.
 
 Test by forcing a collection between return and copy, attempting to use the expired metadata handle after slot reuse, and independently exhausting guest steps and host-side work. Both success and failure must release the temporary references. The observable invariant is that each callback returns an owned caption or a defined error, and cannot see metadata outside the revision and permissions supplied for that invocation.
+
+% Annotated walkthrough
+\section{Commit Guest-Supplied Edits Only After Whole-Batch Validation}
+
+An embedding need not choose between read-only scripts and giving the guest direct access to document setters. For an illustrative annotation plug-in, let the script produce a bounded list of proposed edits against a snapshot. The host copies the proposals into ordinary host data, validates each against the granted operations and snapshot, and applies them to a private draft. Assume validation and draft edits invoke no guest callbacks and have no external effects. At publication, compare the current revision with the snapshot revision and replace the document in one atomic host operation. The outcome is a new revision containing all requested changes, or an explicit error with no document changes attributable to this invocation.
+
+\begin{verbatim}
+run_plugin(plugin, snapshot, grant):
+  proposals = guest_call_and_copy(plugin, snapshot, grant)
+  if proposals is Error(e): return e
+  if size(proposals) > grant.max_edits: return TooManyEdits
+  draft = private_copy(snapshot)
+  for edit in proposals:
+    # Inspect resolved targets, not guest spellings alone.
+    if not allowed(edit, draft, grant): return Denied
+    if not apply_checked(draft, edit): return BadEdit
+  # An intervening host change wins over this draft.
+  return publish_if_current(snapshot.revision, draft)
+\end{verbatim}
+
+At revision \(7\), give a plug-in permission to edit captions only. It proposes changing the caption from \texttt{north} to \texttt{east} and changing the document title to \texttt{Maps}. Validation returns \texttt{Denied}; the published caption is still \texttt{north} at revision \(7\). With only the caption edit, the result is revision \(8\) with caption \texttt{east}. If another editor first publishes revision \(8\) with caption \texttt{west}, the plug-in instead gets \texttt{Conflict}, and \texttt{west} stays published.
+
+Before publication, only the private draft can contain partial work; the revision test and publication cannot be separated by another editor's commit. Returning an error must dispose of temporary guest roots and the draft. A proposal count bounds only the number of operations, not their size or the cost of copying the document. Bounded strings and structural sharing can reduce those other costs without giving the guest direct access to the published data.

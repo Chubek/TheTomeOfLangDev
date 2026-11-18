@@ -29,6 +29,50 @@ on_call(f, args):
 
 No interpreter dispatch remains in the native body. For a branch whose target expects a value in a different location, emit a parallel move on the incoming edge, using a scratch location if moves form a cycle. The entry invariant is that at every reachable block the native layout represents exactly the bytecode operand stack and live locals specified for that block. If a helper can allocate, its call site must report live references in the agreed locations; an integer payload is not a root. Test the sample at \(2^{32}-1\), expecting \(2\), and test a diamond with a different location for the same stack slot on each edge. Route both edges through a helper that can collect to catch a misplaced root as well as a misplaced value.
 
+% Annotated walkthrough
+\subsection{Choose a Fixed Baseline Layout for a Loop Header}
+
+At a structured loop header the baseline compiler has yet to see
+the backedge. Instead of keeping a patchable set of register agreements,
+choose the entry layout before emitting the body. In this toy VM
+each typed loop parameter has a dedicated canonical frame slot;
+locals used across edges also have canonical slots. Incoming paths
+may temporarily compute parameters in registers or other slots.
+Reconcile their layouts by parallel moves, with enough scratch
+for cycles. Only the layout contract is fixed at compile time;
+the runtime values in those places can differ each iteration.
+
+\begin{sudocode}[Build a header seen before its backedges]
+\State allocate typed parameter slots for header $H$
+\State record their order as $layout[H]$ \Comment{Independent of path}
+\State emit incoming-edge moves into $layout[H]$
+\State bind native label for $H$
+\State initialize compiler operand map from $layout[H]$
+\State compile loop body with ordinary lazy operands
+\ForAll{backedge stubs recorded during body emission}
+  \State read sources from the stub's saved operand map
+  \State emit parallel moves to $layout[H]$
+    \Comment{One predecessor's layout is not another's}
+  \State jump to $H$
+\EndFor
+\end{sudocode}
+
+Use loop parameters $(a,b,k)$ in three slots. Enter with
+$(2,5,2)$; each iteration swaps $a,b$ and decrements $k$,
+returning $10a+b$ when $k=0$. The slots at successive headers
+must be $(2,5,2),(5,2,1),(2,5,0)$ and the final result is 25.
+If both values remain in their old slots until the edge, a
+sequential copy for the first swap makes both 5, so the eventual
+result is 55. Also test initial $k=0$ to exercise entry without
+any backedge and $k=1$ to distinguish the swapped result 52.
+
+The invariant at the native header is that the canonical slots
+represent the bytecode parameters in order, whichever path arrived.
+This layout trades extra edge moves for immediate code generation.
+A later tier can keep selected parameters in registers once it has
+a budget for analyzing all incoming states. Track the emitted moves
+on each edge separately when comparing the two tiers.
+
 \section{Tier transitions and shared machinery}
 
 Izawa, Masuhara and Bolz-Tereick's \emph{Two-level Just-in-Time Compilation with One Interpreter and One Engine} presents adaptive RPython: threaded code generation is the first compilation tier, and ordinary tracing the optimizing tier. The former keeps calls to interpreter operations and connects control flow; the latter can optimize through the interpreter operations (Chapter~\ref{ch:ext-253}). Xu and Kjolstad's \emph{Deegen: A JIT-Capable VM Generator for Dynamic Languages} makes a different trade: bytecode semantics written as C++ functions drive generation of an interpreter, a native baseline and inter-tier transitions. Titzer's Wasm case starts with static stack types; a dynamic-language generator additionally needs fast tagged cases, slow paths and runtime feedback. Sharing definitions reduces duplicated implementation, but agreement between two tiers generated from the same faulty definition is not an independent correctness test.

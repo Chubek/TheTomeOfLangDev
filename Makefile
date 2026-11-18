@@ -13,7 +13,7 @@
 ##   make bib        — Regenerate bibliography only
 ##   make count      — Count words/pages
 ##   make lint       — Check for common LaTeX issues
-##   make check-expansion — Check new chapters, dossier links and source catalogue
+##   make check-expansion — Check chapter walkthroughs, dossier links and source catalogue
 ##   make help       — Show this help
 ##
 
@@ -108,5 +108,5 @@ help:
 	@echo "  make bib        Regenerate bibliography only"
 	@echo "  make count      Count words and chapters"
 	@echo "  make lint       Check for common LaTeX issues"
-	@echo "  make check-expansion  Check new chapters, dossier links and source catalogue"
+	@echo "  make check-expansion  Check chapter walkthroughs, dossier links and source catalogue"
 	@echo "  make help       Show this help"

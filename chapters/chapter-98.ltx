@@ -441,6 +441,36 @@ Speculative optimizations can be implemented as transactions:
   \item If validation fails, roll back and try a different optimization.
 \end{itemize}
 
+% Annotated walkthrough
+\subsection{Protecting an Empty Predicate Read at Commit}
+
+Atomic writes alone do not protect a transformation validated against a snapshot. Suppose a pass deletes a side-effect-free definition after finding no uses. A concurrent pass can insert a use without modifying any tuple the first pass read. The empty lookup needs validation too: a new matching row is a phantom.
+
+\textbf{Inputs and assumptions.} Index $\mathrm{Uses}$ by operand value, and maintain a monotonically increasing stamp for each bucket, including empty ones. Increment the stamp on every committed insert, delete, or change affecting that bucket. Assume the usual validation for other reads and writes, and a commit lock shared by all writers. Each bucket read obtains rows and stamp from the same snapshot.
+
+\begin{sudocode}[Validate a negative use lookup]
+\Require Value $v$, candidate deletion in transaction $T$
+\Ensure Commit only with a valid no-use check
+\Let{U,e}{\Call{SnapshotUseBucket}{T,v}}
+\If{$U\ne\emptyset$}
+  \State \Return keep definition
+\EndIf
+\State Stage deletion of the pure definition of $v$
+\State Lock commit mutex
+\If{current stamp for $v$ differs from $e$}
+  \State Unlock and abort \Comment{Even if the old bucket was empty}
+\EndIf
+\If{remaining reads or writes fail validation}
+  \State Unlock and abort
+\EndIf
+\State Apply validated writes \Comment{Still under the commit lock}
+\State Unlock and return committed
+\end{sudocode}
+
+\textbf{Example.} Transaction $T_1$ reads an empty bucket for value 42 at stamp 7. Transaction $T_2$ inserts use $(19,42)$ and commits, advancing the stamp to 8. $T_1$ aborts before deleting the definition. On retry it finds the use and keeps the definition. If $T_1$ commits first instead, the inserter's own validation must check that definition 42 still exists.
+
+\textbf{Invariant.} A successful commit with unchanged stamp cannot have missed a committed change to the bucket between snapshot and commit. Other invariants, such as dominance, still require their own checks. Stamps can reject harmless insert-then-delete histories, but this false conflict is preferable to committing a broken IR. Bucket metadata must survive removal of its last row; otherwise a newly assigned stamp can accidentally match an older empty snapshot.
+
 \section{Summary}\label{sec:compiler-db-summary}
 
 Viewing the compiler as a database---with the IR as a collection of relations, analyses as queries, and transformations as query-driven rewrites---offers a fundamentally different approach to compiler architecture. It enables natural incrementality, persistence, and parallelism, and provides a declarative interface for expressing analyses and optimizations. While the approach is still largely research, it points toward a future where compilers are more modular, more maintainable, and more responsive to changes.

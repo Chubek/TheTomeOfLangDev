@@ -23,3 +23,26 @@ Now suppose a new source revision starts using guarded patterns before the seed 
 Pin build inputs that can perturb output, including locale, generated table order, source paths, and timestamps. Preserve provenance for the compiler binary, its runtime, and generated files. If the two deterministic generations disagree, inspect the first differing artifact: a parsed syntax dump, lowered intermediate representation, assembly file, or executable. A difference only in source paths or debug metadata may explain the discrepancy, but fixing or explicitly accounting for the nondeterminism makes the byte test stronger than silently discarding arbitrary sections from comparison.
 
 A fixed point is not a proof of semantic correctness. Two generations may reproduce an arithmetic bug, and a defective seed can propagate errors through regenerated artifacts. Maintain interpreter comparisons and, when practical, a bootstrap path through an independent implementation. This separates the evidence that the dependency cycle closes from the evidence that the translator is correct. \emph{The Modern Compiler Dossier}, Chapter~13, emphasizes this separation for metacircular compilation; Chapter~44 proposes recording exact build inputs in hermetic compilation capsules. For a release process, the practical invariant is that a fresh machine given the declared seed and inputs can reproduce the documented generation and run its semantic tests, without relying on artifacts from the developer's previous build.
+
+% Annotated walkthrough
+\section{Catch a Compiler Feature Entering Its Own Seed Too Early}
+
+A bootstrap check can localize a too-new dependency before spending time on complete builds. In an illustrative release workflow, assign the seed an explicit manifest of language capabilities, including core syntax and selected library interfaces. An independent, newer analyzer reads the compiler sources and their generated inputs, and reports the features they require with the first relevant source span. For this screening pass, assume those feature uses and their transitive prerequisites can be extracted conservatively in a fixed configuration. The output is a reproducible list of missing capabilities or a signal to try the real bootstrap, not a claim that the seed runs correctly.
+
+\begin{verbatim}
+screen(seed, units, feature_table):
+  report = empty map
+  for unit in units in stable path order:
+    # Inspect generated inputs as well as handwritten ones.
+    for (feature, span) in required_uses_in_span_order(unit):
+      for need in closure_with_self(feature_table, feature):
+        if need in seed.supported: continue
+        record_first(report, need, span)
+  # Stable diagnostics make the first regression reviewable.
+  if report is not empty: return sorted_entries(report)
+  return TryBootstrap
+\end{verbatim}
+
+Suppose seed \(S_0\) supports basic patterns but not tuple destructuring, and a feature table says guarded tuple patterns require both tuple destructuring and guards. The compiler branch uses a guarded tuple pattern at \texttt{parser:42}. The check returns two missing entries, \texttt{guards} and \texttt{tuple}, both with that span. Rewriting the compiler source to use a basic pattern and an explicit conditional permits \texttt{TryBootstrap} with \(S_0\). A transitional compiler can add support for both features while using neither in its own source. Screening the original branch against that transitional seed now returns \texttt{TryBootstrap} without rewriting the guarded pattern.
+
+The practical invariant is that a manifest entry denotes a capability in the exact seed executable and environment, not an aspiration derived from its version string. A negative result pinpoints a build-order problem, while a positive result says little about semantics or undocumented dependencies. Follow it with compilation using that seed, preferably in a clean environment. To keep the checker maintainable, derive its manifest from declared language modes and test it against small capability fixtures.

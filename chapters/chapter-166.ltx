@@ -38,3 +38,34 @@ The first exit leaves \texttt{n} at 1. Invoking \texttt{saved} from outside the 
 \section{Compile-time continuations are not all runtime objects}
 
 Richard Kelsey's \emph{A Correspondence between Continuation Passing Style and Static Single Assignment Form} explains why suitable local CPS continuations can be represented by blocks with parameters; not every CPS term meets the necessary restrictions. Maurer, Downen, Ariola, and Peyton Jones make related control structure explicit in direct style in \emph{Compiling without Continuations}, using join points that need not allocate closures. A block parameter names a value arriving on a control-flow edge, whereas a first-class continuation may escape, be invoked later, and restore dynamic context. Keep those cases distinct. The design in Chapter~\ref{ch:ext-164} makes local joins visible without assuming anything about how the runtime handles \texttt{call/cc}.
+
+% Annotated walkthrough
+\section{Pass Tail Context Through a Core Syntax Tree}
+
+A compiler can determine syntactic tail position before it knows any call targets. Apply the following walk to an expanded core with atoms, lambdas, calls, conditionals, sequences, and single-binding \texttt{let}. The input is a node and a flag saying whether its result is the result of the current lambda. The output is an annotation on each application: a marked call can use the current continuation unchanged, while an unmarked application must return to the surrounding evaluation context. This pass identifies syntactic tail calls only; the special invocation obligations of primitives such as \texttt{apply} belong in their implementations.
+
+\begin{verbatim}
+mark(expr, tail):
+  case expr of
+    lambda(body):
+      # A lambda starts a fresh return context.
+      mark(body, true)
+    if(test, yes, no):
+      mark(test, false)
+      mark(yes, tail); mark(no, tail)
+    let(rhs, body):
+      mark(rhs, false); mark(body, tail)
+    begin(prefix, last):
+      for e in prefix: mark(e, false)
+      mark(last, tail)
+    call(op, args):
+      # Computing a callee is not calling it.
+      expr.tail = tail
+      mark(op, false)
+      for a in args: mark(a, false)
+    atom: pass
+\end{verbatim}
+
+Trace a \texttt{let} binding \(x\) to the result of \texttt{read}. Its body tests \texttt{ok?(x)}. On success it calls \texttt{step} on the result of \texttt{next(x)}; on failure it calls \texttt{done(x)}. The walk marks only the calls to \texttt{step} and \texttt{done}. Suppose \texttt{read} returns \(6\), \texttt{ok?} returns true, \texttt{next} returns \(7\), and \texttt{step} doubles its argument. The calls are \texttt{read()}, \texttt{ok?(6)}, \texttt{next(6)}, and \texttt{step(7)}, in that order; the body returns \(14\). The temporary continuation for \texttt{next} still owes the application of \texttt{step}; treating both calls as tail transfers would return \(7\) instead.
+
+The induction invariant is that a true flag reaches a node exactly when the surrounding core construct has no work after that node produces its result. A nested lambda resets the flag even if the lambda expression is, for example, an argument to another call. The pass visits each node once and needs traversal space proportional to syntax depth. It neither allocates continuation objects nor proves a bound on the space consumed by data.

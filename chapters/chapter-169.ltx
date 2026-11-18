@@ -22,3 +22,28 @@ Test by collecting between registration and invocation and by forcing allocation
 Marc-Andr\'e B\'elanger and Marc Feeley's \emph{A Scheme Foreign Function Interface to JavaScript Based on an Infix Extension} describes Gambit's mostly implicit conversions and direct-style integration between Scheme threads and JavaScript promises. The invoking Scheme thread can wait for a promise without blocking the host scheduler. A JavaScript completion callback conveys fulfillment or rejection back to Scheme. Test both paths while a second Scheme thread makes progress. Implicit conversion is also not a promise of lossless round trips: for instance a Scheme exact integer beyond JavaScript's safe integer range need not survive conversion to a JavaScript number and back.
 
 Yannis Bres, Bernard Paul Serpette, and Manuel Serrano's \emph{Compiling Scheme Programs to .NET Common Intermediate Language} reports a historical Bigloo backend with managed closure representations and CIL tail-call support. Tail transfer on the host does not provide stack capture. The reported managed backends use an exception-based mechanism limited to the dynamic extent of capture, not full R5RS continuations. A separate Scheme stack would make more control state representable, but would require a protocol for callbacks and foreign invocation. Test long tail calls and resumption after an earlier call has returned as different properties. The dossier's ABI discussion in Chapter~\ref{ch:adaptive-abi} concerns agreement on how to communicate; this example shows why an adapter must also respect what control and lifetime semantics each side can actually supply.
+
+% Annotated walkthrough
+\section{Preserve Exact Integers Across a Number-Only Host API}
+
+Suppose an application passes integer identifiers through a JavaScript interface that accepts either a number or a tagged decimal string, but not \texttt{BigInt}. This is an application wire contract, not the behavior of the Gambit interface described above. Let \(M=2^{53}-1\). A host number may carry an integer in the inclusive range \([-M,M]\); otherwise an exact Scheme integer travels in the record \verb|{decimal: "..."}|. Require canonical signed decimal notation with no leading zeros, plus sign, exponent, or negative zero. Given a value in one of these two representations, the reader returns an exact Scheme integer or a defined error. Assume an implementation able to represent all integers in the accepted string range.
+
+\begin{verbatim}
+encode(n):
+  require n is an exact integer
+  if -M <= n <= M: return number(n)
+  # Convert directly from exact arithmetic.
+  return record(decimal = format_exact(n))
+decode(v):
+  if v is a number:
+    # Reject ambiguity already present at the boundary.
+    if not safe_integer(v): return BadNumber
+    return exact_integer(v)
+  if v is not an accepted decimal record: return BadTag
+  if not canonical_decimal(v.decimal): return BadDigits
+  return parse_exact(v.decimal)
+\end{verbatim}
+
+For \(9007199254740991\), encoding yields a number and decoding yields that same exact integer. Encoding \(9007199254740993\) instead puts the string \texttt{"9007199254740993"} in the \texttt{decimal} field, and decoding preserves the last digit. If a foreign caller supplies the latter identifier as a JavaScript number, it has already rounded to \(9007199254740992\) and decoding reports \texttt{BadNumber}; the wrapper cannot recover the lost bit. A decimal field containing \texttt{"003"} gives \texttt{BadDigits}. Numeric negative zero has no distinct result in the chosen Scheme integer model.
+
+The invariant is exact round-trip equality for values the encoder admits, without any narrowing conversion on the decimal path. The string representation requires work and allocation dependent on digit count; a service can bound that count on both sides if it declares an explicit size error. This test exercises the marshalling semantics independently of the handle and callback lifetime checks.

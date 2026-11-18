@@ -23,3 +23,61 @@ There is also a genuine ambiguity at a sequence boundary: the expression $\textt
 Sergey Baranov's \textit{A Formal Language Processor Implemented in Forth} separates an LL(1) context-free component from other concerns of the language processor, including generating pseudocode. In a combinator library, keeping a similarly visible boundary lets tooling inspect which parts of a grammar are predictive. An applicative sequence has a fixed second parser even if its final value combines both results. A monadic bind can choose the second parser from the first result, for example to read a count and then precisely that many items. This can be useful, but the chosen parser is no longer recoverable from the static combinator structure alone. Offer dynamic operations through an explicit interface instead of claiming the same analysis for every parser.
 
 Krishnaswami and Yallop also use the static information to stage the parser. To test a staged implementation, run the same small grammar through both a reference interpreter and the generated parser. For the factored command above, assert the branch tag, consumed interval, and end-of-input outcome separately. If diagnostics are part of the library's contract, compare expected token sets as well. An algebraic equality of accepted languages cannot justify an optimization that changes an observable commitment point or error location. Chapter~\ref{ch:ext-140} shows how to extend this test beyond a few handwritten strings.
+
+% Annotated walkthrough
+\section{Finding Recursive Calls That Consume Nothing}
+
+A combinator library can detect one source of nontermination before
+generating recursive parser functions. Work on a finite grammar
+represented by named rules and expressions for epsilon, tokens,
+choice, sequence, and rule calls. Assume pure combinators with
+unordered alternatives and no dynamic bind or lookahead predicates.
+First compute the least fixed point of nullability. Next build a
+graph whose edge $A\to B$ means the body of $A$ can reach a call of
+$B$ before consuming any input. Traverse each sequence until the
+first nonnullable child, and visit every branch of a choice. The
+output is a cycle witness or a certificate that this particular
+zero-consumption graph is acyclic.
+
+\begin{sudocode}
+  \Input rule bodies $R$ and their fixed-point nullability
+  \Output a cycle witness or an acyclic graph
+  \Function{Leading}{$e$}
+    \If{$e$ is a call to $B$}
+      \State \Return $\{B\}$ \Comment{Record, do not unfold}
+    \ElsIf{$e$ is a sequence of children $C$}
+      \State $L\gets\varnothing$
+      \ForAll{$p$ in $C$ in source order}
+        \State $L\gets L\cup\Call{Leading}{p}$
+        \If{$p$ is not nullable} \Comment{Later calls must advance}
+          \State \Return $L$
+        \EndIf
+      \EndFor
+      \State \Return $L$
+    \ElsIf{$e$ is a choice of children $C$}
+      \State \Return $\bigcup_{p\in C}\Call{Leading}{p}$
+    \EndIf
+    \State \Return $\varnothing$
+  \EndFunction
+  \State $G\gets\{(A,B): B\in\Call{Leading}{R[A]}\}$
+  \State \Return a cycle in $G$ if one exists, else $G$
+\end{sudocode}
+
+Use $A\to H B\mid y$, $H\to\epsilon\mid z$, and $B\to A x\mid w$.
+Nullability marks $H$ but neither $A$ nor $B$. The graph has edges
+$A\to H$, $A\to B$, and $B\to A$. In particular, the call to $B$
+is reachable through the empty alternative of $H$; the final
+token $x$ cannot guard the earlier call to $A$. Cycle detection
+returns $A,B,A$. If the first production instead starts with
+$z B$, the only remaining edge is $B\to A$. This graph accepts
+the revision, without ruling on one-token predictability.
+
+For each edge, the skipped sequence prefix has an epsilon derivation.
+Conversely, any direct recursive call reached without consumption
+is encountered by this traversal. Keep source sites on the edges
+so a cycle report can show the rule call and the nullable prefix
+responsible. A strongly connected component pass is linear in the
+graph size; singleton components are cyclic only if they have a
+self edge. Passing this check does not establish that a separate
+repetition combinator has a consuming body, so check repetition
+progress independently if the library provides it.

@@ -20,6 +20,54 @@ Consider \texttt{LOAD k; DIV} with one integer $a$ on top of the stack. \texttt{
 
 Test the fused view against the unfused view with normal, exceptional, and single-step modes. Raise a breakpoint on the second operation and assert the intermediate stack, or deliberately use the unfused view for that location. Test the same sequence behind a branch that targets the second operation: an optimizer must leave a valid entry there, for example by not selecting the sequence.
 
+% Annotated walkthrough
+\subsection{Charge a Fused Handler by Guest Instruction}
+
+An execution budget can turn what looks like a private bytecode
+boundary into a visible yield point. Take a VM that grants a
+worker slices measured in guest operations. A slice of zero returns
+control before running the next operation; a return or trap on the
+last unit takes precedence over yielding. The dispatcher can still
+fuse two pure, nontrapping instructions whose total cost is two.
+For this example assume no other inspection points and no branches
+into the second operation. If refinement of the schedule permits
+arbitrary interruption between host instructions, this fast path
+would need a different contract.
+
+\begin{sudocode}[Dispatch under an exact guest budget]
+\While{$budget>0$}
+  \If{$pc$ starts an eligible pair and $budget\geq 2$}
+    \State run pair and advance to next external PC
+    \State $budget\gets budget-2$ \Comment{Count guest operations}
+  \Else
+    \State run exactly one reference operation at $pc$
+      \Comment{Bypass fusion for a short slice}
+    \State $budget\gets budget-1$
+    \If{operation returned or trapped}
+      \State \Return its outcome
+    \EndIf
+  \EndIf
+\EndWhile
+\State \Return yielded frame and next external PC
+\end{sudocode}
+
+Take \texttt{DUP; ADD; RET} beginning at PC 0, with integer 6 on
+the stack and each instruction one byte. A slice of one executes
+only \texttt{DUP}, yielding PC 1 and stack $(6,6)$. A second slice
+of one yields PC 2 and stack $(12)$. Starting over with a slice
+of two permits fusion and must yield the same PC 2 and stack
+$(12)$. A slice of three must return 12, not yield a continuation
+after the return. Force all four budgets including zero in a
+deterministic interpreter test, and track that a paired dispatch
+actually ran on the two-unit path.
+
+The invariant at every yield is agreement with an unfused VM
+that consumed exactly the granted budget. Fusing reduces
+dispatches, not guest charges. If a guest opcode's charge depends
+on its operands, a fixed pair cost is insufficient: either compute
+the charge without crossing an observation boundary or leave the
+pair out of this scheme.
+
 \section{Measuring the whole interpreter}
 
 Compare matched builds with the same guest workload, stack representation, and profiling policy. Record guest operations, host indirect branches and mispredictions where measurable, and instruction-cache pressure. Distinguish predecode time and expansion in bytes from execution gains. A sequence may eliminate millions of dispatches but add enough handler text to slow unrelated hot paths. Use profiles from a training workload to select a bounded set of fusions, then measure on held-out programs; report both bytes of added handler code and improvement in useful work per second.

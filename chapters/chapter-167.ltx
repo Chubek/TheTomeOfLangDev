@@ -30,3 +30,31 @@ L\'eonard Oest O'Leary, Mathis Laroche, and Marc Feeley's \emph{A R4RS Compliant
 In \emph{A Compact and Extensible Portable Scheme VM}, O'Leary and Feeley describe host-source annotations for specializing the VM and keeping the transitive dependencies of selected features and primitives. This removes requirements no live program path can reach, provided the analysis also accounts for what a REPL can name after startup. The compiler and decoder must agree on primitive numbers and any optional calling protocol. Test a primitive whose implementation depends on a feature not otherwise selected and run the resulting image, rather than inspecting only whether the requested primitive's name occurs in generated source.
 
 Report executable size separately from peak decoding storage and live execution heap. The 4K paper's small Scheme system and the later roughly 7 KB R4RS REPL cover different language and library requirements; those sizes are not claims about peak live memory. A port to another host can preserve decoded semantics while shifting the relative costs of dispatch, allocation, and compression.
+
+% Annotated walkthrough
+\section{Build a Primitive Table Before Encoding Operands}
+
+Feature selection and operand numbering interact when the encoded program uses compact numeric indices. A small, illustrative toolchain can share a manifest between its host builder and its image encoder; the scheme below is not a reconstruction of Ribbit's format. Give each primitive a stable logical name and a fixed signature, and give each feature a list of prerequisite features. The inputs are the primitive names available to the program, including any promised interactive bindings, and the manifest. On success the tool returns the included feature set and a dense mapping from logical primitive name to image-local index. The runtime dispatch table must be built from the same mapping.
+
+\begin{verbatim}
+plan(requested, manifest):
+  names = sort(unique(requested))
+  pending = empty stack; keep = empty set
+  for name in names:
+    require manifest has primitive name
+    push manifest.feature(name) onto pending
+  while pending is not empty:
+    f = pop pending
+    if f in keep: continue
+    require manifest has feature f
+    # Mark before descent; prerequisites may cycle.
+    add f to keep
+    push each manifest.requires(f) onto pending
+  # Table order cannot depend on feature traversal.
+  index = number names consecutively from zero
+  return (keep, index)
+\end{verbatim}
+
+Suppose \texttt{add} requires feature \texttt{math}, \texttt{display} requires \texttt{print}, and \texttt{print} requires \texttt{strings}. Request \texttt{display} once and \texttt{add} twice. The plan keeps three features: \texttt{math}, \texttt{print}, and \texttt{strings}. The table is \verb|[add, display]|. In a test image, operand \(0\) with arguments \(2,5\) returns \(7\); operand \(1\) on that result appends the character \texttt{7} to the output. Reordering the input requests leaves both outputs unchanged. Adding an interactive \texttt{car} binding shifts \texttt{display}'s index, so mixing the old image with the new table is invalid unless the loader has enough information to remap the old indices.
+
+Every visited feature is reachable from a requested primitive, and every outgoing prerequisite of a visited feature is eventually visited. Sorting the primitive names adds a comparison cost; the closure walk is otherwise linear in its visited vertices and edges. To catch encoder/runtime drift, compare the format version and a manifest identity derived from the ordered names and signatures before using any numeric operand.

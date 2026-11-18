@@ -27,3 +27,28 @@ Allocate a node for \texttt{xs} and enter it for the outer case. The resulting c
 \section{Measure Retention, Not Just Reductions}
 
 When the update drops a thunk's old payload, a collector should be able to reclaim captured objects that are no longer reachable. But sharing can also keep a large computed value reachable. A left fold that does not force a numeric accumulator can retain a long chain of additions until the final demand. Compare it with a fold that demands the new accumulator before each tail call: for a finite list and total integer addition the values agree, but the accumulation chain no longer grows. Measure peak reachable bytes as well as total allocations and thunk entries. Heap updates and live roots are semantic obligations for a lazy runtime, not arbitrary low-level stores. This is a concrete setting for the distinction made in \emph{The Modern Compiler Dossier}, Chapter~17, between hiding memory in incidental instruction order and making memory dependencies explicit.
+
+% Annotated walkthrough
+\section{Compress Indirections Without Forcing Their Target}
+
+Graph reduction can leave a chain of forwarding nodes when one thunk returns another node that already has an indirection. Reading the chain repeatedly is unnecessary. Take a heap address and follow only indirections, stopping at the first address whose node has any other tag. In this simplified sequential routine, neither the collector nor another evaluator runs during the walk. Forwarding chains are assumed acyclic by construction; a repeated address is reported as an internal invariant failure, not as a black-hole exception. On success the returned address is the old endpoint, and subsequent walks from any visited forwarding address reach it directly.
+
+\begin{verbatim}
+compress(heap, start):
+  seen = empty set; path = empty list
+  p = start
+  while heap[p] is Forward(q):
+    if p in seen: return BrokenForwardingCycle
+    add p to seen; append p to path
+    p = q
+  # A Suspended endpoint is not a demand to evaluate it.
+  endpoint = p
+  for old in path:
+    # Keep each published address usable by other edges.
+    write_with_barrier(old, Forward(endpoint))
+  return endpoint
+\end{verbatim}
+
+Let \(10\to20\to30\), where \(30\) suspends \(40+2\), and let two heap edges point to \(10\) and \(20\) respectively. Compression from \(10\) returns \(30\), leaves \(10\to30\) and \(20\to30\), and performs zero additions. Demand through the second edge can now enter \(30\), compute \(42\), and update it; demand through the first edge subsequently returns \(42\) without another addition. If \(30\) instead holds an in-progress marker, compression still returns \(30\); only the demand operation interprets the marker. This separates forwarding resolution from evaluation.
+
+Every rewritten address previously named the same endpoint, so each observer following heap edges preserves its interpretation. A walk of length \(k\) uses \(O(k)\) time and temporary storage here; later walks take one forwarding hop until the endpoint itself changes. Compression writes may not pay off on cold paths, and even a rewrite of an existing forwarding pointer can require a generational write barrier. The retained forwarding nodes cannot be individually freed while published references still name them.

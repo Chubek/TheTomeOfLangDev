@@ -24,3 +24,26 @@ In C, record the draft's live state and the writer's validity explicitly. Route 
 The invariant on every returning or unwinding edge is that an owned, untransferred handle is released once, and no cleanup edge releases a handle that another owner has taken over. For a typical function, inspect the lowered control flow: a call that unwinds before successful acquisition must bypass the release block; one after acquisition must reach it. In a test harness replace acquisitions, writes, close, and publish with stubs and inject failure at each step. Assert an event trace, not just a final file count. A double close can go unnoticed when nobody reuses the handle before the second close.
 
 Do not propagate language-specific exceptions through a foreign interface unless its contract explicitly supports it. Translate failures at the boundary, pair allocations with the correct deallocator, and pin the calling convention separately from the ownership policy. The \href{dossier-on-modern-cc-design/chapters/17-memory-as-an-explicit-ir.md}{dossier's Memory as an Explicit IR chapter} explores representing memory operations directly in an IR. Resource obligations need similar treatment when the resource is not memory: a close, a rollback, and a move of ownership cannot all be modeled as a deallocation.
+
+% Annotated walkthrough
+\section{Preserve the First Failure When Cleanup Also Fails}
+
+A scope guard specifies when cleanup runs, not how its failure should be reported. Consider an illustrative wrapper for a device lease. Acquiring the lease either returns a token or fails without transferring ownership. Releasing consumes the token even when the operation reports an error, and the application cannot reuse or retry that token. The body reports an outcome rather than unwinding through the foreign library; a language with exceptions can translate them into this representation before release. The wrapper returns any body failure as primary and records a simultaneous release failure separately. If the body succeeded but release failed, the caller must not see an unqualified success.
+
+\begin{verbatim}
+run_with_lease(body):
+  acquired = acquire()
+  # Failed acquisition did not hand over a resource.
+  if acquired is Error(e): return Failure(e, none)
+  token = acquired.value
+  work = run_as_outcome(body, borrowed(token))
+  cleanup = release(move(token))
+  # A consuming release is never retried by this wrapper.
+  if work is Error(e): return Failure(e, error_of(cleanup))
+  if cleanup is Error(e): return Failure(e, none)
+  return Success(work.value)
+\end{verbatim}
+
+Inject \texttt{WriteError} into the body and \texttt{ReleaseError} into release. The log records \texttt{acquire}, \texttt{work}, and \texttt{release}, each once and in that order. The returned \texttt{Failure} contains \texttt{WriteError} as primary and \texttt{ReleaseError} as secondary. With the same release error but a body that returns \(14\), the result is a failure with only \texttt{ReleaseError}; the wrapper does not promise \(14\) as a usable success. If acquisition reports \texttt{Busy}, the only event is acquisition and the outcome is \texttt{Failure(Busy,none)}.
+
+There is exactly one release call for each successful acquisition, and recording the secondary error cannot transfer ownership back. In C this outcome could be carried by a status record. A C++ RAII fallback can enforce cleanup when ordinary control unexpectedly unwinds, but an explicit path is still useful for collecting the release status; a D exit guard likewise does not choose the diagnostic priority. If the real release API leaves ownership intact on failure, the state machine must instead specify who may retry or take over. That is a different contract, not an implementation detail.

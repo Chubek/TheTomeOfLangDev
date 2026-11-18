@@ -155,6 +155,57 @@ without locking, checking for conflicts only at commit time.
 \end{algorithmic}
 \end{algorithm}
 
+% Annotated walkthrough
+\subsection{Rejecting a Stale Analysis Across Disjoint Writes}
+
+Two compiler transactions can touch different output functions and still
+conflict. An inliner may create a new body for a caller based on the
+observed body of a callee. If another transaction edits the callee in
+the meantime, checking only for competing writes to the caller would
+miss the obsolete read. A compiler transaction should record the
+dependencies of its analyses as well as the locations of its edits.
+
+\textbf{Contract.} Each worker reads from one consistent immutable
+snapshot and builds a private patch. Every object read or replaced
+has a recorded snapshot version; version numbers never repeat.
+Treat derived facts as reads of their underlying objects, and represent
+queries about absent entries with a versioned container. Commit either
+installs the whole patch or requests a retry. The commit lock also
+guards any mutation and snapshot acquisition. The worker preallocates
+the patch so installation under the lock cannot fail partway.
+
+\begin{sudocode}[Validate the complete observed version set]
+\State acquire commit lock
+\To{Check observations, including objects not in the patch.}
+\For{each recorded pair $(x,v)$}
+  \If{$\mathrm{CurrentVersion}[x]\ne v$}
+    \State release commit lock
+    \State \Return retry
+  \EndIf
+\EndFor
+\To{No other writer may intervene after validation.}
+\For{each private edit $(x,b)$}
+  \State install content $b$ for $x$ with a fresh version
+\EndFor
+\State release commit lock
+\State \Return committed
+\end{sudocode}
+
+\textbf{Trace.} Let caller \(F\) have version \(4\) and constant
+callee \(G\) have version \(7\), returning \(5\). A worker prepares
+an inlined \(F\) returning \(5\). A concurrent source-update transaction
+changes \(G\) to return \(9\) at version \(8\). The first worker now
+returns retry because it read \((G,7)\), even though \(F\) is still at
+version \(4\). A retry based on the new snapshot can inline \(9\).
+
+When all comparisons succeed, every observed object still has the
+snapshot content at the commit point. The lock makes the resulting
+installation indivisible to other workers. Validation uses
+\(O(|R\cup W|)\) lookups for read and write sets \(R,W\); private
+construction is outside the lock. Granularity matters: a version on a
+whole symbol table catches absent-name dependencies but invalidates
+unrelated lookups as well.
+
 \subsection{Conflict Resolution}\label{sec:txn-resolution}
 
 When a conflict is detected, the transaction must be resolved:

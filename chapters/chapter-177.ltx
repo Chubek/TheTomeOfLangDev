@@ -26,3 +26,29 @@ Views require special attention. A live slice of \texttt{u1} may alias its backi
 A region groups allocations with a common reclamation point. In \emph{A Simple Region Inference Algorithm for a First-Order Functional Language}, Manuel Montenegro, Ricardo Pe\~na, and Clara Segura describe Safe, where each call has a working region released at return and the compiler infers region parameters for data that must live elsewhere. In a pipeline inspired by this design, a temporary work array can live in a callee's local region while the output buffer is allocated in a region supplied by the caller. Returning a frozen view into the callee region is illegal even if that view is unique. Conversely, two arrays safely stored for a long time in the same region are not necessarily aliases, and sharing a region does not establish the uniqueness of either one.
 
 The region invariant is that every surviving root and every object it can reach refers only to live storage. A useful paired test returns an array into a caller region successfully, then changes the program to return a view into the work region and checks that inference promotes or rejects the unsafe allocation. Use separate test cases for writes with live aliases and for reclamation with live references. As in the memory IR proposed in \emph{The Modern Compiler Dossier}, Chapter~17, explicit memory versions help express which state each operation observes. In an array compiler, versions, uniqueness facts, and region lifetimes each justify a different part of the lowering.
+
+% Annotated walkthrough
+\section{Split a Unique Buffer Into Disjoint Write Capabilities}
+
+An illustrative array API can permit parallel writes by splitting exclusive access rather than by sharing a writable handle. The input is a live unique capability describing the half-open interval \([a,b)\) of a contiguous buffer and an offset \(k\) relative to \(a\). Split consumes the original capability and gives each part its own token plus a private reunion key. Only the exact siblings can be joined, after any borrows have ended. Assume the backing allocation remains live while either token is live and that the descriptor integers represent every valid index. The postcondition of join is one unique capability for the original interval, with the edits from both halves.
+
+\begin{verbatim}
+split(u, k):
+  require live(u) and 0 <= k <= u.end - u.start
+  mid = u.start + k
+  # Check bounds before invalidating the old capability.
+  (left, right, key) = fresh_siblings(u, mid)
+  consume(u)
+  return (left, right, key)
+join(left, right, key):
+  require live(left, right, key) and no_borrows(left, right)
+  # Adjacent ranges alone do not establish provenance.
+  require exact_siblings(left, right, key)
+  whole = original_interval(key)
+  consume(left, right, key)
+  return fresh_unique(whole)
+\end{verbatim}
+
+Split a five-element all-zero array at offset \(2\). A write to local index \(1\) of the left part sets global index \(1\) to \(7\); a write to local index \(0\) of the right part sets global index \(2\) to \(9\). Joining and freezing gives \verb|[0, 7, 9, 0, 0]|, regardless of the order of the writes. A left write to local index \(2\) is rejected, even though global index \(2\) is valid in the underlying buffer. Splitting at \(0\) yields a usable empty token but no legal write to it.
+
+The disjointness invariant concerns actual bytes, not the inequality of two descriptor addresses. In a packed representation two logical elements might share a word that an assignment reads and rewrites; that representation needs a different split boundary or a synchronization rule. With ordinary separately writable elements, split and join can be constant time, without copying any element. They still do not establish the buffer's lifetime; the enclosing region or owner must continue to protect it.

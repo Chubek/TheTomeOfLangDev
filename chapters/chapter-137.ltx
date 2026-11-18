@@ -23,3 +23,58 @@ Anthony Aaby's \textit{Compiler Construction using Flex and Bison} illustrates a
 Unchanged source text is necessary for direct reuse of a token node, but does not make its context independent. For example, inserting a quote before a token can change the lexer mode in which the token was recognized. Similarly, a subtree that started in one parser state may not be reusable in another. A cache needs to check the relevant entry conditions, including lexer modes, parser context, and the grammar or extension configuration. For valid text, the incrementally maintained tree should agree with a fresh parse at the same revision, up to identity and metadata such as reuse counters. For incomplete text, a history-based method may intentionally choose a different provisional tree; test instead that it covers source faithfully, resolves or flags uncertainty, and does not cross ownership boundaries.
 
 A useful edit script deletes the operand, inserts it back, deletes the box terminator, and undoes both edits. Test that recovery makes progress on every step: it consumes input, unwinds to a different bounded recovery context, or spends from a finite insertion budget. Test that restoring validity removes the synthetic node and its diagnostic. The parser can reuse a nearby tree node yet still need to recheck bindings after an environment change; see Chapter~\ref{ch:ext-133}. \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/22-incremental-compiler-as-a-reactive-system.md}{Markdown Dossier Chapter~22} generalizes this principle to dependencies across the incremental frontend.
+
+% Annotated walkthrough
+\section{Ranking Repairs Within a Single Statement}
+
+An editor can compare small repair candidates without mutating the
+document or repeatedly synchronizing at the end of the file. Take a
+parser checkpoint immediately before the error and a host-delimited
+window of real tokens that the current statement owns. The procedure
+below considers inserting one expected punctuation token or skipping
+the first real token in the window. Assume the parser can replay a
+checkpoint without committing actions and require a candidate to
+parse to the known statement boundary. The result is a provisional
+tree with one marked repair, or an error region containing the entire
+window. It is not an automatic edit to the user's text.
+
+\begin{sudocode}
+  \Input checkpoint $s$, statement suffix $W$, expected set $E$
+  \Output recovered node or an error region
+  \State $best\gets\mathsf{none}$
+  \State $C\gets\Call{Insertions}{E,W}$
+  \If{$W$ begins with a nonboundary token}
+    \State add $\Call{SkipFirst}{W}$ to $C$
+    \Comment{Retain skipped token in the tree}
+  \EndIf
+  \ForAll{candidate $c$ in $C$}
+    \State $r\gets\Call{Replay}{s,c}$
+    \Comment{No effects on the live parser}
+    \If{$r$ succeeds at the boundary}
+      \State $best\gets\Call{Prefer}{best,r}$
+    \EndIf
+  \EndFor
+  \State \Return $best$ or $\Call{ErrorRegion}{W}$
+\end{sudocode}
+
+Let \texttt{emit 1 2;} be a malformed command in a language that
+expects either a comma-separated argument list or a single argument.
+At the second integer the expected punctuation is comma or semicolon.
+The suffix window contains \texttt{2 ;}, including the original
+terminator. Inserting a comma produces a two-argument node with a
+zero-width separator at the start of \texttt{2}. Inserting a
+semicolon would leave \texttt{2 ;} unconsumed, so that candidate
+fails the boundary test. Skipping \texttt{2} produces a one-argument
+node with an unexpected-token child. Prefer the comma repair by
+ranking successful candidates first by real tokens retained in
+ordinary syntax, then by a stable punctuation order. No candidate
+consumes any part of the following command.
+
+The preservation invariant is that every source token belongs to
+the normal tree or to an explicit error child. Boundary tokens
+cannot disappear by deletion, and synthetic tokens have no source
+width. The cost is at most $|E|+1$ replay attempts, each bounded
+by the window and the parser's per-attempt work limit. On a timeout,
+do not publish a guessed repair as though it had reached the
+boundary. Nested constructs need an appropriate host checkpoint:
+a semicolon inside a string cannot be the window terminator.

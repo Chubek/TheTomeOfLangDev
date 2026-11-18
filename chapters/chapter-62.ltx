@@ -151,6 +151,53 @@ The transition from high-level to low-level IR involves several key transformati
 
 Bufferization determines where to allocate memory and how to manage lifetimes, a critical step for efficient execution.
 
+% Annotated walkthrough
+\subsection{Choosing a Copy for a Tensor Update During Bufferization}
+
+A functional tensor update returns a new tensor and leaves the
+old value available to its remaining users. During bufferization
+it can become an in-place store only if overwriting the buffer
+cannot be observed through the old value. Consider a straight-line
+region, a destination tensor with a known mutable backing buffer,
+and an update of a known portion of that buffer. Its lowering
+must read the update's inputs before any that might be clobbered
+are overwritten. Require complete alias and later-read information
+for reuse; unknown reads, escaped views, and overlapping old-value
+returns are conservatively treated as conflicts.
+
+\begin{sudocode}
+\Require Update of tensor $x$, written range $W$, later old-value users $U$
+\State $b\gets$ backing buffer of $x$
+\State $reuse\gets$ mutable buffer and safe update evaluation
+\ForAll{$u\in U$}
+  \If{the old-version read of $u$ may overlap $W$}
+    \State $reuse\gets\mathrm{false}$ \Comment{Include aliased views}
+  \EndIf
+\EndFor
+\If{not $reuse$}
+  \State $b\gets$ fresh buffer with the same shape as $x$
+  \State copy all elements of $x$ into $b$ \Comment{Keep untouched elements}
+\EndIf
+\State emit the update on $b$ from the original operands
+\State \Return $b$ as the new tensor's storage
+\end{sudocode}
+
+Let $x=[3,5,8]$ and let $y$ update element 1 of $x$ to 9,
+using zero-based indices. A later read of element 1 through a
+view of the old $x$ must return 5. Reusing $x$ would make that
+read return 9, so the procedure copies and gives $y=[3,9,8]$
+in a new buffer. If the only later old-value read is instead
+element 0, it still returns 3 after an in-place update.
+
+The invariant is observational: every remaining old-version
+read obtains the same data as in the tensor dialect. A copy is
+linear in the tensor size; the decision itself examines each
+later user once in this simplified region. For loops or branches,
+``later'' and ``old version'' require control-flow reasoning.
+Keeping tensor alias relations explicit until bufferization makes
+it possible to check this obligation before the rewrite turns a
+functional update into a store.
+
 \subsection{Loop Lowering}\label{sec:loop-lowering}
 
 High-level loop constructs are lowered to lower-level loops:

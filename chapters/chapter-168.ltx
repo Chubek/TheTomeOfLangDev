@@ -30,3 +30,28 @@ At the Unix level, attach the pipe endpoints to the child descriptors and close 
 \section{A runtime at the hardware boundary}
 
 Samuel Yvon and Marc Feeley's \emph{Running Scheme On Bare Metal}, from the 2020 Scheme and Functional Programming Workshop, describes Mimosa, which uses Gambit and keeps runtime services such as garbage collection and threads. This is a third choice, not a restriction to Pre-Scheme or scripting over a host OS. An interrupt can arrive during a partially completed allocation, when the Scheme handler must not run. Mimosa registers the event from low-level code, and the running Scheme thread can invoke the handler at a compiler-inserted polling point. The boundary trades some delivery latency for a consistent runtime state. Test for delayed delivery both during allocation and in a loop with no allocation; safe deferral is not enough if a busy path never polls.
+
+% Annotated walkthrough
+\section{Budget Poll Distance Without Splitting an Allocation}
+
+Consider an illustrative code generator, not the Mimosa polling algorithm. It receives a control-flow graph partitioned into chunks separated by boundaries where the runtime invariant holds and all roots can be described. Each block entry is such a boundary. Each chunk has a conservative bound on its executed instruction count, including any branch at its end; it may include a short allocation sequence that must run uninterrupted. To make the policy simple, poll at every block entry, then add polls inside blocks that contain several chunks. The output either has at most \(B\) ordinary instructions between polls or reports that the requested budget cannot be met with the given boundaries.
+
+\begin{verbatim}
+place_polls(graph, B):
+  for block in graph:
+    # Every incoming path starts a new interval.
+    insert poll at entry of block
+    spent = 0
+    for chunk in block:
+      if chunk.bound > B: return NeedsSmallerChunk
+      if spent + chunk.bound > B:
+        # A boundary has a valid root map.
+        insert poll before chunk
+        spent = 0
+      spent = spent + chunk.bound
+  return graph with polls
+\end{verbatim}
+
+For a self-loop made of chunks of costs \(3,2,3,1\) and \(B=5\), the emitted polls occur before chunk one and before chunk three. Assuming each chunk uses its full bound, a trace records polls after instruction counts \(0,5,9,14,18,\ldots\), not counting the polls themselves. An event posted just after the poll at \(5\) can first be observed at \(9\); no handler runs halfway through the three-instruction chunk. An indivisible chunk of cost \(6\) produces \texttt{NeedsSmallerChunk}, rather than a poll at an unsafe point. In a real compiler, a failed planning pass would discard its tentative insertions.
+
+The running sum bounds the path segment since the most recent poll, and every back edge reaches an entry poll even when the loop never allocates. The construction takes one pass over the chunks but can insert unnecessary polls on short blocks. This is not a wall-clock guarantee: a blocking foreign call, an unbounded instruction latency, or time spent in handlers needs separate treatment. In particular, assigning a unit cost to a call is sound only if its execution is accounted for separately.

@@ -27,6 +27,60 @@ exit:  return 0
 
 On \texttt{left}, \texttt{u} must still be computed for \texttt{consume}. Its value can also serve as the return value on that path. On the right, insert \texttt{v = add(a, b)} only on the edge to \texttt{join}. That edge is critical: \texttt{right} has two successors and \texttt{join} has two incoming edges. Putting the instruction in \texttt{right} adds work on the path to \texttt{exit}; simply putting it in \texttt{join} leaves the original redundancy. Split the edge, compute \texttt{v} in the new block, and replace \texttt{w} with a merge of \texttt{u} and \texttt{v}. The left path now evaluates the addition once instead of twice, the right-to-join path still does so once, and the exit path still does not evaluate it. Those three counts make a simple placement test that a return-value test alone would miss.
 
+% Annotated walkthrough
+\section{Translate Operands Before Looking for Redundancy}
+
+An available-expression table keyed only by the printed operator and
+join operands misses computations whose operands are defined by a merge.
+Consider a pure, nontrapping binary operation at the start of a join
+block, immediately after its merges. Assume each operand is either a
+merge result local to the join or a value available on every incoming
+edge. The lookup table is keyed by ordered SSA values and the exact
+operator semantics. The proposed plan either reuses an available value
+or requests insertion on that incoming edge. Assume a later stage
+checks placement and implements edge splitting before rewriting the join.
+
+\begin{sudocode}
+\Require Join $J$, expression $\operatorname{op}(a,b)$
+\Let{P}{\varnothing}
+\ForAll{incoming edges $e$ of $J$}
+  \To{Select both operands using the same edge.}
+  \Let{u}{\operatorname{translate}(a,J,e)}
+  \Let{v}{\operatorname{translate}(b,J,e)}
+  \Let{r}{\operatorname{lookupAvailable}(e,\operatorname{op},u,v)}
+  \If{$r$ exists}
+    \Let{P[e]}{\operatorname{reuse}(r)}
+  \Else
+    \To{Record a request, not a speculative edit.}
+    \Let{P[e]}{\operatorname{insert}(\operatorname{op},u,v)}
+  \EndIf
+\EndFor
+\State \Return $P$
+\end{sudocode}
+
+Let the join's first operand be $p=\phi(L:a,R:b)$ and
+the second $q=\phi(L:c,R:d)$. The operation is wrapping
+subtraction. If $L$ has already computed \texttt{sub(a,c)},
+the left translation finds that result; if $R$ has only
+\texttt{sub(d,b)}, the right translation must request
+\texttt{sub(b,d)}. With left values $(a,c)=(9,2)$ and right
+values $(b,d)=(4,10)$, the merged result should be $7$ or
+$-6$ viewed as a signed word of sufficient width. The
+existing right-hand expression yields $6$ and is not
+reusable. A key that sorts operands would fail this test.
+
+On each edge, translated operands denote the values the
+original expression would read after the merges, so the
+replacement merge delivers exactly the original value.
+This local plan does not decide whether a result is profitable
+to carry across a long path, or whether the join is anticipated
+from earlier blocks. Under the stated assumptions, direct
+operand maps and available-expression queries take constant
+time per incoming edge. If the pass is extended to expressions
+later in the join block, an operand defined by an ordinary
+instruction in the join cannot be translated just by consulting
+the merge table.
+
 \section{Anticipation Does Not Authorize Every Move}
 
 The example uses modular addition so the new evaluation cannot trap, change flags visible to the source, or inspect memory. Replacing it with a checked division requires separate proof about exception timing. In particular, moving a possibly trapping operation ahead of a visible store can change whether the store takes place, even if the original division was anticipated. Loads additionally need evidence about intervening writes, and volatile accesses cannot be treated as mere reusable values. The dossier's Chapter~16, \emph{Effect-Aware IR}, motivates making these constraints visible to placement analysis. Chapter~\ref{ch:ext-205} develops a representation for the memory case.

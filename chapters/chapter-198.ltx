@@ -32,6 +32,59 @@ Join:
 
 The conditional consumes the flag, so on both incoming paths to \texttt{Join} the operand stack has depth one and the top has verification type \texttt{int}. A verifier for modern class files uses the method's initial frame and the declared stack-map frames at the relevant targets to check the transfers. Replacing \texttt{iconst\_2} with \texttt{aconst\_null} gives the same stack height, but the reference value cannot satisfy the required integer frame and return. Depth alone is not enough. Internally, a JIT can decode the two pushes to SSA value definitions and the join to one block parameter or \(\phi\)-node; it need not use an actual hardware stack for these temporaries.
 
+% Annotated walkthrough
+\section{Check the Stack at a Handler, Not at the Throw Site}
+
+An ordinary branch preserves the operand stack left by its source
+instruction. An exception transfer does not. When a JVM handler runs,
+its operand stack starts with only the caught exception. The verifier
+still checks the locals against the handler's frame using the state
+associated with each covered instruction. The procedure below isolates
+that rule for a toy method: locals have fixed verification types,
+there are no uninitialized objects, and every protected instruction
+has a checked frame before execution. Assume the exception table has
+already been validated and each handler has a declared entry frame.
+The catch type lookup returns \texttt{Throwable} for a catch-all.
+
+\begin{sudocode}
+\Require Checked instruction frames $F$, handlers $H$
+\ForAll{$h\in H$}
+  \Let{G}{\operatorname{declaredFrame}(h)}
+  \ForAll{checked $p$ in the protected range of $h$}
+    \To{Keep local types from before the instruction.}
+    \Let{L}{F[p].\mathrm{locals}}
+    \To{Discard the normal operand stack.}
+    \Let{S}{[\operatorname{catchType}(h)]}
+    \If{$(L,S)$ is not assignable to $G$}
+      \State \Return reject
+    \EndIf
+  \EndFor
+\EndFor
+\State \Return accept these edges
+\end{sudocode}
+
+Take an integer division with locals holding the input pair $(8,0)$.
+The stack before division holds those same two integers. Protect the
+division with an \texttt{ArithmeticException} handler that discards the
+exception and returns $-1$. The normal successor would receive one
+integer on successful division, but this invocation enters the handler
+with one reference and returns $-1$. With inputs $(8,2)$ it instead
+returns the normal quotient $4$. A handler frame declaring one integer
+must fail the compatibility check even though its declared stack depth
+is one. A useful interpreter regression checks both outcomes separately
+from the verifier's rejection test.
+
+For each checked exceptional transfer, the invariant is that the
+handler frame covers the types of the retained locals and the single
+incoming exception. Compatibility here means assignability to the
+declared entry types, not necessarily exact type equality.
+The example is not a complete JVM verifier: constructor initialization
+needs additional rules, handlers need ordinary instruction checking, and
+a normal edge into a handler location, if permitted, must independently
+satisfy the same frame. An exception table is therefore more than a list
+of backup branch offsets; it also defines how the abstract state crosses
+each exceptional edge.
+
 \section{Which Boundaries Survive Distribution?}
 
 Public bytecode format, managed API, and native calling convention are different layers. The same class file can be distributed to JVMs on multiple architectures, but a call to a native library requires a compatible library and a platform-specific boundary. Likewise, the fact that a field's type verifies does not ensure that the field exists in the linked version of its defining component. A robust producer tests artifact decoding, link-time resolution, and behavior on separately selected platforms, not just accepted stack maps. The dossier's Markdown Chapter~42, \textit{Adaptive ABI Negotiation}, takes up the further problem of choosing concrete interface conventions when independently produced pieces meet. None of these obligations requires the verifier to know how the producer's optimizing IR was organized.

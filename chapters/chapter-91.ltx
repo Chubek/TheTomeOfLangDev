@@ -262,6 +262,34 @@ JIT compilation runs on separate threads to avoid blocking the application:
   \item \textbf{Background compilation}: the application continues to run (in the interpreter) while compilation proceeds.
 \end{itemize}
 
+% Annotated walkthrough
+\subsection{Rejecting Stale Background Compilation Results}
+
+Executing a compilation job in the background separates the decision to speculate from the decision to publish. The method may be redefined or a dependency invalidated in that interval. A successful compilation is therefore only a candidate: its assumptions and tier must still be current when the entry point changes.
+
+\textbf{Inputs and assumptions.} A job takes a consistent snapshot of its method generation and the validity tokens for its assumptions. Publication and invalidation use the same lock. Tokens never regain validity once invalidated. Code and metadata are prepared for execution before publication; dependent-code retirement and handling of frames already on stack are provided by the runtime.
+
+\begin{sudocode}[Validate and publish compiled code atomically]
+\Require Job $j$, artifact $a$, live method record $m$
+\Ensure Install only an artifact valid at publication
+\State Prepare executable artifact and metadata
+\State Lock the publication mutex
+\If{$j$ has the wrong generation or an invalid token}
+  \State Unlock; discard $a$; \Return stale
+\EndIf
+\If{the current entry has an equal or higher tier}
+  \State Unlock; discard $a$; \Return superseded
+\EndIf
+\State Register $a$ on each dependency token
+\State \Comment{Registration and publication share the lock}
+\State Publish the new entry with release ordering
+\State Unlock; \Return installed \Comment{Readers acquire the entry}
+\end{sudocode}
+
+\textbf{Example.} A tier-2 job starts for method generation 7 with a token for receiver layout $L$. Before it finishes, redefining the method installs a baseline entry at generation 8. The old tier-2 artifact is discarded, despite outranking that baseline. A job for generation 8 with fresh tokens can publish. A second tier-2 job finishing after that one is superseded, avoiding a pointless entry change.
+
+\textbf{Invariant.} At publication, the artifact's generation matches and all registered assumptions are valid. A later invalidation can find the artifact because registration happened first. This check is linear in the number of tokens, so expensive code preparation stays outside the critical section. Dropping code already published requires a separate lifetime protocol; entry replacement alone does not establish that no thread is executing it.
+
 \section{JIT Testing and Debugging}\label{sec:jit-testing}
 
 \subsection{Testing JIT Compilers}\label{sec:jit-testing-methods}

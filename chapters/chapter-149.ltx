@@ -22,3 +22,60 @@ The root keeps the object live and supplies a current reference after movement; 
 A practical compiler can generate stubs from declarations recording layout and calling convention, ownership of pointer arguments and results, allocation effects, and callback policy. Separate an effect like ``may enter managed code'' from ordinary C allocation: even a function with no explicit allocation of managed objects can call back and cause collection. Propagating that effect through wrappers lets a verifier check root registration at each relevant call. The dataflow invariant is that every managed reference live across a collection point is discoverable by the runtime as required, and any surviving native address is either independently allocated or known stable for its entire use.
 
 Neither a precise declaration nor a verified stub can make an arbitrary native body honor a borrow or return a valid value. Check cheap interface properties where possible, document which promises are trusted, and use isolation when foreign code itself cannot be trusted. Test ABI layout on each supported target, force collection at callback and helper boundaries, and exercise exceptional cleanup. Chapter~\ref{ch:calling-conventions} explains the ABI substrate; Markdown Dossier Chapter~42 explores versioned ABI negotiation, which can help match descriptors but does not by itself verify ownership or root discipline.
+% Annotated walkthrough
+\section{Comparing Native Layouts Before Generating a Stub}
+
+An adapter can model the type correctly yet generate the wrong
+field loads because the managed-side descriptor was built using
+a different packing rule. For a concrete check, use a trusted C
+probe compiled with the same headers, target, and layout options
+as the native library. The probe reports record size, alignment,
+and $(\mathit{offset},\mathit{width})$ for each named field of
+a plain fixed-width record. Compare this with the compiler's
+predicted descriptor before allowing direct marshalling. Assume
+identical scalar representations, byte order, and field meanings.
+The output is a layout match or the mismatching entries, not a
+claim that the record may be passed by value with any calling
+convention.
+
+\begin{sudocode}
+  \Input predicted layout $P$, native probe layout $N$
+  \Output layout verdict and mismatch list
+  \State $D\gets$ empty list
+  \ForAll{$k$ in $\{\mathrm{size},\mathrm{alignment}\}$}
+    \State record a difference in $D$ if $P[k]\ne N[k]$
+    \Comment{Tail padding matters for array stride}
+  \EndFor
+  \ForAll{$f$ in the union of their field names}
+    \State $p\gets\Call{EntryOrMissing}{P,f}$
+    \State $n\gets\Call{EntryOrMissing}{N,f}$
+    \If{$p\ne n$}
+      \State append $(f,p,n)$ to $D$
+      \Comment{Equal size alone is not enough}
+    \EndIf
+  \EndFor
+  \State \Return $(D=\varnothing,D)$
+\end{sudocode}
+
+Consider a target with one-byte alignment for \texttt{uint8\_t}
+and four-byte alignment for \texttt{uint32\_t}. A descriptor
+for an unpacked record with an eight-bit \texttt{kind} followed
+by a 32-bit \texttt{count} predicts offsets $0$ and $4$, size
+$8$, and alignment $4$. A library built under a one-byte
+packing rule reports offsets $0$ and $1$, size $5$, and
+alignment $1$. The checker reports three mismatches: size,
+alignment, and \texttt{count} offset. On a little-endian
+target the packed native bytes for \texttt{kind} $3$ and
+\texttt{count} $258$ are \texttt{03 02 01 00 00}. Reading
+four bytes starting at offset $4$ cannot recover that count
+from this record. Reject direct layout access or use a C
+accessor compiled for the native record.
+
+Each matching descriptor entry certifies only the layout
+property it measures. Keep separate tests for C argument and
+result classification, scalar widths and signedness, and
+ownership or lifetime policy. Bit fields and flexible array
+members do not fit this simple fixed-field probe. In a
+cross-compile, obtain measurements from the target toolchain
+or run the probe on the target; a host layout match is not
+evidence about the compiled library.

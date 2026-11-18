@@ -20,6 +20,52 @@ An old-to-young reference can be the only way a nursery object is reachable. Wit
 
 Test by storing a fresh object into an old array, dropping the only direct root, and forcing a minor collection. The array element must still identify the object and must be updated if it moved. Repeat through each store path, including bulk copying. Separately check that remembered information is not cleared while an unrecorded old-to-young edge remains. A concurrent marking collector can require a different barrier, such as logging overwritten references; a new-value generational barrier does not provide that guarantee by itself.
 
+% Annotated walkthrough
+\subsection{Repair Derived Addresses from Relocated Bases}
+
+A compiler may keep an address into an object rather than the
+object reference used to compute it. At a moving safepoint, the
+interior address cannot be treated as a second ordinary root: it
+does not necessarily identify an object boundary. Adopt a map
+format with two kinds of entries, independently rewritable base
+homes and derived homes with fixed byte offsets. Require every
+derived home to name a listed, nonnull base, and prove that its
+offset is within that object's layout. Assume the move preserves
+the layout and the collector stops the thread until all fixups
+are done. This simplified format leaves dynamic offsets to
+ordinary compiler spills or to a richer map.
+
+\begin{sudocode}[Update the roots, then rebuild derived values]
+\ForAll{base homes $b$ in the frame map}
+  \State $old\gets\Call{ReadHome}{b}$
+  \If{$old$ is not null}
+    \State $new\gets\Call{Forward}{old}$
+    \State \Call{WriteHome}{$b,new$}
+      \Comment{Update the rewritable root}
+  \EndIf
+\EndFor
+\ForAll{derived entries $(d,b,k)$ in the frame map}
+  \State $base\gets\Call{ReadHome}{b}$ \Comment{Use the new base}
+  \State \Call{WriteHome}{$d,base+k$}
+\EndFor
+\State resume only after both passes
+\end{sudocode}
+
+Let slot 2 hold base address 1000, and let a saved register hold
+1012 for a field at offset 12. A forced collection moves the
+object to 3400. The restored register must hold 3412 and read the
+field's sentinel 27. Put the integer 1012 in a scalar slot as well;
+that slot must remain 1012. Repeat with two derived homes at
+offsets 4 and 12 to verify that both use one relocated base. Reject
+a malformed map that deletes slot 2, even if an accidental copy of
+the old base exists in another register.
+
+On resume, each derived address denotes the same logical field as
+before the stop. Distinct writable homes and a root-first traversal
+make the fixup linear in map size. If the target cannot rewrite
+the saved register, keep the base live and regenerate the address in
+compiled code instead of advertising an unimplementable map.
+
 \section{Roots outside managed frames}
 
 Globals, code objects, and foreign handles can hold roots too. Marcus Crestani's \emph{Foreign-Function Interfaces for Garbage-Collected Programming Languages} describes explicit root registration and reference objects as ways to track values that native code might otherwise hide. Give each foreign root an owner and a well-defined last use. Chapter~\ref{ch:ext-250} discusses transferring those lifetimes across a callback; Chapter~\ref{ch:garbage-collection} deals with the collector algorithms themselves.

@@ -18,6 +18,51 @@ Instantiate the same module twice with different output sinks and separate memor
 
 Manuel F\"ahndrich and colleagues' \emph{Language Support for Fast and Reliable Message-based Communication in Singularity OS} describes private heaps and an exchange heap whose blocks have single-owner access. Transferring a block does not mean two components obtain write access to the same memory: verification prevents use through references that the sender no longer owns. This gives a different design point from copying messages between hardware-separated address spaces. When relying on software checks instead of page boundaries, the correctness of the checker and the rules for trusted native components become part of the isolation argument. A stronger deployment can put the runtime inside a separate least-privilege OS process and restrict the external resources that process can reach.
 
+% Annotated walkthrough
+\subsection{Reserve Output Credits before Accepting a Record}
+
+Checking a single span does not prevent a whole series of valid
+records from filling the host queue. Give each instance a logical
+byte quota and a record quota. The latter bounds per-record overhead
+and also accounts for zero-length records. Assume a synchronous bounded
+snapshot of the caller's record is made in fixed-size scratch storage
+after span and UTF-8 checks; scratch is budgeted separately. A sink
+lock serializes admission and accounting, and a bounded queue supports
+all-or-none append. Successful append admits the immutable record for
+delivery, while rejection has no output effect. The policy below
+counts a record even after a worker takes it from the queue.
+
+\begin{sudocode}[Account for both queued and in-flight records]
+\State $r\gets$ validated snapshot of caller's record, or reject
+\State acquire sink lock
+\If{$|r|>freeBytes$ or $freeRecords=0$}
+  \State unlock and return busy \Comment{Do not wait inside the import}
+\EndIf
+\If{appending an owned copy of $r$ fails}
+  \State unlock and return busy \Comment{No credits consumed}
+\EndIf
+\State $freeBytes\gets freeBytes-|r|$
+\State $freeRecords\gets freeRecords-1$
+\State unlock and return accepted
+\State on terminal delivery or discard, refund both under lock
+\end{sudocode}
+
+With six byte credits and two record credits, accept a four-byte
+record and an empty one. A two-byte record is then refused even
+though two byte credits remain. Move the four-byte record into
+delivery but pause the sink; the third call is still refused.
+Once that delivery finishes, the two-byte record may be accepted.
+The trace must contain one delivery of each accepted record,
+including the empty one, assuming the sink finishes successfully.
+Give a second instance its own quotas and verify the refusal on
+the first does not consume any of the second's allocation.
+
+The invariant is that remaining credits plus charges for all owned
+outstanding records equal the initial quotas. Refund once, after
+terminal handling, not at dequeue. This primitive bounds one sink's
+retained data; a runtime admitting many instances must separately
+bound aggregate storage and schedule delivery fairly.
+
 \section{What must travel with code}
 
 In \emph{Analyzing Mobile Code Languages}, Gianpaolo Cugola, Carlo Ghezzi, Gian Pietro Picco, and Giovanni Vigna distinguish moving code from moving its execution state and data bindings. A portable module can be instantiated anew; a portable suspended instance needs a representation of the continuation and policy for rebinding external resources. Do not serialize a native pointer or assume the destination has equivalent authority. Revalidate imports at the destination and reject continuation state or features that the destination cannot represent. The Modern Compiler Dossier's Chapter~34, \emph{Capability-Secured Compiler IR}, applies a similar idea at another layer: a pass needs explicit authority for its actions even when it operates on well-typed IR.

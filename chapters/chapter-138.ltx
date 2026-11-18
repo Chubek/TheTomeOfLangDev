@@ -21,3 +21,60 @@ Test a valid import, a private field, a task with the same spelling, and two equ
 Extensions can introduce names as well as look them up. Justin Pombrio and Shriram Krishnamurthi's \textit{Inferring Type Rules for Syntactic Sugar} shows why deriving a surface type rule from a desugaring can be preferable to reporting an error only in generated core code. Their example of short-circuit disjunction uses a temporary binding so that the left expression is not evaluated twice. This suggests two separate obligations for an expansion: its generated references must resolve to the intended binders, and its result must obey the type rule promised at the surface.
 
 For a short-circuit expression \texttt{a or tmp}, expanding with a textual local also named \texttt{tmp} can capture the reference in the right operand. Give the generated binder a fresh identity and preserve the original operand's use-site binding; do not rely on a spelling convention that a user can happen to choose. Retain source origins for generated nodes so a checker can blame the right operand when it fails. The provenance interface in \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/06-bidirectional-compilers.md}{Markdown Dossier Chapter~06} explains why such a link is useful even when there is no inverse translation. Chapter~\ref{ch:ext-139} treats binding preservation as a precondition for changing already written source.
+
+% Annotated walkthrough
+\section{Coalescing Re-Exports Without Merging Distinct Views}
+
+Suppose a dashboard imports two facade modules that both re-export
+one sensor from a third module. One defining symbol can then occur
+twice among the candidates for a single reference. Treating every
+import route as a new declaration creates a false ambiguity. But
+coalescing candidates on declaration identity alone can hide a real
+ambiguity if the two facades supply different unit conversions.
+Assume the composition contract gives each semantic adapter a
+stable view identity and that only visible candidates at the
+winning precedence tier are supplied as input. Resolution returns
+one selected view, a set of conflicting views, or a missing-kind
+diagnostic. Preserve import routes for explanations even when the
+routes do not affect the result.
+
+\begin{sudocode}
+  \Input candidates $C$, required symbol kind $K$
+  \Output unique view, ambiguity, or missing kind
+  \State $G\gets$ empty map
+  \ForAll{candidate $c$ in $C$}
+    \ForAll{view $v$ in \Call{AsKind}{$c,K$}}
+      \State $k\gets(v.definition,v.adapter)$
+      \Comment{Identity includes the conversion}
+      \State record $v$ and $c.route$ in group $G[k]$
+    \EndFor
+  \EndFor
+  \If{$|G|=0$}
+    \State \Return missing kind
+  \ElsIf{$|G|=1$}
+    \State \Return sole group \Comment{Keep both import routes}
+  \EndIf
+  \State \Return ambiguity with groups $G$
+\end{sudocode}
+
+Let sensor $42$ export a reading of $20$ degrees Celsius. Facades
+\texttt{lab} and \texttt{floor} initially both import the Celsius
+view using adapter $7$. Looking up \texttt{ambient} as a readable
+quantity sees keys $(42,7)$ and $(42,7)$, produces one group, and
+loads $20$ Celsius. If \texttt{floor} instead installs Fahrenheit
+adapter $8$, its view would return $68$ Fahrenheit. Now the keys
+are $(42,7)$ and $(42,8)$, and the same unqualified reference is
+ambiguous. Reporting only the two spellings would be unhelpful;
+show the units and import routes, so the client can choose the
+intended qualified name. Go-to-definition in either case can still
+point to the one sensor declaration.
+
+The invariant is that each group represents one observable reading
+operation under the composition contract. An adapter identity must
+therefore include relevant configuration, not just the name of its
+implementation routine. Two different keys may coincidentally
+produce the same number for one reading; that is not grounds for
+deduplication. With hashing, grouping takes expected linear time in
+the number of emitted views, aside from the cost of constructing
+them. Filtering out invisible routes must happen before grouping;
+otherwise the diagnostic could disclose a private export.

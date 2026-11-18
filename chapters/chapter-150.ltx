@@ -34,3 +34,54 @@ The invariant is that a direct target must equal the lookup result for the exact
 Suppose the same interface also exposes $\mathsf{intersects}:\mathsf{Shape}\to\mathsf{Bool}$. An override cannot narrow its accepted argument to $\mathsf{Circle}$ while remaining usable at the original signature: a client selecting it through $\mathsf{Shape}$ may pass a rectangle. Self-dependent binary methods need an explicit relationship between receiver and argument, or a checked dynamic operation. Similarly, devirtualizing a call made by an inherited method on its own receiver must respect possible subclass overrides. The class that supplied a body need not be the receiver's class.
 
 Urs H\"olzle, Craig Chambers, and David Ungar's \emph{Optimizing Dynamically-Typed Object-Oriented Languages with Polymorphic Inline Caches} uses several receiver-specific lookup results per call site and uses the observed receivers to inform adaptive compilation. In a compiler that uses this technique, a cache hit can refine the receiver on its guarded edge, a miss can perform normal lookup, and too many cases can justify reverting to generic dispatch. Test an overriding subclass, a site alternating receiver classes, and table invalidation if updates are allowed. Markdown Dossier Chapter~03 covers speculative IR; the distinction here is between a static interface, a conditional type refinement, and an observation used only to predict which path will be hot.
+% Annotated walkthrough
+\section{Refreshing a Bimorphic Cache After a Method Change}
+
+A dispatch cache can preserve ordinary lookup while retaining
+two hot cases. In this teaching runtime each call site has a
+fixed interface slot, at most two entries, and a global method
+epoch. A change affecting dispatch increments the epoch before
+further calls. Assume execution is single-threaded, epochs do
+not wrap, and the receiver is nonnull. The cache key is the
+receiver's exact class, and an entry contains the target plus
+any adjustment needed for the receiver. Use a least-recently-used
+policy purely to select which performance hint to forget.
+The output is the call's result, as in ordinary dispatch;
+the cache and its statistics are not part of that result.
+
+\begin{sudocode}
+  \Input receiver $v$, arguments $A$, slot $s$, site cache $C$
+  \Output result of dispatch on the supplied receiver
+  \If{$C.epoch\ne\mathit{methodEpoch}$}
+    \State clear $C.entries$ \Comment{Old targets are no longer valid}
+    \State $C.epoch\gets\mathit{methodEpoch}$
+  \EndIf
+  \State $k\gets\Call{ExactClass}{v}$
+  \State $t\gets C.entries[k]$
+  \If{$t$ is missing}
+    \State $t\gets\Call{LookupSlot}{k,s}$
+    \State insert $(k,t)$, evicting the oldest use if full
+  \EndIf
+  \State mark $k$ as most recently used
+  \State \Return $\Call{Invoke}{t,v,A}$
+  \Comment{Use the receiver tested above}
+\end{sudocode}
+
+For the slot \texttt{weight}, let the methods for two shapes
+$A$ and $B$ return $3$ and $5$ initially. At epoch $8$, calls
+on receivers of classes $A,B,A$ return $3,5,3$; the first
+two miss and the third hits. Update only $B$'s method to
+return $7$, advancing the epoch to $9$. The next $B$ call
+clears the cache, resolves the new target, and returns $7$.
+The next $A$ call misses too, even though it still returns
+$3$. That extra miss is the price of this coarse version
+dependency, not evidence that $A$ changed.
+
+Every hit uses the same slot lookup result that would be
+obtained for this exact receiver class at the current epoch.
+Eviction cannot change behavior because a miss recomputes that
+lookup. Two entries can be probed in constant time, but
+cycling through three classes can cause eviction on every
+call. A concurrent version needs a publication and lifetime
+protocol so a method cannot be replaced between a version
+check and invocation in a way the dispatch semantics forbid.

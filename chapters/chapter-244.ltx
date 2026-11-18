@@ -20,6 +20,54 @@ Suppose two builds run the same verified request workload. Build A processes a r
 
 Add a correctness experiment alongside the throughput run. Warm a call site using a single concrete implementation, then call it with another allowed receiver whose method returns a distinguishable value. The optimized run and interpreter should produce the same sequence of return values and visible side effects, including during any invalidation or fallback. Compare checksums computed from useful outputs, not just counts of completed iterations; if the program does less work, higher throughput is not evidence of a better tier.
 
+% Annotated walkthrough
+\subsection{Separate Class Preparation from Initialization in Tests}
+
+A test that starts the timer only on entry to a hot Java method
+can conflate class initialization and compilation history.
+Build a single-threaded fixture with one freshly defined class
+per trial, no hierarchy dependencies beyond an initialized
+superclass, and no initializer recursion or exceptions. Give it a
+non-final static integer and an initializer that records a marker
+and assigns 12. Expose separate instrumentation hooks for
+preparation and completion of initialization. Read raw prepared
+state only in the runtime instrumentation; a Java-level read
+of that field is an active use and would change the very state
+being observed.
+
+\begin{sudocode}[Measure an active use with an initialization probe]
+\State $C\gets$ define fresh fixture class in an isolated loader
+\State install probes scoped to defining identity of $C$
+\State request linking without initialization
+  \Comment{Do not read the field from Java}
+\State require prepare probe reports default value 0
+\State require observation log empty
+\State $a\gets$ invoke static getter of $C$
+  \Comment{First active use initializes before executing}
+\State $b\gets$ invoke same getter again
+\State require $(a,b)=(12,12)$
+\State require observation log $=[\mathsf{init}]$
+\State record initialization and tier events separately
+\end{sudocode}
+
+Suppose the first getter takes $80\,\mu\mathrm{s}$ and the second
+requires $5\,\mu\mathrm{s}$, with the probes recording
+$70\,\mu\mathrm{s}$ in the initializer. The pair by itself does not
+show the getter was optimized. Repeat with the fixture initialized
+before both timed calls and collect compilation events. As an
+identity check, run the same spelling through a second defining
+loader with the initializer assigning 23; expect two independent
+initialization markers and results 12 and 23 for their respective
+classes.
+
+The invariant in this fixture is one completed initialization
+before any successful active use per class identity, not per
+spelling or installed method version. Do not generalize the
+single-threaded test to the JVM's synchronization and exceptional
+initialization rules. Use the instrumented run to explain phases
+and the minimally instrumented run to estimate their cost. Retain
+the class identity in the event log even when method names agree.
+
 \section{Reporting can change execution}
 
 Heavy event tracing can alter compilation decisions and cache behavior. Compare minimally instrumented timing runs with diagnostic runs, and explain if the two runs exhibit different tier transitions. Chapter~31 of the Modern Compiler Dossier, \emph{Causal Profiling IR}, distinguishes the observation that a site is hot from evidence that it controls elapsed time. A measured improvement only matters for the workload and metric for which it was tested.

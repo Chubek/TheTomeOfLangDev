@@ -40,6 +40,53 @@ An existing version is compatible only if the edge facts imply every entry assum
 
 Test \texttt{a=4} for 5 and use a non-integer \texttt{a} with a varying \texttt{b} to exercise the generic version independently. Force cap zero and cap one, and compare return values and exceptions. Test maximal small-integer \texttt{a} separately: its tag proves that unboxing is safe, not that addition cannot overflow. In compiler dumps, assert that every patched edge both entails the target context and implements the parameter mapping.
 
+% Annotated walkthrough
+\subsection{Drop Only Shape Facts That a Store May Invalidate}
+
+Losing a shape fact within a block can increase the number of
+contexts compiled at its successors. Keep such facts only while
+their dependencies are known. Consider a compiler that labels
+a checked reference with a shape and gives each reference a
+conservative set of abstract objects it may name. A property
+store that may transition its receiver's shape kills facts whose
+object sets intersect the receiver's set. This model has no
+concurrent heap mutation, invokes no user code for the store,
+and does not mutate shared shape descriptors. Treat an unknown
+effect that can change any object as a kill of all shape facts;
+immutable tag facts may survive. Assume the store is the last
+operation before the outgoing edge in this walkthrough.
+
+\begin{sudocode}[Transfer a context across a shape-changing store]
+\State $out\gets$ copy of incoming context
+\State $writes\gets$ abstract targets of the store
+\ForAll{$(v,shape)$ in incoming shape facts}
+  \If{$writes$ is unknown or $mayObjects[v]\cap writes\ne\emptyset$}
+    \State remove shape fact for $v$ from $out$
+      \Comment{Other names can denote the receiver}
+  \EndIf
+\EndFor
+\State keep immutable tag facts \Comment{Tags are not heap fields}
+\State project $out$ onto live successor parameters
+\State \Return $out$
+\end{sudocode}
+
+Let $x$ and $y$ potentially name object $A$ checked at shape 2,
+and $z$ name disjoint object $B$ at shape 7. A store through
+$y$ changes $A$ from shape 2 to 3. On an execution where
+$x=y$, the successor must be able to observe the new shape 3;
+it cannot enter a version that assumes $x$ still has shape 2.
+If field \texttt{n} changes from 9 to 12 along with that
+transition, a generic read returns 12. The version can still
+use the shape-7 layout to read a field of $z$, say 40. Test
+both results to catch unsound retention and track the selected
+context to catch needlessly dropping the disjoint fact.
+
+The invariant is implication: actual values on the outgoing edge
+must satisfy every remaining fact. Overapproximate alias sets
+reduce precision but preserve that direction. If an interposed
+setter can call arbitrary code, the local write set is no longer
+sufficient even if the nominal receiver is disjoint.
+
 \section{Heap facts, production scale and version budgets}
 
 Chevalier-Boisvert and Feeley's \emph{Extending Basic Block Versioning with Typed Object Shapes} associates type information with property layouts so a checked shape can justify both the offset and type of a load. Shape facts are not immutable-value facts. An unknown call or a store through an alias can change the shape: discard the dependent fact, or use a proof or a renewed guard. In \emph{YJIT: A Basic Block Versioning JIT Compiler for CRuby}, Chevalier-Boisvert and colleagues describe an implementation that compiles lazily and can return to the interpreter by restoring its PC and stack pointer. This is not a contradiction of non-speculative edge reasoning: an implementation can combine proved context facts with speculative fast paths whose misses have separate exits.

@@ -18,6 +18,57 @@ and the instruction bytes become \texttt{8B 05 FA 0F 00 00}. Adding \texttt{0x0F
 
 Use a separately defined nonpreemptible symbol in a test fixture and inspect both the relocation before linking and the bytes afterward. Rearrange the final sections so the target is at a lower address and check a negative displacement as well. If the linker cannot encode the signed displacement, it must diagnose the failure unless a legal replacement sequence or layout change is available. Truncation is not a relocation strategy.
 
+% Annotated walkthrough
+\section{Check a Signed Relocation Before Writing the Field}
+
+Separate relocation arithmetic from byte serialization. The
+routine below handles one resolved \verb|R_X86_64_PC32| with
+an explicit addend and a writable four-byte field in a section
+image. The final link addresses are already known, and the
+symbol is the intended definition under the link's binding
+rules. Compute the displacement in mathematical or widened
+integer arithmetic before narrowing. Failure must leave the
+image unchanged so the caller can diagnose the range error
+or try a separately legal layout. This routine neither relaxes
+instructions nor changes symbol bindings.
+
+\begin{sudocode}
+\Require Section image $B$, field offset $i$, addresses $S,P$, addend $A$
+\If{$i<0$ or $i+4>|B|$}
+  \State \Return invalid field
+\EndIf
+\To{Use the relocation place, not the instruction start.}
+\Let{d}{S+A-P}
+\If{$d<-2^{31}$ or $d>2^{31}-1$}
+  \State \Return out of range
+\EndIf
+\To{Only narrow after checking the signed range.}
+\Let{w}{d\bmod 2^{32}}
+\State Write the four little-endian bytes of $w$ at $i$
+\State \Return applied
+\end{sudocode}
+
+Place the worked load at \texttt{0x2000}, so the patch
+place is \texttt{0x2002} and the next instruction is at
+\texttt{0x2006}. Put the data item at \texttt{0x1000}.
+With addend $-4$ the displacement is $-\mathtt{0x1006}$,
+so the field contains \texttt{FA EF FF FF}. Sign
+extension and addition to the next instruction address
+recover \texttt{0x1000}. For a range regression, fix
+$P$ and $A$ and choose $S=P-A+2^{31}-1$; the field
+must accept it. Moving the symbol one byte farther must
+fail rather than encode the most negative displacement.
+
+The invariant on success is that decoding the field as
+signed gives exactly $S+A-P$. The section offset $i$
+only selects bytes to modify; it is not an address to
+substitute for $P$. With an implicit-addend relocation the
+addend has to be decoded first using that relocation's
+specified field semantics. If a later relaxation changes
+either address, invalidate the old calculation and recompute
+from the original addend on the new layout, not from the
+patched field of the previous layout.
+
 \section{Relaxation Changes the Layout}
 
 A linker may sometimes turn a conservative sequence into a shorter one after learning the relevant placements or binding rules. Relaxation is not simply substituting a constant: a size change moves later symbols and can change alignment padding and other displacements. An implementation needs a convergence policy, rechecks of the ranges on the settled layout, and a way to keep section, symbol, and metadata offsets consistent. A PC-relative access to an address in a global offset table is also not automatically interchangeable with a direct reference to the definition. For a symbol that can be resolved to a different shared object at runtime, bypassing that indirection may change which definition is used. Check what the object format and target relocation promise before relaxing it.

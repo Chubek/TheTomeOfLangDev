@@ -14,6 +14,57 @@ Suppose a board has 32~KiB of RAM and a fixed partition. Reserve 4~KiB for drive
 
 Linker symbols or a memory map can check static reservations; high-water marks observe stacks and scratch space on tested workloads. Add a synthetic workload that retains exactly the selected live graph across a collection, then attempts one allocation that fits and one that does not. Also test the transient RAM use during program loading and peak interrupt nesting. Specify what failure does: reject a job, keep the last valid configuration, or report an error. An allocator that repeats collection forever after it has recovered no space has turned a memory boundary into a deadline failure.
 
+% Annotated walkthrough
+\subsection{Bound a Fixed-Width Device Event Ring}
+
+The interrupt handoff has a memory budget even when the VM
+heap is full. As a reference design, use four event records
+and indices for one producer and one consumer. Events are
+plain, fixed-width integers, not managed references. Reserve
+one record as the gap that distinguishes full from empty.
+On this toy single-core board the consumer masks the sole
+producer interrupt while manipulating the queue; assume the
+platform primitive also provides the required compiler ordering
+and the producer cannot reenter itself. Choose drop-new on
+overflow. An overflow count is saturating so a long burst does
+not silently wrap it to zero.
+
+\begin{sudocode}[Fixed storage, no interrupt-time allocation]
+\Function{OnEvent}{$x$}
+  \State $n\gets(tail+1)\bmod4$
+  \If{$n=head$}
+    \State saturating increment of $drops$ \Comment{Preserve old events}
+  \Else
+    \State $slot[tail]\gets x$; $tail\gets n$ \Comment{Publish last}
+  \EndIf
+\EndFunction
+\Function{Poll}{}
+  \State mask producer interrupt, preserving prior mask
+  \State $r\gets$ empty
+  \If{$head\ne tail$}
+    \State $r\gets slot[head]$; $head\gets(head+1)\bmod4$
+  \EndIf
+  \State restore mask; \Return $r$
+\EndFunction
+\end{sudocode}
+
+With both indices initially zero, deliver 10, 20, 30, and 40
+without a poll. The first three fit and $drops=1$; 40 is lost.
+Poll 10, deliver 50, and drain. The remainder is $(20,30,50)$
+then empty; this case crosses the array boundary and checks
+the distinction between full and empty. Measure the maximum
+masked interval while taking the nonempty path. A too-long
+masked section can violate a driver deadline even if the ring
+never loses an event.
+
+The records between head and tail in cyclic order are precisely
+the published unread events. Both operations take constant work
+and use bounded storage. Read or clear the drop counter under
+the same exclusion rule. A producer on another core would not
+be excluded by a local interrupt mask and needs a different
+publication protocol. In either case consumers must not read an
+unpublished record merely because its storage contains old bytes.
+
 \section{Scheduling collector and device work}
 
 An interrupt handler should do only bounded work needed to service the device: acknowledge it, record an event in preallocated storage, and leave processing to a task that can allocate. If that handoff queue fills, choose and document either backpressure where supported or a drop policy with an explicit counter. The event publication must respect the target's concurrency rules; an ordinary non-atomic flag alone is not a portable synchronization mechanism between execution contexts.

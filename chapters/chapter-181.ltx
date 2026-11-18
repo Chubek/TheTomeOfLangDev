@@ -31,3 +31,32 @@ Kathleen Fisher, Yitzhak Mandelbaum, and David Walker offer a more structured al
 Evaluate the alternatives against at least two jobs: a one-shot import that must reject a corrupt file and an interactive preview that must continue after a corrupt line. Compare the number of decisions required in user code, the source location in diagnostics, and runtime cost in success-heavy and error-heavy inputs. Keep the decoder and data fixed so that a faster parsing algorithm does not get credited to a change in error semantics. Include a separately compiled client: making failure visible only after whole-program analysis is a poor contract for a public interface.
 
 Disagreement across workloads is a result, not a defect in the comparison. A sensible language may expose both fail-fast import and explicit recovery, while giving silent substitution a distinctive name and requiring an argument. The \href{dossier-on-modern-cc-design/chapters/16-effect-aware-ir.md}{dossier's Effect-Aware IR chapter} asks the corresponding compiler question: once an operation can fail, what dependencies must a transformation preserve? Moving a potentially failing conversion ahead of a conditional that guards it, for example, can change a skipped record into a job-ending exception.
+
+% Annotated walkthrough
+\section{Make an Explicit Recovery Policy Composable}
+
+If a log reader exposes a result for each row, partitioning a large file across workers should not force the application to change its recovery policy. Consider a language design in which workers return a summary of accepted measurements and rejected rows, and only the final consumer decides whether the batch is publishable. The input is already partitioned into disjoint sets of complete records with stable row numbers. For this illustrative design, temperatures are scaled integers and the accumulator uses exact arithmetic. The postcondition is a publication result independent of partition boundaries and completion order, including the same ordered diagnostic row numbers.
+
+\begin{verbatim}
+summarize(rows):
+  s = (sum=0, count=0, rejected=empty set)
+  for row in rows:
+    match read_temp(row):
+      Ok(t): s.sum += t; s.count += 1
+      Error: add row.number to s.rejected
+  return s
+combine(a, b):
+  # Keep counts rather than averaging worker averages.
+  return (a.sum+b.sum, a.count+b.count,
+          a.rejected union b.rejected)
+publish(s, max_errors):
+  errors = sort(s.rejected)
+  # No data is not a measurement of zero.
+  if size(errors) > max_errors: return Rejected(errors)
+  if s.count == 0: return NoData(errors)
+  return Report(s.sum/s.count, s.count, errors)
+\end{verbatim}
+
+For rows \(1\) through \(4\) with values \(10,\texttt{?},20,30\), split after row two. The summaries are \((10,1,\{2\})\) and \((50,2,\varnothing)\); merging yields \((60,3,\{2\})\). With one error permitted, the output is \texttt{Report(20,3,[2])}; with none permitted it is \texttt{Rejected([2])}. Averaging the two local means instead would publish \(17.5\). A single corrupt row with an adequate error budget yields \texttt{NoData}, whereas a single measured zero yields a report with mean zero and count one.
+
+For each processed prefix, the sum includes exactly the accepted rows and the count is their cardinality. The merge is associative and commutative under the stated arithmetic and disjointness assumptions. Floating-point sums or worker retries that duplicate rows invalidate parts of that reasoning. Retaining every diagnostic uses space proportional to the number of errors; a product that caps diagnostics must specify a deterministic cap, not keep whichever errors arrive first.

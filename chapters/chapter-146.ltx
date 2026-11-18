@@ -24,3 +24,54 @@ The invariant for the host in this model is that every result delivered as a sta
 Tobias Wrigstad and colleagues' \emph{Integrating Typed and Untyped Code in a Scripting Language} contrasts wrapper-based integration with a design that distinguishes concrete types from \emph{like} types and checks uses of the latter dynamically. The enforcement strategy determines where checks and representation costs land. In the example above a one-time shape check is cheap, but a wrapper may add a call, a tag operation or allocation, and a result test to every iteration of a host loop. Proxy chains can add allocation and indirection, and object identity tests must have specified behavior in their presence. A strategy that checks typed uses instead of wrapping values has different instrumentation and blame behavior; exchanging it for a deep semantics is not a transparent compiler optimization.
 
 Measure crossings as well as aggregate runtime. Compare a fully typed baseline, a fully dynamic baseline, and mixed configurations that put a contract inside and outside the hot loop. Record check counts, allocations, and maximum wrapper depth. An optimizer can fuse compatible coercions or prove a check redundant, but it has to preserve observable failure order and blame according to the language specification. A benchmark with a single cast during startup can miss the dominant cost of an otherwise realistic migration.
+% Annotated walkthrough
+\section{Compressing a Chain of First-Order Tag Checks}
+
+To isolate one boundary cost, restrict a coercion chain to base
+values with immutable runtime tags. Lower injection and projection
+to a representation in which injection does not allocate or
+change the tag and projection only tests it; neither successful
+checks nor their number can be observed by source programs. Every
+test carries the original blame label. Given an ordered sequence
+of tag checks at one program point, emit a compact test that
+returns the same value or reports the same first failing label.
+This does not move a check across computation or cover a function
+wrapper, a representation-changing cast, or a mutable proxy.
+
+\begin{sudocode}
+  \Input ordered checks $C$ on one tagged value
+  \Output equivalent compact coercion
+  \If{$C$ is empty}
+    \State \Return identity
+  \EndIf
+  \State $(t,b)\gets\Call{First}{C}$
+  \State $r\gets\Call{RequireTag}{t,b}$
+  \ForAll{$(u,c)$ in the remaining checks in order}
+    \If{$u\ne t$}
+      \State \Return $r$ then $\Call{Blame}{c}$
+      \Comment{Retain the first conflicting label}
+    \EndIf
+    \State discard this check \Comment{Success already proves $t$}
+  \EndFor
+  \State \Return $r$
+\end{sudocode}
+
+Use a chain with checks $(\mathsf{Int},A)$,
+$(\mathsf{Int},B)$, and $(\mathsf{Bool},C)$. For a tagged integer
+$9$, tests $A$ and $B$ succeed and $C$ fails. For a tagged Boolean
+\texttt{true}, $A$ fails before $C$ is reached. The compact chain
+tests for integer with label $A$, and blames $C$ only on the
+success edge. Replacing the chain with unconditional blame at
+$C$ would give the wrong diagnosis for the Boolean input. If
+the last check is also integer, a successful input still returns
+$9$, with only one tag test instead of three.
+
+The invariant after the first successful test is that the same
+value still has the first required tag. No distinct tag test can
+succeed after that point, so checks after the first conflicting
+one are unreachable. Construction takes linear time in the chain
+length and emits at most one runtime tag test. Benchmark success
+and both failure paths separately; faster success does not justify
+changing the observed label. In a gradual language with profiling
+hooks, preserving a source-observable count would require a
+different optimization contract.

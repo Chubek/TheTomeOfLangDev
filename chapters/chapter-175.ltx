@@ -19,3 +19,31 @@ Consider a conditional followed by \texttt{use v}, where the conditional chooses
 P\'eter D\'avid Podlovics, Csaba Hruska, and Andor P\'enzes, in \emph{A modern look at GRIN, an optimizing functional language back end}, describe making graph operations explicit with \texttt{store}, \texttt{fetch}, and \texttt{update}. Their whole-program setting allows a generated \texttt{eval} function to be analyzed like other code. In a simplified GRIN-like example, store a node \texttt{SuspAdd(20,1)} and pass its address \texttt{p} to \texttt{eval}. If heap analysis gives that node tag as the only possibility on entry, specialize the dispatch to that case. A generic evaluator still needs a separate path for a node that is already a value. Calling \texttt{eval p} twice checks this distinction: the first call evaluates and updates; the second must observe the new tag, not reuse the pre-update abstract fact. A specialization may remove dispatch, but it cannot discard a required update just because the address is locally known.
 
 These representations keep different facts visible. ANF gives names to intermediate results, CPS exposes control transfers, and a heap-oriented IR exposes allocation and demand. None is an obligation to lower everything immediately to loads and jumps. \emph{The Modern Compiler Dossier}, Chapter~15, gives the complementary argument for preserving semantic operators until choosing a lowering. In a pipeline with both levels, a pass should declare which facts its target grammar now encodes, which facts it preserves only as metadata, and which it deliberately forgets.
+
+% Annotated walkthrough
+\section{Forward a Heap Fetch Only While Its Tag Fact Is Current}
+
+In a straight-line graph IR, a known node value can justify more than replacing evaluator dispatch: it can sometimes eliminate the fetch itself. Assume a sequential, nonvolatile heap with valid addresses and no observable fetch operation other than its result. The input is one block of allocations, strong updates, fetches, and calls; allocation sites in this local analysis denote fresh dynamic addresses. Assume a conservative test for whether two address operands may alias. The pass tracks already evaluated node values and replaces a fetch only when its address has a current fact. It preserves all stores and their order.
+
+\begin{verbatim}
+forward(block):
+  known = empty map
+  for instruction in block:
+    case instruction of
+      store p, value: keep; known[p] = value
+      update p, value:
+        # A write can invalidate even a different name.
+        erase known[q] for each q may_alias p
+        keep; known[p] = value
+      fetch p:
+        if p in known: replace fetch by known[p]
+        else: keep
+      call f:
+        # Unknown code can reach any tracked node.
+        if f is not proved heap-read-only: clear known
+        keep
+\end{verbatim}
+
+Allocate \(p\) with \verb|Value(2)| and \(q\) with \verb|Value(9)|. After \verb|update p Value(4)|, fetches of \(p\) and \(q\) can become \verb|Value(4)| and \verb|Value(9)| if their allocations are known disjoint. If a separate operand \texttt{r} aliases \(p\) and an update through it writes \verb|Value(7)|, a later fetch through \(p\) must return \verb|Value(7)|, not the earlier \verb|Value(4)|. The pass does not track must-alias facts, so it simply keeps that fetch. A call that can force a thunk is not heap-read-only merely because the source language is pure: forcing may change the node at its address.
+
+At every program point each table entry names the exact node value stored at its address on any execution reaching that point. Clearing the table at a join is conservative; retaining facts there needs agreement on every incoming path and availability of the substituted value. This simple implementation scans the table at each update. Memory versions and indexed alias sets can narrow that cost, but they do not in themselves establish the alias facts.

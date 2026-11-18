@@ -30,3 +30,33 @@ The code-generation invariant is that following the recorded number of static li
 Changing the language can remove some implementation work rather than merely relocating it. Andreas Pirklbauer's \emph{The Programming Language Oberon-2 (2020 Edition)} explicitly describes a revision based on Oberon-07 and lists the restriction on accessing intermediate objects from nested scopes. This is a property of that specified revision, not a statement about all Oberon dialects. Its type-bound procedure dispatch still needs a way to find the procedure for a receiver's dynamic type, and overriding signatures must match. A small grammar does not make all of the runtime representations trivial.
 
 For a modular implementation, separate the format exported by a compiled module from the symbol table used while compiling its body. An importer needs enough information to check clients and generate correct accesses, but need not receive private local variables. Test this distinction by compiling a client against the exported interface, changing only a provider's private procedure body, and then replacing the compiled provider on the same target. If a public type changes representation, the same test should instead force regeneration or reject the mismatch. The \href{dossier-on-modern-cc-design/chapters/08-demand-driven-compilation.md}{dossier's Demand-Driven Compilation chapter} develops a different compiler architecture, but likewise depends on knowing which facts a phase can request and which changes invalidate them.
+
+% Annotated walkthrough
+\section{Resolve Forward Calls Without Delaying Their Type Checks}
+
+In an illustrative single-pass compiler, a procedure's forward declaration can provide a complete signature before there is a code address. Use one symbol record for both the declaration and the definition, keyed by resolved lexical identity. The compiler receives checked declaration headers and a stream of procedure call and definition events. Assume fixed-width call operands and one output code segment. After the pass, every emitted call has a type-checked argument list and a patched target; an unresolved declaration or incompatible definition prevents publication of the code.
+
+\begin{verbatim}
+call(symbol, actuals):
+  require matches(actuals, symbol.signature)
+  emit_arguments(actuals)
+  # The placeholder reserves space but is not executable.
+  if symbol.entry is unknown:
+    at = emit_call_placeholder()
+    append at to symbol.fixups
+  else: emit_call(symbol.entry)
+define(symbol, header):
+  require no_entry_yet(symbol)
+  require same_signature(header, symbol)
+  symbol.entry = current_offset()
+  # Resolve this lexical symbol, not a spelling.
+  for at in symbol.fixups: patch_target(at, symbol.entry)
+  clear symbol.fixups
+finish():
+  require every forward declaration has a definition
+  return code
+\end{verbatim}
+
+Suppose \texttt{Twice(Int):Int} is declared, and two calls with arguments \(4\) and \(7\) emit placeholder operands at offsets \(12\) and \(28\). When \texttt{Twice} is defined at offset \(40\), both operands become \(40\) under an absolute-address encoding. If its body adds its argument to itself, the callers return \(8\) and \(14\). A call with a Boolean argument fails before its arguments or placeholder are emitted. A definition of \texttt{Twice(Bool):Int} likewise fails before patching; it cannot retroactively legitimize earlier calls.
+
+At every point a fixup is owned by exactly one still-unresolved symbol, and the type rule for a call is independent of whether it enters that list. Each fixup is written at most once after emission. If the instruction set uses relative offsets of limited width, patching must also check representability or arrange a separate longer-transfer mechanism; interpreting an overflowed displacement as some other procedure is not error recovery.

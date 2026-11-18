@@ -24,3 +24,27 @@ In \emph{VLISP: A Verified Implementation of Scheme}, Joshua Guttman, Vipin Swar
 For this kind of argument, specify which result theorem is claimed. The operational faithfulness discussion in VLISP uses partial correctness: when the implementation delivers a computational answer, it must agree with the denotation. This is not a guarantee of termination whenever the abstract semantics predicts an answer, nor a statement that finite heaps cannot fill. Local certificates for optimizations, as discussed in Chapter~\ref{ch:proof-carrying}, can help discharge pass-specific premises. They still depend on the semantics of the primitive operations and the correctness of runtime transitions at the boundaries where those premises are used.
 
 An implementation proof also has to say where its input and output specifications begin. As a point of comparison, Magnus O.\ Myreen and Michael J.\ C.\ Gordon's \emph{Verified LISP Implementations on ARM, x86 and PowerPC} includes parser and printer proofs for a core of Lisp~1.5 and derives guarantees about strings passed to and returned by machine code. That is a different language and theorem from VLISP. A claim about execution of an already constructed expression does not automatically cover the reader that constructs it, just as a claim about compiled bytecode does not by itself cover a native interpreter for it.
+
+% Annotated walkthrough
+\section{Materialize Virtual Objects Once on a Side Exit}
+
+A speculative optimizer may keep the fields of a short-lived record in registers rather than allocate the record, provided its identity and allocation are unobservable during that execution. If a guard later fails, the interpreter may need the object to continue, including any aliases to it. Model an exit description as a graph of virtual object identifiers, with layouts and field recipes, and a list of recipes for interpreter slots. A recipe refers to a virtual identifier or to an already available value; a virtual identity has no corresponding allocated object yet. Assume that field construction itself runs no user code and that allocation failure is outside the modeled semantics. On success the reconstructed frame must have the same values and identity relations as the general frame.
+
+\begin{verbatim}
+materialize(desc, live):
+  map = empty root table
+  ids = reachable_virtual_ids(desc.slots, desc.fields)
+  for id in ids:
+    # Reserve one rooted object per logical identity.
+    map[id] = allocate_blank(desc.layout[id])
+  for id in ids:
+    for (field, recipe) in desc.fields[id]:
+      # Forward and backward references now have targets.
+      set_field(map[id], field, resolve(recipe, live, map))
+  slots = resolve_all(desc.slots, live, map)
+  return interpreter_frame(desc.resume_pc, slots)
+\end{verbatim}
+
+For an exit with slots \(x\) and \(y\) both naming virtual object \(A\), let \(A\) contain the integer \(6\) and a link to virtual object \(B\), and let \(B\)'s link point back to \(A\). The first pass allocates two objects, say at addresses \(40\) and \(72\); the second installs links \(40\to72\to40\). A resumed test comparing \(x\) and \(y\) returns true. After writing \(9\) into the integer field through \(x\), a read through \(y\) returns \(9\). Allocating once per slot would produce distinct objects for \(x\) and \(y\), changing both observations.
+
+The mapping is injective on distinct virtual identities and shared by all occurrences of each identity. With indexed recipes and a visited set, restoration is linear in the reachable fields and slots, even with cycles. If allocation may trigger collection, blank objects must be safely traceable and the mapping must remain a set of registered roots; addresses in the example are illustrative. Restoring a frame also must not replay effects already executed before the guard.

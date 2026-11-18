@@ -626,6 +626,36 @@ Solutions include:
   \item \textbf{Lazy initialization}: defer initialization until the object is first accessed.
 \end{itemize}
 
+% Annotated walkthrough
+\subsection{Rolling Back a Failed Runtime Startup}
+
+Normal teardown assumes the runtime reached a fully initialized state. Startup can fail earlier: the allocator is ready, for example, but opening the tracing sink fails after acquiring only some of its resources. Treating failed startup as normal teardown can invoke destructors on services that were never constructed.
+
+\textbf{Inputs and assumptions.} Each service has an initializer and a nonthrowing undo action for successful initialization. An initializer that fails must clean up its own partial work before it returns. The finite service dependency graph is known before startup. No worker thread or application code may observe the new service table before success; dependencies may be visible privately to later initializers.
+
+\begin{sudocode}[Publish only after successful initialization]
+\Require Service dependency graph $G$
+\Ensure Complete startup or no installed new services
+\Let{L}{\Call{TopologicalOrder}{G}}
+\If{$L$ does not exist}
+  \State \Return dependency cycle \Comment{No initializer ran}
+\EndIf
+\State Start with a private table and empty undo stack
+\ForAll{$s\in L$}
+  \If{initializing $s$ fails with error $e$}
+    \State Pop and undo every recorded success
+    \State \Comment{Dependents are undone before prerequisites}
+    \State \Return $e$
+  \EndIf
+  \State Record $s$ and its undo action
+\EndFor
+\State Publish the table
+\end{sudocode}
+
+\textbf{Example.} Start an allocator, a log sink that needs the allocator, and a worker pool that uses both. The allocator reserves 64 pages and the sink opens one handle. Pool creation fails on its third thread; its initializer joins the two threads it did start. The undo stack closes the sink's handle, then releases the 64 pages. The result is an initialization error with no published table, no open sink handle, and no pool threads.
+
+\textbf{Invariant.} The undo stack contains exactly the successfully initialized services, in dependency order. Topological sorting costs $O(|V|+|E|)$ apart from initialization, and rollback visits only services on the stack. Irreversible actions do not fit this rollback contract: delay them until publication is safe, provide compensation, or document that failure requires process termination.
+
 \subsection{Runtime Teardown}\label{sec:runtime-teardown}
 
 Program termination is as complex as startup:

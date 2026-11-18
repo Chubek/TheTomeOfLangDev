@@ -29,3 +29,27 @@ Diwan, McKinley, and Moss evaluate type-based disambiguation for Modula-3 in \te
 A region can mean an alias partition, a storage lifetime, or a syntactically nested computation; these are different notions. A lifetime region may be modeled as a scope that creates a fresh name \(\rho\), gives its body an allocation capability, and retires that capability on exit. A pointer of type \(\mathrm{Ref}_{\rho}(T)\) cannot survive the exit by being returned, saved into longer-lived storage, or captured by an escaping closure. Checking only the explicit return type misses the second and third paths unless the type or effect system also tracks storage and captures. Bowman's study of ANF explains why scoped region allocation can make apparently administrative movements unsafe: commuting a continuation across a scope can change when its code executes relative to retirement of the region.
 
 At a branch, memory versions from distinct paths must be combined by control selection, not by equating the states. A verifier can check that a memory use has an available definition, that a join has a matching input for each predecessor, and that each operation's state signature is consistent with its summary. Splitting one global chain into per-partition chains then needs an additional semantic argument: accesses from different chains must really be reorderable, and calls that can access several partitions must account for them all. The graph can document the ordering decision, but its well-formedness alone does not prove the alias facts that justify it.
+
+% Annotated walkthrough
+\section{Forward a Load Byte by Byte Through Overlapping Stores}
+
+Partial overlap need not defeat store-to-load forwarding if the exact accessed bytes are known. Consider a small sequential IR with a chain of nonvolatile, nonfaulting stores to statically known byte intervals and a load with a fixed address and width. Assume initialized memory and a known target byte order. Stores contribute the encoded bytes of their already evaluated values; none is removed by this transformation. The input is the load and its incoming memory version. The pass either rewrites the load to a value assembled from dominating store operands or declines when it cannot identify the origin of every byte.
+
+\begin{verbatim}
+forward_bytes(addr, width, memory):
+  need = addresses(addr, width); byte = empty map
+  while need is not empty:
+    if memory is not KnownStore: return KeepLoad
+    s = store_def(memory)
+    for a in need intersect s.interval:
+      # A later store already won for any removed address.
+      byte[a] = encoded_byte(s.value, a - s.start)
+      remove a from need
+    memory = s.previous
+  # Address order and integer significance are distinct.
+  return assemble(byte in address order, load_endianness)
+\end{verbatim}
+
+On a little-endian target a two-byte store of hexadecimal \texttt{1234} at address \(100\) writes \texttt{34} and \texttt{12}. A subsequent one-byte store of \texttt{AB} at \(101\) sets that byte to \texttt{AB}. For a two-byte load at \(100\), the reverse walk takes byte \(101\) from the later store and byte \(100\) from the earlier store. Assembly returns hexadecimal \texttt{AB34}. Forwarding the first store's whole value would instead return \texttt{1234}. A store of unknown footprint between those two stores prevents this particular pass from finding a source for byte \(100\).
+
+Once the algorithm fills a byte, its value is final because all later stores have been considered first. A simple implementation takes \(O(kw)\) work for \(k\) visited stores and load width \(w\); an interval overlap routine can avoid scanning disjoint bytes. The endian assumption belongs to both encoding and assembly. If the load itself is observable or may fault, even exact reconstruction of its bytes cannot justify deleting it.

@@ -33,3 +33,31 @@ Assume addition itself follows the abstract integer type's rules, independently 
 Stanier and Watson's \textit{Intermediate Representations in Imperative Compilers: A Survey} groups representations partly by the organization of control and data. A portable stack format is convenient for decoding and distribution, but it is not obliged to also be the format in which analyses manipulate use--definition links or expose independent computations. A system can decode stack effects into SSA temporaries, optimize there, and preserve the portable execution contract at its public boundary.
 
 When evaluating a UNCOL-like interface, specify which things the producer may assume, which the target may choose, and which services the environment must provide. Integer arithmetic can be fixed semantically while register placement is left open; file access may be delegated to a standard runtime interface. Test new generators and translators against that interface separately, using boundary cases such as the failed store above. This makes the claimed factorization testable rather than just a count of compiler modules.
+
+% Annotated walkthrough
+\section{Translate Virtual Stack Joins to Explicit Block Parameters}
+
+A stack format can hide value names without making values ambiguous at a join. Consider a hypothetical stack bytecode with an already decoded control-flow graph and verified incoming stack shapes for all reachable blocks. Each instruction has a known sequence of popped types and pushed results; it also has defined operand order. The translator assigns one parameter to each incoming stack slot at every block, including loop headers. Given an empty stack at function entry, the output is a graph in which every transfer supplies explicit names for all live virtual stack values. This is an illustrative lowering, not a claim about a particular P-code interpreter.
+
+\begin{verbatim}
+lower(graph, incoming_shapes):
+  for block in reachable(graph):
+    # Predeclare also for targets of back edges.
+    params[block] = fresh_names(incoming_shapes[block])
+  for block in reachable(graph):
+    stack = copy(params[block])
+    for insn in block.instructions_except_transfer:
+      values = pop_operands_in_declared_order(stack, insn)
+      names = emit_explicit_op(insn, values)
+      push_results(stack, names)
+    control = lower_transfer_operands(block.transfer, stack)
+    # Forward slot zero first, even if it was pushed earliest.
+    for target in successors(block):
+      require types(stack) == incoming_shapes[target]
+      emit_edge(block, target, control, bottom_to_top(stack))
+    emit_exit_if_any(block.transfer, control)
+\end{verbatim}
+
+Let one arm push \(20\) and then \(3\), and the other push \(10\) and then \(4\). The next block subtracts the top operand from the value underneath. The emitted transfers carry \((20,3)\) and \((10,4)\) to parameters \((a,b)\); its explicit subtraction \texttt{sub(a,b)} returns \(17\) or \(6\). Reversing slot order on both edges would still type-check and yield \(-17\) or \(-6\). A malformed arm that pushes only one value should fail the upstream shape verifier; the defensive edge check also refuses to supply an invented operand.
+
+After each instruction the symbolic stack, read from bottom to top, names the values that the portable machine would hold in that order. At block entry the incoming edge establishes the invariant for every slot. The method may keep parameters for values a downstream pass can prove dead or identical on all edges; the extra work for lowering transfers is proportional to the sum of stack heights passed along those edges.

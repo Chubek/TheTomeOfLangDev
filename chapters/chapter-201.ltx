@@ -29,6 +29,55 @@ latch:
 
 Discard self-operands when testing for a trivial merge. All remaining operands of \texttt{stepH} agree on \texttt{1}, so redirect its users there; \texttt{iH} has two different incoming values and stays. Retest merges that use a deleted result and repair table entries that still name it. A self-only merge has no independent incoming value and needs the IR's unreachable or undefined-value policy. No merge was necessary for an unused binding just because it happened to be assigned in both arms of a branch. In irreducible flow, several merges can sustain one another while collectively carrying only a single external value; individual trivial-merge cleanup does not suffice. Braun et al.\ describe a cleanup over strongly connected components of the merge graph.
 
+% Annotated walkthrough
+\section{Seal Without Losing a Later Assignment}
+
+A builder can hold two different definitions of one binding in the same
+unfinished block: the incomplete value requested at entry and the
+current value after a local assignment. The sealing operation below
+receives an unsealed block after its predecessor list is frozen.
+Assume the predecessors are filled, their exit definitions can be
+queried recursively, and provisional results already appear in the
+table that resolves cyclic lookups. The operation must give every saved
+entry merge one argument per incoming edge without changing which
+completed definition supplies a later read.
+
+\begin{sudocode}
+\Require Block $B$ with frozen incoming edges
+\Let{P}{\operatorname{pending}(B)}
+\To{Recursive reads see the frozen predecessor list.}
+\State Mark $B$ sealed and clear its pending list
+\ForAll{$(x,m)\in P$}
+  \ForAll{incoming edges $e$ of $B$}
+    \Let{v}{\operatorname{readExit}(\operatorname{source}(e),x)}
+    \State Set operand of $m$ on $e$ to $v$
+  \EndFor
+\EndFor
+\To{Do not write an entry result to the exit table.}
+\State Queue the completed merges for trivial-merge cleanup
+\end{sudocode}
+
+For a concrete loop, initialize $x=4$ and visit the header twice.
+In the header first log $x$, then assign $x+3$ back to $x$; the latch
+does not assign $x$. While unsealed, the first log uses a provisional
+result $m$, but the current table records the addition $a=m+3$.
+Sealing adds the operands $4$ from entry and $a$ from the latch.
+The two logs should be $4,7$. If the frontend then builds an exit
+block that reads $x$ after the second header visit, the exit's lookup
+should find $a$ and return $10$. Overwriting the current table with
+$m$ at sealing would make that lookup find the old value $7$ instead.
+
+The invariant is that entry requests and current definitions have
+separate identities even after an entry merge is completed. If $m$
+really is redundant, replacement must redirect references to $m$,
+including any table entry that still names it, not all references
+indexed by $x$. Delay simplification of a merge until its operands
+are filled; testing it after seeing only the first predecessor could
+lose the backedge. Excluding recursive queries, sealing costs one
+operand attachment per pending merge and incoming edge. Using edge
+identities rather than source names also preserves separate operand
+positions for multiple edges emitted by one predecessor.
+
 \section{Check the Builder at the Boundary}
 
 For each reachable edge into a sealed block, the operand of an entry merge must equal the value the source binding has at that predecessor's exit. Ordinary uses must refer to dominating definitions; an incoming operand must be available on its edge, not necessarily throughout the destination block. These checks apply to finished IR, not to the builder's private incomplete state. Test a zero-trip loop and a multi-iteration loop, then add a header that both reads and overwrites a binding before sealing. For a second oracle, run the frontier-based builder on the same complete CFG and compare observable execution, not the names or exact number of merges. The dossier's Chapter~14, \emph{Interpreter as a Compiler}, suggests a natural setting for such a reference evaluator; Chapter~\ref{ch:ext-210} explains why structural verification alone is not that oracle.

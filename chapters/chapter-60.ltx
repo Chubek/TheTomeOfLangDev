@@ -507,6 +507,52 @@ The interaction between optimization and memory models is one of the most subtle
 %% ============================================================
 %% Section 60.9
 %% ============================================================
+% Annotated walkthrough
+\subsection{Forwarding a Load from an Earlier Byte Range}
+
+In a Memory SSA representation, a load's starting memory version
+may include stores to unrelated addresses. To forward the load, walk
+backward along memory definitions, skipping only those proven not to
+overlap the load. This sketch handles ordinary nonvolatile integer
+accesses in a single-threaded IR with known object provenance, no
+uninitialized or undefined stored bits, and a fixed target endianness.
+Assume removing the load cannot remove an observable trap. Stop at
+a memory phi or opaque effect rather than trying to prove equality
+across multiple control-flow paths. A covering store must have a value
+available at the load.
+
+\begin{sudocode}
+\Require Load of $n$ bytes at $p$, reaching memory version $m$
+\While{$m$ is a memory definition for an ordinary store}
+  \State $s\gets$ store defining $m$
+  \If{$s$ is proven disjoint from the requested range}
+    \State $m\gets$ input version of $s$ \Comment{No loaded byte changed}
+  \ElsIf{$s$ provably covers the range and its value is available}
+    \State $d\gets$ byte offset of $p$ within $s$
+    \State \Return endianness-aware slice of $s$'s value at $(d,n)$
+  \Else
+    \State \Return keep the load \Comment{May alias or covers only part}
+  \EndIf
+\EndWhile
+\State \Return keep the load
+\end{sudocode}
+
+On a little-endian target, store the 32-bit value
+\texttt{0x11223344} at offset 0 in object $X$; then write 99 into
+a disjoint object $Y$. A 16-bit load at $X+1$ skips the store to $Y$,
+then reads bytes \texttt{33} and \texttt{22} from the covering store.
+The result is \texttt{0x2233}. If the intervening write instead
+stores one byte at $X+2$, it is a partial overlap and this
+procedure leaves the load intact.
+
+The invariant is that traversed definitions have not changed any
+of the requested bytes. Consequently the first proven covering
+definition supplies the entire value, including when the load and
+store types have different widths. Walking takes one alias query
+per visited version. A bounded search can simply keep the load
+on exhaustion. Extending the method to stitch together bytes from
+multiple stores requires a separate proof per byte interval.
+
 \section{Summary and Further Reading}\label{sec:summary-60}
 
 Memory models in IRs must bridge the gap between the source language's memory semantics and the target hardware's memory behavior. Memory SSA makes memory dependencies explicit; alias analysis determines which operations may conflict; and atomic/fence operations represent synchronization. The compiler's role is to preserve the source language's guarantees while generating efficient code for the target hardware.

@@ -23,6 +23,56 @@ With zero cost for the two available input registers, the specialized cover cost
 
 The width predicate is part of legality, not profitability. Using a wider operation with no truncation can produce a different result at the boundary: at \(w=32\), with \(\texttt{base}=0\) and \(\texttt{index}=2^{30}\), the specified result is zero, not \(2^{32}\). If the source operator instead checked overflow, wrapping at the selected width would also be wrong. A rule test should exercise those boundary cases, and a rule validator can prove a bit-vector identity for the admitted width and separately check the target feature and operand classes at match time.
 
+% Annotated walkthrough
+\section{Retire a Matched Node Only After Its Last Use}
+
+Matching an expression through a producer does not give the replacement
+ownership of that producer. Consider a local rewriter for a pure SSA
+arithmetic graph. Assume every ordinary instruction is total, roots
+represent returned values or other visible uses, and use counts include
+each operand occurrence and each root reference. The replacement must
+already have passed type, dominance, and semantic checks, and it must not
+refer directly or transitively to the result being replaced. Here the
+replacement's new nodes are not yet attached to the graph. The rewriter
+updates the matched result and removes only now-unreferenced computations.
+
+\begin{sudocode}
+\Require Old result $o$, validated replacement $r$
+\State Attach $r$ and register its operand uses
+\To{Count new uses before removing old ones.}
+\State Redirect all users and roots from $o$ to $r$
+\Let{W}{[o]}
+\While{$W$ is not empty}
+  \Let{v}{\operatorname{pop}(W)}
+  \If{$v$ is removable, attached, and has zero uses}
+    \Let{A}{\operatorname{operands}(v)}
+    \State Detach $v$ and remove its outgoing operand references
+    \To{Only these producers can have lost users.}
+    \State Append the producers in $A$ to $W$
+  \EndIf
+\EndWhile
+\end{sudocode}
+
+Use wrapping arithmetic with $\texttt{base}=11$ and $\texttt{index}=5$.
+Let $v$ be the shift by two, and let the two returned values be
+$\operatorname{add}(\texttt{base},v)$ and $v$ itself. Before rewriting,
+$v=20$ has two references and the result pair is $(31,20)$. Replacing
+the addition by a scaled-address operation redirects the first root;
+removing the original addition takes the use count of $v$ from two to
+one. The final pair stays $(31,20)$. If the second root is absent, that
+same detachment takes the count to zero and the separate shift can go
+away. This is a better selector test than checking just the cost of the
+tree rooted at the addition.
+
+At every iteration the counts describe the attached graph, so a node
+with zero uses is not needed by any root or attached instruction.
+With constant-time use-list operations the cleanup is proportional to
+the redirected uses and the operand references of detached instructions,
+not the full graph. The restricted procedure will not reclaim a dead
+cycle based on counts alone. Nor may it discard an unused operation with
+observable effects: such an operation needs an explicit effect root or a
+nonremovable designation even if its value has no users.
+
 \section{Retarget Without Leaking Target Choices}
 
 Lewis, Deutsch, and Goldstein's \textit{Clarity MCode: A Retargetable Intermediate Representation for Compilation} illustrates a split between portable type information and target-specific restrictions. Primitive sizes are explicit in MCode, while the backend determines platform alignment and aggregate layout from type information. Its native interface has ABI obligations even though much of the IR is machine independent. Likewise, in a rule system, legality checks must include ABI, register, and addressing constraints whenever generated code exposes them. Changing rule priorities should affect cost, not weaken those checks.
