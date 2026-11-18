@@ -1,0 +1,28 @@
+% Source: ssa-form-for-machine-code.txt
+% Source: vm-ssa.txt
+
+\section{Separate Value Identity from Register Identity}
+
+At a low level, an instruction may implicitly read a flag, write a fixed result register, or clobber caller-saved registers. Assigning an SSA name to the result version identifies which value a use needs. It does not excuse the compiler from satisfying the instruction's concrete operand constraints. Allen Leung and Lal George's \emph{Static Single Assignment Form for Machine Code} separates renaming for optimization from reconstruction of references to dedicated physical registers. When a later instruction still needs an earlier value of a dedicated register, compensation copies can preserve the value without pretending the machine has two versions of that register.
+
+Consider a selected-IR fragment where \texttt{RET} is a physical return register, \texttt{keep} is an unconstrained virtual location, and \texttt{g} clobbers \texttt{RET}. The SSA names \texttt{v1} and \texttt{v2} represent different values:
+
+\begin{verbatim}
+v1 = call f()       # result required in RET
+v2 = call g()       # result required in RET
+return sub(v1, v2)
+\end{verbatim}
+
+Mapping both values directly to \texttt{RET} makes the subtraction read the result of \texttt{g} twice. The emitted code needs to save \texttt{v1} before the second call, to a location that survives that call, and read it from there. \texttt{keep} can ultimately be a suitably saved register or a spill slot; an arbitrary other caller-saved register is not enough. Return the result in the required ABI location. A mock target test with \texttt{f} returning \texttt{9} and \texttt{g} returning \texttt{4} should return \texttt{5}, not \texttt{0}. Also test a use of a flag across a flag-writing instruction and overlapping registers if the target has them.
+
+\section{Direct SSA Interpretation Needs Edge State}
+
+A VM can retain value names as instruction-result slots instead of deciding on physical registers ahead of time. In \emph{A Virtual Machine for Interpreting Programs in Static Single Assignment Form}, Jeffery von Ronne, Ning Wang, Alexander Apel, and Michael Franz describe an interpretable SSA form with a control-flow edge number set by branching instructions. Each \texttt{phi} reads the operand for that number. Knowing the destination program counter is not always enough; two edges into the same block can supply different operands even when they come from the same terminator.
+
+Static single definition does not mean that a result slot is only written once per activation. A loop revisits the same instruction slots. Two loop merges can read each other's previous values; immediate writes would make later merges see the new state. The paper buffers the transfers and commits them at an explicit end-of-merge instruction. The interpreter's contract is that all merge operands are read using the incoming state and all ordinary instructions see the committed state. The swap from Chapter~\ref{ch:ext-207} is a direct regression: run zero, one, and two iterations and check that the pair alternates, including when it is not the first merge in a larger group.
+
+\section{Choose the Boundary Where Constraints Become Explicit}
+
+Direct interpretation avoids lowering merges into ordinary moves before execution, but it adds branch metadata and merge handling to the dispatcher. The verifier should check edge indices, matching operand counts, and legal entry points into a merge group. A stack-bytecode VM has different costs: on translation into SSA, incoming bytecode stack shapes and local types must be reconciled at joins, and values from each incoming frame state can become arguments to a block. Neither execution format implies that the VM must use that same format for its optimizer.
+
+For a tiered runtime, record where each logical frame value lives at a safepoint or how to reconstruct it. A native frame might keep a value in a saved register, in a spill slot, or only as a rematerialization recipe. Reaching a native instruction with all registers ``correct'' for the upcoming arithmetic is insufficient if the runtime cannot rebuild the interpreter frame there. The dossier's Chapters~2 and~4, \emph{Multi-Level Interpreter} and \emph{Deoptimization as an IR Operation}, expand this state correspondence into an interface between tiers.

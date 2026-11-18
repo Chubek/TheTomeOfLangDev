@@ -1,0 +1,29 @@
+%% chapter-174.ltx -- Lazy Evaluation and Graph Reduction
+% Source: spj-impl-funlang-tutorial.txt
+
+\section{Separate the Heap from the Demand Stack}
+
+Call-by-need is non-strict evaluation with sharing of demanded computations. In a graph machine, variables are represented by edges to heap nodes. A node may hold an application, a constructor with pointers to its fields, a function entry, a suspended computation, or an indirection to another node. The graph is not necessarily acyclic: a recursive binding can be allocated as a placeholder before installing its defining edges. The evaluator's stack, by contrast, records the current demand: pending arguments, the branch to select after a case scrutinee becomes available, or the primitive operation waiting on its operands.
+
+Simon L. Peyton Jones and David R. Lester's \emph{Implementing Functional Languages: a tutorial} presents template instantiation and the G-machine as concrete designs. Its template-instantiation evaluator shows how to unwind the left spine of a sequence of applications to find the head. Once the head is known, the spine identifies both the operands and the root of the saturated redex. An underapplied function is already a weak head result. A saturated constructor is also in weak head normal form even if its fields are suspended. Forcing a list to determine whether it is empty must not force its head or traverse its tail.
+
+\section{Update the Address That Other Edges Know}
+
+In the tutorial, a supercombinator reduction can instantiate a right-hand-side graph and overwrite the redex root with an indirection to the new graph. In a machine organized around explicit thunks, the corresponding update protocol saves the address of the entered thunk on an update frame. It computes a weak head result and writes that result or an indirection to it at the saved address. Updating just the current stack slot is insufficient: a later demand through a different heap edge would still see the suspended computation. Chapter~\ref{ch:ext-175} considers what becomes possible when these heap operations are visible in a compiler IR.
+
+A sequential thunk machine may put an in-progress marker at the saved address while evaluating it. Re-entry through that address indicates a circular demand, often called a black hole. This check is not a general detector of divergence, and a cyclic data structure is not itself a black hole. The update frame and live stack slots must be scanned as roots by the collector, with a moving collector updating saved addresses. A generational collector also needs its usual write barrier when an update installs a pointer from an old thunk to a young result. The implementation should specify which node layouts the collector can encounter before, during, and after update.
+
+\section{Worked Example: A Productive Cycle}
+
+\begin{verbatim}
+letrec xs = Cons (20 + 1) xs in
+  case xs of
+    Cons h t -> case t of
+      Cons k u -> h + k
+\end{verbatim}
+
+Allocate a node for \texttt{xs} and enter it for the outer case. The resulting constructor has one field pointing to the suspended addition and the other pointing back to the node for \texttt{xs}. The second case follows the tail, sees the already available constructor, and binds \texttt{k} to the same address as \texttt{h}. The first operand demand computes \(21\) and updates that field's thunk; the second reads the result. The expected answer is \(42\), with one reduction for the suspended addition and one for the outer addition. Replace the defining constructor with \texttt{xs} itself and force the binding: now the attempt to obtain a weak head result re-enters the unresolved node. The two tests distinguish cyclic values from cyclic demand.
+
+\section{Measure Retention, Not Just Reductions}
+
+When the update drops a thunk's old payload, a collector should be able to reclaim captured objects that are no longer reachable. But sharing can also keep a large computed value reachable. A left fold that does not force a numeric accumulator can retain a long chain of additions until the final demand. Compare it with a fold that demands the new accumulator before each tail call: for a finite list and total integer addition the values agree, but the accumulation chain no longer grows. Measure peak reachable bytes as well as total allocations and thunk entries. Heap updates and live roots are semantic obligations for a lazy runtime, not arbitrary low-level stores. This is a concrete setting for the distinction made in \emph{The Modern Compiler Dossier}, Chapter~17, between hiding memory in incidental instruction order and making memory dependencies explicit.

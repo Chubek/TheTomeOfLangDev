@@ -1,0 +1,35 @@
+%% chapter-256.ltx -- Deoptimization State and Replay
+% Source: formal-verif-jit.txt
+% Source: deot-typed-static-vm.txt
+% Source: osr-survey-deopt-jit.txt
+
+\section{A snapshot denotes a semantic continuation}
+
+Deoptimization resumes a less specialized execution after a guard miss or invalidation. It is neither rolling back the heap nor restarting a function. A descriptor belongs to one native version and one instruction boundary; it names the corresponding semantic revision, logical frames and resume PCs. Its value recipes can read machine locations, use constants, box scalars and reconstruct virtual objects. Keep root maps and reconstruction maps distinct: a location holding an object may be live for GC even if the debugger does not name it, and a reconstructed integer need not occupy a GC root. The two maps must nevertheless agree on reference locations across any allocation during recovery.
+
+Yee's OSR survey describes the classic Self debugging use of logical call trees and source positions to reconstruct optimized execution. Aur\`ele Barri\`ere's \emph{Formal Verification of Just-in-Time Compilation} makes an assumption failure a transition into a reconstructed execution state in the semantics of CoreIR. This supplies a precise alternative to treating a snapshot as a best-effort annotation. Kedlaya and colleagues' \emph{Deoptimization for Dynamic Language JITs on Typed, Stack-based Virtual Machines} shows a different implementation constraint: recovering guest JavaScript execution on an unmodified CLR cannot be done by arbitrarily manufacturing host-native frames. Their implementation routes an internal guard-failure exception to a recovery handler and resumes through unspecialized subroutines that share an explicit guest stack. The semantic continuation obligation does not depend on which runtime technique implements it.
+
+\section{Materialize sharing, then transfer}
+
+In this single-threaded example, \texttt{outer} creates a pair with fields \texttt{n} and \texttt{next}, then calls \texttt{inner(p,p)} and returns its result. A pair may hold a reference to itself. The optimized outer frame inlines \texttt{inner} and scalar-replaces the unpublished pair. At PC 2 of \texttt{inner} a byte has already been read from a device. The next operation \texttt{convert} accepts any byte in the reference interpreter; its fast version only handles \(0\) through \(9\).
+
+\begin{verbatim}
+inner(a, b):
+  0: token = device_read()
+  1: # boundary after the read
+  2: return (a is b, a.next is a, a.n + convert(token))
+
+guard token <= 9 else D
+D:
+  outer: waiting for inner, resume at return of call result
+  inner: pc=2, a=virtual(0), b=virtual(0), token=r5
+  virtual(0): Pair { n=4, next=virtual(0) }
+\end{verbatim}
+
+Allocate one rooted shell per virtual ID, then fill fields using the rooted ID table. This preserves sharing and cycles; allocating once per reference would make the identity tests false. The interpreter receives both logical frames, including the outer return continuation, and the device stays advanced by one read. Take \texttt{convert(t)=t} in the reference test. Force the guard to fail with token 42; assert result \texttt{(true,true,46)} and a device-read count of one. Force GC between allocations in a two-object version of the test to check that the rooted table tracks moved objects. A descriptor for PC 0 would duplicate the read even if it reconstructed every local correctly.
+
+\section{Replay needs more than deoptimization}
+
+Dossier Chapter~04 proposes explicit deoptimization operations, and the system blueprint checks their recipes before publication. Dossier Chapter~35 proposes extending recovery to checkpointed deterministic replay. This is additional machinery, not a property of ordinary deoptimization or of dispatched specialized continuations in Fl\"uckiger and colleagues' \emph{Deoptless}~\cite{fluckiger2022deoptless}. The latter provides a faster kind of forward continuation under appropriate contexts, not a time machine.
+
+In the example, a checkpoint before \texttt{inner} must retain the guest heap state, logical stack and semantic revision, plus the next event cursor. The log stores the read result 42 at that cursor. Restore a private copy, feed the result through a replay stub and send writes to a validating sink. Compare the reconstructed PC, alias graph and observation prefix to the saved failing state, checking that replay itself made zero real device calls. For edits and code retirement (Chapter~\ref{ch:ext-259}), the log must pin or otherwise retrieve the version metadata it promises to use. A missing event must stop replay rather than silently consulting the device. With threads, deterministic replay additionally needs the relevant schedule or memory-order decisions; the single-thread example makes no such guarantee. Measure event volume and checkpoint retention separately from the cost of normal guard exits.

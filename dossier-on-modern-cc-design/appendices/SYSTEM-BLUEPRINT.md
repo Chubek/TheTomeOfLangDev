@@ -91,6 +91,11 @@ These are **interface sketches**, not actual standardized APIs. For a proof-of-c
 
 **Stage 6: research extensions.** Evaluate causally informed profiles, resource constraints, cross-program summaries, proof-carrying artifacts or digital-twin ranking one at a time. Do not introduce all at once or experiments cannot attribute outcomes.
 
+See the [Tome design review](TOME-DESIGN-REVIEW.md) for a concrete Stage 2–3
+example: the exact checkpoint at which a failed guard must resume, the
+metadata a live activation pins, and the tests that distinguish those
+correctness obligations from performance measurements.
+
 ## Scope and non-goals
 
 A self-hosted optimizing compiler, a portable binary lifter, a multi-device scheduler and a formally validated runtime are each major independent projects. This blueprint makes them interoperable through contracts; it does not assert they can all be completed as one minimal prototype. Concurrency and FFI substantially increase proof and recovery obligations. Focus on a small semantics and one useful path before broadening target support.

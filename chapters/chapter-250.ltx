@@ -1,0 +1,26 @@
+% Source: psabi-x86-64.txt
+% Source: ffi-for-gc-langs.txt
+% Source: checking-type-safety-of-ffis.txt
+% Source: lang-emb-and-ffi.txt
+
+\section{Where a native call begins}
+
+An FFI lets guest code call a service in another language; embedding also lets the host create the VM, load guest code, manage errors, and call back into it. Yu Zhang's \emph{Language Embedding and Foreign Function Interface} discusses both directions in systems such as Lua and C. A native-call descriptor should name the ABI, exact representation of each argument and result, ownership policy, and permitted callback behavior. A signature of the correct arity is not enough: a structure may be returned through registers on one ABI and through caller-provided storage on another.
+
+For example, with the System V AMD64 ABI described in the \emph{AMD64 Architecture Processor Supplement}, a nonvariadic function with C signature \texttt{double scale(int n, double x)} receives its integer and floating-point arguments in separate register sequences: \texttt{edi} and \texttt{xmm0} respectively; its result is returned in \texttt{xmm0}. A generic trampoline cannot put both arguments in consecutive general-purpose registers. It must also honor stack alignment and preservation rules. Use a C fixture that returns $n x$ to check explicit scalar marshalling. Add separate aggregation tests on each supported ABI rather than assuming the same rule for a two-field record.
+
+\section{Representations and lifetimes}
+
+Michael Furr and Jeffrey S.\ Foster's \emph{Checking Type Safety of Foreign Function Calls} models both the shaped values of a high-level language and their representations in C glue code. Their OCaml example distinguishes boxed values from tagged immediate integers; a C typedef alone does not enforce that a conversion macro sees the right kind. The same distinction matters for length conversions in a binding: check sign and range before converting to an unsigned native size, and never infer a host string's ownership or encoding from a character pointer.
+
+Marcus Crestani's \emph{Foreign-Function Interfaces for Garbage-Collected Programming Languages} compares explicit protection of roots with reference objects, including local and global reference lifetimes. A local handle lasts only as long as its activation; extending the lifetime needs an explicit transfer to a longer-lived root. A handle keeps a value reachable and lets the VM find its new location after collection; it does not pin the memory. To lend a raw pointer to a synchronous native call, use an approved pinning protocol or copy to a native buffer. To allow retention after return, attach ownership and an explicit release protocol instead of extending a borrow indefinitely.
+
+\section{Worked callback: queued completion during teardown}
+
+Suppose an embedder starts a native job that returns on a foreign worker. On submission, the bridge promotes the guest callback to a persistent handle and copies the request into job-owned storage. Completion publishes native result data to a VM queue rather than invoking guest code while holding a library mutex. The VM worker checks that the instance is still running, resolves the callback handle in the proper runtime context, and calls it at a boundary that catches guest exceptions. It then releases the result buffer and eventually the persistent handle. The library worker never dereferences guest objects directly.
+
+Cancellation and completion need a shared ownership protocol. Marking a job cancelled before delivery has begun suppresses delivery but does not mean the library stopped accessing its buffers. Serialize the change to closing state with callback admission: an executor can check and begin callbacks on the same VM thread that begins teardown, or admission can claim a counted in-flight slot under a lock. Teardown prevents new submissions and admissions, then cancels or drains outstanding work and waits for producers and admitted callbacks to finish before destroying the handle table. Only one finalizer frees each buffer and releases its reference. Force collection between submission and delivery, then force teardown with completion already queued and again with the library still running. Assert one release per allocation and no new delivery after closing.
+
+\section{Keep the public convention stable}
+
+Do not unwind guest exceptions across arbitrary host frames; translate them into a status and, when appropriate, an error handle with a documented lifetime. Decide whether host code may reenter the same instance and which threads may attach. Document that policy along with the signature. Chapter~42 of the Modern Compiler Dossier, \emph{Adaptive ABI Negotiation}, explores changing private calling conventions between cooperating units. A published foreign entry point instead needs a stable adapter, including across changes to tagging, collector strategy, or internal register use.

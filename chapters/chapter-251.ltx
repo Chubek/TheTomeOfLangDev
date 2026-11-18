@@ -1,0 +1,40 @@
+%% chapter-251.ltx -- Tiered Compilation and Baseline Latency
+% Source: whose-baseline-compiler-is-it-anyways.txt
+% Source: two-level-jit-with-one-interp-and-one-engine.txt
+% Source: jit-capable-vm-gen-for-dynlang.txt
+
+\section{A baseline is a point on a frontier}
+
+An interpreter can start as soon as the input is ready to execute. A baseline compiler delays some work to generate native code but should remove enough dispatch and representation overhead to repay that delay quickly. An optimizing compiler spends more time on analysis, transformation and validation; it is profitable only if enough suitable work remains. ``Baseline'' describes the cost objective, not a requirement that each opcode emit exactly one fixed sequence. In an interactive service, the right comparison is time from arrival to response, including lazy compilation, not native throughput measured after warm-up.
+
+Ben L. Titzer's \emph{Whose baseline compiler is it anyway?} studies single-pass WebAssembly compilers, including Wizard-SPC. A forward walk tracks abstract stack entries as constants, registers or frame slots. Thus a local read can be a change to compiler state rather than a load, and an add with a constant can use an immediate. Wasm's structured control flow lets the compiler see the incoming branches of an ordinary block exit before it emits the exit code. Loop headers are different: unseen backedges require a conservative entry layout. Naively copying an entire locals-and-stack model at each split can make a nominally single-pass compiler expensive. Limit the size of saved states or record changes to them.
+
+\section{A stack machine with a callable baseline}
+
+Suppose a typed bytecode defines addition modulo \(2^{32}\). The prototype below uses a shared frame ABI: the interpreter stores tagged argument slots, and the baseline entry assumes bytecode verification has established that the arguments here are \texttt{i32}. The native register names in the listing are abstract.
+
+\begin{verbatim}
+bytecode sum3(x):
+  local.get 0      # compiler stack = [slot(0)]
+  i32.const 3      # compiler stack = [slot(0), const(3)]
+  i32.add          # load payload r0, slot(0); add32 r0, 3
+  return           # return i32 r0 according to VM ABI
+
+on_call(f, args):
+  v = dispatch[f].load_and_pin()
+  if v.tier == INTERP and saturating_increment(calls[f]) >= 64:
+    try_enqueue_once(f, v.revision, BASELINE)
+  return invoke_and_unpin(v, args)
+\end{verbatim}
+
+No interpreter dispatch remains in the native body. For a branch whose target expects a value in a different location, emit a parallel move on the incoming edge, using a scratch location if moves form a cycle. The entry invariant is that at every reachable block the native layout represents exactly the bytecode operand stack and live locals specified for that block. If a helper can allocate, its call site must report live references in the agreed locations; an integer payload is not a root. Test the sample at \(2^{32}-1\), expecting \(2\), and test a diamond with a different location for the same stack slot on each edge. Route both edges through a helper that can collect to catch a misplaced root as well as a misplaced value.
+
+\section{Tier transitions and shared machinery}
+
+Izawa, Masuhara and Bolz-Tereick's \emph{Two-level Just-in-Time Compilation with One Interpreter and One Engine} presents adaptive RPython: threaded code generation is the first compilation tier, and ordinary tracing the optimizing tier. The former keeps calls to interpreter operations and connects control flow; the latter can optimize through the interpreter operations (Chapter~\ref{ch:ext-253}). Xu and Kjolstad's \emph{Deegen: A JIT-Capable VM Generator for Dynamic Languages} makes a different trade: bytecode semantics written as C++ functions drive generation of an interpreter, a native baseline and inter-tier transitions. Titzer's Wasm case starts with static stack types; a dynamic-language generator additionally needs fast tagged cases, slow paths and runtime feedback. Sharing definitions reduces duplicated implementation, but agreement between two tiers generated from the same faulty definition is not an independent correctness test.
+
+Dossier Chapters~02 and~08 suggest selecting among representations and compiling on demand. A concrete implementation of the blueprint's execution plane uses an atomic dispatch cell per function, plus distinct entries for existing activations (Chapter~\ref{ch:ext-255}). Publish only a complete code-and-metadata bundle whose revision still matches. Keep the old bundle pinned while any active frame can use it. The queue in the example must coalesce duplicate requests and permit interpretation to continue if compilation has not started or was rejected. Choosing several representations is established practice; the dossier's more general policy for switching among them is a design to evaluate, not evidence that more tiers are better.
+
+\section{Measuring the latency dividend}
+
+As an illustrative synchronous case, if baseline preparation takes \(80\,\mu\mathrm{s}\) and saves \(0.4\,\mu\mathrm{s}\) per future call, it breaks even after 200 calls, not counting the 64 calls already interpreted. If preparation is asynchronous, count only calls after installation in that saving, and measure compiler CPU and queue contention separately. Run fresh-process workloads with many one-shot functions, a small set of frequently called functions, and a single long-running loop. For the last case, call-only counting is intentionally insufficient. Compare interpreter-only, eager baseline and demand baseline using time to first result, total elapsed time, and installed bytes including metadata. An engine that improves the median while delaying the slowest first requests has not necessarily met its latency contract.

@@ -1,0 +1,42 @@
+%% chapter-252.ltx -- Copy-and-Patch Compilation
+% Source: copy-and-patch-jit.txt
+% Source: code-copying-jit-in-action.txt
+% Source: copy-and-patch-jit-for-r.txt
+
+\section{Put instruction selection in the library}
+
+Xu and Kjolstad's \emph{Copy-and-Patch Compilation} shifts work from program runtime to the construction of a library of machine-code \emph{stencils}. At build time, a native compiler emits many implementations of the same operation, with holes for constants, stack offsets and continuation addresses. Its object file gives the extractor relocation information. At runtime, choose variants for the actual operand locations, lay them out, and resolve their holes. In the original design a tail call to a continuation transfers control between stencils; when the continuation is immediately next and the encoding permits it, the final jump can be elided. Extra continuation parameters can carry values through a stencil in registers rather than spilling after each operation. A stencil's input and output locations are thus part of its interface, not an optimization the patcher may guess.
+
+Code copying predates this organization. Ertl and Paysan's \emph{Code-Copying Compilation in Production} describes Gforth copying snippets of its threaded engine, dropping dispatch where possible and falling back to threaded execution for problematic cases. The report illustrates a maintenance issue: native snippets that happened to be movable under one host compiler may cease to be movable when instruction layout or addressing changes. Kocourek, K\v{r}ikava and Vitek's \emph{Copy-and-Patch Just-in-Time Compiler for R} instead extracts handlers from GNU R's existing bytecode engine, including rich slow paths that must preserve R semantics. Their prototype can pre-patch variants of the for-loop step and select the variant once the loop initializer knows the iteration type. Replacing a running code site's variant is an extension of basic copy-and-patch; a first implementation can select only at compilation and keep installed code immutable.
+
+\section{A patch is a typed relocation}
+
+Consider an x86-64 baseline with a slot-resident VM stack. These offsets and sizes describe a simplified stencil layout, not the complete encoding. For this example \texttt{BRZ} tests the payload of slot 0, and the false continuation is fall-through. A verified bytecode target is resolved by bytecode instruction identity, never by treating a bytecode index as a byte offset in the native image.
+
+\begin{verbatim}
+bytecode:
+  0: BRZ slot0, 2
+  1: RETURN_I32 7
+  2: RETURN_I32 9
+
+native layout relative to code_base:
+  0: BRZ_slot0  (12 bytes, rel32 starts at byte 8)
+ 12: RETURN_imm ( 6 bytes, imm32 starts at byte 13)
+ 18: RETURN_imm ( 6 bytes, imm32 starts at byte 19)
+
+target = native_offset[2]                     # 18
+disp   = target - (8 + 4)                     # +6
+write_le_signed32(code, 8, checked_i32(disp))
+write_le_unsigned32(code, 13, 7)
+write_le_unsigned32(code, 19, 9)
+\end{verbatim}
+
+The displacement origin is the end of the instruction with the relative operand, not the start of the hole. An absolute helper relocation uses another kind and may require symbol resolution. Bounds, addend, range and encoding must be checked before publishing; an out-of-range branch needs a wider stencil, a reachable intermediary, or a fallback. The layout invariant is that every hole resolves to its declared kind of value and every edge reaches a stencil with compatible register, frame and flag expectations. Test slot values 0 and 1 for returns 9 and 7 respectively, and decode the branch to assert that the resolved target is byte 18. Test a deliberately out-of-range synthetic fixup without allocating a huge buffer. Executing a fragment with a silently truncated displacement is not an acceptable failure mode.
+
+\section{Where the fast path ends}
+
+Dossier Chapter~14 sketches generating several engines from semantic opcode definitions; Chapter~24 discusses quickening the interpreter's bytecode view. Quickening changes which interpreter handler is selected; copy-and-patch selects and connects actual native fragments. A practical combination is to assign stable opcode IDs, generate both handlers and stencils from definitions, and keep independent conformance tests for traps and helper calls. This combines the dossier ideas without assuming that the stencil extractor itself verifies the opcode implementation.
+
+Following the dossier's system blueprint, the execution plane seals code together with PC, stack and unwind metadata. Create it privately, finish all patches, perform the target's required instruction-cache synchronization and executable-memory transition, then publish the entry. If a helper throws or collects, its metadata must describe the native call site, not merely the start of the stencil containing it. Keep artifact identities sensitive to the library ABI, target features and generator revision (Chapter~\ref{ch:ext-259}).
+
+More stencil variants can save branches and spills but inflate the prebuilt library and generated instruction footprint. Fusing a common bytecode pair can eliminate intermediary loads; it cannot erase a possible exception between the pair or admit a branch into the middle without a compatible entry. A fair baseline experiment compares a one-stencil-per-op emitter against a small fused library and a direct single-pass emitter (Chapter~\ref{ch:ext-251}). Count library build time and resident bytes separately from runtime layout, relocation and publication latency. A fast \texttt{memcpy} alone is not a measurement of compilation.

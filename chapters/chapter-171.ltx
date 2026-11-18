@@ -1,0 +1,31 @@
+%% chapter-171.ltx -- Compiling a Small Functional Language
+% Source: cc-a-funlang.txt
+
+\section{Choose the Semantics Before the Instructions}
+
+An implementation of a small functional language need not start with a native code generator. Start with an evaluator and a bytecode compiler for the same core. Let the core contain integers, variables, lambdas, single-argument application, nonrecursive \texttt{let}, integer equality, addition, and a conditional. Evaluate left to right: an application evaluates its operator and then its operand, and a conditional evaluates only its selected branch after the test. Use signed 64-bit integers with wrapping addition. A simple type system with integers, Booleans, and function types suffices to reject ill-typed operations before execution. Fix these choices in the reference evaluator. Otherwise even a discrepancy on an overflow test may be mistaken for a bug in the wrong component.
+
+The evaluator represents a function value by its parameter, body, and lexical environment. The compiler must preserve lexical binding even when the environment that created the function is no longer on the stack. Luca Cardelli's \emph{Compiling a Functional Language}, describing an ML compiler, explains one practical solution: pass arguments on a real stack and keep copies of relevant values or pointers in closures. This allows direct indexed access rather than following chains of lexical links. The design here adopts the flat layout but omits most of ML, including pattern matching and recursive binding.
+
+\section{Resolve Names and Lay Out Closures}
+
+Resolve each variable occurrence to a binder identifier before computing free variables. Spelling is for diagnostics; two occurrences of \texttt{x} may denote different binders. Assign each free binder a stable slot in the function's environment. Processing nested lambdas requires some care: a binder used only by an inner lambda still has to be accessible to the enclosing function when it constructs that inner closure. The compiler emits one code block per lambda, records the ordered list of captured binders, and classifies each access in the block as a local or a capture. Keep code labels independent of source variable names so alpha-renaming cannot change name resolution.
+
+Define a stack convention for \texttt{CALL}: pop the operand and closure, save the caller's continuation and frame base, and enter the code with the operand in local slot zero and the closure as the environment. \texttt{RETURN} restores the frame and leaves one result. \texttt{MAKE\_CLOSURE} takes a code label and a count; it consumes that many values placed on the stack in layout order. Captures are values, not addresses of local slots. The lowered invariant is that every capture read has a matching initializing write by construction. If the language later gains mutable variables, a captured mutable binding needs a shared cell rather than a snapshot of its contents.
+
+\section{Worked Example: An Escaping Function}
+
+\begin{verbatim}
+let make = fun x -> fun y -> x + y in
+let add7 = make 7 in
+let x = 100 in
+add7 5
+\end{verbatim}
+
+The binder of the inner \texttt{x} use is the parameter of \texttt{make}. The closure for \texttt{make} has no captures; its code loads local zero and builds a closure for the inner function with one capture. At the call \texttt{make 7}, that slot receives \(7\). The body of the inner function loads capture zero, loads local zero, adds, and returns. It executes after the frame of \texttt{make} has been popped and produces \(12\), not \(105\). This single example checks capture construction, frame lifetime, and shadowing. A stronger companion test builds both \texttt{make 7} and \texttt{make 8}, keeps both results live, and calls them in alternating order. This catches a runtime that allocates a single mutable environment per code label.
+
+\section{Validate the First Pipeline}
+
+Put an instruction checker between the compiler and the virtual machine. Propagate operand stack heights and, if useful, representation types to branch targets. Every reachable join must agree on the incoming stack shape; every return must provide exactly one value above the frame's operand base. Reject out-of-range slots and closure instructions whose capture count disagrees with the code block descriptor. These are structural checks, not a proof that the emitted code computes the right result.
+
+Next, generate closed, well-typed small terms and compare the evaluator and the bytecode machine at integer result type. Include conditionals with distinct branch results, and instrument the machines to make sure the unselected arm never ran, even if the final result happens to be right. Compare escaped functions by applying them to test inputs, not by comparing closure addresses. In the spirit of \emph{The Modern Compiler Dossier}, Chapter~39, also generate metamorphic pairs: consistently rename a binder and all its uses to a fresh name, then require the same result. Once this baseline is stable, add direct calls or tail calls one at a time and retain the unoptimized backend as an independent comparison. The small compiler pays for itself most when it remains simple enough to diagnose a failure in a more ambitious successor.

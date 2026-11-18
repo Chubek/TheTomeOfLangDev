@@ -1,0 +1,45 @@
+%% chapter-257.ltx -- Dynamic Optimization Cost Models
+% Source: osr-survey-deopt-jit.txt
+% Source: dynamo-dynopt-jit.txt
+% Source: whose-baseline-compiler-is-it-anyways.txt
+
+\section{Estimate remaining savings, not historical heat}
+
+A hot operation has consumed time; that does not mean it will consume enough \emph{more} time to repay optimization. A dynamic optimizer buys an uncertain future saving with present compiler CPU, waiting time and cache space. Ming-Ho Yee's \emph{On-Stack Replacement} survey reports that Fink and Qian's Jikes RVM work weighed recompilation cost against estimated speedups at several optimization levels. A related but different setting is Bala, Duesterwald and Banerjia's \emph{Dynamo: A Transparent Dynamic Optimization System}: it builds traces from a native instruction stream and uses a sharp increase in fragment creation rate as a signal to flush its fragment cache. That heuristic responds to a changed working set. It is not evidence that every increase in new code production warrants reclamation in a managed runtime, where frames may still point into old code.
+
+Dossier Chapters~11 and~27 explore learned ranking and explicit uncertainty, while Chapter~33 proposes a budget-aware optimization market. The system blueprint separates exploration from adaptation and assurance. One workable interpretation is to estimate a benefit and its uncertainty for each legal request, while reserving wall-time and memory limits outside the model. Profiling supplies a likelihood, not a fact the optimizer may assume without a corresponding guard or proof.
+
+\section{Price the continuation that can actually run}
+
+Let \(N\) be the estimated number of eligible entries \emph{after} the artifact can install and \(\delta\) the time saved per successful entry versus the current tier. Let \(q\) be the miss probability and \(b\) the incremental cost of a miss versus that tier. Both path costs include their guard work. For a first approximation with uniform costs and no persistent invalidation on misses, estimated net CPU saving is
+\[
+   G=N\bigl((1-q)\delta-qb\bigr)-C-P ,
+\]
+where \(C\) is compile and validation CPU and \(P\) is additional profiling and installation CPU not already included. A one-time deopt that disables the artifact cannot be charged as an independent miss on every later entry: use an expected number of fast entries before invalidation and a separately estimated one-time cost. Where OSR exists, estimate remaining loop iterations separately from future calls; a long current invocation may never pass through the call entry again (Chapter~\ref{ch:ext-255}).
+
+Suppose a trace costs \(600\,\mu\mathrm{s}\) to compile and validate, \(P=40\,\mu\mathrm{s}\), and gives \(\delta=0.18\,\mu\mathrm{s}\), \(q=0.02\), \(b=1.5\,\mu\mathrm{s}\). The gain is \(0.1464\,\mu\mathrm{s}\) per eligible entry. At 6,000 entries the expected net is \(238.4\,\mu\mathrm{s}\); at 4,000 it is \(-54.4\,\mu\mathrm{s}\). Even the first estimate turns negative if a conservative miss estimate of \(0.06\) is used. This is an illustrative calculation, not data. Ben L. Titzer's \emph{Whose baseline compiler is it anyway?} measures compile and execution time as separate dimensions; a measurement of the second dimension alone cannot supply this decision.
+
+\section{A small scheduler with an explicit no-op}
+
+\begin{verbatim}
+every window:
+  for j in candidate_requests:
+    g = lower_bound_gain(j, profile_epoch, queue_delay)
+    if g > margin and j.is_current() and not cooling_down(j):
+      eligible.add(j, score=g / max(j.compile_cpu, quantum))
+  for j in eligible.by_descending_score():
+    if not meets_deadline(j): continue
+    reservation = try_reserve(j.cpu_limit, j.max_bytes)
+    if reservation and not try_enqueue_once(j, reservation):
+      release(reservation)
+on_complete(j, artifact):
+  if stale(j) or over_budget(j, artifact):
+    discard(artifact)
+  else:
+    validate_and_try_publish(j, artifact)
+  settle_reservation(j, installed_bytes_or_zero(j))
+\end{verbatim}
+
+Here the reservation is all-or-none and is released on any no-enqueue path, rejection or job completion; installed bytes become a separate live-code charge until retirement. Enforce limits inside the compiler too, rather than relying on an estimate. Use a minimum dwell time for profitability decisions, never to delay a semantic invalidation. Hysteresis and decayed samples reduce churn at phase boundaries; hold separate per-version counters so a fast-path sample does not masquerade as generic execution. Greedy ordering is a policy approximation, not an optimal solution to a two-resource knapsack.
+
+Test with a deterministic clock and synthetic phases: stable observations yield one installation, then a sharp miss-rate rise prevents a new job based on the old window. Inject enough queue delay to make \(N=4{,}000\) and assert that the scheduler declines the illustrative request. Compare whole-run CPU and tail latency against a fixed backedge threshold and the baseline-only tier. The model earns its keep only if useful savings survive measurement, queue delay and phase changes.

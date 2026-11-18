@@ -17,6 +17,11 @@ Read [the preface](PREFACE.md) for the shared vocabulary and boundaries. Follow 
 
 Read [the system blueprint](appendices/SYSTEM-BLUEPRINT.md) for a suggested integrated architecture, [the implementation plan](appendices/IMPLEMENTATION-PLAN.md) for a staged project, and [the glossary](appendices/GLOSSARY.md) for technical terms. The [source map](appendices/SOURCE-MAP.md) ties the original 28 ideas to specific files. The [reading list](appendices/REFERENCES.md) separates published foundations from our proposed extensions.
 
+The [Tome design review](appendices/TOME-DESIGN-REVIEW.md) connects all 45
+chapters to the expanded book. It works through one guard and its fallback,
+then separates state-transfer checks, artifact publication, and performance
+experiments.
+
 ## Table of contents
 
 ### I. Adaptive execution and recovery

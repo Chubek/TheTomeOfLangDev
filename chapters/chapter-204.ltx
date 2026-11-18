@@ -1,0 +1,34 @@
+% Source: partial-redundancy-elimination-with-ssa.txt
+% Source: dataflow-analysis-theory-and-practice.txt
+
+\section{Make a Partly Available Result Fully Available}
+
+An expression at a join is partially redundant when some, but not all, paths to the join have already evaluated it with the needed operands. Common subexpression elimination cannot replace the expression by a single existing value; that value may not dominate the join. Partial redundancy elimination (PRE) can insert an evaluation on the missing paths, use existing results on the others, and remove the original occurrence by joining the results.
+
+Computing the expression prematurely can increase work or extend its live range. In \emph{Data Flow Analysis: Theory and Practice}, Khedker, Sanyal, and Karkare describe lazy code motion in terms of early and late placement points. One objective is to avoid extra evaluations on paths where the expression was not needed. Another is to avoid carrying the result farther than necessary. Their presentation computes sets at CFG points; the sparse approach solves related placement questions on a smaller, expression-specific graph.
+
+\section{Find Placement in the Expression Graph}
+
+Kennedy et al.'s \emph{Partial Redundancy Elimination in SSA Form} calls this structure the factored redundancy graph. It has nodes for actual expression occurrences and provisional expression merges, often written with a capital $\Phi$ to distinguish them from ordinary SSA $\phi$ instructions. The insertion phase uses the iterated dominance frontiers of actual occurrences and also accounts for merges of the expression's operands. The renaming phase labels occurrences with redundancy classes. Operand SSA versions matter: identical printed expressions with different reaching operands do not necessarily compute the same value. If an operand is defined by a scalar $\phi$ at the join, looking for a matching computation on a predecessor requires translating that operand through the corresponding edge. An incoming expression that has not been computed may be represented by a missing operand.
+
+DownSafety propagates backward to ask where a matching evaluation is anticipated: can control leave the region, or invalidate the operand values, before reaching a real evaluation? WillBeAvail propagates forward to find where missing computations can safely be supplied and where placement can be delayed. The paper combines availability and delay predicates rather than treating every provisional merge as a request to insert code. Finalize selects actual insertion and replacement sites; CodeMotion materializes expression temporaries and their scalar SSA merges. Keeping candidate nodes separate from IR instructions avoids repeatedly rewriting the CFG while deciding which opportunities to take.
+
+\section{Work the Critical Edge}
+
+Take \texttt{a} and \texttt{b} as already defined, with pure, nontrapping wrapping addition:
+
+\begin{verbatim}
+entry: if p then left else right
+left:  u = add(a, b); consume(u); goto join
+right: if q then join else exit
+join:  w = add(a, b); return w
+exit:  return 0
+\end{verbatim}
+
+On \texttt{left}, \texttt{u} must still be computed for \texttt{consume}. Its value can also serve as the return value on that path. On the right, insert \texttt{v = add(a, b)} only on the edge to \texttt{join}. That edge is critical: \texttt{right} has two successors and \texttt{join} has two incoming edges. Putting the instruction in \texttt{right} adds work on the path to \texttt{exit}; simply putting it in \texttt{join} leaves the original redundancy. Split the edge, compute \texttt{v} in the new block, and replace \texttt{w} with a merge of \texttt{u} and \texttt{v}. The left path now evaluates the addition once instead of twice, the right-to-join path still does so once, and the exit path still does not evaluate it. Those three counts make a simple placement test that a return-value test alone would miss.
+
+\section{Anticipation Does Not Authorize Every Move}
+
+The example uses modular addition so the new evaluation cannot trap, change flags visible to the source, or inspect memory. Replacing it with a checked division requires separate proof about exception timing. In particular, moving a possibly trapping operation ahead of a visible store can change whether the store takes place, even if the original division was anticipated. Loads additionally need evidence about intervening writes, and volatile accesses cannot be treated as mere reusable values. The dossier's Chapter~16, \emph{Effect-Aware IR}, motivates making these constraints visible to placement analysis. Chapter~\ref{ch:ext-205} develops a representation for the memory case.
+
+As a negative regression, split \texttt{join} into a new test followed either by the last addition or by an early return. Putting the right-arm computation before that test would now add an evaluation to the early-return path. After proving legality, a compiler can still reject a transformation because another block, a longer live range, or growth in static code outweighs the saved dynamic work.

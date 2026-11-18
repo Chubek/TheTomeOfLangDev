@@ -1,0 +1,30 @@
+% Source: intel-instr-vol2a.txt
+% Source: intel-instr-vol2b.txt
+% Source: art-of-x86-64.txt
+
+\section{Decode a Form, Not Just an Opcode}
+
+Randall Hyde's \emph{The Art of 64-Bit Assembly}, volume~1, introduces the architectural registers and addressing modes from the programmer's perspective. The byte-level reference is Intel's \emph{64 and IA-32 Architectures Software Developer's Manual}, especially the instruction-format tables in Volume~2A and individual entries such as \texttt{MOV} in Volume~2B. A decoder starts with the execution mode and a known instruction boundary. It interprets any prefixes, selects the opcode map, finds the available form, and follows that form's specification of the subsequent bytes. Legacy opcodes, the REX prefix, and the VEX and EVEX families cannot all use one default operand rule.
+
+Some opcodes have a ModR/M byte. Its \texttt{mod} bits distinguish register operands from several memory forms. Its \texttt{reg} bits can encode another register or select a suboperation, depending on the opcode. For an eligible memory form, the low bits may indicate a SIB byte describing scale, index, and base. Displacements and immediates are distinct fields; a displacement contributes to an address while an immediate is an operand of the operation. The width of an encoded field is not necessarily the width of the decoded operand: a form may sign-extend a short immediate, and some EVEX forms interpret the signed byte displacement in units larger than one byte.
+
+\section{Worked Decode: Five Bytes}
+
+In 64-bit mode, start with the following byte stream:
+\begin{verbatim}
+4F 8B 4C A5 F0
+mov r9, qword ptr [r13 + r12*4 - 16]
+\end{verbatim}
+The prefix \texttt{4F} sets the four REX bits \texttt{W,R,X,B}, selecting 64-bit data and extending the three register fields used here. Opcode \texttt{8B} selects a register destination and a register-or-memory source. The ModR/M byte \texttt{4C} splits as \texttt{01 001 100}: memory with a signed byte displacement, a destination whose low three bits are one (extended to \texttt{r9}), and the SIB indicator. The SIB byte \texttt{A5} splits as \texttt{10 100 101}: scale four, extended index \texttt{r12}, and extended base \texttt{r13}. In this form, index bits \texttt{100} with REX.X set name \texttt{r12}; the same bits with REX.X clear would mean no index. The signed byte \texttt{F0} is $-16$.
+
+A reverse check assembles the displayed instruction in Intel syntax and compares the operands recovered by an independent disassembler. An execution check can use a small buffer, choose base and index within the buffer so the effective address is valid, and test that changing the index changes the selected value. Include negative displacement tests at $-128$ and $-129$ to check that the encoder expands to the larger form when the signed byte no longer suffices.
+
+\section{Emission and Address Fixups}
+
+An encoder chooses a concrete form after registers and operand widths are known. Some valid-looking combinations have no encoding: the high byte register \texttt{ah}, for example, cannot be named in an instruction with a REX prefix. A memory base of \texttt{rbp} or \texttt{r13} without an explicit displacement may require an encoded zero displacement; the otherwise tempting no-displacement ModR/M form has a special meaning. In long mode, a common symbolic operand is RIP-relative, and its base is the address of the \emph{next} instruction. The emitter should record a fixup for an unresolved symbol rather than guessing the displacement; Chapter~\ref{ch:ext-228} follows that record to the linker.
+
+\section{Test Bytes and Meanings Separately}
+
+Some semantically equivalent instructions have different encodings. Even within a single mnemonic a canonical assembler may shorten a displacement or choose a different form than the one it decoded. Thus \emph{decode after encode} should preserve the typed instruction, up to documented aliases, and consume exactly the bytes emitted; \emph{encode after decode} need not preserve bytes unless the intermediate representation retains the selected form and enough raw details. For the worked load, construct a version with a four-byte sign-extended displacement and compare the decoded address expressions while expecting different lengths. The dossier's \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/39-semantic-fingerprints-and-metamorphic-compiler-testing.md}{Semantic Fingerprints and Metamorphic Compiler Testing} applies tests based on these kinds of relations more broadly.
+
+Test malformed inputs too: a decoder must not consume beyond its supplied buffer if a prefix or addressing byte is truncated, and an architectural x86 instruction cannot exceed 15 bytes. Finally, decoding from an arbitrary offset in a section is not proof that it was a valid instruction boundary. Keep instruction boundary evidence and data regions distinct when reading object or linked code.

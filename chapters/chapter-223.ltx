@@ -1,0 +1,32 @@
+% Source: vector-instrselect-for-dsp.txt
+% Source: intel-instr-vol2b.txt
+% Source: intelinstruction..txt
+% Source: x86-intrin-cheatsheet-v2.1.txt
+
+\section{Select a Semantics, Not a Mnemonic}
+
+A specialized instruction usually recognizes a stronger contract than an ordinary arithmetic instruction. A saturating add clamps rather than wraps. A widening multiply extends its inputs before multiplying, and the choice of sign or zero extension changes the result. A floating-point fused multiply-add rounds once; it cannot generally replace a separately rounded multiply and add unless the IR authorizes contraction. For vector code, the contract also includes lane order, element width, mask handling, and the grouping of lanes into independently processed sub-vectors. Even when two instructions compute the same scalar function, they may distribute the results differently.
+
+Jan Finis's \emph{x86 Intrinsics Cheat Sheet} groups operations by intent and is useful for finding candidates. Semantics should then be checked against the actual instruction form, as in Intel's \emph{Instruction Set Reference}. An intrinsic may name a specific target capability, but it is not a substitute for checking operand types, subtarget availability, or any required operating-system support for the register state. A baseline expansion should remain available. Do not rely on runtime dispatch if the extended instruction can already execute on the baseline path before dispatch takes place.
+
+\section{Worked Example: Packing Clamped Samples}
+
+Consider a conversion of two 256-bit vectors, each with sixteen signed 16-bit samples. The required output has 32 unsigned bytes: all of the converted samples from $a$, then all of those from $b$. Each sample $x$ becomes $\min(255,\max(0,x))$. The AVX2 YMM form of \texttt{VPACKUSWB}, as documented by Intel, performs exactly this signed-to-unsigned saturation, but processes the two 128-bit halves independently. In terms of 64-bit chunks of the result it yields
+\[
+  [a_{\rm low}, b_{\rm low}, a_{\rm high}, b_{\rm high}],
+\]
+where each chunk is eight converted samples. To meet the specified order, permute by chunk indices $(0,2,1,3)$ using \texttt{VPERMQ} with immediate \texttt{0xD8}. Intel's combined Volume~2 entry for this form specifies a two-bit source index per destination chunk, starting at the low bits of the immediate. The alternative is to keep the interleaved layout, but only when all consumers can accept it. A wrapping truncation would fail on $x=256$; treating a source sample with bits \texttt{FFFF} as unsigned would produce 255 rather than the correct zero for signed $-1$.
+
+Test lane identity as well as arithmetic. Populate $a$ with 10 through 25 and $b$ with 100 through 115, and compare against the concatenated scalar conversion. A test using uniform samples would not detect the misplaced middle chunks. In a separate test insert $-32768$, $-1$, $0$, $255$, $256$, and $32767$ in both halves. For a loop, also compare its output around the vector group size and make sure the final group never reads past the source. An inactive output lane does not make a separately issued full-width load safe.
+
+\section{Lane Layout Is a Selection Decision}
+
+Wrong lane order is a correctness bug; an unnecessary reorder is a cost problem. A selector that canonicalizes every intermediate into the logical order may insert a pack permutation that the next instruction immediately undoes. An alternative is to give each matched operation an input and output layout, recording a short permutation of the logical lanes. Shuffles become explicit conversions between layouts. The search can keep an inexpensive noncanonical value when its uses agree, while demanding the external order at a store or interface. At a value with multiple uses, the price of converting must be charged where each incompatible use actually requires it.
+
+Ahmad, Root, Adams, Kamil, and Cheung's \emph{Vector Instruction Selection for Digital Signal Processors using Program Synthesis} describes Rake, which lifts to abstract ``uber-instructions'' before synthesizing concrete target sequences. Its separation of a swizzle-free sketch from the synthesis of data movement illustrates a search decomposition: selecting what arithmetic to do and determining where its input lanes come from can be different subproblems. Their answers still have to compose. For example, switching the accumulator representation might remove a shuffle but make the new operand types incompatible with the next accumulation.
+
+\section{Account for the Edge of a Kernel}
+
+For a masked operation, distinguish preserving inactive destination lanes, setting them to zero, and producing values that are never observed. Preserve an old destination only when it is part of the operation's semantics; otherwise a merging form can create a needless dependency. For the packing example, compare the vector candidate with the baseline over the whole kernel, including loads, the permutation, stores, and the scalar or masked tail. Small arrays may never reach the steady-state vector loop. Report the size distribution alongside any measured advantage: a winning packed body does not by itself justify the dispatch or the tail expansion.
+
+When a kernel sits inside a device pipeline, the end-to-end layout may be more consequential than any one shuffle. The dossier's \href{https://github.com/Chubek/TheTomeOfLangDev/blob/HEAD/dossier-on-modern-cc-design/chapters/25-heterogeneous-ir.md}{Heterogeneous IR} discusses tracking layout and data movement across device boundaries.

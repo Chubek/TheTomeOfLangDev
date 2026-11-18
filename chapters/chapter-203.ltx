@@ -1,0 +1,37 @@
+% Source: constpropssa.txt
+% Source: extending-ssa-for-opt-cc.txt
+
+\section{Track Values and Executable Edges Together}
+
+Mark Wegman and F. Kenneth Zadeck's \emph{Constant Propagation with Conditional Branches} shows why propagating constants and discovering unreachable control flow should be one analysis. An ordinary constant pass may give up at a join because its inputs disagree. But if a controlling branch is constant, one of those inputs may never arrive. In turn, establishing a constant at that join can resolve a later branch. Sparse conditional constant propagation (SCCP) follows SSA uses to show where an updated value matters and control-flow edges to show where instructions might run.
+
+For a simple IR with concrete scalar inputs, keep one state per SSA name: unseen ($\bot$), known constant $C(c)$, or varying ($\top$). The join with unseen leaves the other state intact; equal constants agree; unequal constants join to varying. A varying input may happen to hold a constant at runtime, but this analysis cannot specify which constant it is. Track separately a bit per CFG edge for whether the solver has found it potentially executable. Seed the synthetic entry edge and mark unconstrained parameters varying. Do not encode an unvisited definition as the source language's undefined value: unseen means only that the solver has not yet accumulated evidence.
+
+\section{Two Queues for Different Changes}
+
+On first reaching a block, evaluate its instructions and terminator. Each newly marked edge to an already reachable block must also trigger reevaluation of that block's merges. A $\phi$ joins only operands whose incoming edges are marked. Use a second worklist to revisit executable users of values whose lattice state rises. For a pure operation, fold known operands according to the IR's semantics and otherwise use a conservative transfer function. For an ordinary conditional with a known Boolean, mark the selected edge; for a varying Boolean, mark both. For an unseen condition, defer the decision. An unconditional branch marks its edge as soon as its block is reachable.
+
+Never unmark an edge during the solve. In a loop a condition that was first constant can later become varying, so its other edge must be reconsidered. Finite graph size and the short ascending lattice chains give termination when transfers are monotone and work is scheduled for changes. Before using an unmarked edge as proof of dead control flow, make sure the solver has modeled every source of runtime values and every kind of transfer. If an executable terminator's condition can remain unresolved, conservatively enable its possible edges and continue the solve, unless the dialect lets the compiler prove the terminator has no defined successor.
+
+\section{A Constant Crosses Two Branches}
+
+\begin{verbatim}
+entry:  c = (2 * 3 == 6)
+        if c then left else right
+left:   a = 7; goto join
+right:  b = input(); goto join
+join:   x = phi(left: a, right: b)
+        if x == 7 then good else bad
+good:   return 1
+bad:    return 0
+\end{verbatim}
+
+Only the left incoming edge contributes to \texttt{x}. The call to \texttt{input} is never reached, and \texttt{good} is the only possible exit. Replace \texttt{x} by \texttt{7}, rewrite the constant terminators, remove the unreachable blocks, and repair the predecessor-to-operand mapping. That cleanup occurs \emph{after} the solve, not when the first useful constant appears.
+
+Now change \texttt{c} to an unconstrained parameter and schedule the left edge first. The solver may observe $C(7)$ at \texttt{x} before processing the right edge. Once the right edge contributes a varying call result, \texttt{x} must ascend to varying and both outgoing edges must be marked. Run this test with reversed queue orders as well. The final result should agree in both orders, and neither order may delete the right-hand call.
+
+\section{Nonexecution Is Not Low Frequency}
+
+For a production IR, check the arithmetic width, traps, poison, and exceptional successors explicitly. A division by zero is not an ordinary constant result; a fold that drops an operation must preserve its observable behavior under the dialect's rules. Nor does def-use sparsity make this solver relational. It can lose the pairing between two values selected by the same predicate and therefore miss an expression that is constant on every concrete path.
+
+Roy and Srikant's \emph{The Hot Path SSA Form} explores a speculative counterpart that focuses on frequent reaching definitions. A rare edge omitted from that analysis is not the same as an edge ruled out by SCCP. For instance, a profile containing only left-arm observations says nothing definitive about the next input. Using the resulting constant specialization requires a guard and a correct fallback for the right arm. The dossier's Chapters~3 and~4, \emph{Speculative IR} and \emph{Deoptimization as an IR Operation}, place that fallback in the semantics instead of allowing profile counts to stand in for proofs.

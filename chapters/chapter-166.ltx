@@ -1,0 +1,40 @@
+% Source: scheme-r7rs-report.txt
+% Source: scheme-impl-3meth.txt
+% Source: impl-pc-scheme.txt
+% Source: corr-between-ssa-and-contp-style.txt
+% Source: compiler-cc-no-cont.txt
+
+\section{Tail position means reusing the continuation}
+
+A continuation represents what is to happen with the result of the current computation. Given a pending continuation $k$, evaluating an ordinary call in a context that still has work to do creates a record linked to $k$. A tail call passes $k$ directly to its callee. In the \emph{Revised$^{7}$ Report}, a call can be active even after control has left its first execution if a previously captured continuation can return from it. Proper tail recursion is therefore a rule about the representation of pending work, not an optimization limited to self-recursion.
+
+Tail context is defined relative to a lambda body: a final expression can pass it to the selected branch of an \texttt{if}, but not to the conditional test. In \verb|(f (g x))|, the inner call still has a pending application to \texttt{f}. Some procedures have their own explicit control contracts: \texttt{apply} must invoke its procedure argument in a tail call, and \texttt{call-with-values} must tail-call its consumer. Test a long mutual recursion through \texttt{apply}, tracking maximum live control depth. If one activation per step survives solely for a return to the previous activation, the implementation has failed even if a short run returns the right answer. Avoid building an accumulating data structure in this test; proper tail recursion is not a promise of constant total allocation.
+
+\section{Capturing and restoring control}
+
+In a heap representation, a continuation object can retain a chain of control frames. The frames must be persistent or copied before destructive reuse. Copying the active portion of a native stack is another strategy, discussed in R.\ Kent Dybvig's \emph{Three Implementation Models for Scheme}. David H.\ Bartley and John C.\ Jensen describe a segmented control stack in \emph{The Implementation of PC Scheme}; only the current stack buffer needs copying during capture, while older segments can already reside in continuation objects. The copied data records control and saved references, not an earlier copy of the Scheme store. In particular, writes through shared locations remain visible after restoring a continuation.
+
+Where \texttt{dynamic-wind} is supported, restoring the control pointer alone is insufficient. Compare the current and destination chains of wind extents by identity. Run exiting \texttt{after} thunks from innermost out, then entering \texttt{before} thunks from outermost in, leaving the common prefix alone. An implementation must track which wind extents are active while running the thunks, since a thunk can itself transfer control.
+
+\section{Worked test: enter the same extent twice}
+
+\begin{verbatim}
+(let ((saved #f) (n 0) (log '()))
+  (define (note x) (set! log (cons x log)))
+  (dynamic-wind
+    (lambda () (note 'enter))
+    (lambda ()
+      (call/cc (lambda (k) (set! saved k) #f))
+      (set! n (+ n 1))
+      (note n))
+    (lambda () (note 'exit)))
+  (if (= n 1)
+      (saved #f)
+      (reverse log)))
+\end{verbatim}
+
+The first exit leaves \texttt{n} at 1. Invoking \texttt{saved} from outside the wind extent enters it again, resumes after the capture, sees the existing store, and exits with \texttt{n} equal to 2. The result is \verb|(enter 1 exit enter 2 exit)|. Change the guard to \verb|(< n 3)| to check a multi-shot invocation. A stack-copy system that copies an assigned variable by value when it should copy a reference may repeat the first iteration indefinitely.
+
+\section{Compile-time continuations are not all runtime objects}
+
+Richard Kelsey's \emph{A Correspondence between Continuation Passing Style and Static Single Assignment Form} explains why suitable local CPS continuations can be represented by blocks with parameters; not every CPS term meets the necessary restrictions. Maurer, Downen, Ariola, and Peyton Jones make related control structure explicit in direct style in \emph{Compiling without Continuations}, using join points that need not allocate closures. A block parameter names a value arriving on a control-flow edge, whereas a first-class continuation may escape, be invoked later, and restore dynamic context. Keep those cases distinct. The design in Chapter~\ref{ch:ext-164} makes local joins visible without assuming anything about how the runtime handles \texttt{call/cc}.

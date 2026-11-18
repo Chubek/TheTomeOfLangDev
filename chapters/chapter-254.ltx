@@ -1,0 +1,47 @@
+%% chapter-254.ltx -- Basic Block Versioning
+% Source: bbv-type-check-removal-.txt
+% Source: bbv-extending-with-typed-object-shapes.txt
+% Source: bbv-jit-cc-compiler-for-cruby.txt
+
+\section{Compile a block in the context of its incoming edge}
+
+Conventional flow analysis merges facts at control-flow joins. If a local can be either a small integer or an object, a single compiled join block may need a type test even though each predecessor knows its incoming value's tag. In \emph{Simple and Effective Type Check Removal through Lazy Basic Block Versioning}, Chevalier-Boisvert and Feeley give the join multiple implementations. Each implementation has a context of facts about its live SSA values. A compilation stub on an unexplored edge can request a version when execution first takes that edge. As the compiler walks the successor, it propagates facts and removes redundant tests. The compiled block still has all its reachable outcomes; the selection unit is a block and an entry context, not an entire recorded path as in Chapter~\ref{ch:ext-253}.
+
+Facts may come from a branch just executed, a constant-producing instruction or a proven callee contract. A profile can suggest which edge to compile first, but cannot by itself establish a fact. In particular, a block version entered solely from a successful test need not deoptimize if the test is false: the failing edge already has its own legal continuation.
+
+\section{Implementing a bounded version table}
+
+This example evaluates \texttt{Inc} on the value supplied by either arm. It increments exact integers and uses a generic operation for all other values, including its defined error cases. The taken edge carries a fact about the SSA operand handed to \texttt{Join}, not about every SSA value that ever used its physical register.
+
+\begin{verbatim}
+Test(a, b):
+  if is_small_int(a): goto Join(a) with x:SmallInt
+  else:              goto Join(b) with no fact
+Join(x):
+  return Inc(x)
+
+Join[SmallInt](x: tagged):
+  z, overflow = add_checked(unbox(x), 1)
+  if overflow: return IncGeneric(x)
+  return box_small(z)
+Join[Generic](x: tagged):
+  return IncGeneric(x)
+
+version(block, edge_facts):
+  facts = project_onto_live_block_parameters(edge_facts)
+  exact = lookup_version(block, facts)
+  if exact != none: return exact
+  if facts and num_specialized(block) < cap:
+    return compile_and_register(block, facts)
+  return most_precise_compatible_or_generic(block, facts)
+\end{verbatim}
+
+An existing version is compatible only if the edge facts imply every entry assumption of the version. In the simple set representation this is a subset test in the direction \emph{version requirements are a subset of edge facts}. With one specialized slot, a future edge with a known object tag can use \texttt{Join[Generic]}, never \texttt{Join[SmallInt]}. Both versions in the example take tagged values; if a backend uses distinct unboxed entry layouts, it must also generate the required edge adapter. A real emitter reserves a version slot before generating nested blocks, or defers linking through stubs, so a self-edge does not recursively compile the same key.
+
+Test \texttt{a=4} for 5 and use a non-integer \texttt{a} with a varying \texttt{b} to exercise the generic version independently. Force cap zero and cap one, and compare return values and exceptions. Test maximal small-integer \texttt{a} separately: its tag proves that unboxing is safe, not that addition cannot overflow. In compiler dumps, assert that every patched edge both entails the target context and implements the parameter mapping.
+
+\section{Heap facts, production scale and version budgets}
+
+Chevalier-Boisvert and Feeley's \emph{Extending Basic Block Versioning with Typed Object Shapes} associates type information with property layouts so a checked shape can justify both the offset and type of a load. Shape facts are not immutable-value facts. An unknown call or a store through an alias can change the shape: discard the dependent fact, or use a proof or a renewed guard. In \emph{YJIT: A Basic Block Versioning JIT Compiler for CRuby}, Chevalier-Boisvert and colleagues describe an implementation that compiles lazily and can return to the interpreter by restoring its PC and stack pointer. This is not a contradiction of non-speculative edge reasoning: an implementation can combine proved context facts with speculative fast paths whose misses have separate exits.
+
+Dossier Chapter~20 treats variants as persistent siblings, and Chapter~41 proposes choosing optimization granularity adaptively. BBV supplies an established block-sized design point, not the adaptive policy. In the blueprint's terms, the exploration plane could rank block contexts under a byte budget, but assurance still checks incoming facts and exit maps. Benchmark generic-only versus capped BBV while counting distinct contexts, stub hits, removed type tests and total code bytes. A program that cycles through many unrelated heap shapes tests whether the generic fallback bounds cost more effectively than compiling another plausible-looking specialization.

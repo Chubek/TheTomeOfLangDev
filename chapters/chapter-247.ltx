@@ -1,0 +1,27 @@
+% Source: ostep-osdev.txt
+% Source: intel-threading-building-blocks.txt
+% Source: osdev-rt-thread.txt
+
+\section{Two schedulers, two units of work}
+
+An OS scheduler dispatches host threads to CPUs. A language runtime may map a guest task to a host thread or multiplex many tasks over a pool of workers. In the latter design, saving a guest continuation is not the same as suspending the host thread. A yielding task saves its resumable state and frees the worker. A task blocked in a native syscall can hold the whole worker; if every worker blocks while runnable tasks wait to produce results, the runtime can stall even though the OS is behaving correctly. Nonblocking I/O, a separate blocking pool, and restrictions on native calls are different ways to address this problem.
+
+In \emph{Intel Threading Building Blocks}, James Reinders presents work stealing as an alternative to assigning all tasks from a central queue. A worker can prefer its own newly spawned tasks for locality and try another worker's queue when it runs out. Stealing is a load-balancing policy, not a fairness guarantee. A latency-sensitive runtime still needs a rule for checking global arrivals or aging ready tasks. State what unit is charged for time: a worker's CPU time, a guest task's executed operations, and a queued task's wall-clock wait are different observables.
+
+\section{Sleeping is a state transition, not a delay}
+
+Remzi H.\ and Andrea C.\ Arpaci-Dusseau's \emph{Operating Systems: Three Easy Pieces} presents condition variables using a predicate protected by a mutex. The waiter rechecks that predicate after waking; a signal is not a stored permission to proceed. In a VM, the same discipline holds for an internal scheduler that parks a continuation instead of a native thread. Changes to waiting state and enqueueing of runnable work need explicit synchronization. Code must both prevent missed wakeups and publish the result or exception before the receiving task reads it.
+
+Give each continuation one owner while it is running. During a transition to waiting, the scheduler may have to publish the continuation and acknowledge that it is no longer executing on its old worker before another worker can claim it. A duplicated runnable entry is not benign: two workers could each execute a side effect that was supposed to happen once. Lock-based transitions are a good reference implementation; a lock-free replacement must preserve both unique ownership and visibility of the suspended frame and delivered result.
+
+\section{Worked race: a completion during registration}
+
+Consider awaiting a future whose poll operation returns \texttt{Pending}. If the runtime checks the future, unlocks it, and then registers its waiter, a producer can set \texttt{Ready} in the gap and find no one to wake. One repair is to use the same lock for changing the future state and registering a waiter. Under that lock, \texttt{Ready} returns the result directly; \texttt{Pending} links a waiter under a scheduler handoff protocol. The producer publishes the result and detaches registered waiters under the lock; enqueueing then happens through that protocol, so completion before the waiter actually parks is not lost. Cancellation and completion must compete for the same waiter; exactly one transition wins the right to arrange its resumption with a result or cancellation.
+
+Test with barriers on either side of registration, not a probabilistic \texttt{sleep}. Force both event orders and then race cancellation against completion. Assert one resumption, a valid outcome, and an empty wait-list at quiescence. Include a case where the producer runs before the waiting worker yields.
+
+\section{Preemption, priority, and latency}
+
+Cooperative execution needs polls in code that can otherwise run indefinitely. Polling at backward branches bounds work in simple loops only if individual instructions and calls are themselves bounded. A GC request likewise needs a thread to reach a state in which its roots are visible, or a protocol for safely treating it as outside managed code. A priority runtime also faces inversion: Yi Qiu, Puxiang Xiong, and Tianlong Zhu's \emph{The Design and Implementation of the RT-Thread Operating System} illustrates priority inheritance for mutexes. Raising the lock owner's priority can limit preemption by intermediate-priority tasks while a high-priority task waits. It does not bound a critical section that can block indefinitely. Measure time to poll, ready-queue delay, and lock wait separately before attributing a missed deadline to the scheduler.
+
+Chapter~23 of the Modern Compiler Dossier, \emph{Compiler as an Actor System}, applies message-driven scheduling to compilation tasks. The same distinction holds there: ordering guarantees at a mailbox do not determine when a worker runs its next message.

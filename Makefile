@@ -13,14 +13,16 @@
 ##   make bib        — Regenerate bibliography only
 ##   make count      — Count words/pages
 ##   make lint       — Check for common LaTeX issues
+##   make check-expansion — Check new chapters, dossier links and source catalogue
 ##   make help       — Show this help
 ##
 
-.PHONY: all pdf xelatex pdflatex watch clean distclean index bib count lint help
+.PHONY: all pdf xelatex pdflatex watch clean distclean index bib count lint check-expansion help
 
 MAIN    := the-tome-of-langdev
 CLASS   := $(MAIN).cls
 LTX     := $(MAIN).ltx
+EXTENSIONS := tome-extensions.ltx
 PDF     := $(MAIN).pdf
 BIB     := references.bib
 SUPPORT := $(wildcard support/*.sty)
@@ -35,7 +37,7 @@ all: pdf
 pdf:
 	$(LATEXMK) $(ENGINE) -shell-escape $(LTX)
 
-$(PDF): $(LTX) $(CLASS) $(SUPPORT) $(CHAPTERS) $(BIB) .latexmkrc
+$(PDF): $(LTX) $(EXTENSIONS) $(CLASS) $(SUPPORT) $(CHAPTERS) $(BIB) .latexmkrc
 	$(LATEXMK) $(ENGINE) -shell-escape $(LTX)
 
 xelatex:
@@ -63,8 +65,8 @@ bib:
 
 count:
 	@echo "=== Word count estimate ==="
-	@detex $(LTX) $(CHAPTERS) 2>/dev/null | wc -w || \
-		(cat $(LTX) $(CHAPTERS) | sed 's/\\[^ ]*//g' | wc -w)
+	@if command -v detex >/dev/null; then detex $(LTX) | wc -w; \
+		else cat $(LTX) $(EXTENSIONS) $(CHAPTERS) | sed 's/\\[^ ]*//g' | wc -w; fi
 	@echo "=== Chapter count ==="
 	@ls chapters/*.ltx 2>/dev/null | wc -l
 	@echo "=== Source file count ==="
@@ -84,9 +86,12 @@ lint:
 	done || true
 	@echo "--- Undefined references ---"
 	@grep -oh '\\ref{[^}]*}' $(CHAPTERS) 2>/dev/null | sort -u > /tmp/refs.txt || true
-	@grep -oh '\\label{[^}]*}' $(CHAPTERS) $(LTX) 2>/dev/null | sed 's/\\label/\\ref/' | sort -u > /tmp/labels.txt || true
+	@grep -oh '\\label{[^}]*}' $(CHAPTERS) $(LTX) $(EXTENSIONS) 2>/dev/null | sed 's/\\label/\\ref/' | sort -u > /tmp/labels.txt || true
 	@comm -23 /tmp/refs.txt /tmp/labels.txt | head -20 || true
 	@echo "=== Lint complete ==="
+
+check-expansion:
+	python3 -B support/check_expansion.py
 
 help:
 	@echo "The Tome of Programming Language Development — Build System"
@@ -103,4 +108,5 @@ help:
 	@echo "  make bib        Regenerate bibliography only"
 	@echo "  make count      Count words and chapters"
 	@echo "  make lint       Check for common LaTeX issues"
+	@echo "  make check-expansion  Check new chapters, dossier links and source catalogue"
 	@echo "  make help       Show this help"

@@ -1,0 +1,32 @@
+% Source: array-ssa.txt
+% Source: tree-ssa-new-opt.txt
+
+\section{One Store Is Usually a Partial Definition}
+
+A scalar SSA assignment supplies the entire value of its result. An array store gives a new value for one element but must preserve the previous values of the other elements. Naming a fresh scalar-like version of the array is useful only if the IR records what that version inherits. Giving every element its own SSA name is not a practical general solution: the size may be dynamic and the compiler may not know the index.
+
+In \emph{Array SSA Form and Its Use in Parallelization}, Kathleen Knobe and Vivek Sarkar distinguish two jobs. A define $\phi$ combines a partial definition with the prior state to supply values for unmodified elements. A merge $\phi$ combines states from control-flow paths. At element granularity, the question ``which write produced this value?'' is different from ``which array version reaches this use?'' The paper accounts for dynamic instances of static definitions, including iterations in which an indexed update may or may not occur. That distinction matters when proving independence of iterations, not just when naming array states.
+
+\section{Forward a Load by Proving Which Index Was Written}
+
+Use an idealized, functional notation for a private array of fixed-size cells. Assume all indices are valid, \texttt{update} preserves other cells, and no other code can change the array:
+
+\begin{verbatim}
+A1 = update(A0, i, 10)
+A2 = update(A1, j, 20)
+x  = read(A2, i)
+\end{verbatim}
+
+If $i=j$, \texttt{x} is \texttt{20}. If $i\ne j$, the second update does not touch cell $i$ and \texttt{x} is \texttt{10}. Without a proof either way, \texttt{x} is not \texttt{10} unconditionally. In this idealized model one could replace the read by a selection on index equality. On mutable memory, do not introduce or remove address computations or checks with observable effects simply because the value equation holds. If the second update is conditional, one edge carries \texttt{A2} and the other carries \texttt{A1}; a state merge at the join is enough to name the read's input but not enough to decide its value.
+
+The same distinction appears in a loop writing \texttt{A[f(i)]}. A unique static definition for that store does not prevent different iterations from writing the same cell. Proving that \texttt{f} is injective over the executed iterations rules out that particular write-write dependence, but not every other dependence: another access in the loop may still read a cell written by an earlier iteration. A parallelization test should include both an injective indexing case and a repeated-index case, such as writing to \texttt{A[i mod 2]} for more than two iterations.
+
+\section{Version Memory without Copying It}
+
+Diego Novillo's \emph{Tree SSA: A New Optimization Infrastructure for GCC} describes historical GIMPLE virtual operands for nonscalar objects, aliases, and call clobbers. Virtual definitions can consume the old state and provide a new one without asserting that the earlier contents were entirely killed. More generally, an SSA-style memory graph can link each read to a candidate state, have writes produce successive states, and merge states on incoming control-flow edges. These names describe dependencies; the compiler does not copy the heap whenever a store defines a new name.
+
+There is a choice of granularity. One state for all memory is simple, but a store to an unrelated object may appear in every subsequent load's state chain. Partitions by region or object can shorten the search when the compiler can justify the separation. Whether partitioned or not, a query for a reaching write must account for the byte ranges: it can skip a write proved disjoint, forward from a write proved to cover the loaded bytes with a compatible value, and stop or reason further at a possible clobber. Pointer inequality alone does not prove that two multi-byte accesses are disjoint. Unknown calls must conservatively clobber the regions they might modify unless their effect summaries justify skipping them.
+
+\section{Test the Clobber Contract}
+
+For every load the optimizer removes, ask what guarantees its replacement on every feasible incoming path. Compare disjoint, identical, and partially overlapping accesses; then put an opaque call between store and load. The forwarding should disappear when the call can change the location, even if none of the scalar def-use edges changed. Atomics, volatile access, and concurrent observation have additional ordering and effect rules; the reaching-write fact alone does not authorize their removal. The dossier's Chapter~17, \emph{Memory as an Explicit IR}, considers the architectural trade-off between making these dependencies explicit and burdening every transformation with memory-state maintenance.

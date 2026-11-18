@@ -1,0 +1,34 @@
+% Source: simple-eff-construction-of-ssa-form.txt
+% Source: efficient-ssa.txt
+
+\section{Let the Read Ask for Its Definition}
+
+Cytron, Ferrante, Rosen, Wegman, and Zadeck's \emph{An Efficient Method of Computing Static Single Assignment Form} treats a completed control-flow graph (CFG) as input. For each source variable, the iterated dominance frontier of its definition blocks gives the candidate join sites; a renaming walk then connects uses to definitions. This order is a good fit when a compiler already has a mutable-variable IR. For a frontend emitting SSA directly, it means building a graph, analyzing it, and making another pass before it can name most operands.
+
+In Braun et al.'s \emph{Simple and Efficient Construction of Static Single Assignment Form}, a read asks where its value comes from, rather than assignments announcing where they might meet. Keep a table indexed by block and source binding, not by the spelling of a variable: shadowed bindings are distinct keys. While emitting a block, an assignment updates its table entry; a read first consults that entry. If there is no entry, the read needs the value at block entry. With one known predecessor in a sealed block, look up the binding at that predecessor's exit. With several predecessors, allocate a $\phi$, cache the result before requesting operands, and read once for each incoming edge. Seed the entry block with parameters and other legitimate initial values. Report an uninitialized read or give it the semantics specified by the source language; the construction algorithm cannot choose that policy.
+
+\section{Two Kinds of Completion}
+
+Call a block \emph{filled} when its instructions and outgoing transfers have been emitted. Call it \emph{sealed} when all incoming edges are known. A structured frontend normally registers an edge from a filled block, so its outgoing value can be queried without risking another later assignment there. A loop header, however, can be filled while its latch edge is still unknown. Reading a binding in an unsealed header must return an incomplete $\phi$ even if there is currently only one predecessor: forwarding that predecessor's value could erase a loop-carried dependency.
+
+Record incomplete merges separately from the current-value table. A read followed by an assignment in the same unsealed block changes the current value but does not cancel the entry lookup requested by the earlier read. On sealing, complete the pending merges in predecessor order without replacing the last local assignment. A recursive lookup encountering a cached provisional result stops there rather than recursing around a loop. If a dialect keeps unreachable single-predecessor cycles, the single-predecessor fast path also needs cycle detection; alternatively exclude unreachable components before relying on it.
+
+\section{Trace a Header with a Late Backedge}
+
+Suppose entry assigns \texttt{i = 0} and \texttt{step = 1}. The loop tests \texttt{i < n}, and the latch adds \texttt{step} to \texttt{i} without changing \texttt{step}. Emitting the test installs an incomplete merge for \texttt{i}; the latch uses that result to compute its new value. The first read of \texttt{step} in the latch likewise asks for the header value. With the backedge registered, the completed operands are:
+
+\begin{verbatim}
+header:
+  iH    = phi(entry: 0, latch: iNext)
+  stepH = phi(entry: 1, latch: stepH)
+  if iH < n then latch else exit
+latch:
+  iNext = iH + stepH
+  goto header
+\end{verbatim}
+
+Discard self-operands when testing for a trivial merge. All remaining operands of \texttt{stepH} agree on \texttt{1}, so redirect its users there; \texttt{iH} has two different incoming values and stays. Retest merges that use a deleted result and repair table entries that still name it. A self-only merge has no independent incoming value and needs the IR's unreachable or undefined-value policy. No merge was necessary for an unused binding just because it happened to be assigned in both arms of a branch. In irreducible flow, several merges can sustain one another while collectively carrying only a single external value; individual trivial-merge cleanup does not suffice. Braun et al.\ describe a cleanup over strongly connected components of the merge graph.
+
+\section{Check the Builder at the Boundary}
+
+For each reachable edge into a sealed block, the operand of an entry merge must equal the value the source binding has at that predecessor's exit. Ordinary uses must refer to dominating definitions; an incoming operand must be available on its edge, not necessarily throughout the destination block. These checks apply to finished IR, not to the builder's private incomplete state. Test a zero-trip loop and a multi-iteration loop, then add a header that both reads and overwrites a binding before sealing. For a second oracle, run the frontier-based builder on the same complete CFG and compare observable execution, not the names or exact number of merges. The dossier's Chapter~14, \emph{Interpreter as a Compiler}, suggests a natural setting for such a reference evaluator; Chapter~\ref{ch:ext-210} explains why structural verification alone is not that oracle.

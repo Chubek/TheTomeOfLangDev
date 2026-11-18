@@ -1,0 +1,25 @@
+% Source: eff-interp-profile-for-hosted-lang.txt
+% Source: ertl-vm-jit-stack-machine.txt
+% Source: growing-vm-forth-pre.txt
+
+\section{Where control goes between operations}
+
+An interpreter's dispatch step fetches the next operation, determines its implementation, and jumps to it. In G\"ulfem Savrun Yeni\c{c}eri's \emph{Efficient Interpreters and Profilers for Hosted Dynamic Languages}, the comparison starts with a loop containing a \texttt{switch} on an opcode. The host compiler may implement it with a jump table and one heavily used indirect branch. With direct threading, predecoded instruction cells instead hold handler addresses and each handler ends with its own dispatch. In indirect threading, instruction cells can point to descriptors from which code addresses are fetched. Multiple dispatch sites can expose useful predecessor context to the host's branch predictor; the result depends on the processor, instruction mix, and whether the host compiler merges those sites back together.
+
+Keep the external program in tokens. An array of handler addresses is an execution object tied to a particular process and build; never serialize those addresses as reusable program code. Paul Frenger's \emph{The Growing Machine, a Pre-Forth Language Implementation} describes a related division of work: symbols can name operations through a table, while a saved instruction pointer implements return. Here \emph{threading} refers to how instruction implementations are linked at execution time, not to scheduling concurrent tasks. A portable switch interpreter remains useful as a reference and as a fallback on systems that lack the host compiler's computed-jump extension.
+
+\section{Fusing operations and canceling stack traffic}
+
+A superinstruction implements a recurring sequence, executing one dispatch for the sequence and often keeping intermediate values in host registers. David Gregg and M.\ Anton Ertl's \emph{Optimizing code-copying JIT compilers for virtual stack machines} uses descriptions of stack effects to generate fused bodies and remove redundant stack accesses; their Gforth experiments compare selection by sequence frequency with selection that also estimates code savings. The interpreter can use the same description without copying native code. In a stack-effect notation where the rightmost element is the top, \texttt{PUSH2} maps $(S\to S,2)$ and integer \texttt{ADD} maps $(S,a,b\to S,a+b)$. Together they give $(S,a\to S,a+2)$, with no reason to write a physical stack cell for 2.
+
+Stack effect alone is insufficient. A candidate can fail, allocate, call out, or invoke a debugger. A fused handler must either materialize the state of each such observable point or exclude the offending boundary. Do not fuse across a branch target into the middle of a sequence, and retain the original bytecode position of each exception. If the scheduler charges an instruction budget, charge the equivalent number of guest operations and stop at the required point; otherwise fusion silently changes the schedule. Chapter~24 of the Modern Compiler Dossier, \emph{Self-Modifying Interpreter}, extends this design to quickened execution views: immutable original offsets make fallback and publication much easier to reason about.
+
+\section{Worked fusion with an exceptional exit}
+
+Consider \texttt{LOAD k; DIV} with one integer $a$ on top of the stack. \texttt{LOAD k} reads an initialized integer local $b$ and pushes it; \texttt{DIV} traps for $b=0$. Define the reference division to test before modifying the stack. In a nonzero case a fused handler can replace $a$ in place with the quotient. For $a=12,b=3$ the result is 4, the net stack height is unchanged, and control advances past both instructions. For $b=0$ the recorded fault position must be that of \texttt{DIV}. If a debugger can inspect the pre-fault stack, the slow path must reconstruct $(S,12,0)$, not $(S,12)$; if handler entry clears the stack that is a separate transition.
+
+Test the fused view against the unfused view with normal, exceptional, and single-step modes. Raise a breakpoint on the second operation and assert the intermediate stack, or deliberately use the unfused view for that location. Test the same sequence behind a branch that targets the second operation: an optimizer must leave a valid entry there, for example by not selecting the sequence.
+
+\section{Measuring the whole interpreter}
+
+Compare matched builds with the same guest workload, stack representation, and profiling policy. Record guest operations, host indirect branches and mispredictions where measurable, and instruction-cache pressure. Distinguish predecode time and expansion in bytes from execution gains. A sequence may eliminate millions of dispatches but add enough handler text to slow unrelated hot paths. Use profiles from a training workload to select a bounded set of fusions, then measure on held-out programs; report both bytes of added handler code and improvement in useful work per second.

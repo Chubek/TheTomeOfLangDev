@@ -1,0 +1,95 @@
+% Source: garbage-coll-in-large-lisp-system.txt
+% Source: lisp-gc.txt
+% Source: lisp-winston-horn.txt
+% Source: appel-a-runtime-system-lisp.txt
+% Source: pure-vs-impure-lisp.txt
+
+\section{Consing, Roots, and Reachability}
+
+A \texttt{cons} produces a pair with two fields and can reuse an
+existing tail. The resulting heap is a graph, not a collection
+of independent list-shaped allocations. Winston and Horn's
+\textit{LISP} explains this through networks of cells, free
+storage, and destructive operations that change existing links.
+After destructive updates, an unreachable cycle can contain
+objects with references to one another. Collecting only objects
+with a reference count of zero cannot reclaim that cycle by itself.
+Nicholas Pippenger's \textit{Pure versus Impure Lisp} makes
+pair mutation the dividing line in a comparison of abstract
+Lisp machines. Constructing a new pair that points to existing
+pairs can introduce sharing without a cycle; redirecting an
+existing pair's field to itself creates a cycle without
+allocating anything. The tracing algorithm must handle both.
+
+A tracing collector starts from roots: for example, live registers
+and stack slots, global bindings, and handles registered by foreign
+code. It follows the pointer fields of visited objects. The safety
+invariant is that everything reachable through strong references
+from a root survives, with its identity relationships unchanged.
+Whether a particular root set includes all interned symbols or
+whether a weak reference keeps its referent alive depends on the
+runtime's rules. Tracing is not a prediction of what the program
+will read in the future; a program that retains an unused table in
+a global binding can still cause a memory leak.
+
+\section{Moving Objects and Choosing What to Scan}
+
+A mark-and-sweep collector marks reachable cells and then walks
+storage to reclaim unmarked cells. A copying collector can instead
+put survivors together in new storage, leaving dead objects behind.
+In Cheney's semispace algorithm, copied but unscanned objects form
+the queue between a scan cursor and the allocation cursor in the
+destination space. Forwarding records in the source space ensure
+that the second edge to a copied object is rewritten to the same
+destination as the first. Once the scan cursor catches the
+allocation cursor, all destination objects have been scanned and
+the old space can be reused. This description assumes the program
+is stopped and that the runtime can distinguish pointer fields
+from immediate values. Andrew W. Appel's \textit{A Runtime System}
+uses Standard ML of New Jersey to demonstrate the same design
+concern outside Lisp: the layout of values and records matters
+to both the code generator and the collector.
+
+David A. Moon's \textit{Garbage Collection in a Large Lisp System}
+describes adding incremental copying and ephemeral-object collection
+to the Symbolics 3600. Incremental work spreads collection across
+program execution and must enforce rules about accessing objects that
+have not yet been evacuated. Generational work avoids repeatedly
+tracing long-lived regions when collecting short-lived objects. The
+two ideas solve different problems. Moon also explains an
+approximately depth-first scan that prioritizes the partially filled
+destination page, intending to keep related objects physically close
+in a demand-paged memory. That choice trades extra scanning for
+better expected locality; Moon reports a scanning cost comparison
+but does not claim to have measured the resulting locality gain.
+
+For instance, an incremental copying collector can use a read
+barrier to ensure that when program code fetches a pointer into
+the evacuated region, it obtains the forwarded object, moving
+the object if necessary. A different barrier strategy would need
+its own invariant. It is not safe just to run an ordinary
+stop-the-world scan in small pieces while allowing arbitrary
+heap reads and writes between them.
+
+\section{Worked Test: An Old Object Points to a Young One}
+
+Start with a rooted old pair \(P\). Allocate a young pair \(Y\),
+store it in both fields of \(P\), then drop every other reference
+to \(Y\). Trigger a young-only collection. If the collector does
+not scan the old generation, its roots for the young collection
+must include incoming pointers from the old generation. A write
+barrier can record the changed object or dirty its containing card
+so the minor collector visits that region. Otherwise the collector
+sees no path to \(Y\) and may reclaim it even though mutator code
+can still find it.
+
+After collection, read both fields of \(P\) and check that they refer
+to the same pair and its contents are intact. If \(Y\) moved, both
+fields must be updated; preserving just its contents twice is not
+enough. Add an unreferenced cycle of young pairs and verify, using
+collector instrumentation, that the cycle does not survive. The
+same distinction between tracked dependencies and abandoned cycles
+applies to compiled artifacts in Chapter~21 of \textit{The Modern
+Compiler Dossier}. For the costs exposed by these collector choices,
+see Chapter~\ref{ch:ext-158}; for general tracing mechanisms, see
+Chapter~\ref{ch:garbage-collection}.

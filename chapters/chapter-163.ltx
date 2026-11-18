@@ -1,0 +1,37 @@
+% Source: scheme-r7rs-report.txt
+% Source: dybvig-scheme-4thed.txt
+% Source: programming-and-metaprogramming-in-scheme.txt
+% Source: proglang-application-interp-racket.txt
+% Source: design-impl-of-typed-scheme.txt
+% Source: pattern-matching-for-scheme.txt
+% Source: schemeplus.txt
+
+\section{Expand syntax, not printed names}
+
+Jon Pearce's \emph{Programming and Meta-Programming in Scheme} introduces macro expanders by writing procedures that construct expressions with quasiquotation. This explains how a transformer computes output, but building an expression as a list of symbols alone does not account for lexical context. The \emph{Revised$^{7}$ Report}'s \texttt{syntax-rules} preserves referential meaning for free identifiers inserted by a template and avoids capturing use-site identifiers with introduced binders. To do both, an expander must distinguish identifiers that print the same way. R.\ Kent Dybvig's \emph{The Scheme Programming Language} describes the recursive process: resolve the head as core syntax or a transformer; invoke the transformer and expand its result; or traverse those subforms that the core form designates as expressions. If the head does not name syntax, expand the form as an application.
+
+An implementation can associate syntax with source locations and scope information. After resolving a binder, give its references the same internal identity and pass that identity to downstream turns of the compiler. Do not expand the argument of \texttt{quote} as an expression; that boundary strips lexical meaning from a datum. A \texttt{syntax-rules} literal identifier matches by binding (or by name when both identifiers are unbound), not merely by string comparison. For ellipses, the pattern match must record repetition structure: a substitution bound under two nested ellipses is a nested sequence, not one flattened list. Corresponding repeated substitutions must have compatible lengths at the depth where they are emitted.
+
+\section{Worked expansion: two roles for one spelling}
+
+\begin{verbatim}
+(define-syntax first-true
+  (syntax-rules ()
+    ((_ a b) (let ((temp a)) (if temp temp b)))))
+(let ((temp 7) (if 8))
+  (first-true #f (+ temp if)))  ; 15
+\end{verbatim}
+
+Resolve the inner \texttt{temp} to a fresh binding and keep the \texttt{temp} in the substituted expression attached to the outer binding. The introduced \texttt{if} denotes the conditional syntax visible at the definition, whereas the final \texttt{if} in the substitution denotes an outer variable. A plain substitution of S-expressions could capture \texttt{temp}, or make the entire introduced conditional into a call to the variable \texttt{if}. Generating a fresh temporary name solves only the first problem. If the first arm is true, its value is returned after exactly one evaluation; duplicating \texttt{a} in both test and consequent would violate the behavior for effects. Test this by substituting an increment-and-read expression for \texttt{a} and an expression that would signal an error for \texttt{b}. Neither hygiene nor the pattern grammar alone checks evaluation count.
+
+\section{Rich transformations and the phase boundary}
+
+Dybvig's discussion of procedural \texttt{syntax-case} separates matching a syntax object from computing and assembling the replacement. It is a richer interface than R7RS-small requires. Andrew K.\ Wright's \emph{Pattern Matching for Scheme} illustrates a different use of that separation: a macro may accept patterns describing runtime data, but compiling those patterns runs at expansion time and the generated value tests run later. A variable matched by the macro expander holds syntax; a binding introduced by a generated match branch holds a runtime value. Treating them as the same storage makes both staging and diagnostics unreliable.
+
+Matthew Flatt, Robert Bruce Findler, and Matthias Felleisen's \emph{Scheme with Classes, Mixins, and Traits} builds the class syntax using macros over procedures and a record-type generator, then builds mixins and traits using the class constructs. The macro does not need to know a superclass value at expansion time; it can generate code that works with the superclass when the class expression is evaluated. That separation permits syntactic extension without requiring arbitrary runtime expressions to be computable at expansion time.
+
+In Racket, Krishnamurthi's \emph{Programming Languages: Application and Interpretation} uses the macro stepper to make desugaring observable without running the result. A module language with procedural transformers must decide which dependencies are available to evaluate a transformer and which will be instantiated for generated code. Loading a helper for runtime use does not automatically make it available during transformation. On the other hand, a runtime reference introduced by a macro can denote a binding in the macro's defining module. These two directions are distinct, and a dependency graph annotated with phase can distinguish them. This is a concrete instance of the dossier's staging boundary (Chapter~\ref{ch:staging}).
+
+\section{Check the core that reaches later passes}
+
+Sam Tobin-Hochstadt and Matthias Felleisen's \emph{The Design and Implementation of Typed Scheme} uses the macro-expanded language to avoid implementing a separate type rule for every surface extension. Some macros nonetheless impose invariants the checker cannot automatically infer. Shape-check the result first: no unresolved transformer calls should reach an ordinary expression input, and renaming a use-site binder should only change the corresponding internal identities. Then run behavioral tests for evaluation count, order, and exceptions. Retain source spans or an expansion origin chain so a type error deep in a generated conditional can point back to the user's argument. That information belongs alongside the core; recovering it from generated temporary names is too late.

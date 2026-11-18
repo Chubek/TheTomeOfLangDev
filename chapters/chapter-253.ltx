@@ -1,0 +1,43 @@
+%% chapter-253.ltx -- Tracing and Meta-Tracing
+% Source: trace-based-jit-type-specialization-of-dynlang.txt
+% Source: pypy-meta-tracing-jit.txt
+% Source: meta-tracing-vm-design-impact.txt
+
+\section{A loop path with checked exits}
+
+Gal and colleagues' \emph{Trace-based Just-in-Time Type Specialization for Dynamic Languages} describes TraceMonkey, which starts in a bytecode interpreter and records operations along a hot path. A root trace specializes a loop path to the types it sees. When behavior changes, a guard exits to the interpreter or to a compiled branch trace. A frequently taken exit can therefore become the start of a new recording, rather than a reason to duplicate a whole function. Nested loops introduce a choice: unrolling an entire inner loop into the outer trace could produce a large, trip-count-specific artifact. TraceMonkey uses nested trace trees so an outer trace can call a compiled inner trace with a compatible entry state and reason about its expected exit.
+
+Unlike a branch profile, a trace records the order and representation of data dependencies through several bytecodes. The optimizer can propagate constants and remove temporary allocations across the recorded path. It cannot delete an instruction whose result is needed at a side exit, nor can it suppose that an observed branch direction will always recur. Guard metadata is part of the trace's semantics, not merely a debugging aid.
+
+\section{Record one iteration, recover at the failed bytecode}
+
+In a toy language \texttt{Add} performs exact integer addition but traps on a Boolean operand. The interpreter runs the loop below from PC 10. The array is immutable, the index and length fit in a machine integer, and entry adapters establish the index representation and an unboxed small-integer accumulator. The recording sees only small-integer elements.
+
+\begin{verbatim}
+10: if i >= len(a): goto 15
+11: x = a[i]
+12: sum = Add(sum, x)
+13: i = i + 1
+14: goto 10
+15: return sum
+
+trace at PC 10:
+  guard 0 <= i < len(a)     else resume(10, a, i, sum)
+  x = load(a, i)
+  guard is_small_int(x)    else resume(12, a, i, sum, x)
+  s1, overflow = add_checked(sum, unbox(x))
+  guard not overflow     else resume(12, a, i, sum, x)
+  jump trace(a, i+1, s1)
+\end{verbatim}
+
+The trace-exit invariant relates each failure to the interpreter \emph{before} its named instruction with exactly the required live values. At PC 12 the snapshot boxes the old \texttt{sum}, not the possibly wrapped \texttt{s1}, and includes \texttt{x}; returning to PC 10 would require a different snapshot and re-execute the load. Test \texttt{[2, 4, true]} starting at index 0 and sum 0: the failing addition must trap at index 2 with sum 6, not at index 3 or with an already modified sum. Test the overflow exit by adding 1 to the maximal small integer; the generic path should produce a larger integer, not a trap. A bridge for a hot overflow exit must accept the exit's state and preserve the same arbitrary-precision semantics. Chapter~\ref{ch:ext-256} develops the recovery machinery further.
+
+\section{Trace the machine that interprets the loop}
+
+In \emph{Tracing the Meta-Level: PyPy's Tracing JIT Compiler}, Bolz, Cuni, Fija{\l}kowski and Rigo trace operations of the interpreter itself. Without guidance, the host interpreter's dispatch loop looks like the hot loop; a trace that returns after each dispatch fails to expose the guest loop's dataflow. The implementer identifies a merge point of the interpreter and a guest backward edge where tracing can start. In RPython terminology the bytecode identity and guest PC can be \emph{green} loop-key values; the frame and numerical arguments are \emph{red} runtime state. In the example, the tracer sees known opcodes as it advances from PC 10 through PC 14. Unrolling dispatch and folding those constants exposes the type checks and loads; the trace closes when control returns to the same guest loop key.
+
+Bolz and Tratt's \emph{The Impact of Meta-Tracing on VM Design and Implementation} explains why annotations and VM design still matter. Promoting a value specializes to the recorded value by inserting a guard. An elidable helper may be folded for known inputs under the documented dependency conditions; an object lookup is not elidable merely because it usually yields the same result. An explicit version token can turn a mutable lookup into a query tied to one version. Promoting every observed receiver instead would cause needless exits and code growth.
+
+\section{Choose a useful recording boundary}
+
+Dossier Chapters~12 and~14 explore specialization in interpreters and sharing semantics among engines. A self-specializing add node rewrites local dispatch; a meta-trace can remove dispatch across several such nodes. Dossier Chapter~41 proposes varying the granularity further. Under the blueprint's separation of exploration from assurance, a prototype can cap trace length and bridges per root, interpret upon exhausting the cap, and compare against block versioning (Chapter~\ref{ch:ext-254}). Measure not only the time of a stable loop but also total bytes, exit frequency and completed work on a loop with irregular branches. A trace that wins for one observed path is not evidence that enlarging the compilation region will win for the workload.

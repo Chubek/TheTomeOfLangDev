@@ -1,0 +1,43 @@
+%% chapter-255.ltx -- On-Stack Replacement across Versions
+% Source: osr-a-la-carte-jit.txt
+% Source: osr-distilled-jit.txt
+% Source: lightweight-osr-in-languages-with-unstructured-loops-jit.txt
+% Source: osr-proggen-jit.txt
+% Source: osr-survey-deopt-jit.txt
+
+\section{Replace a continuation, not a call target}
+
+Changing a function's dispatch cell directs future calls; it does not accelerate an invocation already halfway through a large loop. On-stack replacement (OSR) makes the active continuation itself a target of compilation. Upward OSR can transfer from an interpreter or baseline loop into optimized code. The reverse direction may be used on an assumption failure or by a debugger. Ming-Ho Yee's \emph{On-Stack Replacement} survey contrasts the original Self debugging motivation with adaptive recompilation in Jikes RVM. Both require correspondence between continuation states, but the destination of upward OSR is not generally an ordinary function entry.
+
+An OSR entry identifier should include the semantic revision, resume site and incoming state convention. The point must fix which bytecode effects have already happened, not just the source line. The incoming activation may already have a caller, handler stack or live heap references. The adapter must preserve those links; taking the normal prologue could reinitialize locals, duplicate an effect or create a second activation when there should be only one.
+
+\section{Transfer a partially executed scan}
+
+Take a single-threaded bytecode scan with wrapping \texttt{u32} accumulation and a fixed array length, valid \texttt{i} in the range 0 through \texttt{n}, and an observable \texttt{emit}. OSR is supported at the header after the preceding iteration commits. The optimized header additionally carries a byte offset for word-sized elements; use a wide machine integer and require the entire array's byte range to be representable. Assume a pinned array for the duration of this example, so an offset need not encode a GC interior pointer.
+
+\begin{verbatim}
+H: poll_osr(H)                         # before next test
+   if i == n: return total
+   total = add_wrap32(total, a[i])
+   emit(i)
+   i = i + 1
+   goto H
+
+entry from interpreter at H:
+   require same_revision && compatible_frame
+   pass a, n, i, total, offset=4*i to H_native
+
+exit from H_native to H:
+   decode a, n, i, total from native locations
+   resume reference at H
+\end{verbatim}
+
+The invariant on either side of the adapter is that \texttt{i} names the next element, \texttt{total} is the wrapping prefix sum, and the observable prefix contains precisely the earlier emits. The native invariant includes \(\mathit{offset}=4i\), maintained by adding 4 only after a completed iteration. Check with \texttt{[4,5,9]} and an injected transfer when \texttt{i=2}: the native entry receives total 9, offset 8; the full run must emit \(0,1,2\) and return 18. Force the reverse transfer when \texttt{i=3}; it should return immediately. A transfer requested just after the emit but before \texttt{i} increments waits until \texttt{H}: restarting that intermediate state at \texttt{H} would emit twice.
+
+\section{Choose the points and derive the maps}
+
+D'Elia and Demetrescu's \emph{On-Stack Replacement \`a la Carte} and \emph{On-Stack Replacement, Distilled} formalize correspondences and build compensation code for live state across a class of transformations. A value not live in the old version may still be reconstructible from live inputs and a suitable pure expression; an absent, effectful load is not generally reconstructible that way. Their composition result suggests maintaining per-pass maps rather than reverse-engineering the final machine state, subject to the maps' preconditions. That abstraction does not automatically provide register recovery, unwind or GC support for a concrete runtime.
+
+D'Souza and Duboscq's \emph{Lightweight On-Stack Replacement in Languages with Unstructured Loops} uses backward jumps as an OSR trigger in a Truffle implementation rather than recovering high-level loops first. A backward jump suggests hotness; it does not determine how the frame should be transferred. Essertel, Tahboub and Rompf's \emph{On-Stack Replacement for Program Generators and Source-to-Source Compilers} illustrates another choice: express switches between structured loop variants through continuation functions and carried state. The scan above could use that implementation without a handwritten native stack splice.
+
+Dossier Chapters~02 and~20 and the system blueprint sketch tier transitions and persistent version records. A conservative realization keeps maps to a canonical semantic state instead of maintaining direct maps for every pair of native versions. This only works where both maps describe the same resumable state and the second version's prerequisites can be checked; reject a transition across arbitrary source edits rather than inferring it from matching PCs. Pin source, destination and metadata during transfer and defer reclamation of code until no live stack can refer to it. Chapter~\ref{ch:ext-256} covers cases where the canonical continuation has more than one logical frame.
