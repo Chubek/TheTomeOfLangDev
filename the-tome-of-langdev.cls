@@ -515,12 +515,21 @@
 \setlength{\cftsecnumwidth}{3.8em}
 \setlength{\cftfignumwidth}{4em}
 \setlength{\cfttabnumwidth}{4em}
+\renewcommand{\cftfigfont}{\small}
+\renewcommand{\cftfigpagefont}{\sffamily\small\color{TomeInk}}
+\setlength{\cftbeforefigskip}{2pt}
 \cftsetpnumwidth{3em}
 \cftsetrmarg{4em}
 \renewcommand{\tableofcontents}{%
   \chapter*{\contentsname}
   \@mkboth{\contentsname}{\contentsname}%
   \begingroup\TomeLining{\@starttoc{toc}}\endgroup
+}
+\renewcommand{\listoffigures}{%
+  \chapter*{\listfigurename}
+  \addcontentsline{toc}{chapter}{\listfigurename}%
+  \@mkboth{\listfigurename}{\listfigurename}%
+  \begingroup\TomeLining{\@starttoc{lof}}\endgroup
 }
 
 %% ============================================================

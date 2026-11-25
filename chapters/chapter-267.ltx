@@ -1,0 +1,97 @@
+% Source: blindel-instrselect-book.txt
+
+\section{What the Table Minimizes}
+
+Blindell's ``Optimal Pattern Selection with Dynamic Programming'' describes how TWIG separates match discovery, bottom-up cost computation, and top-down recovery \cite[section~3.6.2]{blindell2016instruction}. The separation matters: a matching pattern may ask for operands that the target cannot produce, or for an operand form whose extra cost makes the pattern a bad choice. Also, solving every subtree for the same preferred goal is not enough. The table stores a best derivation for each goal the parent might request.
+
+Let $C(v,g)$ be the minimum cost of implementing the subtree at $v$ with result form $g$. For a matching rule $r$ with result $g$, let $F(v,r)$ be its frontier: pairs $(u,h)$ of descendant positions and required forms. For the chain-free grammar used here, every $u$ is a proper descendant. With additive rule weights $w$, compute
+\[
+ C(v,g)=\min_{\substack{r\text{ matches at }v\\r\text{ yields }g}}
+ \left(w(r)+\sum_{(u,h)\in F(v,r)} C(u,h)\right).
+\]
+An empty collection of candidates gives infinity; an empty frontier contributes zero. Store the winning rule with each finite cost. Compare candidates only after checking that each frontier entry is finite. In particular, finding a structural match does not justify running its action.
+
+\section{Choosing How to Represent a Condition}
+
+Suppose the IR contains a pure word comparison $\mathrm{lt}$, a conditional value $\mathrm{sel}$, and a wrapping negation $\mathrm{neg}$. The selector may represent a comparison either as a word boolean $B$ or in a predicate register $P$. Ordinary word values have goal $W$. Here $B$ promises a word boolean, not merely an arbitrary $W$; no conversion between the goals is implicit. Use the following invented costs, which model a target where writing a comparison into the predicate bank is expensive.
+
+\begin{center}
+\begin{tabular}{clr}
+Rule & Production & Weight \\
+$a$ & $W\gets\mathrm{arg}$ & 0 \\
+$b$ & $B\gets\mathrm{lt}(W,W)$ & 1 \\
+$p$ & $P\gets\mathrm{lt}(W,W)$ & 5 \\
+$s$ & $W\gets\mathrm{sel}(B,W,W)$ & 3 \\
+$t$ & $W\gets\mathrm{sel}(P,W,W)$ & 1 \\
+$f$ & $W\gets\mathrm{sel}(\mathrm{lt}(W,W),W,W)$ & 5 \\
+$n$ & $W\gets\mathrm{neg}(W)$ & 4 \\
+$j$ & $W\gets\mathrm{neg}(\mathrm{sel}(P,W,W))$ & 2
+\end{tabular}
+\end{center}
+
+Rule $j$ is a machine operation that selects and negates under a predicate. It covers two IR operators without taking the output of the select as an input. Thus its first frontier goal is at the comparison grandchild. Rule $f$ instead covers a select and its comparison without producing a standalone boolean. Neither tile is required to use the cheapest local implementation of an operator inside it.
+
+% Annotated walkthrough
+\section{Price the Alternatives, Then Recover Only One}
+
+Set $k=\mathrm{lt}(a,b)$, $s_0=\mathrm{sel}(k,c,d)$, and $v=\mathrm{neg}(s_0)$, where the four argument leaves are distinct tree occurrences. Only finite entries and their candidates appear below.
+
+\begin{verbatim}
+node          goal   candidate costs              recorded
+a,b,c,d       W      a: 0                         a: 0
+k             B      b: 1 + 0 + 0                 b: 1
+k             P      p: 5 + 0 + 0                 p: 5
+s0            W      s: 3 + 1 + 0 + 0             s: 4 [1]
+                     t: 1 + 5 + 0 + 0
+                     f: 5 + 0 + 0 + 0 + 0
+v             W      n: 4 + 4                     j: 7 [2]
+                     j: 2 + 5 + 0 + 0
+
+recover(v,W) -> j
+    recover(k,P) -> p after retrieving a,b
+    retrieve c,d
+    execute j using P,c,d
+\end{verbatim}
+
+\noindent\textbf{[1]} At the select, the smallest local weight belongs to $t$ and the largest pattern is $f$. Neither wins. The word-boolean select costs four as a whole, and that record is useful if a parent demands the select result in a word.
+
+\noindent\textbf{[2]} At the negation, the best tile skips the stored choice for $s_0$. It also asks for the expensive predicate rather than the cheap word boolean at $k$. The emitted sequence computes the predicate and uses it in the select--negate instruction. It emits neither a word-boolean comparison nor a standalone select. The records are answers to possible demands, not instructions to execute for every node.
+
+As a regression test, disable $p$ but leave the shape for $j$ in the matcher. The predicate entry at $k$ becomes infinite. Rules $t$ and $j$ still match structurally but neither can now be selected. The result should cost eight and recover via $n$, $s$, and $b$.
+
+\section{Why the Local Minima Compose}
+
+In \Cref{fig:visual-267}, the winning root tile covers both the negation and the select. Recovery therefore never asks for the standalone \(W\) result at \(s_0\).
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (v) at (0,0) {\(v:\mathrm{neg}\)};
+  \node[tome box] (s) at (0,-1.25) {\(s_0:\mathrm{sel}\)};
+  \node[tome box] (k) at (-2.25,-2.75) {\(k:\mathrm{lt}\)};
+  \node[ast leaf] (c) at (0.3,-2.75) {\(c:W\)};
+  \node[ast leaf] (d) at (1.7,-2.75) {\(d:W\)};
+  \node[ast leaf] (a) at (-3.1,-4.05) {\(a:W\)};
+  \node[ast leaf] (b) at (-1.4,-4.05) {\(b:W\)};
+  \draw (v)--(s);
+  \draw (s)--node[above left,font=\footnotesize]{\(P\)} (k);
+  \draw (s)--(c);
+  \draw (s)--(d);
+  \draw (k)--(a);
+  \draw (k)--(b);
+  \begin{scope}[on background layer]
+    \node[tome group,fit=(v)(s)] (tile) {};
+  \end{scope}
+  \node[anchor=west,align=left,font=\footnotesize] at (1.5,-0.62)
+    {Root tile \(j\): weight 2\\Requests \(P,W,W\)};
+  \node[anchor=west,align=left,font=\footnotesize] at (-0.9,-3.78)
+    {\(k\) in \(P\): rule \(p\), cost 5\\Total: \(2+5+0+0=7\)};
+\end{tikzpicture}
+\caption{Top-down recovery from the dynamic-programming table. The dashed tile skips the standalone select choice; the comparison must supply a predicate despite the cheaper word boolean.}
+\label{fig:visual-267}
+\end{figure}
+
+The postorder invariant is that every completed entry is the optimum for that node and goal. Cut any derivation at its first tile. Its disjoint frontier subtrees have fixed operand goals, and replacing each derivation there with a cheaper one for the same goal cannot change the enclosing tile's legality. The recurrence therefore gives a lower bound on each derivation. Conversely, joining the winning tile and winning frontier derivations attains the computed sum. Recovery follows those witnesses, moving to a proper descendant at every step. For a fixed grammar the candidate and frontier counts per node are bounded, so the computation with precomputed matches takes linear time in the tree size.
+
+Blindell's ``DP Versus LR Parsing'' qualification is that code generation does not always have this optimal substructure. If two operands compete for the same fixed register, the cheapest ways to obtain them separately might not be usable together. Likewise a weighted sum here does not predict every schedule or spill. Add goals only for interface properties that really make frontier choices independent, or treat the chosen cover as optimal under the selector's model rather than optimal machine code.

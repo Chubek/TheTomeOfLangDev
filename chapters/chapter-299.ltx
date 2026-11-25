@@ -1,0 +1,88 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{One Symbol Describes Many Objects}
+
+For a C declaration such as \verb|_Thread_local int ticks = 7;|, each thread has a distinct instance initialized to \(7\). A relocation cannot generally install the one absolute address of \texttt{ticks}, because the same instruction may run on any thread. Levine's discussion of dynamic binding explains which information can be deferred until the loader sees the actual modules. He also describes an older Windows DLL restriction on allocating static TLS for modules loaded after startup \cite[chapter~10]{levine2000linkers}; that account is historical, not a rule for current Windows. The ELF models below extend Levine's treatment using the x86-64 System V processor supplement (AMD64 ABI draft 0.99.7, TLS relocations in Section~4.4.1).
+
+On x86-64 GNU/Linux the compiler chooses an access model and the assembler marks the corresponding symbol and instruction fields. Typically the input object places initialized TLS in \texttt{.tdata} and zero-initialized TLS in \texttt{.tbss}. The latter reserves space without storing its contents in the file. The linker assigns offsets and describes the module's TLS template in a \texttt{PT\_TLS} program header, including alignment, the initialized file extent, and the total memory extent. This header describes a template, not a second mapping of the same mutable variable into every thread. The runtime arranges to copy or zero the appropriate bytes for each thread's instance.
+
+\section{Choose the Offset You Can Promise}
+
+In the \emph{local-exec} model the final executable can establish the variable's fixed signed offset from the thread pointer (on this target, the \texttt{\%fs} base). A \texttt{R\_X86\_64\_TPOFF32} relocation can put that displacement into the instruction. The instance still differs by thread because the base changes. This model is not suitable for access from an arbitrary shared object whose position in the static TLS area is not fixed at its own link time.
+
+\emph{Initial-exec} instead gets the thread-pointer offset from a GOT slot; an input \texttt{R\_X86\_64\_GOTTPOFF} references the slot and a \texttt{R\_X86\_64\_TPOFF64} can fill it at load time. This assumes that the defining module gets static TLS. A build using this model is normally intended for startup loading. A later \texttt{dlopen} can work with a loader's spare static TLS capacity, but that capacity is finite and not a general contract.
+
+The traditional \emph{global-dynamic} sequence uses \texttt{R\_X86\_64\_TLSGD} to reference a GOT pair and calls \texttt{\_\_tls\_get\_addr}. The pair represents a module ID and the symbol's offset within that module's TLS block, which can be filled by \texttt{DTPMOD64} and \texttt{DTPOFF64} relocations. The helper uses the current thread's dynamic thread vector to find that block, establishing it if necessary. \emph{Local-dynamic} can share a lookup of the current module's TLS base across multiple references and add their link-known offsets. Linkers can relax recognized sequences when the final image proves stronger locality and placement assumptions; the instruction pattern and relocation together tell the linker what is safe to replace. Some x86-64 toolchains also use TLS descriptors; the experiment below deliberately selects the older GNU dialect so the relocations are easy to compare.
+
+% Annotated walkthrough
+\section{Trace Two Threads, Then Inspect the Relocations}
+
+Suppose module \(4\) has \texttt{ticks} at offset \(0\) and \texttt{scratch} at offset \(4\). Its template has the four initialized bytes for \(7\), followed by four bytes to zero; the total size is eight bytes. The following models the global-dynamic access and ignores alignment beyond that needed for these two integers.
+
+\begin{verbatim}
+addr(thread, module_id, offset):
+    block = thread.dtv[module_id]   # not a process-wide block
+    if block is absent:
+        block = new_aligned_block_from_template(module_id)
+        thread.dtv[module_id] = block
+    return block + offset          # offset is not relative to FS
+
+step(thread):
+    ticks   = addr(thread, 4, 0)
+    scratch = addr(thread, 4, 4)
+    *ticks += 1                     # do not modify the template
+    return *ticks + *scratch
+\end{verbatim}
+
+If A's module block starts at \texttt{0x7000} and B's starts at \texttt{0x9000}, the address of \texttt{scratch} is \texttt{0x7004} or \texttt{0x9004}, respectively. Calling \texttt{step} in the order A, B, A yields \(8,8,9\), not \(8,9,10\). A genuine two-thread test can call in the main thread, create a worker for the second call, then join it before the third. The two threads must have separate blocks even if their accesses use the same module ID and instruction.
+
+\Cref{fig:visual-299} shows the template and the two allocations after the three calls.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=5.3cm] (template) at (0,0)
+    {Module 4 TLS template\\\texttt{ticks} \(=7\); zero \texttt{scratch}};
+  \node[tome box,minimum width=4.7cm] (a) at (-3,-2.1)
+    {A's DTV entry 4: \texttt{0x7000}};
+  \node[tome box,minimum width=4.7cm] (b) at (3,-2.1)
+    {B's DTV entry 4: \texttt{0x9000}};
+  \draw[tome arrow] (template.south) -- node[above,sloped] {initialize} (a.north);
+  \draw[tome arrow] (template.south) -- node[above,sloped] {initialize} (b.north);
+  \foreach \x/\lev/\word in {
+    -3/-2.95/{\texttt{0x7000}: \texttt{ticks} \(=9\)},
+    -3/-3.6/{\texttt{0x7004}: \texttt{scratch} \(=0\)},
+     3/-2.95/{\texttt{0x9000}: \texttt{ticks} \(=8\)},
+     3/-3.6/{\texttt{0x9004}: \texttt{scratch} \(=0\)}} {
+    \draw (\x-2.35,\lev+0.325) rectangle ++(4.7,-0.65);
+    \node at (\x,\lev) {\word};
+  }
+\end{tikzpicture}
+\caption{The same module ID and offsets address different memory in different threads. After calls A, B, A, thread A's count is nine, thread B's is eight, and the template has not changed.}
+\label{fig:visual-299}
+\end{figure}
+
+An address obtained by taking \texttt{\&ticks} is the address of a particular instance. It is not a recipe that another thread can use to find its own instance, and the address must not be used after the owning thread's storage has ended. In the example, software that needs to find \texttt{ticks} for the current thread should evaluate the TLS access anew, or invoke a routine that does so.
+
+For object-file evidence, save the following as \texttt{tls.c}:
+
+\begin{verbatim}
+_Thread_local int ticks = 7;
+_Thread_local int scratch;
+int step(void) { return ++ticks + scratch; }
+\end{verbatim}
+
+\begin{verbatim}
+for m in global-dynamic initial-exec local-exec; do
+  gcc -O2 -fPIC -mtls-dialect=gnu -ftls-model="$m" \
+      -c tls.c -o "$m.o"
+  readelf -Wr "$m.o"
+done
+gcc -shared -o libcounter.so global-dynamic.o
+readelf -Wl libcounter.so
+gcc -shared -o bad.so local-exec.o   # expected link failure
+\end{verbatim}
+
+With local GCC and GNU binutils this yields \texttt{TLSGD} (and a call relocation for the helper), \texttt{GOTTPOFF}, and \texttt{TPOFF32}, respectively. The resulting \texttt{libcounter.so} has a TLS header with file size \(4\) and memory size \(8\). The last link fails on \texttt{TPOFF32}: asking for \texttt{-fPIC} does not repair the explicitly selected local-exec model. This failure checks the boundary between what a shared object can describe and what only its eventual executable or loader can decide.

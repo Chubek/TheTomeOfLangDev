@@ -1,0 +1,75 @@
+% Source: holm-logic-programming-in-scheme.txt
+% Source: sca-pql-prog-query-lang.txt
+
+\section{A Query That Should Not Walk the Whole Program}
+
+An interactive compiler asks which functions can be called, transitively, from one edited entry point. A full closure is convenient when a later pass needs every caller--callee pair. For a single entry, however, a disconnected library should not have to participate. Demand restricts which answers to compute without, in the positive example below, changing the answers to the requested query. This is distinct from approximating the call graph: if its edges overapproximate indirect calls, the closure still reports \emph{possible} callees, not calls guaranteed to execute.
+
+Holm's \emph{Logic Programming in Scheme} explains unification and backtracking in a small symbolic engine. With ordinary depth-first clause selection, a successful base case does not prevent a recursive branch from looping on later backtracking. SLG-style tabling, as developed in systems such as XSB \cite{swift2012xsb}, instead reuses calls and their answers. In this SWI-Prolog example, calls differing only in variable names are variants:
+
+\begin{verbatim}
+:- table calls/2.
+
+edge(main,scan).
+edge(scan,parse).
+edge(parse,scan).
+edge(util,format).
+
+calls(X,Y) :- edge(X,Y).
+calls(X,Y) :- edge(X,Z), calls(Z,Y).
+\end{verbatim}
+
+The query \verb|?- setof(Y, calls(main,Y), Ys).| yields \verb|Ys = [parse,scan]|. There is no reflexive seed, so \verb|calls(main,main)| is not an answer. Conversely, \verb|calls(scan,scan)| is an answer through a nonempty cycle. When evaluating the mutually recursive calls from \texttt{scan} and \texttt{parse}, a repeated variant can consume answers from the existing table instead of expanding a fresh copy of the recursion. A suspended consumer can resume when another distinct answer arrives. Tables can be completed when their mutually dependent computations can produce no more answers; exhausting one clause's current alternatives is not sufficient. For finite, function-free rules of this kind, the number of distinct calls and answers is finite. Tabling by itself does not guarantee termination when terms can grow without bound.
+
+\section{Make the Demand a Relation}
+
+Magic sets achieve a related specialization in a bottom-up engine. Mark \texttt{calls} as bound in its first argument and free in its second. For the recursive clause, read the body left to right: the bound caller finds an edge, which binds the intermediate callee and thereby supplies a new demanded first argument. Guard both answer-producing rules with the demand. Here is a hand rewrite in function-free Datalog, with uppercase variables and lower-case constants, using the same \texttt{edge} facts:
+
+\begin{verbatim}
+need(main).
+need(Z)    :- need(X), edge(X,Z).
+ans(X,Y)   :- need(X), edge(X,Y).
+ans(X,Y)   :- need(X), edge(X,Z), ans(Z,Y).
+answer(Y)  :- ans(main,Y).
+\end{verbatim}
+
+The first two rules are the magic seed and its propagation rule. Dropping \texttt{need(X)} from the base answer clause would already materialize answers unrelated to the query. With the guards intact, \texttt{need} contains \texttt{main}, \texttt{scan}, and \texttt{parse}; \texttt{answer} contains exactly \texttt{parse} and \texttt{scan}. Every emitted answer still witnesses an original path. Conversely, the prefixes of any path from \texttt{main} make its intermediate vertices demanded, so induction on path length shows that no requested answer is lost. This argument is for these positive rules and this binding pattern. In particular, failure to derive a row in a sliced relation is not evidence of absence for a query outside the slice.
+
+\Cref{fig:visual-346} separates demand along outgoing call edges from answers propagated back to the requesting callers.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (m) at (0,0) {\texttt{main}};
+  \node[tome box] (s) at (3,0) {\texttt{scan}};
+  \node[tome box] (p) at (6,0) {\texttt{parse}};
+  \node[tome box,draw=TomeRule] (u) at (8.8,0) {\texttt{util}};
+  \draw[tome arrow] (m) -- (s);
+  \draw[tome arrow] (s) to[bend left=24] (p);
+  \draw[tome arrow] (p) to[bend left=24] (s);
+  \draw[tome dashed] (s) to[bend left=27] (m);
+  \node at (4.5,-1.03) {solid: demand follows edges;\quad dashed: answers return};
+\end{tikzpicture}
+\caption{Calling for answers from \texttt{main} activates the \texttt{scan}--\texttt{parse} cycle without activating the disconnected caller \texttt{util}.}
+\label{fig:visual-346}
+\end{figure}
+
+% Annotated walkthrough
+\section{Compare Results, Not Just Work}
+
+\begin{verbatim}
+oracle := full_positive_closure(edges)
+slice  := saturate(magic_rules, edges, seed = main)
+assert slice.answer == oracle.callees(main)  # same requested rows
+assert util not in slice.need               # slice is narrower
+edges := edges without (scan, parse)
+repeat both evaluations on the new snapshot
+assert slice.answer == {scan}               # old answer retracts
+\end{verbatim}
+
+The deletion test matters for an incremental front end. A completed ordinary table may outlive the input facts that justified it; use correctly declared incremental tabling or invalidate the relevant tables before rerunning after an edit. The rewritten Datalog program also needs a new fixed point for the new snapshot; \texttt{need(parse)} is no longer supported even though \texttt{parse} still has an outgoing edge. Within one immutable snapshot both rewritten operators are monotone in their accumulating relations. Snapshot deletion is a different problem.
+
+There is a documented example of a source-to-rule boundary in Martin, Livshits, and Lam's PQL paper: its static approximation translates program queries into Datalog and uses bddbddb. The call-graph examples here illustrate tabling and magic sets independently; they are not claims about PQL's evaluation strategy. When a compiler issues thousands of similarly shaped queries, compare the number of reached demand keys and answer tuples against a shared full closure. If nearly every key is needed, guarding joins and storing many specialized tables can cost more than a well-indexed full analysis.
+
+Cache a demand result under both its query key and the program snapshot. Its smaller output is valid only for that requested entry and version; it is not a replacement for a whole-program call-graph artifact.

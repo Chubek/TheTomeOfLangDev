@@ -1,0 +1,90 @@
+% Source: introduction-to-computer-organization-an-under-the-hood-look-at-hardware-and-x86-64-assembly-robert-g.-plantz-.txt
+
+\section{Unknown Is Not a Third Logic Voltage}
+
+The Boolean calculus used to design a gate describes inputs drawn from \(\{0,1\}\). Robert G. Plantz explicitly works at this logic level in chapter~6 of \emph{Introduction to Computer Organization}, abstracting the electrical implementation. Verilog's simulator instead represents four logic values: \texttt{0}, \texttt{1}, \texttt{x} (unknown), and \texttt{z} (high impedance). An uninitialized register can start as \texttt{x}, a floating net can read \texttt{z}, and equally strong drivers that disagree can yield \texttt{x}. The simulator does not compute a voltage from these symbols. It also cannot use \texttt{x} to predict which value real hardware will read after a setup or hold violation.
+
+The operators distinguish what can and cannot be determined. For example, \verb|1'b0 & 1'bx| is known zero, because either binary interpretation of the other operand gives zero. But \verb|1'b1 & 1'bx| is unknown. This is not full symbolic reasoning: \verb|a ^ a| is \texttt{x} when \texttt{a} is \texttt{x}, even though for every actual binary assignment to that one bit the mathematical result is zero. Some tools and gates can simplify the binary function despite that difference in simulation behavior.
+
+\section{Put Two Drivers on a Net}
+
+The following is Verilog-2005 \cite{ieee1364verilog}. This is a valid simulation model. Mapping it to a bidirectional pin depends on the device and tool; FPGA fabrics commonly do not provide arbitrary internal tri-state buses. Do not count this example as portable internal synthesis RTL.
+
+\begin{verbatim}
+module shared_pin (
+    input  wire ea, eb,
+    input  wire da, db,
+    inout  tri  pad,
+    output wire observed
+);
+    assign pad = ea ? da : 1'bz;
+    assign pad = eb ? db : 1'bz;
+    assign observed = pad;
+endmodule
+\end{verbatim}
+
+Each \verb|assign| supplies an independent driver; neither assignment wins by appearing last. \texttt{tri} is a net type with ordinary wire resolution. If one enable is low, its driver contributes high impedance, so another driver can determine \texttt{pad}. If the two enabled drivers fight, the default equally strong drivers resolve to \texttt{x}. An external connection can add yet another driver, and explicit drive strengths can change the outcome. If an enable is \texttt{x}, a conditional expression on a one-bit result merges the two alternatives bitwise: driving a known \texttt{1} in one branch and \texttt{z} in the other produces \texttt{x}, not a guaranteed release.
+
+% Annotated walkthrough
+\section{Resolve First, Then Compare the Observation}
+
+\begin{verbatim}
+# Assume no external driver and equal default strengths.
+for each pair (ea, eb) in [(0,0), (1,0), (0,1), (1,1)]:
+    drive da=0, db=1 and set the two enables
+    wait for all zero-delay propagation
+    expect observed === next value from [Z, 0, 1, X]
+# A matching X is a diagnostic, not a successful transfer.
+\end{verbatim}
+
+The \verb|===| in the sketch denotes Verilog's case equality: \verb|observed === 1'bx| produces a known Boolean answer, even if the operand is a meta-value. Ordinary \verb|==| may yield \texttt{x}. Use the former when the test is explicitly checking simulator symbols, not to claim that physical logic can detect an unknown voltage. \Cref{fig:visual-308} isolates the resolution operation from the processes that compute the driver values.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a) at (-2.65,1.2) {Driver A\\\(0\) or Z};
+  \node[tome box] (b) at (-2.65,-1.2) {Driver B\\\(1\) or Z};
+  \node[tome box dark] (r) at (.7,0) {Resolve\\on \texttt{pad}};
+  \node[tome box accent] (y) at (4.1,0) {\texttt{observed}\\Z, 0, 1, or X};
+  \draw[tome arrow] (a) -- (r);
+  \draw[tome arrow] (b) -- (r);
+  \draw[tome arrow] (r) -- (y);
+\end{tikzpicture}
+\caption{A high-impedance driver does not supply an ordinary Boolean value. The observer reads the result of resolving the contributions, not either driver separately.}
+\label{fig:visual-308}
+\end{figure}
+
+VHDL-2008's IEEE \verb|std_logic_1164| package makes the distinction explicit through nine-valued \verb|std_ulogic| and its resolved subtype \verb|std_logic| \cite{ieee10762008}. The table has, among others, \verb|'U'| for uninitialized and weak values such as \verb|'H'|. Prefer unresolved types for internal signals that must have a single source, so an accidental additional driver is diagnosed instead of appearing as possible contention. When only one source is supposed to own a bus, also check ownership directly: two drivers supplying the same bit can produce a known output while still violating that protocol. A synthesis report that replaces an internal tri-state construction with mux logic does not repair that ownership error; it only chooses an implementation for the modeled resolution behavior.
+
+\section{Separate Ownership From the Sampled Bit}
+
+Suppose the receiver has a separate \texttt{transfer} indicator. The verification model now has three jobs: inspect the control bits, check that the bus is owned when the receiver samples, and compare against the owner's data. It cannot perform the middle check by looking at the resolved wire. In particular, the two cases that produce a known one in the table have different protocol outcomes. Conversely, an idle \texttt{Z} is not a fault unless the receiver claims to have accepted a word.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Contributions & Resolved bit & If transfer is asserted \\
+\hline
+Z, Z & Z & Missing owner \\
+Z, 1 & 1 & Valid binary data \\
+1, 1 & 1 & Multiple owners \\
+0, 1 & X & Multiple owners \\
+Z, X & X & Invalid data from sole owner \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+check_sample(transfer, ea, eb, da, db, pad):
+    require binary(transfer) and binary(ea) and binary(eb)
+    if transfer == 0:
+        return                       # no payload observation
+    owners := integer(ea) + integer(eb)
+    require owners == 1
+    expected := da if ea == 1 else db
+    require binary(expected)
+    require case_equal(pad, expected)
+\end{verbatim}
+
+Here \texttt{binary} accepts exactly zero and one. Check the controls before counting ownership: treating an unknown enable as false would quietly erase a potential driver. In a testbench, run the check in a sampling phase consistent with the receiver, and drive the inputs before that phase. Run the equal-data contention case with both inputs set to one as a regression. A test that simply compares the received value against one passes this case; the ownership assertion must fail. If the design permits a handover gap, test it at both an idle and an active sample to confirm that the transfer indicator, not just the bus bits, controls the observation.

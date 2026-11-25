@@ -1,0 +1,66 @@
+% Source: linkers-loaders-ocr.txt
+% Source: introduction-to-computer-organization-an-under-the-hood-look-at-hardware-and-x86-64-assembly-robert-g.-plantz-.txt
+% Source: psabi-x86-64.txt
+
+\section{Surface Syntax Is Not the Instruction Set}
+
+In his history of address binding, John R. Levine describes a cost of hand assembly: inserting an instruction meant finding and recomputing the addresses it displaced. A symbolic name lets the assembler do that work \cite[chapter~1]{levine2000linkers}. Keeping a reference symbolic has a second advantage on a modern toolchain. The assembler can determine which part of an expression is fixed now and which part still depends on section placement, without making the programmer predict either. Not every symbolic operand therefore produces a relocation, and a label's being defined in the current file does not guarantee that an absolute address is known.
+
+An assembly parser must distinguish instructions, label definitions, and directives. A label attaches a name to the current position without consuming bytes. A directive can switch sections, allocate storage, assign an equate, or emit data; its spelling is not a processor opcode. An instruction needs typed operands: immediate, register, memory, or another target-defined kind. Robert G. Plantz's comparison of Intel and AT\&T syntax gives a useful parser check. In GNU \texttt{as}'s AT\&T mode, \verb|movl $7, %eax| is a 32-bit immediate move, with the destination last. In its Intel mode selected by \verb|.intel_syntax noprefix|, the corresponding line is \verb|mov eax, 7|. The register width and value are the same even though the source lines differ. Translating between dialects by just reversing tokens would lose distinctions such as AT\&T's \verb|$| for an immediate.
+
+\section{Keep Track of Uncancelled Section Bases}
+
+In a simple expression evaluator, model a defined label as a section base plus a known offset, once the layout of that input section has settled. A literal is absolute; adding a literal to a label keeps the same base and changes the offset. For two nonpreemptible local labels in one fixed section, subtraction cancels the shared base. This is not generally true across sections: if their bases can move independently, the result still involves both bases. Marking an expression as a constant just because both symbols have definitions loses that distinction.
+
+Levine's account of relocatable ELF in Chapter~3 describes ordinary symbol values relative to sections and the special index for absolute values. A practical evaluator can distinguish an absolute result, a section-relative result, a reference to an unresolved symbol, and an expression that cannot be represented in the selected context. Retain expression trees until the needed values are known. In particular, multiplying the \emph{difference} of two settled same-section labels by two is not the same operation as multiplying a remaining section base by two. A conventional single-symbol absolute relocation describes a symbol plus a constant, not an arbitrary expression over addresses. Some targets offer more specialized relocation operations, so representability checks belong to the target and object writer.
+
+% Annotated walkthrough
+\section{Count a Payload and Name an Interior Address}
+
+Save the following as \texttt{packet.s} and assemble it with GNU \texttt{as} for x86-64 ELF. It contains only data.
+
+\begin{verbatim}
+.section .rodata
+packet:
+    .ascii "moss"
+limit:
+    .byte 0
+    # Subtract labels before multiplying; their base cancels.
+    .set glyphs, limit - packet
+    .long glyphs * 2 + 1
+    # This field instead asks for an address in the final image.
+    .quad packet + 1
+\end{verbatim}
+
+Run \verb|as --64 -o packet.o packet.s| and inspect with \verb|readelf -x .rodata -Wr packet.o|. The label offsets are zero and four, so \texttt{glyphs} is four; the terminator is not counted. The \texttt{.long} starts at offset five and contains $4\cdot2+1=9$, in bytes \texttt{09 00 00 00}. The \texttt{.quad} starts at offset nine. In this GNU object, \texttt{readelf} reports one absolute 64-bit relocation against the \texttt{.rodata} section symbol, with addend one. The bytes there are placeholders, not an already valid address or a second source of the addend. Using the section symbol rather than the local name \texttt{packet} is valid here because that name is at offset zero in \texttt{.rodata}. The AMD64 ABI's explicit-addend record preserves the uncancelled base for the linker.
+
+\Cref{fig:visual-280} keeps the two output fields separate: one contains a completed integer, and the other still needs a section base.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=west] at (0,0.9) {\texttt{.rodata} offsets (schematic)};
+  \foreach \lo/\hi/\body in {0/2.6/{\texttt{moss}},2.6/4.25/{\texttt{00}},
+       4.25/7.5/{\texttt{09 00 00 00}},7.5/11.7/{address placeholder}} {
+    \draw (\lo,0) rectangle (\hi,-0.75);
+    \node at ({(\lo+\hi)/2},-0.375) {\body};
+  }
+  \foreach \x/\off in {0/0,2.6/4,4.25/5,7.5/9,11.7/17}
+    \node[anchor=north] at (\x,-0.8) {\off};
+  \node[tome box] (count) at (5.875,-2.4) {\(2(4-0)+1=9\)\\base cancels};
+  \node[tome box] (addr) at (9.6,-2.4) {\texttt{.rodata} base \(+1\)\\base survives};
+  \draw[tome arrow] (count) -- (5.875,-0.75);
+  \draw[tome arrow] (addr) -- (9.6,-0.75);
+\end{tikzpicture}
+\caption{The count and the address have different placement dependencies. The relocation's place is offset 9, but its target is offset 1 within the payload.}
+\label{fig:visual-280}
+\end{figure}
+
+\section{Test an Expression by Moving Something}
+
+Replace \verb|"moss"| with \verb|"fernleaf"|. The difference becomes eight, the emitted integer becomes seventeen, and the relocation site moves from nine to thirteen. Its target is still the second byte in the payload, so its addend stays one. As a negative test, switch to \texttt{.data} just before \texttt{limit}. Now \verb|limit - packet| no longer cancels a base, and GNU \texttt{as} rejects the expression in this fixture rather than writing a fictitious length. These tests distinguish a value change, a change in the site of a reference, and a change in whether the expression can be evaluated at all.
+
+The invariant is that absolute expressions are unchanged by rebasing sections without otherwise changing their internal layout. A relocatable expression must carry every surviving placement dependency in a form the ABI can encode. Neither a lexer classifying a token as an identifier nor an early provisional offset decides that question on its own.
+
+There is a separate check at the point of use: representability as an expression does not guarantee a fit in the chosen storage field. A count of nine is absolute and fits in a four-byte field; a much larger absolute count might not. Conversely, even a label currently at offset zero can require a full address field. Expression evaluation should not silently narrow values just to make a later encoding check succeed.

@@ -1,0 +1,85 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Give Storage, Meaning, and Identity Separate Names}
+
+An instruction's bit pattern need not contain its operands in the form an execution unit, compiler, or programmer uses them. A VADL \texttt{format} describes the bit layout and any derived operands. An \texttt{encoding} sets the constant values that identify a particular instruction. Its \texttt{instruction} body defines the operation over the resulting operands. Separating these three lets instructions share a layout without sharing either their operation or their identifying constants. This chapter uses Sections~3.3 and~4.5 of the February 2024 VADL preprint, arXiv:2402.09087v1 \cite{himmelbauer2024vadl}.
+
+Listing~3 illustrates width-based layout: the declarations of the I-type fields, from the first twelve-bit immediate to the final seven-bit opcode, occupy adjacent bits in order from high to low. Listing~2 illustrates explicit positions, necessary when an encoded value is scattered. This excerpt from Listing~2 preserves VADL syntax, normalizing spacing:
+
+\begin{verbatim}
+format Btype : Inst =
+  { imm    [31, 7, 30..25, 11..8]
+  , rs2    [24..20]
+  , rs1    [19..15]
+  , funct3 [14..12]
+  , opcode [6..0]
+  , immS = (imm as SInt<Size1>, 0b0) : predicate {
+      immS => (immS(0) = 0) & (((immS as UInt) + 4096) <= 8191)
+    } : encode {
+      imm => immS(12..1)
+    }
+  }
+\end{verbatim}
+
+With a 32-bit \texttt{Inst} and \texttt{Size1} equal to 31, the cast and concatenation turn a 12-bit stored value into a signed, even byte displacement represented in 32 bits. The predicate accepts from \(-4096\) through \(4094\) in steps of two. The inverse packs displacement bits 12 through 1, omitting the known-zero bit 0. Test the predicate before dropping any bits: otherwise an input of \(+4096\) can appear to fit after being turned into the encoding for \(-4096\).
+
+\section{Read a Split Field in the Written Order}
+
+\Cref{fig:visual-325} shows the significant ordering: instruction bit 7 is not adjacent to bit 31 in the stored word, but the two become neighbors in the assembled immediate. An implementation can represent the format as a list of slices with destination positions. Then the same mapping can be used in reverse for emission, without a second manually maintained list of shifts. Endianness determines how the word is serialized to memory; neither big- nor little-endian serialization renumbers the bits of the resulting word.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=east] at (-0.25,0) {Word bits:};
+  \node[anchor=east] at (-0.25,-1.7) {Displacement bits:};
+  \foreach \x/\src/\dst in {0.9/31/12,2.65/7/11,4.4/{30--25}/{10--5},
+      6.15/{11--8}/{4--1}} {
+    \node[tome box,minimum width=1.55cm] (src) at (\x,0) {\src};
+    \node[tome box accent,minimum width=1.55cm] (dst) at (\x,-1.7) {\dst};
+    \draw[tome arrow] (src) -- (dst);
+  }
+  \node[tome box,minimum width=1.55cm] at (7.9,-1.7) {0 (zero)};
+\end{tikzpicture}
+\caption{The four slices are collected in declared order; displacement bit zero is reconstructed rather than read from the instruction. Upper bits of the full result repeat the sign bit.}
+\label{fig:visual-325}
+\end{figure}
+
+% Annotated walkthrough
+\section{Pack and Unpack a Backward Branch}
+
+For the branch in Listing~2, whose opcode is \texttt{0b110'0011} and whose \texttt{funct3} is zero, take sources 5 and 6 and a target 12 bytes before the branch. This is a hand calculation, not VADL code:
+
+\begin{verbatim}
+immS = -12   # even and within signed displacement range
+imm  = 0xffa # -12 / 2 = -6, represented as 12 bits
+
+word[31]     = 1    # imm[11]
+word[7]      = 1    # imm[10], not the low displacement bit
+word[30..25] = 0x3f # imm[9..4]
+word[11..8]  = 0xa  # imm[3..0]
+insert rs1=5, rs2=6, funct3=0, opcode=0x63
+result = 0xfe628ae3
+
+decode: collect 0xffa, sign-extend -6, append zero -> -12
+\end{verbatim}
+
+Moving a single slice can preserve a round trip when both directions use the same incorrect layout. Keep the expected word as an independent golden test. Include the two range endpoints, zero, an odd displacement, and the out-of-range even values \(-4098\) and \(4096\) to exercise domain checks as well as scattering. Because the raw immediate is twelve bits wide, this particular field is also small enough to test all \(4096\) raw values. Every value should decode to an allowed displacement and re-encode to the same field bits; that property complements the golden test rather than replacing it.
+
+\section{Check More Than Bit Coverage}
+
+Check layout locally for overlap, then check encoding families for ambiguous matches. Equal opcode patterns may be disambiguated by a function field or a field constraint; checking just the mnemonic tells nothing about their binary intersection. Listing~2 deliberately puts an \texttt{[rs1 != rs2]} restriction on its example's BEQ encoding; this is not a requirement of RISC-V. A counterexample with equal indices should therefore be rejected by that example but not treated as invalid by an unmodified RISC-V assembler or decoder. Keep the teaching example and a conformance specification separate.
+
+One review technique is to compare the bits that both candidates fix. If their required values differ at any shared fixed position, no word satisfies both. Otherwise the candidate pair still needs checking: there may be a word that satisfies both fixed patterns but neither operand constraint, or a word that satisfies all conditions and exposes a genuine ambiguity.
+
+An edit to an access function changes not only execution but potentially the immediate range seen by instruction selection, the machine code emitter, and symbolic fixups. A useful generator optimization is to precompute field masks or predecode a scattered value, but it should agree with the format's direct meaning:
+
+\begin{verbatim}
+raw = ((word >> 31) & 0x1) << 11
+    | ((word >>  7) & 0x1) << 10
+    | ((word >> 25) & 0x3f) << 4
+    | ((word >>  8) & 0xf)
+immS = sign_extend(raw, 12) << 1
+\end{verbatim}
+
+This pseudocode is a decoder implementation sketch, not VADL. It gives an optimized mask-and-shift decoder a simple reference for differential tests, while the VADL format remains the source of the mapping and the predicate remains the source of encodability. Section~3.3 describes inference for trivial access functions and explicit predicates and encoders for nontrivial cases. Section~5.1 demonstrates that such formats can describe a range of example architectures, not that every derived format can be inverted or that every pair of instructions is necessarily checked by every prototype generator.

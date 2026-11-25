@@ -1,0 +1,83 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Let the Application Decide When to Load}
+
+An editor might need an optional document filter only when a user opens a particular format. If the filter is an ordinary recorded dependency, a missing library can prevent the editor from starting. Levine contrasts such startup dependencies with explicit dynamic loading: a program can ask the runtime linker to load a shared object and then ask for particular symbols \cite[chapter~10]{levine2000linkers}. His comparison with older mainframe exit routines is useful: the idea of a packaged program admitting an extension is older than either ELF or POSIX. The mechanism described here is the ELF implementation on GNU/Linux, not an interface to historic exit routines or to PE DLLs.
+
+Three events have to be kept separate. First, \texttt{dlopen} maps or acquires a reference to a shared object and processes its dependencies and relocations. Successful loading may execute initialization code before returning to the caller. Second, \texttt{dlsym} searches for a named symbol in the scope associated with a handle; that search can find a symbol in a dependency as well as in the named file. Third, the host decides whether to publish the resulting interface for use. An explicit load can still use eager binding: \texttt{RTLD\_NOW} resolves the object's required undefined references before a successful return, but it cannot verify that the object provides the particular entry point the host will later ask for.
+
+\section{The Handle Owns the Right to Use the Interface}
+
+Use a known, trusted plugin at a host-selected path and pass \texttt{RTLD\_LOCAL} with \texttt{RTLD\_NOW}. The local flag does not add its exports to the global scope used to resolve ordinary references in subsequently loaded objects. It does not create isolation: the plugin shares the host process and can run native code, and symbol resolution still interacts with the existing process. For a tiny synchronous interface the host and plugin agree that \texttt{scale\_v1} implements the C signature \verb|int scale_v1(int)|. On POSIX the result of a successful \texttt{dlsym} for a function can be converted to the correct function pointer type; a generic pointer and a matching string are not proof that the signature is correct.
+
+A useful ownership rule is that a raw function or data pointer is borrowed from the live module handle. Copying the pointer does not acquire another loader reference. A real extension protocol should also specify the calling convention, representation of any structures, ownership of allocated objects, and how an interface version changes. An opaque host-owned wrapper can enforce the borrowing rule without exposing the raw pointer to its callers.
+
+% Annotated walkthrough
+\section{Publish, Drain, and Close a Synchronous Plugin}
+
+The host serializes installation and removal. The wrapper admits concurrent calls, but the plugin in this example has no workers, retained callbacks, or objects that outlive a call. A mutex protects the state and the active-call count; waiting for zero releases that mutex while blocked.
+
+\begin{verbatim}
+install(path):
+    h = dlopen(path, RTLD_NOW | RTLD_LOCAL)
+    if h is null: return Unavailable(dlerror())
+    dlerror()                       # clear any old error
+    p = dlsym(h, "scale_v1")
+    err = dlerror()                 # null alone is not diagnostic
+    if err or p is null:
+        report(err or "null entry") # use the message before dlclose
+        dlclose(h)
+        return Incompatible
+    publish Live(h, typed(p), active=0) under mutex
+
+invoke(x):
+    under mutex:
+        require state == Live
+        active += 1                 # acquire before unlocking
+        f = entry
+    try: return f(x)
+    finally: under mutex, decrement active and notify
+
+remove():
+    under mutex:
+        state = Draining            # disallow new leases
+        wait until active == 0
+        h = handle; clear entry and handle
+    status = dlclose(h)             # finalizers may run here
+    mark Closed and report close failure if status != 0
+\end{verbatim}
+
+Test with a plugin that doubles \(7\) to \(14\). If thread A has already begun the call, removal can change the state to Draining but must wait for A's count of \(1\) to fall to \(0\). Thread B, requesting a new invocation during that wait, must be refused. Calling the saved pointer only after releasing the lease invalidates the test: another thread could close the module in between. A second test loads a well-formed module that exports \texttt{scale\_v2} but not \texttt{scale\_v1}; it must never publish a callable interface, even though the load itself can succeed. Loading can already have run a constructor by then, so refusal is not a promise to roll back all side effects.
+
+\Cref{fig:visual-298} shows the gate that prevents a successful load or a saved pointer from being mistaken for permission to call.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box,minimum width=3.1cm] (verify) at (0,0)
+    {Acquire handle\\check \texttt{scale\_v1}};
+  \node[tome box,minimum width=3.1cm] (live) at (4.2,0)
+    {Live\\admit calls};
+  \node[tome box,minimum width=3.1cm] (drain) at (8.4,0)
+    {Draining\\refuse new calls};
+  \node[tome box,minimum width=3.1cm] (failure) at (0,-2)
+    {Incompatible\\never publish};
+  \node[tome box,minimum width=3.1cm] (closed) at (8.4,-2)
+    {Closed\\no callable pointer};
+  \draw[tome arrow] (verify) -- node[above] {publish} (live);
+  \draw[tome arrow] (live) -- node[above] {remove} (drain);
+  \draw[tome arrow] (verify) -- node[right] {symbol check fails} (failure);
+  \draw[tome arrow] (drain) -- node[left,align=right]
+    {Close only when\\active calls reach zero} (closed);
+  \node[align=center] at (4.2,-3.05) {A call admitted while Live can finish during Draining.};
+\end{tikzpicture}
+\caption{Publication and closing are host decisions. Draining excludes new leases but keeps the handle available until the last existing lease ends.}
+\label{fig:visual-298}
+\end{figure}
+
+\section{Closing a Reference Is Not an Unmap Guarantee}
+
+On GNU/Linux, repeated successful opens can refer to the same loaded object. Closing one handle releases one reference; other handles, dependency references, or a policy such as \texttt{RTLD\_NODELETE} can keep the object mapped. Therefore a successful close does not demonstrate that the bytes have vanished, and a stale pointer that seems to work is not evidence of a valid contract. The host must stop exposing the interface after closing its reference regardless of what the loader does.
+
+For a plugin with background work, count more than API calls. A pending callback can carry a plugin code pointer, and an object in host storage can require a destructor in the module. Define a shutdown protocol that stops new work, drains or cancels outstanding work, joins workers, and destroys plugin-owned objects while a handle is still held. Run the close outside the registry lock so library finalization cannot deadlock merely by trying to take that lock. Shutdown must not be invoked by an operation that holds a lease it is itself waiting to drain.

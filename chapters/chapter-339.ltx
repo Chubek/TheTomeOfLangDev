@@ -1,0 +1,73 @@
+% Source: algo-ds-in-prolog-lisp-java.txt
+% Source: holm-logic-programming-in-scheme.txt
+% Source: semantics-of-pred-logic-proglang.txt
+
+\section{Terms Are Trees with Named Holes}
+
+A compiler tool can represent a tiny expression as \verb|add(reg(r0), imm(1))|. Its root has functor \texttt{add} and arity two. The leaves \texttt{r0} and \texttt{1} are an atom and an integer, respectively; neither is a variable. A term such as \verb|add(reg(R), imm(N))| has two variables and is not ground. The same variable occurring twice in a term is one hole shared between positions. In Prolog the standalone anonymous variable \verb|_| is an exception to spelling-based sharing: each occurrence is fresh. When used as a goal, an outer symbol also has a predicate role, but a compound term by itself does not call anything.
+
+A substitution maps variables to terms. Unification solves a set of term equations by finding one substitution that makes both sides of every equation identical. It is symmetric, unlike a matcher that binds variables on only one side. A \emph{most general unifier} (MGU) leaves anything unconstrained free: every other unifier can be obtained by further instantiating the result. The variable picked to represent an unconstrained equivalence class can differ across implementations. Van Emden and Kowalski use most general unifiers in their account of resolution; unification is the local step that joins a goal with the head of a fresh clause.
+
+\section{Test Equality Without Evaluating a Term}
+
+Run the following at a Prolog top level. The commented lines give representative answers; variable aliasing and cyclic terms can print differently across systems.
+
+\begin{verbatim}
+?- inst(Op, reg(R), R) = inst(add, reg(r0), D).
+% Op = add, R = D, D = r0 (or R = r0, D = r0).
+?- copy(reg(X), reg(X)) = copy(reg(r0), reg(r1)).
+% false.
+?- imm(1+1) = imm(2).
+% false: the left argument is a compound arithmetic expression.
+?- unify_with_occurs_check(X, wrap(X)).
+% false.
+\end{verbatim}
+
+The first goal binds variables on both sides. The second fails after the repeated variable forces \texttt{r0} and \texttt{r1} to agree. The third illustrates that \texttt{=/2} does not evaluate an arithmetic expression. In Prolog, \texttt{is/2} evaluates its right operand first, subject to its numeric and instantiation requirements. Luger and Stubblefield's chapter on unification discusses the interaction of binding, evaluation, and backtracking; those jobs should stay separate in the compiler tool as well.
+
+An MGU need not fill every hole. Unifying \verb|copy(reg(A), B)| with \verb|copy(reg(C), reg(C))| makes \texttt{A} and \texttt{C} aliases and makes \texttt{B} a register term containing that same unbound variable. Binding \texttt{C} to \texttt{r0} would also solve the original equations but would gratuitously exclude \texttt{r1}. A later instruction constraint can still choose between them. This is why a compiler pass must not mistake a successful unification for proof that the output is ground.
+
+% Annotated walkthrough
+\section{Walkthrough: Keep Equations and Bindings Consistent}
+
+Here is finite-tree unification pseudocode, starting with acyclic inputs and an empty substitution. A worklist equation may contain pointers to previously bound variables. To \emph{walk} a root is to chase variable aliases until the root is unbound or nonvariable.
+
+\begin{verbatim}
+pending := input equations; bindings := empty
+while pending is not empty:
+    take (s, t); walk both roots through bindings
+    if s and t are the same variable or same constant: continue
+    if only t is a variable: swap s, t
+    if s is a variable:
+        if occurs(s, t, bindings): fail
+        bind s to t; continue         # pending will see this binding
+    if s and t have the same compound functor and arity:
+        add the argument equations to pending
+    else: fail                       # unequal leaves or constructors
+return bindings                       # recursively expand if needed
+\end{verbatim}
+
+The occurs test walks every visited subterm through current bindings, not just the original syntax. For the first query above, decomposition yields \verb|Op = add|, \verb|reg(R) = reg(r0)|, and \verb|R = D|. Take these left to right, processing the argument equation from \texttt{reg} immediately. After \verb|R = r0|, the last equation walks to \verb|r0 = D| and binds \texttt{D}. The invariant is that solutions of the input equations are exactly the substitutions extending the bindings and solving the pending equations (with aliases interpreted through the bindings). Decomposition preserves that invariant by equality of corresponding arguments; variable binding removes an equation without choosing a value for any unrelated variable. An implementation can normalize bindings on return if the caller needs fully expanded terms. Holm's Scheme implementation provides a contrasting representation in which a substitution is explicit data.
+
+\section{Finite Trees Are Not Rational Trees}
+
+Starting with \verb|X = Y| followed by \verb|Y = wrap(X)|, a shallow textual check for \texttt{Y} inside \verb|wrap(X)| would miss the alias. The correct check follows \texttt{X} back to the same variable class as \texttt{Y}, as in \Cref{fig:visual-339}. No finite tree equals a proper subtree of itself.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (y) at (0,0) {Unbound \texttt{Y}};
+  \node[tome box] (w) at (4,0) {\texttt{wrap(X)}};
+  \draw[tome dashed] (y.north east) to[bend left=30]
+    node[above]{proposed binding} (w.north west);
+  \draw[tome arrow] (w.south west) to[bend left=30]
+    node[below]{argument \texttt{X} walks to \texttt{Y}} (y.south east);
+\end{tikzpicture}
+\caption{Walking the argument exposes a cycle before binding. The dashed edge must not be installed by a finite-tree unifier.}
+\label{fig:visual-339}
+\end{figure}
+
+With SWI-Prolog's default occurs-check setting, the query \verb|?- X = wrap(X).| succeeds with a cyclic term. It represents the regular infinite tree \(\mathrm{wrap}(\mathrm{wrap}(\cdots))\) by a finite cyclic graph, a \emph{rational tree}. This does not satisfy finite-tree equality. Operations on such terms need a cyclic-aware implementation or a documented restriction to acyclic inputs. SWI's \texttt{unify\_with\_occurs\_check/2} prevents creating new cycles but can accept inputs which were already cyclic. Use \texttt{acyclic\_term/1} checks as well if the interface must reject those inputs. Do not silently borrow unchecked unification for a finite syntax-tree or type representation: the constructor equations would then be solved in the wrong domain.
+
+A compiler pass should also state whether it exports an MGU with residual variables or requires a fully reified, ground term. Those are different output contracts: forcing a register choice while unifying an instruction template can discard legal later allocations.

@@ -1,0 +1,113 @@
+% Source: introduction-to-computer-organization-an-under-the-hood-look-at-hardware-and-x86-64-assembly-robert-g.-plantz-.txt
+
+\section{Specify the Transfer at an Edge}
+
+A register-transfer specification says what a register samples and when, including conditions under which it holds. Robert G. Plantz develops the positive-edge D flip-flop in chapter~7 of \emph{Introduction to Computer Organization}, then uses these building blocks for word-wide registers in chapter~8. An HDL normally describes the sampling behavior rather than drawing the gates of every flip-flop. Physical clocking still has setup, hold, distribution, and frequency constraints; the edge in an RTL simulator is an abstraction.
+
+Consider a stage that receives a word and a valid bit on each rising edge. There is no backpressure. An invalid input inserts a bubble: the stage clears its output valid bit without overwriting the retained word. A reset must flush validity, but does not have to initialize the payload if downstream logic obeys the contract to ignore invalid data. That choice can avoid a reset on every payload bit. If invalid data is observable for some other reason, this policy is not necessarily acceptable.
+
+\section{Reset the Contract, Not Necessarily Every Bit}
+
+The example uses synthesizable SystemVerilog \cite{ieee1800systemverilog}. Synchronous reset has priority for validity. The enable on the data register deliberately disables writes during reset as well as during bubbles.
+
+\begin{verbatim}
+module pipe_stage (
+    input  logic        clk, rst, in_valid,
+    input  logic [15:0] in_data,
+    output logic        out_valid,
+    output logic [15:0] out_data
+);
+    always_ff @(posedge clk) begin
+        if (rst) out_valid <= 1'b0;
+        else     out_valid <= in_valid;
+
+        if (!rst && in_valid) out_data <= in_data;
+    end
+endmodule
+\end{verbatim}
+
+\Cref{fig:visual-310} separates the two paths. No assignment to \texttt{out\_data} on an edge means hold, because this is a clock-edge process, not a combinational process. The state can map to a flip-flop with enable or to a flip-flop with a feedback mux. Before a reset edge, the simulator can show \texttt{x} for both outputs. After a reset edge it may still show \texttt{x} for the data, but the valid bit must be zero. The first accepted word replaces the entire payload.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (cv) at (0,1.0) {Reset or\\propagate valid};
+  \node[tome box] (cd) at (0,-1.0) {Enable from\\reset and valid};
+  \node[tome box accent] (v) at (4,1.0) {Valid flip-flop};
+  \node[tome box accent] (d) at (4,-1.0) {Data register};
+  \node (ck) at (4,-2.35) {Common rising edge};
+  \draw[tome arrow] (cv) -- (v);
+  \draw[tome arrow] (cd) -- node[above] {write enable} (d);
+  \draw[tome dashed] (ck.north) -- (d.south);
+  \draw[tome dashed] (ck.east) -- ++(1.3,0) |- (v.east);
+\end{tikzpicture}
+\caption{Reset controls the meaning of the stored word by clearing validity. In this implementation it also prevents a payload write, but does not prescribe a payload value.}
+\label{fig:visual-310}
+\end{figure}
+
+% Annotated walkthrough
+\section{Write a Transition Rule and a Reset Test}
+
+This rule assumes binary control inputs meeting the clocking contract. The state on the right of an assignment is the old state; the final step commits the pair together.
+
+\begin{verbatim}
+at each rising edge:
+    next_data = old_data              # hold through reset and bubbles
+    next_valid = 0 if rst else in_valid
+    if !rst and in_valid:
+        next_data = in_data
+    commit(next_valid, next_data)
+# Test reset=1 and in_valid=1 together: reset wins.
+# Release reset with in_valid=0: validity stays zero.
+# Drive a valid payload: check both outputs after the edge.
+\end{verbatim}
+
+\section{Choose Synchronous or Asynchronous Reset Deliberately}
+
+Asynchronous reset is a different interface contract. A SystemVerilog implementation of the valid flip-flop could use a process sensitive to both edges shown here:
+
+\begin{verbatim}
+always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n) out_valid <= 1'b0;
+    else        out_valid <= in_valid;
+\end{verbatim}
+
+The active-low reset assertion can then invalidate the output without a rising clock edge. Deasserting asynchronously near a capture edge can violate recovery or removal timing; use an appropriate reset release policy for each clock domain. A synchronous reset must instead be present at a sampling edge, and any asynchronous source feeding it needs appropriate synchronization. Neither spelling repairs a clock-domain crossing by itself. The Yosys \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/proc.html}{process-conversion guide} documents asynchronous-reset recognition; recognition does not establish the target's reset timing.
+
+\section{Scoreboard the Output After Commit}
+
+Start the reference model with no known retained word. Drive the stimuli before each rising edge and compare only after the nonblocking assignments have committed. In the trace below, the first and last reset both clear validity. Only the last reset has a known previous payload to retain. The observable stream includes both accepted words, in order, but contains neither reset's input nor the bubble's arbitrary data.
+
+\begin{center}
+\begin{tabular}{cccll}
+\hline
+Edge & Reset & In valid & In data & Output after edge \\
+\hline
+0 & 1 & 1 & 99 & Invalid, no known payload \\
+1 & 0 & 1 & 17 & Valid, 17 \\
+2 & 0 & 0 & 42 & Invalid, retains 17 \\
+3 & 0 & 1 & 23 & Valid, 23 \\
+4 & 1 & 1 & 51 & Invalid, retains 23 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+retained := none
+received := []
+for each (rst, valid, data) in stimulus:
+    drive_before_edge(rst, valid, data)
+    accepted := not rst and valid
+    if accepted: retained := some(data)
+    (v, d) := observe_after_register_commit()
+    require case_equal(v, accepted)
+    if accepted:
+        require case_equal(d, data)
+        append(received, d)
+    else if retained exists and checking_this_implementation:
+        require case_equal(d, retained.value)
+require received == [17, 23]
+\end{verbatim}
+
+The last payload check tests this implementation's hold behavior, not the interface. Another implementation could write zero into the invalid data register and still satisfy the observable valid/data contract. Keep two versions of the check if the implementation is being replaced: a white-box check that diagnoses a lost enable on this RTL, and a black-box check that permits either representation. To test a two-stage pipeline, evaluate both next states from the same pre-edge snapshot. Passing the first stage's newly committed value into the second stage in the same call would remove a cycle of latency from the reference model.

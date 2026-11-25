@@ -1,0 +1,78 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{One Printer Can Have Many Valid Inverses}
+
+A disassembler printer picks a string for an instruction. An assembly parser has a different contract: it must accept the supported spellings, report operand errors, and recover the instruction with enough information to emit it. Spaces and register aliases may vary even when the same bytes result. Conversely, if the printer omits a field that can have multiple values, parsing its output cannot recover all original words unless that field is determined by other operands. In the February 2024 VADL preprint, arXiv:2402.09087v1, Sections~3.3 and~3.7 deliberately separate canonical ISA-level formatting from an auxiliary assembly grammar \cite{himmelbauer2024vadl}.
+
+The ISA \texttt{assembly} clause is a string expression; a comma inside the parenthesized expression concatenates its results. A string literal such as \verb|", "| contributes actual punctuation. Built-ins like \texttt{mnemonic}, \texttt{register}, and \texttt{decimal} describe how to render parts of an instruction. This suffices for a canonical spelling without requiring the ISA author to enumerate every accepted spacing or alternative. A separate \texttt{assembly description} can provide grammar rules, aliases for directives, and names for modifiers. The detailed Section~3.7 example associates the description with an ABI, so its register names can use that ABI's assignments.
+
+\section{Read an Explicit Rule as Typed Extraction}
+
+This is the rule from Listing~24, shown alone and with spacing normalized:
+
+\begin{verbatim}
+LuiInstruction : (
+  mnemonic="lui" @operand
+  rd=<RegisterOperand>
+  ","
+  imm20=<ImmediateOperand>
+) @instruction
+\end{verbatim}
+
+The rule records a mnemonic and two named operands; it requires a comma rather than storing one. The two operand nonterminals have built-in definitions that can be overridden. For example, accepting a token as a register needs more than identifying a lexical word: a conversion must check that the name denotes a supported register. After parsing, the Section~4.5.2 prototype matches on the named operands and their contents. Satisfying a grammar alternative alone does not prove that a legal instruction instance exists. An immediate may parse as an integer and still exceed its range; a symbol with a modifier must retain information for later resolution.
+
+% Annotated walkthrough
+\section{Infer the Structure, Not a List of Every Line}
+
+Sections~4.5.2 and~4.5.5 describe two paths to a rule. The hybrid inference algorithm examines VIR operations for structural cases such as concatenation; it falls back to interpretation when it encounters operations it does not directly handle. Interpretation can tabulate outputs for small sets of inputs, but one twenty-bit field has \(2^{20}\) values before considering any other operand. A table of full strings also throws away distinctions useful for error messages. This teaching trace illustrates a structural inversion and the point where a hand-written rule can take over; it is not VADL grammar syntax:
+
+\begin{verbatim}
+printer pieces: literal("lui "), register(rd),
+                literal(", "), render(imm20)
+structural result: "lui" REGISTER-as-rd "," IMMEDIATE-as-imm20
+  # Use terminal and typed nonterminal rules, not exact spaces.
+parse "lui ra, 12":
+  mnemonic="lui", rd=1, imm20=12   # with the example ABI
+  find the corresponding instruction, then check its range
+parse "lui nowhere, 12":
+  fail register conversion       # a word is not always a register
+\end{verbatim}
+
+With symbolic input such as \verb|lui ra, %hi(main)|, immediate conversion must carry \texttt{main} and the modifier forward, not manufacture a numeric constant. \Cref{fig:visual-326} contrasts this shared internal form with the one canonical spelling a printer elects to return.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a) at (0,0) {\texttt{lui ra, 12}};
+  \node[tome box] (b) at (0,-1.4) {\texttt{lui ra,12}};
+  \node[tome box accent] (r) at (4.45,-0.7)
+    {\texttt{LUI}\\ \texttt{rd=1, imm20=12}};
+  \node[tome box] (p) at (8.85,-0.7) {\texttt{lui ra, 12}};
+  \draw[tome arrow] (a.east) -- (r.north west);
+  \draw[tome arrow] (b.east) -- (r.south west);
+  \draw[tome arrow] (r) -- node[above] {print} (p);
+\end{tikzpicture}
+\caption{Presentation differences, such as optional spacing after a comma, need not survive parsing. The typed operands must.}
+\label{fig:visual-326}
+\end{figure}
+
+\section{Review Printer Edits as Grammar Edits}
+
+If an architect omits a default operand from the pretty printer, the inferred parser may change even though no encoding or behavior changes. Test that both long and abbreviated forms yield the intended operands, that leading tokens do not create an unresolved parser choice, and that the printer's result still parses. When an omitted operand is not uniquely determined, either define a canonical choice or retain enough text to distinguish it. Rule factoring can keep common prefixes from consuming lookahead; it is a grammar optimization, not a reason to loosen operand checks.
+
+The generated parser's useful boundary is therefore explicit:
+
+\begin{verbatim}
+tokens   = lex(source)
+operands = parse_LuiInstruction(tokens)  # grammar and typed conversion
+match    = find_instruction("lui", operands)
+require immediate_is_encodable(match, operands.imm20)
+emit_internal_instruction(match, operands)
+\end{verbatim}
+
+Memoizing a typed conversion or factoring a common prefix can improve parser generation and runtime, but neither can replace the final instruction match and format-range check. In particular, a relocation expression may be syntactically an immediate while remaining deliberately non-numeric until object generation.
+
+Compare diagnostics before and after that change, too. For example, a missing comma and a register whose spelling is unknown should not both be reported as an unknown mnemonic. The structure inferred from a concatenation gives the parser a place to report each error.
+
+The Section~5.5 prototype used LL(1) recursive descent and reused LLVM tokenization with a built-in terminal set. Its inference counts were 74 of 74 instructions for the RV32I specification tested, 104 of 106 for MIPS IV, and 1437 of 1439 for AArch64. The paper reports trouble with MIPS abbreviations and with conveying some AArch64 syntactic distinctions to the instruction matcher. Counts of inferred rules are evidence about those formatting functions, not proof that every legal spelling is recognized or that the same limits apply to any later implementation.

@@ -1,0 +1,89 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{The Import Library Is Not the DLL}
+
+A Windows native toolchain typically assembles or compiles into COFF object files and links them into a Portable Executable (PE) image. An EXE and a DLL are both images; the DLL flag distinguishes the latter. Their import and export tables are image structures, not the COFF symbol and relocation tables used during the build. Levine describes the format and the ordinary DLL binding mechanism for the 32-bit Windows systems of his time \cite[chapter~3]{levine2000linkers}\cite[chapter~10]{levine2000linkers}. Here the mechanism is applied to x86-64 PE32+. Neither Win16's shared address-space model nor the older convention of fixed-base EXEs is a rule for current PE images.
+
+Suppose the build of \texttt{arith.dll} exports \texttt{twice}. Its import library, \texttt{arith.lib}, supplies the consumer's linker with the name of the DLL and information for generating an import of \texttt{twice}. It is not an archive of the routine's implementation. The code for a declaration using \texttt{\_\_declspec(dllimport)} can call through an import address table (IAT) slot directly. Other call sites can use a linker-supplied thunk that jumps through the slot; the thunk need not resolve the symbol itself. In the case of imported data, the slot contains the address of the actual object, not a copy of its stored value.
+
+\section{From Relative Virtual Address to Import Slot}
+
+The PE optional header of an image supplies data-directory entries for imports and exports. They give relative virtual addresses (RVAs), not raw file offsets. At runtime the actual mapping base plus the RVA gives the virtual address. In an on-disk inspector the section's mapped RVA and raw file range must instead be used to locate backed bytes. Section names such as \texttt{.idata} and \texttt{.edata} are conventional; a directory need not live in a section of that name.
+
+An ordinary import descriptor names a DLL and refers to parallel lookup and address tables. On PE32+ their entries are 64 bits; the high bit distinguishes an ordinal import (ordinal in the low 16 bits) from a hint/name RVA. The 16-bit hint in a hint/name record suggests an export name-table index. If that index is out of range or the name differs, the loader searches by name instead. Name lookup selects a zero-based index in the export address table (EAT) through the parallel name-ordinal table. A public ordinal selects an index by subtracting the export directory's ordinal base. A nonzero EAT entry within the export directory's RVA range denotes a forwarder string naming another export, not an address at which to execute instructions. These encoding details follow Microsoft's \href{https://learn.microsoft.com/en-us/windows/win32/debug/pe-format}{\emph{PE Format}} specification; in particular, the hint is not a four-byte value and is not a public ordinal.
+
+% Annotated walkthrough
+\section{Bind a Small PE32+ Import}
+
+Suppose the consumer's first IAT slot is at RVA \texttt{0x2038}, the export name hint is \(0\), the DLL's ordinal base is \(1\), and its EAT has a single RVA \texttt{0x1000}. Assume these are ordinary imports and there is no forwarder.
+
+\begin{verbatim}
+descriptor.dll = "arith.dll"
+lookup[0] = HintName(0, "twice")
+
+name_pos = check_hint_or_find_name(dll, lookup[0])
+idx = dll.name_ordinals[name_pos]   # a zero-based EAT index
+rva = dll.export_addresses[idx]    # reject missing/empty entry
+p = dll.actual_base + rva          # add the provider's base
+client.iat[0] = p                  # store a VA, not an RVA
+
+call through client.iat[0]         # with argument 21
+\end{verbatim}
+
+For a DLL base of \texttt{0x180000000}, the value written into the slot is \texttt{0x180001000}. Importing public ordinal \(1\) would also select index \(0\). An import of ordinal \(2\) must fail in this one-entry example. If a new build moves the named export to another index, the name import still works when the stale hint fails; an ordinal import works only if the producer preserved its ordinal contract.
+
+\Cref{fig:visual-300} shows the two image-relative coordinates used during import binding.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=4.55cm] at (0,0) {Consumer};
+  \node[tome box dark,minimum width=4.55cm] at (7.4,0) {\texttt{arith.dll}};
+  \node[tome box,minimum width=4.55cm] (name) at (0,-1.25)
+    {Import by name\\hint 0, \texttt{twice}};
+  \node[tome box,minimum width=4.55cm] (eat) at (7.4,-1.25)
+    {EAT index 0\\export RVA \texttt{0x1000}};
+  \node[tome box,minimum width=4.55cm] (iat) at (0,-3.05)
+    {IAT slot at RVA \texttt{0x2038}\\stores \texttt{0x180001000}};
+  \node[tome box,minimum width=4.55cm] (p) at (7.4,-3.05)
+    {Actual DLL base \(+\) export RVA\\\texttt{0x180001000}};
+  \draw[tome arrow] (name) -- node[above] {find export} (eat);
+  \draw[tome arrow] (eat) -- (p);
+  \draw[tome arrow] (p) -- node[above] {store VA} (iat);
+\end{tikzpicture}
+\caption{The DLL's base converts the export RVA into the value stored in the IAT. The consumer's base is used to locate the IAT slot itself.}
+\label{fig:visual-300}
+\end{figure}
+
+To inspect the structure without running a Windows process, use Clang and LLD with the Windows MSVC target. Save this definition as \texttt{arith.c}:
+
+\begin{verbatim}
+__declspec(dllexport) int twice(int x) { return 2*x; }
+\end{verbatim}
+
+Save the caller as \texttt{client.c}:
+
+\begin{verbatim}
+__declspec(dllimport) int twice(int);
+int main(void) { return twice(21) != 42; }
+\end{verbatim}
+
+\begin{verbatim}
+clang --target=x86_64-pc-windows-msvc -ffreestanding \
+    -fno-stack-protector -c arith.c client.c
+lld-link /dll /noentry /nodefaultlib /out:arith.dll \
+    /implib:arith.lib arith.o
+lld-link /entry:main /subsystem:console /nodefaultlib \
+    /out:client.exe client.o arith.lib
+llvm-readobj --coff-exports arith.dll
+llvm-readobj --coff-imports client.exe
+\end{verbatim}
+
+The local cross-link yields ordinal \(1\) at RVA \texttt{0x1000} and a named import of \texttt{twice} from \texttt{arith.dll}; the reported hint is \(0\). The RVAs are observations of one build, not promised addresses.
+
+\section{Binding Is Not Rebasing or Delay Loading}
+
+COFF relocations are consumed when the linker places a symbol such as \verb|__imp_twice| in the consumer's image. PE base relocations are a separate mechanism: they adjust selected addresses when an image moves from its preferred base. They do not find \texttt{twice} in a DLL. Ordinary import binding populates that consumer's IAT before the client makes its first call. Toolchain-supported delay imports instead use a helper that can defer loading the DLL as well as binding the procedure. This differs from the classic ELF lazy PLT for a startup dependency, where the library is ordinarily already mapped and only the lookup for that call is deferred.
+
+PE also has a \emph{bound import} representation for saving previously computed import addresses. Such addresses are useful only when the loader can establish that the provider matches and the resulting addresses apply to this mapping. Bound imports are neither the normal symbolic import description nor a request for delay loading. The three cases differ in when the target address is computed and what information is still needed at load time.

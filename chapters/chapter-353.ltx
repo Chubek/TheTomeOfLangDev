@@ -1,0 +1,106 @@
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: dataflow-graphs-program.txt
+
+\section{Read Arcs as Operand Protocols}
+
+In a token dataflow graph, nodes denote operations and directed arcs carry values. A node is fireable when the tokens required by one of its firing rules are available. Firing consumes the specified inputs, performs the operation, and produces specified outputs. Readiness is not completion: a runtime may delay a ready firing, and several ready nodes may execute concurrently. The pure model has no program counter selecting a unique next node \cite{johnston2004dataflow}.
+
+An arc is more than a drawn dependence. Its protocol says whether it is a one-place operand slot, a FIFO stream, or part of a tagged matching discipline. Forking must duplicate a token when two consumers both need the value. An uncontrolled merge is not equivalent to a deterministic conditional merge because arrival order can become observable.
+
+\section{Fire a Small Arithmetic Graph}
+
+Use this textual graph notation, where each input port consumes one token and each output port produces one:
+
+\begin{verbatim}
+input x -> fork fx
+const  2 -> mul.left
+fx.a     -> mul.right
+fx.b     -> add.left
+mul.out  -> add.right
+add.out  -> output y
+\end{verbatim}
+
+For input token \(3\), \texttt{fork} creates two \(3\) tokens. Then \texttt{mul} produces \(6\), while \texttt{add} must wait for both \(3\) and \(6\), finally producing \(9\). The firing order between the fork's output deliveries and other independent firings is implementation latitude; consuming an operand twice is not. \Cref{fig:visual-353} depicts the token obligations.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (in) at (-4,0) {\(x:3\)};
+  \node[tome box] (fork) at (-2,0) {fork};
+  \node[tome box] (mul) at (0,-1.2) {\(\times\)};
+  \node[tome box] (two) at (-2,-2.3) {\(2\)};
+  \node[tome box accent] (add) at (2.3,0) {\(+\)};
+  \node[tome box dark] (out) at (4.4,0) {\(y:9\)};
+  \draw[tome arrow] (in) -- (fork);
+  \draw[tome arrow] (fork) -- node[above]{\(3\)} (add);
+  \draw[tome arrow] (fork) -- node[above left]{\(3\)} (mul);
+  \draw[tome arrow] (two) -- (mul);
+  \draw[tome arrow] (mul) -- node[below right]{\(6\)} (add);
+  \draw[tome arrow] (add) -- (out);
+\end{tikzpicture}
+\caption{The add node is enabled only after tokens \(3\) and \(6\) occupy its distinct input ports. The fork, not an implicit shared read, supplies both consumers.}
+\label{fig:visual-353}
+\end{figure}
+
+% Annotated walkthrough
+\section{Implement Firing Without Inventing Semantics}
+
+\begin{verbatim}
+enqueue(input_x, 3)
+while output_y is empty:
+    n := choose_any_ready_node()
+    args := atomically_consume(n.firing_rule.inputs)
+    results := evaluate_pure_operator(n.op, args)
+    append_in_port_order(n.outputs, results)
+return dequeue(output_y)
+\end{verbatim}
+
+Atomic consumption prevents two firings from claiming the same token. Fair selection can matter for liveness, but does not license firing without operands. The example has a unique finite result under every schedule that eventually executes ready nodes.
+
+\section{Represent and Rewrite the Graph}
+
+A suitable IR has operator, fork, merge, input, and output nodes; typed, port-numbered FIFO edges; firing rules and production/consumption rates; explicit delay or feedback state; optional clocks or tags; effect summaries; and source provenance on nodes and synthetic forks. Compilation may emit a graph interpreter table, a distributed actor network, scheduled sequential code, or hardware with handshake storage.
+
+Legal optimizations include folding \(\texttt{mul}(x,2)\) if numeric overflow and exceptions are preserved, and node fusion when token order, rates, and firing atomicity are unchanged. Semantic-preservation risks include removing a fork, coalescing two queues, or speculating an operator: these can lose tokens, change blocking, or expose a trap. A validator should compare output token sequences and externally visible effects, and should retain provenance so a changed firing rule can be traced back to the source construct that required it.
+
+\section{Trace the Join in Port Order}
+
+Give the multiplier's constant port a per-firing literal operand, not a FIFO preloaded with one copy of \(2\). With a FIFO literal, the first firing would consume the only token, and the graph would stop producing results on the next input. The fork, in contrast, produces one token on each of two queues for every input it consumes. For the input \(3\) the queue state evolves as follows; the literal is not listed because it is not buffered.
+
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+After firing & Into multiplier & Into add, left & Into add, right \\
+\hline
+Fork & \(3\) & \(3\) & empty \\
+Multiply & empty & \(3\) & \(6\) \\
+Add & empty & empty & empty \\
+\hline
+\end{tabular}
+\end{center}
+
+The add can fire only in the third row's transition, after both of its operands are present. The arithmetic result is \(9\). Replace addition with subtraction temporarily: the expected result is then \(-3\), which detects an implementation that assembles operands in arrival order instead of named port order. Even with pure operators, the two operands are not interchangeable.
+
+\begin{verbatim}
+try_fire(node):
+    if any required FIFO prefix is missing: return BLOCKED
+    operands := []
+    for port in declared_operand_order(node):
+        if port is literal: append(operands, port.literal)
+        else: append(operands, peek(port.queue))
+    results := run_pure_total_operator(node, operands)
+    if outputs cannot all be committed: return BLOCKED
+    for port in consumed_ports(node): pop(port.queue)
+    for port in output_ports(node): push(port.queue, results[port])
+    return FIRED
+\end{verbatim}
+
+This sketch assumes a single scheduler and total operators. Under concurrent scheduling, reserve output space and make the readiness check and commit one transaction. Reserving only one output of a fork may let a consumer advance on one branch while the producer retries the entire firing and publishes a duplicate. Test two input items and stall the consumer of one branch. A sound finite implementation either publishes both copies or leaves the input untouched at that firing boundary.
+
+\paragraph{Check a full queue at resume.}
+Record each fork's logical firing number on both outputs in debug builds.
+At the join, assert that the numbers at the two heads agree. This is redundant
+for correctly implemented one-to-one FIFO branches but makes a dropped
+or duplicated emission show up at the first mismatched join instead of
+as a mysterious wrong result downstream.

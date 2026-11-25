@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check chapter walkthroughs and integration, dossier integrity, and the source map."""
+"""Check chapter walkthroughs, visuals and integration, dossier integrity, and the source map."""
 
 import hashlib
 import json
@@ -10,8 +10,28 @@ import source_catalogue
 
 
 ROOT = source_catalogue.ROOT
-CHAPTERS = range(131, 261)
-ALL_CHAPTERS = range(1, CHAPTERS.stop)
+EXTENSIONS = (
+    ("tome-extensions.ltx", range(131, 261), (10,) * 13),
+    ("tome-native-toolchain.ltx", range(261, 303), (18, 24)),
+    ("tome-description-languages.ltx", range(303, 352), (20, 15, 14)),
+    ("tome-alternative-languages.ltx", range(352, 382), (10, 11, 11)),
+)
+PLACEMENTS = (
+    (382, "the-tome-of-langdev.ltx", 40, 41),
+    (383, "tome-alternative-languages.ltx", 362, 363),
+    (384, "tome-alternative-languages.ltx", 381, None),
+)
+CHAPTERS = (*range(EXTENSIONS[0][1].start, EXTENSIONS[-1][1].stop),
+            *(item[0] for item in PLACEMENTS))
+ALL_CHAPTERS = (*range(1, EXTENSIONS[0][1].start), *CHAPTERS)
+PRIMARY_SOURCES = (
+    (range(261, 279), "blindel-instrselect-book.txt", "blindell2016instruction"),
+    (range(279, 303), "linkers-loaders-ocr.txt", "levine2000linkers"),
+    (range(323, 338), "vienna-arch-desc-lang.txt", "himmelbauer2024vadl"),
+    ((382,), "typed-algebraic-approach-to-parsing.txt", "krishnaswami2019typedparsing"),
+    ((383,), "leroy-a-verif-cc-compiler-backend-for-lustre.txt", "bourke2017verifiedlustre"),
+    ((384,), "adavances-in-dataflow-langs-lucid.txt", "johnston2004dataflow"),
+)
 LABEL = re.compile(r"\\label\{([^}]+)\}")
 REFERENCE = re.compile(r"\\(?:ref|pageref|autoref|[cC]ref)\{([^}]+)\}")
 CITATION = re.compile(r"\\(?:cite|textcite|parencite)(?:\[[^\]]*\]){0,2}\{([^}]+)\}")
@@ -20,6 +40,7 @@ NUMBERED_INPUT = re.compile(
     r"\\chapter\{[^{}\n]+\}\\label\{ch:ext-(\d+)\}\s*"
     r"\\input\{chapters/chapter-(\d+)\.ltx\}"
 )
+CHAPTER_INPUT = re.compile(r"^\\input\{chapters/chapter-(\d+)\.ltx\}", re.M)
 LOCAL_LINK = re.compile(r"\]\((\.\.?/[^()]+\.(?:md|txt))\)")
 WALKTHROUGH_MARKER = re.compile(r"^% Annotated walkthrough[ \t]*$", re.M)
 SECTION = re.compile(r"^[ \t]*\\((?:sub)*)section\*?(?:\[[^\n]*\])?\{", re.M)
@@ -27,6 +48,11 @@ PSEUDOCODE_BLOCK = re.compile(
     r"\\begin\{(sudocode|algorithmic|verbatim|Verbatim|lstlisting)\}"
     r".*?\\end\{\1\}",
     re.S,
+)
+VISUAL_MARKER = re.compile(r"^% Explanatory visual[ \t]*$", re.M)
+VISUAL_FLOAT = re.compile(
+    r"^[ \t]*\\begin\{figure\}(?:\[[^\n]*\])?(.*?)\\end\{figure\}",
+    re.M | re.S,
 )
 
 
@@ -64,7 +90,7 @@ def check_walkthrough(path, text, errors):
 def check_walkthroughs(errors):
     labels = Counter(
         label
-        for name in ("the-tome-of-langdev.ltx", "tome-extensions.ltx")
+        for name in ("the-tome-of-langdev.ltx", *(entry[0] for entry in EXTENSIONS))
         for label in LABEL.findall(contents(ROOT / name))
     )
     walkthroughs = {}
@@ -91,24 +117,91 @@ def check_walkthroughs(errors):
                 errors.append(f"{name}: walkthrough label {label} is not unique")
 
 
+def check_chapter_visuals(path, text, number, errors):
+    """Check marked figures, not older illustrative material or LaTeX layouts."""
+    primary = f"fig:visual-{number}"
+    named = set()
+    for marker in VISUAL_MARKER.finditer(text):
+        figure = VISUAL_FLOAT.match(text, marker.end() + 1)
+        if figure is None:
+            errors.append(f"{path.name}: visual marker must immediately precede a figure")
+            continue
+        body = figure[1]
+        labels = LABEL.findall(body)
+        if len(labels) != 1 or not re.fullmatch(rf"{primary}(?:-[a-z])?", labels[0]):
+            errors.append(f"{path.name}: expected one {primary} label (a suffix is allowed)")
+            continue
+        label = labels[0]
+        named.add(label)
+        if len(re.findall(rf"\\label\{{{re.escape(label)}\}}", text)) != 1:
+            errors.append(f"{path.name}: visual label {label} must be unique")
+        if not re.search(r"\\caption(?:\[[^\n]*\])?\{", body):
+            errors.append(f"{path.name}: {label} is missing its caption")
+        if r"\begin{tikzpicture}" not in body or r"\end{tikzpicture}" not in body:
+            errors.append(f"{path.name}: {label} needs editable TikZ artwork")
+        prose = text[:figure.start()] + text[figure.end():]
+        if label not in keys(REFERENCE, prose):
+            errors.append(f"{path.name}: no reader-facing reference to {label}")
+    if primary not in named:
+        errors.append(f"{path.name}: missing marked explanatory visual {primary}")
+    return len(named)
+
+
+def check_visuals(errors):
+    count = 0
+    for number in ALL_CHAPTERS:
+        path = ROOT / f"chapters/chapter-{number}.ltx"
+        if path.is_file():
+            count += check_chapter_visuals(path, contents(path), number, errors)
+    return count
+
+
 def check_tome(errors):
     root = contents(ROOT / "the-tome-of-langdev.ltx")
-    ext = contents(ROOT / "tome-extensions.ltx")
-    if root.count(r"\input{tome-extensions.ltx}") != 1:
-        errors.append("main manuscript must include tome-extensions.ltx once")
-    elif root.index(r"\input{tome-extensions.ltx}") > root.index(r"\backmatter"):
-        errors.append("new chapters must precede the back matter")
+    manuscripts = {"the-tome-of-langdev.ltx": root, **{
+        name: contents(ROOT / name) for name, _, _ in EXTENSIONS
+    }}
+    for number, name, before, after in PLACEMENTS:
+        order = [int(n) for n in CHAPTER_INPUT.findall(manuscripts[name])]
+        count = sum(CHAPTER_INPUT.findall(text).count(str(number))
+                    for text in manuscripts.values())
+        expected = [before, number] + ([after] if after is not None else [])
+        correct = (any(order[i:i + len(expected)] == expected for i in range(len(order)))
+                   if after is not None else order[-2:] == expected)
+        if count != 1 or not correct:
+            errors.append(f"{name}: expected chapter input order {expected}")
+        if (str(number), str(number)) not in NUMBERED_INPUT.findall(manuscripts[name]):
+            errors.append(f"{name}: chapter {number} needs its heading and stable label")
 
-    expected = [(str(n), str(n)) for n in CHAPTERS]
-    if NUMBERED_INPUT.findall(ext) != expected:
-        errors.append("new chapter headings, labels and inputs must match 131–260 in order")
-    if len(re.findall(r"^\\part\{", ext, flags=re.M)) != 13:
-        errors.append("expected thirteen new parts")
+    positions = []
+    new_labels = Counter()
+    for extension, chapter_range, expected_sizes in EXTENSIONS:
+        registration = rf"\input{{{extension}}}"
+        if root.count(registration) != 1:
+            errors.append(f"main manuscript must include {extension} once")
+        else:
+            positions.append(root.index(registration))
+        ext = manuscripts[extension]
+        new_labels.update(LABEL.findall(ext))
+        order = list(chapter_range)
+        for number, name, before, _ in PLACEMENTS:
+            if name == extension:
+                order.insert(order.index(before) + 1, number)
+        expected = [(str(n), str(n)) for n in order]
+        if NUMBERED_INPUT.findall(ext) != expected:
+            errors.append(
+                f"{extension}: chapter headings, labels and inputs must match its registered order"
+            )
+        parts = re.split(r"^\\part\{", ext, flags=re.M)
+        sizes = tuple(len(NUMBERED_INPUT.findall(part)) for part in parts[1:])
+        if NUMBERED_INPUT.search(parts[0]) or sizes != expected_sizes:
+            errors.append(f"{extension}: expected chapter counts per part {expected_sizes}")
+    if positions != sorted(positions) or any(pos > root.index(r"\backmatter") for pos in positions):
+        errors.append("extension files must appear in chapter order before the back matter")
 
     old_labels = set(LABEL.findall(root))
-    for n in range(1, CHAPTERS.start):
+    for n in range(1, EXTENSIONS[0][1].start):
         old_labels.update(LABEL.findall(contents(ROOT / f"chapters/chapter-{n}.ltx")))
-    new_labels = Counter(LABEL.findall(ext))
     bodies = {}
     for n in CHAPTERS:
         path = ROOT / f"chapters/chapter-{n}.ltx"
@@ -120,9 +213,13 @@ def check_tome(errors):
         if len(re.findall(r"\\section\*?(?:\[.*?\])?\{", body)) < 3:
             errors.append(f"{path.name}: needs at least three sections")
         if re.search(r"(?m)^\s*\\(?:chapter|part)\b", body):
-            errors.append(f"{path.name}: use the heading in tome-extensions.ltx")
-        if not source_catalogue.SOURCE_NOTE.search(text):
+            errors.append(f"{path.name}: use the heading in the extension file")
+        notes = set(source_catalogue.SOURCE_NOTE.findall(text))
+        if not notes:
             errors.append(f"{path.name}: no local source notes")
+        for source_range, source, key in PRIMARY_SOURCES:
+            if n in source_range and (source not in notes or key not in keys(CITATION, body)):
+                errors.append(f"{path.name}: expected its primary source note ({source}) and citation ({key})")
         new_labels.update(LABEL.findall(body))
         bodies[path.name] = body
     for label, count in sorted(new_labels.items()):
@@ -165,6 +262,7 @@ def main():
     errors = []
     check_tome(errors)
     check_walkthroughs(errors)
+    visual_count = check_visuals(errors)
     check_dossier(errors)
     catalogue = source_catalogue.CATALOGUE
     try:
@@ -175,7 +273,14 @@ def main():
         errors.append(str(error))
     if errors:
         raise SystemExit("\n".join(errors))
-    print("260 chapter walkthroughs, 45 dossier chapter links, and local source catalogue checked.")
+    print(
+        f"{visual_count} explanatory visuals, {len(ALL_CHAPTERS)} chapter walkthroughs, "
+        "18 instruction-selection chapters, "
+        "24 toolchain chapters, 20 HDL chapters, 15 architecture description chapters, "
+        "14 logic-programming chapters, 30 core alternative-language chapters, "
+        f"{len(PLACEMENTS)} bridge and capstone placements, "
+        "45 dossier chapter links, and local source catalogue checked."
+    )
 
 
 if __name__ == "__main__":

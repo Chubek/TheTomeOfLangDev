@@ -1,0 +1,75 @@
+% Source: memory-eff-softsynth-from-dataflow-graph.txt
+% Source: ir-il-for-datapath-gen.txt
+
+\section{An Array's Access Contract Determines Its Implementation}
+
+An inferred memory is a match between RTL behavior and the resources in a selected target. Its important properties include width, depth, port count, clocks, enables, initialization, and what a read does during an address collision. Matching capacity is necessary but not sufficient. A device with synchronous block RAM cannot generally use it as a combinational lookup table without changing latency. LUT storage, flip-flops with muxes, replication, banking or an explicit external memory interface are different implementation choices, each with a different cost.
+
+Sung, Kim, and Ha study \emph{software} synthesis from synchronous dataflow. Their examples separate the code size of a schedule from the capacity of buffers induced by it. In hardware, the analogous question is how many values are simultaneously live and how many accesses the schedule needs. For example, if producer \(P\) emits two words per firing and consumer \(C\) takes three, one balanced period requires three \(P\) and two \(C\) firings. With atomic firings and an initially empty buffer, \(P,P,P,C,C\) peaks at six words, while \(P,P,C,P,C\) peaks at four. This calculation gives capacity for that schedule, not port bandwidth or a block RAM count.
+
+% Annotated walkthrough
+\section{Specify Read-During-Write Before Counting Blocks}
+
+The SystemVerilog module below \cite{ieee1800systemverilog} has one synchronous write port and one synchronous read port, with a common clock. Reset belongs to the surrounding protocol; the array is not cleared by hardware reset.
+
+\begin{verbatim}
+module store256(input logic clk, we, re,
+                input logic [7:0] wa, ra,
+                input logic [15:0] din,
+                output logic [15:0] dout);
+    logic [15:0] mem [0:255];
+    always_ff @(posedge clk) begin
+        if (we) mem[wa] <= din;
+        if (re) dout <= mem[ra];
+    end
+endmodule
+\end{verbatim}
+
+Pseudocode for the read-first contract on a rising edge:
+
+\begin{verbatim}
+old = memory[ra] if re else unused    # take the pre-edge value
+if we: memory[wa] = din               # commit the write
+if re: dout = old                     # hold the prior output otherwise
+\end{verbatim}
+
+If address \(9\) contains \(17\), then a simultaneous read of \(9\) and write of \(42\) to \(9\) gives \(17\); a later enabled read gives \(42\) until another write. The simulator implements that ordering through nonblocking assignments. An implementation with a different native collision policy needs extra logic where possible or a different memory resource; silently promising write-first is not legal. A proof that the controller never reads and writes the same address could weaken the external contract, but document and verify the proof before asking inference to exploit it.
+
+\Cref{fig:visual-316} shows why a capacity calculation does not settle port compatibility. In this case \(256\times16=4096\) payload bits, but the selected primitive still has to support this geometry and read policy.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (write) at (0,0.75) {Write\\\((9,42)\)};
+  \node[tome box] (read) at (0,-0.75) {Read\\address \(9\)};
+  \node[tome box dark] (mem) at (3.7,0) {Array slot \(9\)\\\(17\rightarrow42\)};
+  \node[tome box] (out) at (7.2,-0.75) {Read result\\\(17\)};
+  \draw[tome arrow] (write.east) -- (mem.west);
+  \draw[tome arrow] (read.east) -- (mem.west);
+  \draw[tome arrow] (mem.east) -- (out.west);
+\end{tikzpicture}
+\caption{Both ports act at the same edge. The write changes the stored contents, but the registered read result contains the older word.}
+\label{fig:visual-316}
+\end{figure}
+
+\section{Inspect Inference Before and After Mapping}
+
+With the source saved as \texttt{store256.sv}, the following Yosys script preserves a collected memory for diagnosis instead of intentionally mapping it to generic flip-flops:
+
+\begin{verbatim}
+read_verilog -sv store256.sv
+hierarchy -check -top store256
+proc
+memory -nomap
+stat
+write_rtlil store256.rtlil
+\end{verbatim}
+
+The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/memory.html}{Yosys memory documentation} describes collecting ports, merging a registered read into the memory representation where possible, selecting target-specific cells, and lowering leftover memories to generic logic. Follow the separate target synthesis flow and inspect its mapped cell inventory; seeing a memory in RTLIL does not prove that the design uses block RAM. Per-bit write enables, arbitrary clocks, and a one-cycle clear of the entire array can rule out the primitive. Valid bits or a sequential initialization pass can solve some reset requirements, but the latter changes startup latency.
+
+\section{Preserve Arithmetic the DSP Block Can Recognize}
+
+Kasprzyk and colleagues note that bit-width analysis is useful for hardware realization. Width and signedness matter especially for multiply-accumulate inference. For example the SystemVerilog fragment \verb|logic signed [15:0] a, b;| with \verb|logic signed [31:0] p;| and \verb|always_ff @(posedge clk) p <= a * b;| represents a full-width signed product. The case \(a=b=-32768\) produces \(2^{30}\), one more than the maximum of a signed 31-bit result, so dropping a bit changes the contract.
+
+Targets differ in multiplier widths, pre-adders, accumulator modes and staging registers; an unsupported combination may use several DSP blocks, a DSP plus fabric, or only soft logic. A gratuitous truncation or an incompatible reset can stop a multiply-plus-add from fitting one native block. Conversely, forcing DSP inference for a small constant operator can waste a scarce block. Preserve word-level arithmetic until the target pass has a chance to see it, and check the implementation report for the final resource tradeoff. A successful inference alone says nothing about a routed clock period.

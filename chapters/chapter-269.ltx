@@ -1,0 +1,74 @@
+% Source: blindel-instrselect-book.txt
+
+\section{Separate Three Kinds of Rewrite}
+
+In ``A Note on Tree Rewriting vs. Tree Covering,'' Blindell contrasts choosing a compatible set of patterns on a tree with repeatedly replacing matched parts of it until a goal remains \cite[section~3.5]{blindell2016instruction}. For ordinary instruction patterns these can describe the same derivation: reducing the chosen tiles in operand order presents their goal symbols to each enclosing tile. There is no need to mutate the IR just to carry out such a derivation.
+
+Two other operations can look similar on paper. A \emph{chain} changes the form promised at the same node, without matching another IR operator. It may emit an instruction, for example to transfer to another register bank. A \emph{canonicalization} changes the subject tree before matching, preserving the computation but possibly exposing or hiding particular patterns. Blindell's discussion of BURS grammars with terminals on both sides of a production is a reminder that tree transformations can also be included in the search itself \cite[section~3.6.3]{blindell2016instruction}. The separate canonicalization below is a simpler engineering choice, not a claim that every such search can throw away all but its canonical form.
+
+\section{Orient the Shape Changes}
+
+Take pure, nontrapping, fixed-width word expressions with no hidden flag effects. For bitwise $\mathrm{xor}$ use two directed rewrites: move a literal on the left to the right when the right operand is nonliteral, and erase an exclusive-or with literal zero on the right. The first uses commutativity, and the second uses the identity element. Do not install the inverse rules. A postorder normalizer applies these rewrites at the current node until neither applies, after first normalizing its children.
+
+Termination follows from the lexicographic pair consisting of total node count and the number of literal-left, nonliteral-right exclusive-ors. Erasing an identity strictly reduces node count. A swap preserves node count and removes one misoriented node without changing the literal/nonliteral classification of its root for its parent. When erasure exposes a subtree, that subtree has already been normalized. An enclosing exclusive-or might newly see a literal, but it will be inspected later in postorder. The resulting normal form is relative to these rules; for example it neither reassociates exclusive-ors nor recognizes every expression equal to zero.
+
+\section{Charge Transfers as Part of the Cover}
+
+Let $G$ hold a word. For the Boolean result of $\mathrm{iszero}$, let $F$ denote a condition flag, $P$ a predicate register, and $M$ a word mask (all ones for true, all zeros for false). These are representations of the same abstract truth value. An incoming argument supplies $G$ for free. In the grammar below $\mathrm{lit}_5$ is a literal whose unsigned value fits in five bits, while $\mathrm{lit}$ accepts any word literal. The direct mask instruction is an alternative to transferring a flag through the predicate bank.
+
+\[
+\begin{array}{lr@{\qquad}lr}
+\text{Production} & \text{Cost} & \text{Production} & \text{Cost}\\
+G\gets\mathrm{lit} & 2 & F\gets\mathrm{iszero}(G) & 1\\
+G\gets\mathrm{xor}(G,G) & 2 & M\gets\mathrm{iszero}(G) & 5\\
+G\gets\mathrm{xor}(G,\mathrm{lit}_5) & 1 & P\gets F & 2\\
+ & & M\gets P & 1
+\end{array}
+\]
+
+Blindell's ``Handling Chain Rules in Purely Coverage-Driven Designs'' compares closure, inserting auxiliary nodes, and injecting conversions after selection \cite[section~3.5.1]{blindell2016instruction}. In this case the chain graph is acyclic, so closure needs only one pass in dependency order. Late injection cannot generally price the choice between a conversion path and a directly produced mask.
+
+% Annotated walkthrough
+\section{Normalize, Label, and Recover a Mask}
+
+\begin{verbatim}
+subject: iszero(xor(0, xor(31, arg(a))))
+
+[1] normalize inner xor: xor(arg(a), 31)
+    swap outer xor, then erase its right zero
+    subject becomes iszero(xor(arg(a), 31))
+
+    xor at G: min(generic 2 + 0 + 2, immediate 1 + 0) = 1
+    iszero: seed F = 1 + 1 = 2; seed M = 5 + 1 = 6
+[2] close iszero: P = F + 2 = 4; M = min(6, P + 1) = 5
+
+    recover M via P via F at the iszero node
+    recover G at xor; emit XOR-immediate, test, and transfers
+\end{verbatim}
+
+\noindent\textbf{[1]} Neither of these rewrites emits machine code. The normalized subject exposes the immediate on the encodable side, and $31$ is the five-bit maximum. Replacing it by $32$ leaves the normalized shape intact but requires the generic exclusive-or at cost four. All three finite results at the zero test now cost three more, so the mask costs eight instead of five.
+
+\noindent\textbf{[2]} Both chain steps operate at the same IR node. The costs include actual flag-to-predicate and predicate-to-mask actions. If the latter costs three instead of one, the chain path costs seven and the direct mask rule wins at six; appending transfers after choosing the flag would miss that result.
+
+\Cref{fig:visual-269} treats the two ways to obtain \(M\) as paths through the same-node goal graph. The common XOR cost is included in the input to each path.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram, goal/.style={tome box,minimum width=1.65cm}]
+  \node[goal] (g) at (0,0) {XOR in \(G\)\\Cost 1};
+  \node[goal] (f) at (3.08,0) {\(F\)\\Cost 2};
+  \node[goal] (p) at (5.75,0) {\(P\)\\Cost 4};
+  \node[goal] (m) at (8.5,0) {\(M\)\\Cost 5};
+  \draw[tome arrow] (g)--node[above,font=\footnotesize]{test \(+1\)} (f);
+  \draw[tome arrow] (f)--node[above,font=\footnotesize]{\( +2\)} (p);
+  \draw[tome arrow] (p)--node[above,font=\footnotesize]{\( +1\)} (m);
+  \draw[tome dashed] (g.south)--(0,-1.48)--node[below,font=\footnotesize]{Direct zero-test mask \(+5\), total 6} (8.5,-1.48)--(m.south);
+  \draw[decorate,decoration={brace,amplitude=4pt}] (2.18,1.05)--(9.38,1.05);
+  \node[above,font=\footnotesize] at (5.78,1.23) {Three goal forms at one \(\mathrm{iszero}\) node};
+\end{tikzpicture}
+\caption{Closure improves the word-mask cost from 6 to 5 by routing the zero test through its flag and predicate forms. Only the first edge on either route consumes the zero-test operator.}
+\label{fig:visual-269}
+\end{figure}
+
+The cover assumes that nothing clobbers the flag between its production and transfer; a real backend must preserve that dependency through scheduling. The cost is optimal for the normalized subject and these additive weights, not over all equivalent subjects. A different machine grammar might describe a fused zero-test tile for an exclusive-or with a literal specifically on the left; always swapping that literal right would hide the tile. Test normalization for semantic preservation and termination, and test covering for completeness and cost on the shapes the normalizer actually supplies.

@@ -1,0 +1,64 @@
+%% chapter-277.ltx -- Pattern Selection with PBQP
+% Source: blindel-instrselect-book.txt
+% Source: code-instrselect-using-ssa-graphs.txt
+
+\section{Pay for combinations, not just individual rules}
+
+The cheapest rule at a producer may leave a value in a form that is expensive for its consumers. Eckstein, K\"onig and Scholz's \emph{Code Instruction Selection based on SSA-Graphs} makes that problem concrete using a DSP whose fixed-point multiply leaves a shifted result. Keeping a loop-carried value in the internal mode can avoid shifts in the body, while the return still needs the ordinary representation. Hjort Blindell describes their selection model as a partitioned Boolean quadratic problem (PBQP): pick one rule per SSA node and pay additional costs for pairs of rules connected by def-use edges \cite[chapter~5]{blindell2016instruction}.
+
+Give each decision \(v\) a domain of available alternatives and a vector \(c_v\) of unary costs. One alternative \(x_v\) must be selected. A table \(C_{uv}\), with rows for \(u\) and columns for \(v\), gives the cost of each combination. The objective is
+\[
+  \min_x \left(\sum_v c_v[x_v] +
+                  \sum_{(u,v)} C_{uv}[x_u,x_v]\right).
+\]
+This notation looks up the entries directly; the usual quadratic expression uses one-hot Boolean vectors. Two alternatives that agree on the interface can have a zero pair cost. A required conversion contributes its cost; an impossible combination is forbidden, conventionally written \(+\infty\). Where several chain rules can translate the produced mode into the required one, compute the least legal chain cost and retain the sequence for emission. If an edge-specific conversion cannot actually be placed, its matrix entry must be forbidden, not merely expensive. When two flows contribute costs between the same decisions, add their tables after aligning their rows and columns. This assumes distinct charges; if one conversion serves both flows, counting it twice would bias the model.
+
+% Annotated walkthrough
+\section{Choose a loop representation and count edge traffic}
+
+Consider a toy machine with a general register class \(G\) and a fast accumulator class \(A\). Both hold the same 32-bit value exactly, and the two alternatives for a recurrence step compute the same wrapping result. Let \(p\) supply the initial value, \(h\) be the loop-header \(\phi\), \(u\) the step in the loop body, and \(r\) the return. On the modeled workload the step executes eight times, each time followed by a backedge to \(h\); there is also one entry and one exit. Unary costs for \(p\) are \(1\) in \(G\) and \(2\) in \(A\). The step costs \(3\) in \(G\), \(1\) in \(A\), per execution. The \(\phi\) has zero base cost, and the return has only a zero-cost \(G\) alternative. A class change costs two per edge traversal. Assume conversion placements are legal on all the given edges.
+
+\Cref{fig:visual-277} puts the cost of a bank change on the edge that actually carries the converted value.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (p) at (0,0) {\(p\)\\initial value};
+  \node[tome box] (h) at (3.6,0) {\(h\)\\header \(\phi\)};
+  \node[tome box] (r) at (7.2,0) {\(r\)\\return in \(G\)};
+  \node[tome box] (u) at (3.6,-2.45) {\(u\)\\step};
+  \draw[tome arrow] (p) -- node[above] {\(1\times2\)} (h);
+  \draw[tome arrow] (h) -- node[above] {\(1\times2\)} (r);
+  \draw[tome arrow] (h.south west) to[out=-105,in=105]
+    node[left] {\(8\times2\)} (u.north west);
+  \draw[tome arrow] (u.north east) to[out=75,in=-75]
+    node[right] {\(8\times2\)} (h.south east);
+  \node at (3.6,-3.5) {Mismatch charge = traversal count \(\times\) conversion cost};
+\end{tikzpicture}
+\caption{Both recurrence edges are hot in the modeled workload. Choosing \(A\) for \(p,h,u\) pays just the exit conversion; matching classes on all other edges cost zero.}
+\label{fig:visual-277}
+\end{figure}
+
+\begin{verbatim}
+# Charge each mismatch at the frequency of its actual edge.
+p -> h: 2;     h -> u: 16;   u -> h: 16;   h -> r: 2
+u unary: G=24, A=8.  Matching classes cost 0 on every edge.
+
+# For each (h,u), minimize p first; r is fixed to G.
+ (h,u)     best p       minimum total
+ (G,G)       G          1 + 24          = 25
+ (G,A)       G          1 +  8 + 32     = 41
+ (A,G)       A          2 + 24 + 32 + 2 = 60
+ (A,A)       A          2 +  8 +  2     = 12
+\end{verbatim}
+
+Thus the least-cost solution keeps the recurrence in \(A\) and copies to \(G\) once on the way out. If the target has no legal \(A\)-to-\(G\) transfer, replace the corresponding entries by \(+\infty\). The choices with \(h\) in \(A\) then fail at the return and the choice with \(u\) alone in \(A\) fails on the backedge. The all-\(G\) assignment remains feasible at 25. The invariant is that every finite-cost edge admits a concrete implementation with equal values on the two sides of the interface. Counting cheapest defaults while discarding the incompatible edges would not preserve that invariant.
+
+\section{Reduce what is exact; identify what is not}
+
+The original SSA-graph paper describes a reduction phase followed by back-propagation. For example, a decision \(v\) interacting only with \(u\) can be removed: for each alternative of \(u\), add the minimum of \(c_v+C_{uv}\) over alternatives of \(v\) to \(u\)'s unary cost. Retain the minimizing choice so it can be restored. This is exactly the calculation for \(p\) in the table. A degree-two elimination can similarly induce a new pair table. Higher-degree elimination may induce a cost over more than two remaining decisions, so general PBQP is not just tree dynamic programming. If a heuristic fixes one of those decisions, verify the assignment and report it as feasible rather than proven optimal. Recover with a verified baseline if a bounded search fails to provide a legal cover.
+
+\section{Tie a multi-operation choice together}
+
+With several covered roots, independent per-node choices can select half an instruction. Hjort Blindell describes Ebner et al.'s extension using complex-rule instances and local proxy choices \cite[chapter~5]{blindell2016instruction}. In a simple implementation with instance-specific proxies, give each complex match an on/off decision. Pairwise constraints force every participating node to choose that match's proxy when it is on, and forbid those proxies when it is off. If proxies have zero base cost, charge the actual instruction once at the on decision. Single coverage of participating nodes then excludes overlapping matches. It does not guarantee schedulability: collapsing operation groups can create a dependency cycle, potentially involving more than two selected matches. Check the resulting dependencies and order, distinguishing genuine loop-carried edges from impossible same-iteration cycles. A minimum PBQP score is only a minimum for the decisions, compatibility constraints, and costs represented in the model.

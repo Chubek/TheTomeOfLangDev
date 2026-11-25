@@ -1,0 +1,68 @@
+%% chapter-262.ltx -- Machine Descriptions and Instruction Semantics
+% Source: blindel-instrselect-book.txt
+
+\section{Describe the state transition, not the spelling}
+
+A machine description can answer three different questions about a form: whether its operands and target features allow it, what executing it does, and how to represent it in the output. An assembler can accept a mnemonic without knowing what program effect the selector intends. A selector needs the behavior as well as the operand restrictions. A separate policy can rank legal forms, but timing and resource estimates must not change the meaning of the opcode or relax a constraint.
+
+Blindell's account of Miller's D-MACS provides an early example of separating such knowledge from the expander. The description declares register classes and paths that transfer values between classes or memory; the generated automata guide the emission of transfers until the operands are in permissible locations (\cite[chapter~2, section~2.2.2]{blindell2016instruction}). Blindell also describes Fraser's register transfer lists, which say how an instruction updates observable machine state (\cite[chapter~2, section~2.3.1]{blindell2016instruction}). These describe different aspects of the same target: placing an operand in a suitable register makes a form usable, but it does not establish that the form implements the required operation.
+
+\section{A postincrement load has two results}
+
+Take a toy machine with 32-bit registers and byte-addressed memory. Its optional \texttt{PULL16 d,p} reads two little-endian bytes using old \texttt{p}, zero-extends the resulting word into \texttt{d}, and advances \texttt{p} by two modulo $2^{32}$. Both operands are general registers and must denote different physical registers. The description marks the feature and the distinct-register rule as legality conditions. There are no status flags or device-memory effects in this model. For a mapped access, both updates commit together; for a fault, neither commits. The first failing condition determines the fault: an odd pointer reports alignment before mapping is checked.
+
+Blindell classifies a load with pointer update as \emph{multi-output}: both the data value and the updated pointer are accessible to later instructions. He distinguishes this from disjoint outputs, whose computations do not share inputs, as in independent SIMD lanes (\cite[chapter~1, section~1.2.1]{blindell2016instruction}). Here the old pointer is used twice, for the address and the increment. Even when the IR has no subsequent use for the updated pointer, the architectural write has not disappeared. If old \texttt{p} is still needed after the load, the allocator must keep that value elsewhere or the selector must use a form without writeback.
+
+Treat the load and its updates as one transition with a normal and a fault outcome. In a declarative description, right-hand sides read entry-state values unless an ordering is explicitly specified. Describing the load using the updated pointer would change the access. Describing the pointer write as unconditional would change fault behavior. Describing the register restriction as a scheduling hint would let the allocator generate an unencodable operand pair.
+
+% Annotated walkthrough
+\section{Test the successful and faulting transitions}
+
+Consider an independent interpreter for this description. A fault report carries the access's base address; the interpreter exposes the register state at the report. Check the feature and distinctness before execution. The remaining guards are runtime checks, not predicates that the compiler must prove before using the instruction to implement a load with the same fault contract.
+
+\begin{verbatim}
+require feature(PULL16) and Reg32(d) and Reg32(p) and d != p
+a = old.R[p]                      # All address uses read old p.
+if a is odd: fault(Alignment, a)
+if either byte is unmapped: fault(Unmapped, a)
+w = M[a] + 256 * M[a+1]
+commit R[d] = w, R[p] = (a+2) mod 2^32
+                                  # No write precedes either check.
+
+p=0xFFFFFFFE, bytes=[0x34,0x12] -> d=0x00001234, p=0
+p=0x00001000, second byte unmapped -> both registers unchanged
+p=0x00001001, unmapped -> Alignment, not Unmapped
+\end{verbatim}
+
+The first access uses the last two addresses in memory. Its sign-independent data calculation is $52+256\cdot18=4660$, and the increment wraps to zero. Another useful data test reads bytes \texttt{FF 80} and requires \texttt{0x000080FF}, not \texttt{0xFFFF80FF}. Initialize \texttt{d} to a sentinel for both fault cases. An implementation that commits \texttt{p} early could leave a correct fault report while still corrupting the register state. An attempted \texttt{PULL16 r4,r4} must instead fail before emission, not become a legal instruction with an arbitrary priority between writes.
+
+\section{Use the description at more than one boundary}
+
+\Cref{fig:visual-262} orders the runtime checks for an already legal \texttt{PULL16}. Both fault exits precede the register writes.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram, transition box/.style={tome box,text width=3.4cm}]
+  \node[transition box] (align) at (0,0) {Is old \texttt{p} even?};
+  \node[transition box] (mapping) at (0,-1.55) {Are both bytes mapped?};
+  \node[transition box] (commit) at (0,-3.1) {Read both bytes and\\commit \texttt{d}, \texttt{p} together};
+  \node[transition box] (afault) at (5.7,0) {Alignment fault};
+  \node[transition box] (mfault) at (5.7,-1.55) {Unmapped fault};
+  \draw[tome arrow] (align)--node[left,font=\footnotesize]{yes} (mapping);
+  \draw[tome arrow] (mapping)--node[left,font=\footnotesize]{yes} (commit);
+  \draw[tome dashed] (align)--node[above,font=\footnotesize]{no} (afault);
+  \draw[tome dashed] (mapping)--node[above,font=\footnotesize]{no} (mfault);
+  \draw[decorate,decoration={brace,mirror,amplitude=4pt}]
+    (3.83,-2.2)--(7.57,-2.2);
+  \node[below,font=\footnotesize] at (5.7,-2.4) {Neither register changes};
+\end{tikzpicture}
+\caption{The old pointer supplies the access address. An odd, unmapped pointer reports alignment without checking mapping; only the success path writes back the pointer.}
+\label{fig:visual-262}
+\end{figure}
+
+Suppose the baseline implements the IR with an ordinary load followed by a nonfaulting pointer increment. If the load uses the old pointer and faults without writing anything, it is valid to merge the pair when no observation between those instructions is required and the fault outcomes agree. If the original contract requires an intervening observation, or requires the increment before a possibly faulting read, the combined form is not justified by the success equation alone. Read and write sets are useful for finding the candidate; they do not express the conditions under which the writes occur.
+
+At the selector interface, name old \texttt{p} and new \texttt{p} as distinct values, even though the instruction ties them to the same physical location. Record that \texttt{d} must not overlap that location. The allocator can then preserve the old value by inserting a copy when needed, and the emitter can check distinctness again on the assigned operands. If a transformation discards the pointer result, keep the write or clobber in the machine-level form. Forgetting it makes the description look simpler at the expense of later passes that rely on knowing what an instruction destroys.
+
+A practical backend can generate operand checks and semantic tests from one description. Still test at least some cases against an independent interpretation of the architecture: an expander and a checker generated from the same mistaken transition can agree on the wrong answer. Try a disabled feature, tied physical operands, a successful update, and a fault before commit. Chapter~\ref{ch:ext-264} uses similarly explicit instruction effects to recognize combined implementations, while keeping semantic equivalence and form recognition as separate checks.

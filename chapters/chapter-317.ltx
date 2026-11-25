@@ -1,0 +1,77 @@
+% Source: ir-il-for-datapath-gen.txt
+% Source: c-to-async-dataflow.txt
+
+\section{A Legal Cover Depends on the Target}
+
+Technology mapping replaces generic logic with primitives in a target library. It preserves the logic and sequential interface, subject to the behavior specified for unknowns, initialization, and black boxes. It must also map every state-holding construct to a cell with compatible clock, reset, enable, scan, and initialization semantics; a combinationally equivalent replacement with a different reset priority is not an equivalent sequential implementation. A mapped netlist says which cells are connected; it does not say where they fit or how long their wires will be. Some target passes do higher-level work first, such as recognizing adders for carry chains or matching RAM and multiplier blocks before the relevant word-level structure is lost.
+
+In an FPGA, a mapper can cover a cone by a lookup table (LUT) if the cone has few enough distinct inputs. In an ASIC, coverage depends on whether a cell in the available library computes the needed function with particular pin polarities. A library can offer multiple drive strengths of one cell, each with different delay and area. Neither type of mapper generally tries every partition of the entire netlist. It enumerates manageable subsets, estimates arrival times and costs, and may recover area after identifying timing-critical regions.
+
+The COMRADE flow described by Kasprzyk and colleagues calls the GLACE module generator; resource decisions begin well before all expressions become scalar gates. The asynchronous CASH flow of Venkataramani and colleagues emits structural Verilog and then performs technology synthesis and physical implementation. Thus even a lower-level-looking HDL file need not be target mapped. Examine the contents of the file and its cell dependencies rather than classifying it by its extension.
+
+% Annotated walkthrough
+\section{Encode One Function in a LUT and in Standard Cells}
+
+Consider \(f=a\land(b\lor c)\). For a LUT indexed with \(a\) as the low address bit, \(i=a+2b+4c\). Exactly the indices \(3,5,7\) evaluate to \(1\), so the low eight configuration bits have value \(2^3+2^5+2^7=\texttt{0xA8}\). An iCE40 four-input LUT with its fourth pin tied low can be instantiated using Verilog-2005 technology-cell syntax:
+
+\begin{verbatim}
+module f_ice40(input a, b, c, output f);
+    SB_LUT4 #(.LUT_INIT(16'h00A8)) lut (
+        .I0(a), .I1(b), .I2(c), .I3(1'b0), .O(f)
+    );
+endmodule
+\end{verbatim}
+
+The upper byte is unused only because \texttt{I3} is tied low. This source depends on the iCE40 simulation model for functional simulation and on the device library for implementation. If writing generic source for multiple targets, use \verb|assign f = a & (b | c);| instead. An ASIC library with an OR-AND-invert cell can make \(\neg f\) in one cell and use an inverter for \(f\); if it lacks that cell the mapper must use a different cover. A neighboring negative-polarity consumer could use \(\neg f\) directly. \Cref{fig:visual-317} compares these choices without assuming equal delays or areas.
+
+Pseudocode for choosing a combinational cover:
+
+\begin{verbatim}
+for root in topological_order(net):
+    for cut in enumerate_bounded_cuts(root):
+        table = evaluate_function(root, cut)
+        for match in target_matches(table):
+            score = delay_and_cost(match, arrivals_at(cut))
+            record_candidate(root, match, score)
+instantiate_cover_from_sinks()  # overlapping cuts need not all be used
+check_netlist_equivalence()     # include primitive functional models
+\end{verbatim}
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (f) at (0,0) {\(a\land(b\lor c)\)};
+  \node[tome box] (lut) at (4.3,0.85) {iCE40 LUT\\\texttt{00A8}};
+  \node[tome box] (oai) at (4.3,-0.85) {ASIC OR-AND-invert\\outputs \(\neg f\)};
+  \node[tome box] (inv) at (7.65,-0.85) {Inverter\\outputs \(f\)};
+  \draw[tome arrow] (f.east) -- (lut.west);
+  \draw[tome arrow] (f.east) -- (oai.west);
+  \draw[tome arrow] (oai) -- (inv);
+\end{tikzpicture}
+\caption{One three-input function admits different covers in different libraries. The ASIC cover shown requires both the inverting compound cell and an inverter to produce the positive output.}
+\label{fig:visual-317}
+\end{figure}
+
+\section{Use the Mapped Inventory, Not an Abstract Gate Count}
+
+With a generic module named \texttt{top} in \texttt{top.v}, the \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/techmap_synth.html}{Yosys technology-mapping guide} and its \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/cell_libs.html}{cell-library guide} motivate two distinct scripts. For iCE40:
+
+\begin{verbatim}
+read_verilog top.v
+synth_ice40 -top top -json top_ice40.json
+\end{verbatim}
+
+For a simple ASIC design with a real target Liberty file \texttt{cells.lib}, start with a clean Yosys process:
+
+\begin{verbatim}
+read_verilog top.v
+synth -top top -noabc
+dfflibmap -liberty cells.lib
+abc -liberty cells.lib
+check
+stat -liberty cells.lib
+write_verilog -noattr top_stdcell.v
+\end{verbatim}
+
+The second script assumes the library covers the required sequential cells; real flows also handle memories, scan, tie cells, clocks, and physical-only cells. The \texttt{check} command catches obvious undriven or multiply driven connections, but it does not prove that no generic cell remains or that a particular library cell has the intended reset semantics. Check the cell inventory and unexpected generic cells before handing the netlist onward. Inspect LUTs, carry chains, hard blocks and register counts on FPGA, and separate cell area, buffer insertion and utilization on ASIC. Delay estimates at this stage use an incomplete physical model; the winning cover can change if placement puts loads far apart. Even exact Boolean equivalence does not guarantee fitting a package or meeting timing at a specified operating corner.

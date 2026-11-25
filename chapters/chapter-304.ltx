@@ -1,0 +1,92 @@
+% Source: c-to-async-dataflow.txt
+
+\section{A Module Is a Definition, Not a Call}
+
+A module collects a boundary, local declarations, and concurrent structure or behavior. A port defines the direction from that boundary's point of view. An instance installs a copy of the definition in the elaborated hierarchy; it is not a function invocation that executes and returns. Two instances with identical input connections may see the same values, but they still have distinct hierarchical identities and, if the module contains registers, distinct state. A synthesizer can sometimes merge equivalent logic after it reasons about those instances. That optimization is not part of module instantiation.
+
+Venkataramani, Budiu, Chelcea, and Goldstein use structural Verilog for the output of their asynchronous compiler. In \emph{C to Asynchronous Dataflow Circuits}, that output describes distributed operators and their connections, not the order in which a CPU visits those operators. Small synchronous designs also benefit from separating a reusable module's data dependencies from the hierarchy that wires it.
+
+\section{A Verilog-2005 Boundary and a SystemVerilog Body}
+
+The following Verilog-2005 modules use ANSI-style port declarations, continuous assignments, and named port associations \cite{ieee1364verilog}. They simulate as written and are ordinary combinational RTL for synthesis. The top computes \(y=(a\mathbin{\&}\textit{mask})\mathbin{\oplus}b\) bit by bit for known operands.
+
+\begin{verbatim}
+module mask4 (
+    input  wire [3:0] a, mask,
+    output wire [3:0] masked
+);
+    assign masked = a & mask;
+endmodule
+
+module mix4 (
+    input  wire [3:0] a, b, mask,
+    output wire [3:0] y
+);
+    wire [3:0] kept;
+    mask4 u_mask (.a(a), .mask(mask), .masked(kept));
+    assign y = kept ^ b;
+endmodule
+\end{verbatim}
+
+In \verb|.masked(kept)| the name after the dot is the child's formal port; the expression in parentheses is the connection in the parent. Selecting \texttt{mix4} as top gives a \texttt{u\_mask} child. Selecting \texttt{mask4} by itself does not instantiate a parent. Named associations survive a reordering of the declarations, but they are not a substitute for width checks: a connection with a mismatched width can undergo extension or truncation even though its name is correct. Declare intermediate widths explicitly and treat unexpected width diagnostics as defects.
+
+Here is a SystemVerilog variant of the child (IEEE 1800-2023), also for simulation and ordinary synthesis \cite{ieee1800systemverilog}. Substitute the module name at the instantiation to use it. \texttt{output var logic} explicitly declares a variable port.
+
+\begin{verbatim}
+module mask4_sv (
+    input  wire logic [3:0] a, mask,
+    output var  logic [3:0] masked
+);
+    always_comb begin
+        masked = a & mask;
+    end
+endmodule
+\end{verbatim}
+
+In SystemVerilog, the four-state data type \texttt{logic} and the object kind (net or variable) are different concepts; \verb|wire logic| makes both explicit. Neither \texttt{logic} nor Verilog's \texttt{reg} names a flip-flop. Here the variable has a single combinational procedural writer, and it receives a value on every execution. The standard's \verb|always_comb| supplies implicit sensitivity, runs once at time zero, and restricts writing its assigned variables from other processes. Compile the second definition in SystemVerilog mode, not as Verilog-2005. The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/cmd/index_frontends.html}{Yosys frontend reference} documents \verb|read_verilog -sv| and the distinction between a tool's supported subset and the language.
+
+Port direction and object kind also answer different questions. The child drives its output from inside; the parent should read that connection, not independently assign a second value to it. An inadvertent second driver on a resolved net is not a reliable priority mechanism. In code using implicit nets, even a misspelled actual connection can create a new scalar wire rather than name the intended vector. An explicit declaration policy, for example \verb|`default_nettype none| with the surrounding project's default restored at the file boundary, can turn such a typo into a diagnostic.
+
+% Annotated walkthrough
+\section{Trace Drivers Across the Boundary}
+
+The following is a connectivity and settled-value check, not an event-scheduling algorithm. With known inputs, evaluate each edge of \Cref{fig:visual-304} and compare the internal net with the module boundary.
+
+\begin{verbatim}
+select mix4 as the root
+link u_mask.masked to kept       # one driver for the parent net
+drive a=1010, mask=1100, b=0011
+after settling:
+    expect kept == 1000          # AND belongs to the child
+    expect y    == 1011          # XOR belongs to the parent
+change only b to 0000
+after settling:
+    expect kept == 1000          # no dependence on b
+    expect y    == 1000
+\end{verbatim}
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \draw[rounded corners,dashed] (-4.55,-1.25) rectangle (4.55,1.4);
+  \node[anchor=west] at (-4.45,1.15) {\texttt{mix4}};
+  \node[tome box] (mask) at (-1.7,.15) {\texttt{u\_mask}\\bitwise AND};
+  \node[tome box] (xor) at (2,.15) {bitwise XOR};
+  \node (a) at (-4.2,.4) {\texttt{a}};
+  \node (m) at (-4.2,-.15) {\texttt{mask}};
+  \node (b) at (.1,-.85) {\texttt{b}};
+  \node (y) at (4.1,.15) {\texttt{y}};
+  \draw[tome arrow] (a) -- ([yshift=5pt]mask.west);
+  \draw[tome arrow] (m) -- ([yshift=-5pt]mask.west);
+  \draw[tome arrow] (mask) -- node[above] {\texttt{kept}} (xor);
+  \draw[tome arrow] (b) -| (xor.south);
+  \draw[tome arrow] (xor) -- (y);
+\end{tikzpicture}
+\caption{The child drives the parent's internal net. The XOR reacts to changes on either the internal net or port \texttt{b}; it does not call or wait for the child.}
+\label{fig:visual-304}
+\end{figure}
+
+An immediate read after driving the ports in a testbench may observe old values because evaluation and propagation have not yet settled. That is a simulation observation problem, not a reason to insert hardware registers. Likewise, a flattened synthesized netlist may not preserve \texttt{kept} as a named object: it can combine the AND and XOR bit functions into equivalent logic. The boundary behavior is the contract here.
+
+As a second check, tie \texttt{mask} high in a test parent. For all binary values the child now returns \texttt{a} unchanged, leaving only the XOR. A flattened netlist may optimize away that instance altogether. If the instance disappears under this condition, compare the observable result before assuming a binding failure. If its output never influenced \texttt{y} even with a changing mask, check the port associations and connectivity first.

@@ -1,0 +1,76 @@
+% Source: semantics-of-pred-logic-proglang.txt
+% Source: dataflow-analysis-theory-and-practice.txt
+
+\section{Compile Rules into Relations and Joins}
+
+A bottom-up engine materializes facts rather than expanding an individual goal. A rule body is a join of the relations it names: repeated variables constrain columns to agree, constants select matching rows, and head variables specify the output columns. Recursion feeds new rows into subsequent joins. Consider this complete Souffl\'e program for paths in a toy compiler's dependency graph. Node names are constants, not terms describing whole paths.
+
+\begin{verbatim}
+.decl edge(src:symbol, dst:symbol)
+.decl reach(src:symbol, dst:symbol)
+.output reach
+
+edge("a", "b").
+edge("a", "c").
+edge("b", "d").
+edge("c", "d").
+edge("d", "e").
+
+reach(x, y) :- edge(x, y).
+reach(x, z) :- reach(x, y), edge(y, z).
+\end{verbatim}
+
+The recursive rule joins on \texttt{y} and projects \texttt{(x,z)}. The first rule seeds nonempty paths of length one. A naive round joins the entire current \texttt{reach} relation with \texttt{edge} and unions the result back in. Once a pair was tested against a stable \texttt{edge} relation, doing exactly the same join on that pair next round cannot produce a new result. Semi-naive evaluation exploits that fact without changing the least model; Abiteboul, Hull, and Vianu treat this distinction between database semantics and evaluation \cite{abiteboul1995foundations}.
+
+% Annotated walkthrough
+\section{Walkthrough: Extend Only the Newly Discovered Paths}
+
+The pseudocode is for this linear recursion, with one occurrence of \texttt{reach} in the recursive body. It uses sets throughout. Build a lookup table on the source column of the fixed relation \texttt{edge}; it maps \texttt{d}, for instance, to the successor set \(\{\texttt{e}\}\).
+
+\begin{verbatim}
+known := set(edge)
+delta := known
+while delta is not empty:
+    proposed := empty set
+    for (x, y) in delta:
+        for z in successors[y]:          # join on the middle node
+            proposed.add((x, z))        # coalesce repeated witnesses
+    next := proposed minus known        # never schedule an old pair
+    known := known union next
+    delta := next
+return known
+\end{verbatim}
+
+At loop entry \texttt{delta} consists exactly of the pairs first inserted in the preceding stage (or the seed); every older pair has already been joined with all its successors. Joining the five seed pairs emits four witnesses: two for \texttt{(a,d)}, one for \texttt{(b,e)}, and one for \texttt{(c,e)}. Only three pairs enter the next delta. Their join proposes just \texttt{(a,e)}, because the other two pairs end at \texttt{e}, which has no successors. The next join proposes nothing. The final table has nine rows. \Cref{fig:visual-344} shows what is scheduled, not every tuple already in memory.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=2.1cm] (one) at (0,0) {Five edges\\seed};
+  \node[tome box,minimum width=3.3cm] (two) at (3.6,0)
+    {\texttt{(a,d), (b,e), (c,e)}\\three new pairs};
+  \node[tome box,minimum width=2.1cm] (three) at (7.4,0)
+    {\texttt{(a,e)}\\one new pair};
+  \node[tome box accent] (end) at (7.4,-1.7) {Empty delta};
+  \draw[tome arrow] (one) -- (two);
+  \draw[tome arrow] (two) -- (three);
+  \draw[tome arrow] (three) -- (end);
+\end{tikzpicture}
+\caption{Successive deltas in the dependency analysis. Both witnesses for \texttt{(a,d)} feed the same set insertion; duplicate proof paths do not cause duplicate scheduling.}
+\label{fig:visual-344}
+\end{figure}
+
+At termination every stored pair has had all of its extensions considered. Thus the result is closed under both rules. Only facts supported by a rule enter the result, so by induction it is contained in every model. Together these properties identify it as the least model, not a table of all proofs. This argument applies even if a cycle creates infinitely many paths: the finite set of pairs bounds the number of insertions.
+
+\section{Multiple Recursive Inputs Need Multiple Delta Variants}
+
+For a recursive rule with two occurrences of the same relation, write \(R_{\mathrm{new}} = R_{\mathrm{old}} \cup \Delta\), with \(R_{\mathrm{old}}\) the accumulated rows before the most recent insertion. Joining only \(\Delta\) with \(\Delta\) misses pairs where a new row matches an older row. On the other hand, the join of two old inputs has already been considered. A disjoint split of input combinations is \(\Delta \mathbin{\operatorname{join}} R_{\mathrm{new}}\) together with \(R_{\mathrm{old}}\mathbin{\operatorname{join}}\Delta\), using the rule's join constraints. Projection can still produce duplicate heads, so subtract the accumulated head relation and deduplicate before scheduling. In a mutually recursive component, use the old, new, and delta tables for each body occurrence of a predicate defined in that component. Stable inputs do not need a delta variant.
+
+For example, replace the recursive rule above by \verb|reach(x, z) :- reach(x, y), reach(y, z).|. After joining seed pairs, \texttt{(a,d)} is new but \texttt{(d,e)} is old. Their combination belongs in the first variant. Likewise \texttt{(a,b)} is old and \texttt{(b,e)} is new, so the second variant can independently derive the same \texttt{(a,e)} tuple. Taking the first changed body occurrence partitions the join work; it does not partition the possible output tuples.
+
+\section{Keep the Delta Separate from the Storage Strategy}
+
+The fixed-point connection is due to van Emden and Kowalski's account of definite clauses. The efficiency argument is closely related to the change-driven work lists in Khedker, Sanyal, and Karkare's \emph{Data Flow Analysis: Theory and Practice}: propagate a change only to places where it can matter. A production implementation chooses indexes and join order from the rule's equality keys and relation sizes. The quadratic number of possible stored pairs still applies; semi-naive evaluation avoids old-input work but does not make the closure small. A useful test compares output sets against naive saturation on a graph with converging paths and a cycle. Applying the algorithm to deletions requires something more: removing one edge need not invalidate a reachable pair if another path still supports it.
+
+The compiler-facing result is the closure, not the chosen delta schedule. Keep the schedule and its indexes behind the analysis interface so that a client such as a dependency checker sees stable tuples while the implementation changes its join plan.

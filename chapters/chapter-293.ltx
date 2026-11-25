@@ -1,0 +1,63 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{What the static link leaves unfinished}
+
+Mapping an image puts bytes at addresses; relocation makes particular fields inside those bytes hold useful values. The static linker can finish a branch between two known positions in one image: moving both positions by the same amount leaves their distance unchanged. But an initialized pointer to an object in the same image must contain that object's \emph{runtime} address. A pointer to a symbol supplied by a different image additionally needs the identity of the chosen definition. Levine's example in Chapter~8 adds a single displacement to the marked locations of an image loaded as a unit \cite[chapter~8]{levine2000linkers}. On current Linux, the kernel maps the main ELF executable and its interpreter; for an ordinary dynamic executable it is the user-space interpreter, not the kernel ELF mapper, that processes the program's dynamic symbol relocations.
+
+The interpreter finds the dynamic table through \texttt{PT\_DYNAMIC}. The table's tags describe the resident relocation tables and their entry or byte sizes, as well as the symbol and string tables \cite[chapter~10]{levine2000linkers}. For instance, \texttt{DT\_RELASZ} measures bytes, so the count is obtained by dividing by the appropriate entry size after checking consistency. A section named \texttt{.rela.dyn} helps an inspector display those entries, but is not how the interpreter locates them. A relocation's \texttt{r\_offset} in a shared object or PIE denotes a link-time virtual address. It is not the file offset from which to read the word, nor is it the offset of the relocation record within the table.
+
+\section{A type selects the computation}
+
+Write $B$ for the referencing image's bias, $P$ for the runtime address of the field to change, $S$ for the resolved symbol value when needed, and $A$ for the addend. The AMD64 ABI supplement (\S4.4) gives the formulas and field widths. An ordinary x86-64 \texttt{R\_X86\_64\_RELATIVE} writes the 64-bit value $B+A$ to $P$ and needs no symbol lookup. An \texttt{R\_X86\_64\_GLOB\_DAT} writes the symbol value $S$ into a slot, often in the GOT; an \texttt{R\_X86\_64\_64} writes $S+A$. For a normal defined data symbol in another image, $S$ is the provider's bias plus the symbol's linked value. Adding the consumer's bias to $S$ would rebase a value that was already computed in runtime coordinates.
+
+Levine's i386 examples show why the format matters as much as the formula. A \texttt{REL} record has an implicit addend in the field it describes; a \texttt{RELA} record carries an explicit addend. The AMD64 examples here use conventional \texttt{RELA}, not a packed relative relocation format. Type still matters even if two types use the same field width: a PLT jump slot has binding-time rules different from a startup data slot. Thread-local offsets and indirect function resolvers also have separate rules; neither can be modeled as an ordinary data symbol address.
+
+% Annotated walkthrough
+\section{Calculate two writes into one image}
+
+This model handles only two relocation types and omits the lazy PLT pass. Interpret all address arithmetic with bounds checks and assume the destinations are designated relocation slots in private storage writable at this stage. Reject unimplemented types instead of falling back to adding the bias.
+
+\begin{verbatim}
+P = checked_add(B, r_offset)
+require [P, P+8) is an allowed destination
+if type == RELATIVE:
+    require symbol_index == 0   # no lookup and no provider
+    value = checked_add(B, r_addend)
+else if type == GLOB_DAT:
+    value = resolve(symbol)     # already in runtime coordinates
+else:
+    report unsupported type
+store_le64(P, value)
+\end{verbatim}
+
+Set $B$ to \texttt{0x70000000}. A relative relocation at \texttt{0x4030} with addend \texttt{0x2050} writes \texttt{0x70002050} at \texttt{0x70004030}. Its eight little-endian bytes are \texttt{50 20 00 70 00 00 00 00}. A global-data relocation at \texttt{0x4038} resolved to a provider with bias \texttt{0x71000000} and linked value \texttt{0x3018} writes \texttt{0x71003018} at \texttt{0x70004038}. Move just the consumer up by \texttt{0x10000}, holding the provider and scope fixed. Both destinations move and the relative value moves, but the resolved global value stays the same. Also test a destination four bytes before the end of an allowed range: checking only its starting address would admit an eight-byte write extending past that range. The invariant is that type and image determine both the coordinate system of the result and the full extent of the write.
+
+\Cref{fig:visual-293} traces the type-dependent value separately from the place where the loader writes it.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box,minimum width=3.95cm] (froma) at (0,0)
+    {\texttt{RELATIVE}\\Consumer bias \(+A\)};
+  \node[tome box,minimum width=3.95cm] (fromb) at (0,-1.7)
+    {\texttt{GLOB\_DAT}\\Provider bias \(+s\)};
+  \node[tome box,minimum width=4.65cm] (a) at (6.3,0)
+    {At \texttt{0x70004030}\\write \texttt{0x70002050}};
+  \node[tome box,minimum width=4.65cm] (b) at (6.3,-1.7)
+    {At \texttt{0x70004038}\\write \texttt{0x71003018}};
+  \draw[tome arrow] (froma) -- node[above] {\(B+A\)} (a);
+  \draw[tome arrow] (fromb) -- node[above] {\(S\)} (b);
+  \node[align=center] at (6.3,-2.95)
+    {Both destinations use the consumer's bias:\\\(P=B+\texttt{r\_offset}\).};
+\end{tikzpicture}
+\caption{The two writes go into the same consumer image, but only the relative relocation derives its value from that image's load bias. Here \(s\) is the provider's linked symbol value.}
+\label{fig:visual-293}
+\end{figure}
+
+\section{Observe the work the loader actually inherits}
+
+Build an AMD64 fixture from \texttt{static int local = 7;} and \texttt{int *saved = \&local;}, with \texttt{cc -fPIC -shared ptr.c -o libptr.so}. Inspect \texttt{readelf -sW libptr.so} to locate the slot \texttt{saved} and then \texttt{readelf -rW libptr.so} to find the relative relocation for that slot. Other toolchain startup records are not part of the fixture. The numeric slot and addend vary; the addend should denote the linked address of \texttt{local}. The fact that the instructions are position-independent does not remove this initialized pointer.
+
+Writes to private file mappings can dirty whole pages even when the slot itself is small. Keeping these writes out of code preserves shareable code pages. On GNU/Linux, when an image declares a \texttt{PT\_GNU\_RELRO} range, the dynamic linker makes the eligible pages read-only after relocation. Binding all eligible PLT slots early can let the link editor arrange for those slots to be in the protected range too. The final mapping permissions thus need not be identical to the writable permissions used during initialization.

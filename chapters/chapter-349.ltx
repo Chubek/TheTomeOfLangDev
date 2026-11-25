@@ -1,0 +1,73 @@
+% Source: dataflow-anaylsis-book-theory-practice.txt
+% Source: sca-abstract-interp-frameworks.txt
+% Source: speeding-up-dataflow-analysis-with-pointer-anlysis.txt
+
+\section{Put the Analysis Coordinates in the Relations}
+
+A forward reaching-definitions analysis asks which assignments might supply a value at a program point. A flow-insensitive points-to analysis asks which objects might be denoted by a variable anywhere in a function. Both can be written as recursive rules, but the coordinates differ. In the first, a statement ID is essential; in the second, dropping the statement ID intentionally trades precision for a smaller abstract domain. Khedker, Sanyal, and Karkare distinguish reaching definitions from other dataflow problems by its flow direction and union merge. Cousot and Cousot's abstract interpretation frameworks explain why the choice of order and approximation matters independently of how a solver stores an abstract state.
+
+Use the following finite Datalog notation throughout: lowercase identifiers are constants or predicate names, uppercase identifiers are variables, and \texttt{not} denotes stratified negation. A diamond assigns to \(x\) in its left branch but leaves the original assignment intact in its right branch. The declaration \verb|def(d0,x)| names an assignment site, not the runtime number stored in \(x\).
+
+\begin{verbatim}
+edge(a,b). edge(a,c). edge(b,j). edge(c,j).
+def(d0,x). def(d1,x).
+gen(a,d0). gen(b,d1).
+
+kill(N,D) :- gen(N,G), def(G,V), def(D,V).
+rin(N,D) :- edge(P,N), rout(P,D).
+rout(N,D) :- gen(N,D).
+rout(N,D) :- rin(N,D), not kill(N,D).
+\end{verbatim}
+
+Thus \verb|rin(b,d0)| holds, but \verb|rout(b,d0)| does not; \(b\) generates \verb|rout(b,d1)|. Both \verb|rin(j,d0)| and \verb|rin(j,d1)| hold. Including the generated definition itself in \texttt{kill} is harmless since \texttt{gen} reintroduces it. The entry has no predecessor and no incoming definitions in this example; a language that models parameter definitions would seed those explicitly. With \texttt{kill} fixed, \(G\cup(S\setminus K)\) is monotone in \(S\) under inclusion even though it is antitone in \(K\). Changing the IR to add a definition on the right arm can therefore remove \verb|rin(j,d0)| from the answer.
+
+\section{A Store and Load Need a Common Abstract Object}
+
+Now consider a separate pointer fragment in the same toy language. Objects \texttt{left} and \texttt{right} have a single cell each; think of them as distinct abstract allocation sites. The IR facts for address, copy, store and load are extracted from \verb|p=&left; q=&right; r=p; *r=q; s=*p|. The store and load facts list their destination and source operands in that order.
+
+\begin{verbatim}
+addr(p,left). addr(q,right). copy(r,p).
+store(r,q). load(s,p).
+
+pt(V,O) :- addr(V,O).
+pt(D,O) :- copy(D,S), pt(S,O).
+heap(O,T) :- store(P,Q), pt(P,O), pt(Q,T).
+pt(D,T) :- load(D,P), pt(P,O), heap(O,T).
+may_alias(P,Q) :- pt(P,O), pt(Q,O), P != Q.
+\end{verbatim}
+
+The closure adds \verb|pt(r,left)|, \verb|heap(left,right)|, and \verb|pt(s,right)|. It contains \verb|may_alias(q,s)| and \verb|may_alias(p,r)| (and their reverses), not \verb|may_alias(p,q)|. The two inputs to a store join describe the possible object written and possible pointer value written. A load joins the recorded heap contents with its receiver's possible targets. The store only adds possible contents; without statement order, erasing previous contents on a store is not justified. A flow-sensitive strong update needs a proof of a definite write to a single concrete cell at that point, not just a singleton abstract allocation-site set that might summarize several cells.
+
+\Cref{fig:visual-349} follows the join that produces the load's points-to answer.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (r) at (0,0) {\texttt{r} targets \texttt{left}};
+  \node[tome box] (q) at (0,-1.35) {\texttt{q} targets \texttt{right}};
+  \node[tome box dark] (h) at (4,-.675) {\texttt{left} may contain\\a pointer to \texttt{right}};
+  \node[tome box] (s) at (8,-.675) {\texttt{s} targets \texttt{right}};
+  \draw[tome arrow] (r.east) -- (h.west);
+  \draw[tome arrow] (q.east) -- (h.west);
+  \draw[tome arrow] (h) -- node[above]{load} (s);
+\end{tikzpicture}
+\caption{The load via \texttt{p} can read the value of the store via \texttt{r} because both accesses can go through the abstract object \texttt{left}.}
+\label{fig:visual-349}
+\end{figure}
+
+% Annotated walkthrough
+\section{Hand a Conservative Answer to a Client Pass}
+
+\begin{verbatim}
+points_to, contents := solve_pointer_rules(snapshot)
+for memory_read in snapshot.loads:
+    stores := all_stores_with_intersecting_targets(memory_read)
+    include_unknown_effects(stores)     # calls, escapes, missing models
+    pass_candidates_to_cfg_solver(stores)
+    # The CFG solver decides which candidates can reach this read.
+\end{verbatim}
+
+Add \verb|copy(r,q).| to model another assignment to \(r\). Recompute: \verb|pt(r,right)| and \verb|heap(right,right)| are new, and \verb|may_alias(r,q)| now holds; \verb|pt(s,right)| still holds. The flow-insensitive analysis treats assignments as alternative contributors regardless of their order. Deleting the added assignment removes the new facts, which means an incremental client must not use the old snapshot's store candidates as if they were current. Conversely, a candidate absent from a sound current result can be excluded from the client pass. Adams and colleagues describe a related staging choice, using a flow-insensitive value-flow representation to reduce the work of later, more precise dataflow analysis. The toy rule system here illustrates the conservative prefilter, not their particular pointer algorithm or an implementation claim about its solver.
+
+Such a relation is an input to a compiler optimization, not a proof that two concrete runtime locations alias. A client may safely omit stores ruled out by a sound current result, but it needs its own flow, context, and effect reasoning before transforming a retained candidate.

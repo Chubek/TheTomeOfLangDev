@@ -1,0 +1,88 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{A Call Whose Destination Is Not Yet Known}
+
+An assembler can encode a branch within a known layout, but it cannot predict where the dynamic loader will map a shared object's code. Even the static linker that builds the executable may not know which eligible definition of a symbol the runtime lookup will select. Levine distinguishes traditional static linking, historical static shared libraries that already committed to addresses at link time, and dynamic shared libraries that resolve remaining symbolic references at runtime \cite[chapter~9]{levine2000linkers}. Lazy procedure binding delays some of that last category of work further: a function is looked up only when its linkage entry is first used \cite[chapter~10]{levine2000linkers}.
+
+On x86-64 GNU/Linux, a conventional ELF call to an external function can go to a stub in the caller object's \emph{procedure linkage table} (PLT). The static linker knows the distance from the call site to that stub. The stub jumps indirectly through a slot in the caller object's \emph{global offset table} (GOT), which will hold an absolute address. Static linking thus resolves the call to an address within the object and leaves a dynamic relocation for the slot. The corresponding \texttt{R\_X86\_64\_JUMP\_SLOT} record identifies both the slot to fill and the dynamic symbol to look up. Neither the call instruction nor the stub text needs rewriting at runtime.
+
+Levine illustrates this scheme with 32-bit Intel ELF: his lazy stub communicates a relocation-table byte offset, and the reserved GOT words are four bytes wide. The x86-64 System V processor supplement, in its Procedure Linkage Table subsection, shows a relocation \emph{index} into the table designated by \texttt{DT\_JMPREL} and uses eight-byte GOT words. These details are not interchangeable. The trace below models the traditional x86-64 stub, not an instruction sequence required of every linker; alternate PLT layouts and compiler-generated GOT-indirect calls can implement different call paths.
+
+% Annotated walkthrough
+\section{Resolve One Slot Without Changing the Call Site}
+
+Take an illustrative caller with a PLT entry at \texttt{0x401030} and a slot at \texttt{0x404000}. At \texttt{0x401125}, a five-byte call pushes \texttt{0x40112a}. Assume \texttt{twice} is an ordinary function with a definition at \texttt{0x7f2200011120} in this process, and that its slot relocation has index \(0\) in this object's procedure relocation table.
+
+\begin{verbatim}
+call twice@PLT                 # pushes the caller's return PC
+twice@PLT:
+    jump through slot[twice]
+    push 0                     # unresolved slot points here
+    jump PLT0
+PLT0:
+    push object_cookie         # index 0 is local to this object
+    jump runtime_resolver
+runtime_resolver:
+    save call state; read the object's relocation 0
+    p = lookup(relocation.symbol, object_lookup_scope)
+    slot[twice] = p            # cache in data, not in code
+    restore state and remove resolver metadata
+    jump p                     # original return PC stays put
+\end{verbatim}
+
+Initially the slot points to \texttt{0x401036}, the instruction after the first indirect jump in this stub layout. The first call, with argument \(21\), follows the slow path, updates the slot to \texttt{0x7f2200011120}, and returns \(42\) to \texttt{0x40112a}. A second call with argument \(1\) jumps through the updated slot and returns \(2\), without going through the resolver. The resolver must preserve ABI-defined argument state (including any applicable vector arguments) and deliver the original return address and expected stack shape to the callee. This is a single-thread trace; the loader must also make binding safe if multiple threads reach the slot concurrently.
+
+\Cref{fig:visual-297} contrasts the two routes through the same PLT entry.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box,minimum width=3.2cm] (call) at (0,0)
+    {Call site\\\texttt{0x401125}};
+  \node[tome box,minimum width=3.2cm] (stub) at (4.05,0)
+    {\texttt{twice@PLT}\\\texttt{0x401030}};
+  \node[tome box,minimum width=3.2cm] (slot) at (8.15,0)
+    {GOT slot\\\texttt{0x404000}};
+  \node[tome box,minimum width=3.2cm] (resolve) at (4.05,-2.45)
+    {Stub tail and resolver\\look up \texttt{twice}};
+  \node[tome box,minimum width=3.2cm] (callee) at (8.15,-2.45)
+    {Callee\\\texttt{0x7f2200011120}};
+  \draw[tome arrow] (call) -- (stub);
+  \draw[tome arrow] (stub) -- (slot);
+  \draw[tome dashed] (slot.south west) --
+    node[above,sloped] {first call} (resolve.north east);
+  \draw[tome arrow] (resolve) -- (callee);
+  \draw[tome arrow] (slot.south) --
+    node[right] {later calls} (callee.north);
+  \node[align=center] at (4.05,-3.5) {Resolver updates the slot, not the call or stub.};
+\end{tikzpicture}
+\caption{Initially the slot points back into the stub; the resolver fills it and transfers to \texttt{twice}. In both paths the callee returns to the original caller at \texttt{0x40112a}.}
+\label{fig:visual-297}
+\end{figure}
+
+\section{Move the Lookup, Not the Dependency}
+
+Lazy binding can avoid lookups for procedures never called in a particular run. It does not generally defer mapping ordinary \texttt{DT\_NEEDED} dependencies, or defer data relocations that have no call stub to mediate their first use. Eager binding fills the procedure slots before ordinary execution of the object rather than waiting for calls. It trades startup work for predictable first-call latency and reports a missing required symbol when the object is loaded rather than when an optional code path finally exercises it. On GNU toolchains, \texttt{-z now} requests eager binding for the linked object, and on glibc a nonempty \texttt{LD\_BIND\_NOW} can request it at process startup. With a suitable \texttt{-z relro} layout, resolving all slots early also lets the loader make their pages read-only after relocation.
+
+\section{Measure When Binding Happens}
+
+In an otherwise clean test directory on x86-64 GNU/Linux with glibc, put \verb|int twice(int x) { return 2*x; }| in \texttt{twice.c} and the following in \texttt{main.c}:
+
+\begin{verbatim}
+extern int twice(int);
+int main(void) { return twice(21) + twice(1) != 44; }
+\end{verbatim}
+
+\begin{verbatim}
+gcc -fPIC -shared -o libtwice.so twice.c
+gcc -fplt main.c -L. -ltwice -Wl,-rpath,'$ORIGIN',-z,lazy -o lazy
+gcc -fplt main.c -L. -ltwice -Wl,-rpath,'$ORIGIN',-z,now -o now
+readelf -Wr lazy now
+readelf -Wd lazy now
+env -u LD_BIND_NOW LD_DEBUG=bindings ./lazy
+LD_BIND_NOW=1 LD_DEBUG=bindings ./lazy
+\end{verbatim}
+
+The two binaries both contain a \texttt{JUMP\_SLOT} for \texttt{twice}; its presence alone does not establish when it is filled. In the local test the eager binary records a \texttt{NOW} flag, while the lazy binary does not. Look for the glibc binding line for \texttt{twice} relative to the line reporting transfer to the program: it follows the transfer in the first run and precedes it in the second. Exit status \(0\) in both runs checks the values, not their binding times. If the required library is absent and not found in any search directory, neither build can start; lazy binding does not turn a required library into an optional plugin.

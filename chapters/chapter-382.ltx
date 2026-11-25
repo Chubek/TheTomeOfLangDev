@@ -1,0 +1,104 @@
+% Source: typed-algebraic-approach-to-parsing.txt
+
+\section{Make a Parser's Choice Part of Its Type}
+
+A successful parser combinator has an ordinary result type, perhaps an expression tree. Before parsing anything, it also accepts a language with facts that can guide its execution. Can it accept the empty string? Which tokens can start a nonempty match? After an accepted prefix, which tokens could extend that prefix to another accepted string? Krishnaswami and Yallop track these facts as \texttt{Null}, \texttt{First}, and \texttt{FLast} for context-free expressions, then use the type information to implement predictive parsing \cite{krishnaswami2019typedparsing}. This is a static check about the grammar, not inference of the types of parsed expressions.
+
+\section{Find a Boundary That First Sets Alone Miss}
+
+Consider \texttt{a} and \texttt{ab} as two accepted strings of a language \(L\). After a parser has consumed \texttt{a}, \texttt{b} can extend that accepted prefix into another word of \(L\). Thus \(b\) is in \(\mathrm{FLast}(L)\), whereas \(a\) is in \(\mathrm{First}(L)\). In \(L\cdot\{b\}\), the lookahead \texttt{b} at that boundary might extend the left parse or start the right parse. A test that compares only the two first sets would miss this conflict. With a right operand \(\{c\}\), the boundary can be distinguished. To isolate this concatenation check, assume \(L\) is supplied by the factored expression \(\texttt{a}(\epsilon\mid\texttt{b})\), not by a choice between two alternatives that both start with \texttt{a}.
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+Expression & Nullable & First & Extension after a word \\
+\hline
+\(\epsilon\) & yes & empty & empty \\
+\(\{b\}\) & no & \(b\) & empty \\
+\(\{a,ab\}\) & no & \(a\) & \(b\) \\
+\(\{a,ab\}\cdot\{c\}\) & no & \(a\) & empty \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-382} shows the two uses of the same lookahead at the unsafe boundary. The rejected grammar may still be unambiguous as a specification of complete strings: \texttt{ab} and \texttt{abb} have distinct complete derivations. Rejection says that the stated interface cannot choose the boundary using this predictive rule. A factored equivalent for the accepted words is \(\texttt{ab}(\epsilon\mid\texttt{b})\). If semantic actions distinguished the old decompositions, account for those actions when changing the grammar.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (point) at (0,0) {Consumed \texttt{a}\\Lookahead \texttt{b}};
+  \node[tome box] (left) at (-3,-1.8) {Continue left\\to \texttt{ab}};
+  \node[tome box accent] (right) at (3,-1.8) {Finish left\\start right with \texttt{b}};
+  \draw[tome arrow] (point) -- (left);
+  \draw[tome arrow] (point) -- (right);
+\end{tikzpicture}
+\caption{At a sequence boundary a token can be ambiguous as a continuation even when the operands have disjoint first sets.}
+\label{fig:visual-382}
+\end{figure}
+
+% Annotated walkthrough
+\section{Reject a Conflicting Composition at Grammar Construction}
+
+The sketch checks two local side conditions on summaries that have already been inferred. It omits the fixed-point rules for recursive grammars and does not by itself calculate the output summary of each composition. The choice rule forbids two distinct empty parses; the sequence rule also requires the left operand not to be nullable in this type system.
+
+\begin{verbatim}
+check_choice(p, q):
+    conflicts := intersection(p.first, q.first)
+    if conflicts not empty:
+        report("shared first tokens", conflicts, p.span, q.span)
+    if p.nullable and q.nullable:
+        report("two empty branches", p.span, q.span)
+
+check_sequence(p, q):
+    if p.nullable:
+        report("nullable left operand", p.span)
+    conflicts := intersection(p.flast, q.first)
+    if conflicts not empty:
+        report("cannot choose sequence boundary",
+               conflicts, p.span, q.span)
+\end{verbatim}
+
+For \(\{a,ab\}\cdot\{b\}\) this checker reports \(\{b\}\) and points at both operands. For \(\{a,ab\}\cdot\{c\}\) it finds an empty intersection. Compare the accepted parser's behavior on \texttt{ac}, \texttt{abc}, \texttt{ab}, and \texttt{abbc}, requiring a complete parse with no leftover tokens. The first two are valid; the last two are not. For a reusable combinator, include semantic-action results in the fixtures so recognizing the same token language is not mistaken for preserving the same tree.
+
+\section{Separate a Grammar Diagnostic From an Input Diagnostic}
+
+A conflict between the left and right operands is a problem in the grammar definition. Once that definition is fixed, an ordinary parse error is a problem with a particular input. Keep source locations for grammar operands as well as token locations in the input; the two messages should not refer to the same file by accident. A deterministic decision may improve a diagnostic by letting the parser name the missing token at a known boundary. It does not automatically provide a recovery policy. \Cref{ch:error-recovery} considers what to do after a valid grammar rejects input.
+
+\section{Trace a Nullable Choice Without Backtracking}
+
+Implement the factored left operand with a token parser for \texttt{a}
+and a predictive choice between \texttt{b} and \(\epsilon\). The choice
+can take the empty arm when the next token is not \texttt{b}. Taking that
+arm does not mean the entire input has been accepted. The following
+token must still satisfy the right operand and the cursor must be at
+end of input when the outer parser returns.
+
+\begin{verbatim}
+parse_safe_sequence(input):
+    cursor := new_cursor(input)
+    a := expect(cursor, 'a')
+    optional_b := None
+    if lookahead(cursor) == 'b':
+        optional_b := Some(expect(cursor, 'b'))
+    c := expect(cursor, 'c')
+    expect_end(cursor)
+    return Sequence(Left(a, optional_b), Right(c))
+\end{verbatim}
+
+On \texttt{ac} the lookahead at the choice is \texttt{c}, and the
+empty arm leaves it for the second operand. On \texttt{ab} the
+lookahead is \texttt{b}, but after consuming it the parser fails
+expecting \texttt{c} at end of input. The parser must not reinterpret a
+consumed token after this error. Add \texttt{acb} to the test suite:
+the operands match a prefix, but the complete parser rejects the
+trailing \texttt{b}. If a caller intentionally parses one item from
+a larger input, give that entry point a different contract: it
+returns the new cursor instead of requiring end of input.
+
+Summaries are allowed to overapproximate actual language properties.
+An overly large first or extension set can cause a safe grammar to
+be rejected; an undersized set can make the predictive parser choose
+wrongly. In a combinator library, construct these summaries from the
+grammar operations or validate annotations instead of accepting
+arbitrary user-supplied claims about them.

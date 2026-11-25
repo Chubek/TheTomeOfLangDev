@@ -1,0 +1,63 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Decide Which Layer You Intend to Optimize}
+
+There are three different ways to speed up a generated architecture project. A simulator optimization makes the host spend less time simulating the same machine. A microarchitecture optimization changes the simulated machine, ideally making it execute the same workload in less target time. A compiler scheduling optimization changes how the program uses that machine without changing the source program's required behavior. The three have distinct regression tests. Removing redundant C++ computations from a cycle model must leave the relevant cycle signals unchanged; adding a forwarding path can change those signals while keeping the architectural results; scheduling instructions around a dependence may change the instruction trace while keeping required program outputs and effects.
+
+The VADL paper's Section~2 calls out two feedback loops for design exploration: compile and simulate workloads to measure cycles, then synthesize hardware to estimate implementation cost \cite{himmelbauer2024vadl}. Neither lane subsumes the other. For example, a wider bypass mux may remove bubbles but lengthen a path that limits the clock. A tool that reports only cycles cannot rank that change alone. If the ISA is fixed, the design choices should be regenerated from the MiA and other modeling inputs. Patching a generated C++ stage by hand leaves neither the hardware branch nor the next generation run with that change.
+
+\section{Treat Generation Parameters as Experimental Controls}
+
+The following annotation and opening line of Listing~8 are VADL, with normalized spacing. They select an ISA for the example MiA and set its memory data bus width; the stage body is omitted here.
+
+\begin{verbatim}
+[dataBusWidth = 32]
+microarchitecture IMPL implements RV32I = {
+\end{verbatim}
+
+A parameter such as this belongs to the implementation source, not the measured artifact. Keep it and the rest of the experiment's inputs with the measurements: effective ISA and ABI, simulator and synthesis versions, executable and memory model, target library, and constraints. If both the binary and pipeline change, a measured cycle difference cannot immediately be credited to either change. Compare the same binary first; then compile separately for each implementation to find whether a machine-specific schedule adds value. Record that second experiment as a comparison of complete configurations, not of the pipelines alone.
+
+Section~4.6 describes the generated functional simulator's sparse dispatch cache, keyed by guest instruction address and recording the instruction and emulator dispatch information. Checking the cached instruction against current instruction bytes when needed preserves the meaning of modified code under the simulated instruction-fetch contract. That cache is a host optimization, not a way to add a target instruction cache. Sections~5.7 and~7 report duplicate computation as a problem for the prototype CAS and discuss optimization opportunities. If two stages redundantly compute a pure expression, sharing it in the host model is safe only for the same inputs and clock snapshot; two device reads are not a redundant pure expression.
+
+% Annotated walkthrough
+\section{Compare Target Time Under a Fixed Cost Assumption}
+
+This illustrative experiment is not VADL syntax or a result from the paper. Take a fixed program, an area budget of \(130\) arbitrary units, and estimated clock periods at the same synthesis conditions. The clock period estimates are assumed achievable and the workload runs at a fixed clock. \Cref{fig:visual-336} compares three hypothetical outcomes.
+
+\begin{verbatim}
+baseline = run_reference(binary)
+for design in [A, B, C]:
+    run = run_cycle_model(design, binary)
+    require committed_effects(run) == baseline
+    period, area = map_design(design, same_constraints)
+    if area <= 130:
+        record(design, run.cycles * period)    # target time, not host time
+\end{verbatim}
+
+Design A takes 1000 cycles at \(2.0\) ns and costs 100 area units, for \(2000\) ns. B takes 800 cycles at \(2.8\) ns and costs 115 units, for \(2240\) ns. A wins between those two, despite B's cycle reduction. C takes 800 cycles at \(2.1\) ns but costs 145 units; ignore its \(1680\) ns for this budget. The invariant is that only behaviorally matching runs under common assumptions enter this ranking; area is a feasibility check, not an unreported preference. A different workload or budget can reverse the recommendation.
+
+For a measured rather than illustrative comparison, repeat host runs and report the aggregation rule, but do not average unlike target configurations. Preserve the exact generated sources and tool options as well as the high-level parameters: a changed synthesis constraint or memory latency is a design input, not measurement noise.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \draw[tome arrow] (0,0) -- (8.6,0) node[right] {ns};
+  \foreach \x/\t in {0/0,3/1000,6/2000} {
+    \draw (\x,0.08) -- (\x,-0.08) node[below] {\t};
+  }
+  \node[left] at (0,0.55) {C};
+  \node[left] at (0,1.20) {B};
+  \node[left] at (0,1.85) {A};
+  \draw[dashed] (0,0.37) rectangle (5.04,0.73);
+  \fill[black!35] (0,1.02) rectangle (6.72,1.38);
+  \fill[black!60] (0,1.67) rectangle (6,2.03);
+  \node[right] at (5.04,0.55) {over budget};
+\end{tikzpicture}
+\caption{The same workload can favor A over B even when B reports fewer cycles. C would run fastest at the assumed clock but violates the area limit.}
+\label{fig:visual-336}
+\end{figure}
+
+\section{State What the Reported Measurements Can Support}
+
+Section~5.9 reports roughly \(12.35\) seconds for the five-stage CAS build and \(58.60\) for the HDL simulation build in the authors' setup. Those build measurements include compiling the emitted code, with the HDL path additionally including Chisel translation and Verilator. They are not measurements of a target processor's speed. The CAS was actually slower than the equivalent Verilator simulation in the reported three-stage runtime comparison (Section~5.7). The idealized memory used in these experiments and the demo library used for the hardware area comparison (Section~5.8) limit how directly those results transfer to another workload or physical implementation.

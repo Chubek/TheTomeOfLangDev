@@ -1,0 +1,106 @@
+% Source: lucid-book.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+
+\section{Treat Every Expression as a Stream}
+
+Classic Lucid gives expressions sequence-valued meanings. Constants denote constant streams, ordinary arithmetic is pointwise, \texttt{next} removes the first element, \texttt{first} repeats the first element as appropriate to its use, and \texttt{fby} constructs a stream from an initial value and a tail. Equations describe relationships among whole streams; textual order is not assignment order \cite{ashcroft1977lucid,wadge1985lucid}.
+
+For streams \(A\) and \(B\), \(A\ \texttt{fby}\ B\) has \(A_0\) at index zero and \(B_{i-1}\) at positive index \(i\). This shift makes a guarded recurrence productive. Without the initial value, an equation such as \(x=x+1\) does not become an imperative increment; it is an inconsistent pointwise equation over ordinary integers.
+
+\section{Define a Running Sum by Equations}
+
+A Lucid program can return the stream \texttt{sum}:
+
+\begin{verbatim}
+sum
+where
+  sum = 0 fby sum + input;
+end
+\end{verbatim}
+
+For input \(\langle3,5,10,\ldots\rangle\), the result begins \(\langle0,3,8,18,\ldots\rangle\). At index \(i>0\), the \texttt{fby} tail asks for \(\texttt{sum}_{i-1}+\texttt{input}_{i-1}\). Whether an implementation pushes tokens through filters or educes requested elements is not fixed by these equations. \Cref{fig:visual-358} makes the one-step dependency explicit.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (zero) at (-3,1.2) {\(0\)};
+  \node[tome box] (delay) at (0,0) {\texttt{fby} / delay};
+  \node[tome box] (add) at (3,0) {\(+\)};
+  \node[tome box accent] (sum) at (0,-1.7) {\texttt{sum}};
+  \node[tome box] (in) at (5.2,0) {\texttt{input}};
+  \draw[tome arrow] (zero) -- (delay);
+  \draw[tome arrow] (delay) -- (sum);
+  \draw[tome arrow] (sum) -- (add);
+  \draw[tome arrow] (in) -- (add);
+  \draw[tome arrow] (add) -- (delay);
+\end{tikzpicture}
+\caption{The feedback passes through an initialized one-index delay. There is no instantaneous algebraic cycle at a single stream index.}
+\label{fig:visual-358}
+\end{figure}
+
+% Annotated walkthrough
+\section{Calculate One Requested Element}
+
+\begin{verbatim}
+value(sum, 0) = 0
+value(sum, i) where i > 0:
+    previous := value(sum, i - 1)
+    item := value(input, i - 1)
+    return previous + item
+\end{verbatim}
+
+Memoization avoids recomputing the prefix, but memoization is an implementation strategy. The stream equation defines the same prefix even for a correct token-driven implementation.
+
+\section{Lower Equations With Index Meaning Intact}
+
+A Lucid IR can use nodes for pointwise operators, \texttt{first}, \texttt{next}, and \texttt{fby}; dependency edges annotated with index shifts; explicit initial state for realizable delays; stream element types and partiality/effect information; a logical index clock; and source provenance for equations and operator occurrences. Compilation may produce an eductive graph and warehouse keys, a lazy stream program, or a stateful loop that emits successive elements.
+
+Legal optimizations include pointwise fusion, constant propagation, and elimination of duplicate pure demands. Retiming is legal only when initial values and observed indices are preserved. Semantic-preservation risks include turning a demand for one element into eager traversal of an infinite stream, moving a partial operation before a selector, and applying ordinary algebraic rewrites to floating-point streams. Compare requested stream prefixes, including errors or nontermination where the language observes them.
+
+\section{Make the Boundary at Index Zero Visible}
+
+For a stream \(X=\langle3,5,10,\ldots\rangle\), compare three operators applied independently to \(X\). The table shows only the terms that follow from the supplied prefix; a dash is not a source-level error but an unspecified input beyond the fixture. Notice that \texttt{first} repeats the value at index zero; it is not a prefix-taking operation that shortens the stream.
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\hline
+Expression & Index 0 & Index 1 & Index 2 & Index 3 \\
+\hline
+\(X\) & 3 & 5 & 10 & --- \\
+\texttt{first X} & 3 & 3 & 3 & 3 \\
+\texttt{next X} & 5 & 10 & --- & --- \\
+\texttt{0 fby X} & 0 & 3 & 5 & 10 \\
+\hline
+\end{tabular}
+\end{center}
+
+An evaluator can model these operators as demand rewrites. The dispatch below expands a demand for an expression at an index into requests for operands at potentially different indices. Treat input lookup as a partial operation so the harness can detect an unnecessary request outside its prefix. A demand for \texttt{0 fby X} at zero does not require any inspection of \(X\).
+
+\begin{verbatim}
+at(node, i):
+    require i >= 0
+    match node:
+        Constant(k): return k
+        Input(name): return request_input(name, i)
+        First(x): return at(x, 0)
+        Next(x): return at(x, i + 1)
+        Fby(seed, tail):
+            if i == 0: return at(seed, 0)
+            return at(tail, i - 1)
+        Add(left, right):
+            return at(left, i) + at(right, i)
+\end{verbatim}
+
+For the running sum, request index 3 first. Expansion takes the tail three times and reaches the initialized result after demanding exactly the first three input positions. Request index 1 next; a warehouse can reuse that result rather than reread input. To see why the initialization matters even under optimization, compare \texttt{next (0 fby X)} with \texttt{0 fby next X}. The former equals \(X\); the latter starts at zero and then gives \(X_1,X_2,\ldots\). Interchanging the operators would shift the visible frontier of demand and change the first result. A useful fixture makes every input component distinct so an off-by-one shift cannot masquerade as an arithmetic error.
+
+\paragraph{Distinguish a run-time frontier from a stream equation.}
+An evaluator serving index 3 must sometimes wait for input 2, whereas a
+streaming loop is normally called only when that input has arrived. Give
+both the same trace of available input, not the same host call sequence.
+Record \texttt{sum[0]} immediately, then deliver one input at a time and
+compare the resulting prefix after each delivery. If a client asks for
+\texttt{sum[2]} before input 1 arrives, the evaluator should not publish an
+invented value to fill that slot. Waiting, rejecting the request, and
+reporting a definedness error are different boundary policies. Adopt one
+that is consistent with how the host supplies the input stream.

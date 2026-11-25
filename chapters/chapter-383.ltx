@@ -1,0 +1,107 @@
+% Source: leroy-a-verif-cc-compiler-backend-for-lustre.txt
+
+\section{Relate an Instant to an Imperative Call}
+
+\Cref{ch:ext-362} lowers one Lustre counter by hand. A compiler must justify the same kind of lowering for nested node instances and sampled clocks. Bourke and colleagues translate scheduled, normalized Lustre equations to an imperative object language, Obc, and then generate CompCert Clight \cite{bourke2017verifiedlustre}. A reset method initializes memory; a step method implements one logical instant. The interesting change is not the replacement of a stream identifier by a variable name. It is the change from equations constraining whole streams to statements that observe and modify one concrete memory.
+
+\section{State the Relation at the Boundary of a Step}
+
+Take a parent with two instances of a toy node. The node starts with delay \(0\), outputs its old delay, and then remembers the current input. The left instance is always active, while the right instance is sampled using an enable. A source history determines the latest present input of each instance independently, or the initial zero if no such input exists. The target memory relation says that each instance's delay field contains exactly that value at step entry. It also says that the two instances have distinct logical memory, even if they share one implementation of the step method.
+
+\begin{center}
+\begin{tabular}{cccccl}
+\hline
+Tick & Input & Right active & Left out & Right out & Memory after \\
+\hline
+0 & 7 & no & 0 & --- & \((7,0)\) \\
+1 & 8 & yes & 7 & 0 & \((8,8)\) \\
+2 & 9 & no & 8 & --- & \((9,8)\) \\
+3 & 10 & yes & 9 & 8 & \((10,10)\) \\
+\hline
+\end{tabular}
+\end{center}
+
+The right output at tick 3 is \(8\), not \(9\) and not \(10\). If the target advances the right child unconditionally and merely masks the result, it returns \(9\). If it overwrites the right delay before reading it, it returns \(10\). \Cref{fig:visual-383} relates two successive step boundaries. This sample illustrates only a small instance of the simulation invariant; additional memory and clock conditions are needed for the full compiler.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (h) at (0,1.15) {Source history};
+  \node[tome box] (hn) at (5.3,1.15) {Extended history};
+  \node[tome box dark] (m) at (0,-1.15) {Entry memory};
+  \node[tome box accent] (mn) at (5.3,-1.15) {Exit memory};
+  \draw[tome arrow] (h) -- node[above]{logical instant} (hn);
+  \draw[tome arrow] (m) -- node[below]{imperative step} (mn);
+  \draw[tome dashed] (h) -- (m);
+  \draw[tome dashed] (hn) -- (mn);
+\end{tikzpicture}
+\caption{Simulation ties memory to history at each boundary. The target implements the instant and reestablishes the relation for the next call.}
+\label{fig:visual-383}
+\end{figure}
+
+% Annotated walkthrough
+\section{Check Initialization and Preservation Separately}
+
+\begin{verbatim}
+reset(parent):
+    parent.left.saved := 0
+    parent.right.saved := 0
+
+child_step(child, input):
+    old := child.saved
+    child.saved := input
+    return old
+
+parent_step(parent, input, enable):
+    left := child_step(parent.left, input)
+    right := Absent
+    if enable:
+        right := Present(child_step(parent.right, input))
+    return (Present(left), right)
+\end{verbatim}
+
+Initialization establishes the invariant for the empty history. For the induction step, read the old saved field to obtain the source delay value. On an active clock the write changes the saved field to the current input, establishing the invariant for the extended history. On an inactive clock neither a source sample nor an imperative write occurs for that child. Applying the two child arguments separately works because a write to one instance's state does not invalidate the invariant for the other.
+
+\section{Keep the Proof Boundary When Optimizing}
+
+Adjacent statements guarded by the same clock can be fused only when evaluating the guard once instead of twice preserves which statements run. In an imperative IR, for example, the first statement must not change the memory used by a later guard in a way that makes that second test differ. Likewise, scheduling current values before writes is not enough if a later computation still refers to a previous value that was overwritten. Keep explicit reads, writes, and clock facts until those obligations are discharged.
+
+Test with unequal inputs, a long absent interval, and enable asserted at the first instant. Then insert a reset between two independent runs; the first active output after reset must be the initial value again. These fixtures catch likely implementation errors, but are not a replacement for the invariant or the verified connection between translation passes. The language-to-object proof and the object-to-Clight proof also have different boundaries: the former explains why step behavior denotes the source streams; the latter explains why the C representation implements those step methods.
+
+\section{Justify an In-Place Update With Old-State Dependencies}
+
+Consider a second node whose two delays exchange values at every active
+instant. Its state begins at \((1,2)\). The first step must leave
+\((2,1)\), and the second restores \((1,2)\). Sequential assignments
+that read the fields directly, first assigning the left field and
+then the right, leave \((2,2)\). The source's equations are not
+commands that can be executed in their textual order.
+
+\begin{verbatim}
+exchange_step(state, active):
+    if not active: return Absent
+    left_before := state.left
+    right_before := state.right
+    state.left := right_before
+    state.right := left_before
+    return Present(left_before, right_before)
+\end{verbatim}
+
+An imperative compiler does not need to copy the whole node record.
+For each scheduled statement, identify which values belong to the
+entry memory and which were computed at this instant. If an old
+value has a use after the proposed overwrite, stage that old value in
+a local or reorder the write after all such uses where legal. The
+optimization proof can relate the staged locals to old memory and the
+updated fields to exit memory. The two need not agree halfway through
+the procedure; the relation is reestablished when the step returns.
+
+Use a trace with one inactive instant between exchanges. On that
+instant the exit memory must equal the entry memory, and no output
+tuple is published. Then attempt the same optimization with two
+distinct child instances whose memory layout has been accidentally
+coalesced. A verifier must reject the layout even if a run with
+identical child inputs happens to produce the same outputs. The
+instance separation condition supports all traces, not just those
+where the memory values happen to coincide.

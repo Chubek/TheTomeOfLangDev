@@ -1,0 +1,70 @@
+% Source: opt-instrsched-using-ip.txt
+% Source: contraint-language-for-semantic-analysis.txt
+
+\section{Post a Constraint Before Choosing Its Values}
+
+In logic programming, unification can equate two terms containing unknowns. Constraint logic programming (CLP) generalizes the idea: a domain solver maintains relationships that may hold for many assignments. In CLP over finite integer domains, CLP(FD), \verb|B #>= A + 2| constrains two unknown issue times without choosing either one. In SWI-Prolog, \verb|B is A + 2| instead evaluates the right-hand side now and requires it to be instantiated. That is not a drop-in replacement for a relational schedule.
+
+A constraint store denotes a set of allowed assignments. Adding a constraint intersects that set with another one, so information increases in the reverse-inclusion order even though the set of possibilities shrinks. A propagator can narrow variable domains without enumerating full assignments. Consistency of all the current domains need not establish that the whole constraint store is satisfiable; search may still expose a contradiction. When Prolog backtracks over a choice, branch-local constraints and their consequences are undone. That operation is not monotone growth of a shared Datalog relation.
+
+\section{Schedule a Four-Instruction Basic Block}
+
+Take a toy single-issue target with unit issue occupancy. The four operations are \(A\), a load; \(B\), an independent constant; \(C\), an add that consumes both; and \(D\), the return using the add. \(A\)'s result is available two cycles after it issues; \(B\) and \(C\) each have one-cycle result latency. There are no other dependencies. Wilken, Liu, and Heffernan motivate this style of modeling with dependence graphs and target restrictions, but their paper uses \emph{integer programming}, not the CLP(FD) solver used here. The following is executable SWI-Prolog with its \texttt{library(clpfd)}:
+
+\begin{verbatim}
+:- use_module(library(clpfd)).
+
+schedule(LoadLat, Last, [A,B,C,D]) :-
+    [A,B,C,D] ins 0..Last,
+    all_distinct([A,B,C,D]),
+    C #>= A + LoadLat,
+    C #>= B + 1,
+    D #>= C + 1.
+
+solve(LoadLat, Last, Slots) :-
+    schedule(LoadLat, Last, Slots),
+    labeling([ffc], Slots).
+\end{verbatim}
+
+Use nonnegative integer \texttt{Last} and positive integer \texttt{LoadLat} as inputs. \verb|?- solve(2, 3, Slots).| has the unique solution \verb|Slots = [0,1,2,3]|. At horizon \(3\), the return forces \(C\leq 2\); the latency and nonnegative start times then force \(C=2\), \(A=0\). The issue and data constraints leave cycle \(1\) for \(B\). If the load latency becomes \(3\), \verb|?- solve(3, 3, Slots).| is false: \(C\geq 3\) and \(D\geq 4\). Horizon \(4\) admits exactly \verb|[0,1,3,4]| and \verb|[0,2,3,4]|, irrespective of enumeration order. The gap is a permitted idle cycle.
+
+\Cref{fig:visual-347} distinguishes a latency constraint from an occupied issue slot: \(B\) issues while the load result is still pending.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (0,0) {0\\load \(A\)};
+  \node[tome box] (b) at (2.65,0) {1\\const \(B\)};
+  \node[tome box] (c) at (5.3,0) {2\\add \(C\)};
+  \node[tome box] (d) at (7.95,0) {3\\return \(D\)};
+  \draw[tome arrow] (a.north) to[bend left=28]
+    node[above]{load latency: 2} (c.north);
+  \draw[tome arrow] (b.south) to[bend right=23]
+    node[below]{1} (c.south);
+  \draw[tome arrow] (c.south) to[bend right=23]
+    node[below]{1} (d.south);
+\end{tikzpicture}
+\caption{A feasible schedule for the two-cycle load. The arrows describe value availability, while the distinct slot numbers enforce one issue per cycle.}
+\label{fig:visual-347}
+\end{figure}
+
+% Annotated walkthrough
+\section{Find the First Feasible Horizon}
+
+\begin{verbatim}
+lower := max(instruction_count - 1, critical_path_latency)
+upper := last_issue_slot_of(a_valid_serial_schedule)
+for last in increasing_range(lower, upper):
+    store := post_resource_and_dependence_constraints(last)
+    result := search_to_completion_or_first_solution(store)
+    if result is a solution:
+        verify(result)              # check IDs, slots, and latencies
+        return result               # all smaller horizons infeasible
+\end{verbatim}
+
+Here the critical-path bound counts latency on edges up to the last issue, not completion of the final instruction. A valid serial schedule can be built by scanning a topological order and delaying issue until both the single issue slot and the operands are ready. Every smaller valid horizon embeds in a larger one without moving any instruction. Consequently, with a complete finite search, the first feasible horizon minimizes the last issue slot. The \texttt{ffc} labeling option is a search heuristic, not a proof that the first answer at a fixed horizon has any secondary optimum. A timeout must not be treated as evidence of infeasibility.
+
+The model intentionally excludes memory reordering, register pressure, instruction bundles, and functional units with multi-cycle occupancy. A compiler must extract the additional restrictions or conservatively refuse the schedule; fitting four distinct integers does not prove machine-code equivalence. As an independent check, enumerate all slot vectors on these two tiny horizons and filter them by the original target rules. Extend the extraction/solver split to front-end analysis with care: van Antwerpen and colleagues use constraints over scope graphs and type terms, together with unification, not a finite integer schedule solver. What transfers is the separation between collecting language-specific requirements and solving them.
+
+The solver's output should therefore be a schedule plus the target assumptions it was checked against. Code generation can consume that certificate, while a changed latency table or alias result forces extraction and validation again.

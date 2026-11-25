@@ -1,0 +1,66 @@
+% Source: c-to-async-dataflow.txt
+
+\section{Cross a Protocol, Not Just a Wire}
+
+Two domains are asynchronous when no reliable edge relationship can be used to time a transfer. Equal nominal frequencies do not guarantee such a relationship. A receiver sampling a transition near its active edge can go metastable. A two-stage synchronizer for a single-bit level gives the first register additional time to resolve before the second samples it. It reduces the probability of propagating metastability; it does not reduce it to zero or guarantee delivery of every input transition. Use device characterization and implementation guidance, such as the synchronizer and CDC material in the \href{https://docs.amd.com/r/en-US/ug949-vivado-design-methodology}{AMD UltraFast Design Methodology Guide}, rather than estimating reliability from how many registers the RTL happens to show.
+
+At 100 MHz the receiver samples every \(10\) ns. If its edges occur at \(0,10,20,\ldots\) ns, a pulse high from \(2\) to \(6\) ns is never sampled even by an ideal flip-flop. Adding a third stage cannot recover it. For an event use a protocol that keeps an indication pending until it has been observed. For a bus, sampling each bit with a separate chain is not a coherent-word protocol: when \texttt{0111} changes to \texttt{1000}, unrelated bit delays can expose a word that was never sent.
+
+% Annotated walkthrough
+\section{Synchronize a Held Level, Then Acknowledge Its Use}
+
+The following SystemVerilog \cite{ieee1800systemverilog} fragment synchronizes just the request toggle into the receive domain. The \texttt{ASYNC\_REG} attribute is an AMD synthesis and placement hint; use the appropriate equivalent for other tools. The rest of the protocol does not follow from the attribute.
+
+\begin{verbatim}
+(* ASYNC_REG = "TRUE" *) logic req_meta, req_sync;
+always_ff @(posedge dst_clk) begin
+    if (dst_rst) begin
+        req_meta <= 1'b0;
+        req_sync <= 1'b0;
+    end else begin
+        req_meta <= req_src;
+        req_sync <= req_meta;
+    end
+end
+\end{verbatim}
+
+For a single outstanding word, the source holds a data register and uses a return acknowledgement toggle through its own synchronizer. Pseudocode below assumes both sides start with zero toggle state and no pending word; neither side resets independently during traffic:
+
+\begin{verbatim}
+on source clock:
+    if have_word and req == synced_ack:
+        held_payload = word           # stay stable until acknowledgement
+        req = NOT req                 # at most one outstanding word
+on destination clock:
+    if synced_req != ack and receiver_can_accept:
+        consume(held_payload)         # check bundled-data timing
+        ack = synced_req              # allow the source to reuse storage
+\end{verbatim}
+
+The invariant is that the source cannot toggle twice without an acknowledgement. A differing synchronized request marks an unconsumed word at the destination; acceptance copies the received toggle into \texttt{ack}, so a stable request cannot deliver it twice. The invariant relies on the toggle crossing eventually resolving and on the payload meeting setup and hold at capture. The destination must capture the payload in a destination-clocked register before it acknowledges it; feeding \texttt{held\_payload} directly into unrelated destination logic would leave that logic exposed to an asynchronous bus. Check the relative timing from the source data register to that destination register against the earliest protocol capture edge. Waiting for the return acknowledgement keeps the source from overwriting the bus early; it does not constrain the outbound routing delay by itself.
+
+\Cref{fig:visual-321} distinguishes the two synchronizer chains from the stable payload connection they govern.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (src) at (0,0) {Source\\holds payload};
+  \node[tome box dark] (dst) at (8,0) {Destination\\accepts once};
+  \node[tome box] (req) at (4,1.3) {Request synchronizer};
+  \node[tome box] (ack) at (4,-1.3) {Ack synchronizer};
+  \draw[tome arrow] (src.east) -- (req.west);
+  \draw[tome arrow] (req.east) -- (dst.west);
+  \draw[tome arrow] (src.east) -- node[above] {Bundled data} (dst.west);
+  \draw[tome arrow] (dst.west) -- (ack.east);
+  \draw[tome arrow] (ack.west) -- (src.east);
+\end{tikzpicture}
+\caption{The request and acknowledgement take separate synchronized paths. The payload bus is not synchronized bit by bit; the protocol holds it stable for a timed capture.}
+\label{fig:visual-321}
+\end{figure}
+
+\section{Constrain the Crossing and Verify Its Assumptions}
+
+Venkataramani and colleagues' C-to-asynchronous-dataflow flow also bundles a data bus with request and acknowledgement, using a four-phase protocol and a matched delay. A clockless stage with those timing obligations is not the same circuit as the two-clock crossing above. In both cases a logical protocol proof needs a separate argument for arrival of the data relative to control.
+
+For sustained traffic, an asynchronous FIFO can decouple rates. Its memory holds the data, while synchronized Gray-coded pointers convey progress; adjacent source pointer values differ in one bit. The physical flow still needs the appropriate maximum delay or skew limits so transitions from successive pointer updates do not overlap arbitrarily at the receiving synchronizer. Synchronize reset release in each domain and specify what happens to pending data across reset. Review CDC paths structurally, verify exactly-once or ordered delivery under variable sampling delays, and check the intra-domain timing and relevant cross-boundary physical bounds separately. A false-path declaration can remove a meaningless periodic timing check, but it cannot enforce the protocol. Logic optimizers and ideal HDL simulation do not model analog resolution; inspect the mapped and placed synchronizer, preserving its stages and keeping unrelated logic out of the metastability-resolution path.

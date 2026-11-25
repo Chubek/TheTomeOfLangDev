@@ -1,0 +1,107 @@
+% Source: finkel-advanced-proglang-design.txt
+% Source: arrays-in-pure-funlang.txt
+% Source: dataflow-graph-repr.txt
+
+\section{Array Combinators State Whole-Value Dependencies}
+
+APL and J make arrays primary values and build computations from scalar functions, reductions, scans, outer products, and rank-sensitive operators. Iverson's notation demonstrated that a short expression can name a large regular computation \cite{iverson1962apl}. J preserves this style with ASCII words. Here is an actual J definition of arithmetic mean:
+
+\begin{verbatim}
+mean =: +/ % #
+mean 2 4 6 8
+5
+\end{verbatim}
+
+In J's right-to-left evaluation, \texttt{\#} counts items, \texttt{+/} sums them, and the fork \texttt{+/ \% \#} divides those two results for the same argument. This is tacit programming: data arguments are omitted and combinators determine dataflow. It is not merely punctuation for a left-to-right pipeline. Rank, shape, and agreement rules decide how verbs apply to cells of an array.
+
+\section{Retain Trains Before Expanding Element Loops}
+
+The frontend should represent nouns, verbs, adverbs, conjunctions, explicit definitions, and tacit trains. A train node records hook or fork formation and inferred ranks; array operations retain shape transformations and scalar-extension behavior. Expanding immediately into scalar loops loses algebraic structure useful for fusion and can mishandle empty arrays or rank. The IR may later normalize a fork \(f\,g\,h\) to a graph in which \(f(y)\) and \(h(y)\) feed the dyadic \(g\).
+
+\Cref{fig:visual-372} displays that normalization for \texttt{mean}; the fork duplicates a logical argument, not necessarily its storage.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (y) at (0,0) {array \(y\)};
+  \node[tome box] (sum) at (3,.8) {\texttt{+/}\(y\)};
+  \node[tome box] (count) at (3,-.8) {\texttt{\#}\(y\)};
+  \node[tome box accent] (div) at (6,0) {\texttt{\%}};
+  \node[tome box] (r) at (8.7,0) {mean};
+  \draw[tome arrow] (y) -- (sum);
+  \draw[tome arrow] (y) -- (count);
+  \draw[tome arrow] (sum) -- (div);
+  \draw[tome arrow] (count) -- (div);
+  \draw[tome arrow] (div) -- (r);
+\end{tikzpicture}
+\caption{A tacit fork gives two consumers the same argument and combines their results; this graph follows train semantics, not textual adjacency alone.}
+\label{fig:visual-372}
+\end{figure}
+
+Compiler artifacts may include a train-preserving HIR, inferred rank and shape constraints, fused array kernels, and an executable plus spelling-aware diagnostics. Pretty-printed source is a separate artifact: canonicalizing a train can make a correct program much harder to relate to its original notation.
+
+% Annotated walkthrough
+\section{Normalize a Fork and Preserve Array Semantics}
+
+\begin{verbatim}
+train := parse_words_with_J_grammar(source)
+typed := infer_valence_rank_and_shape_constraints(train)
+graph := expand_hooks_and_forks_to_shared_argument_nodes(typed)
+graph := fuse_array_combinators_when_rank_rules_still_match(graph)
+kernel := lower_each_remaining_array_node_with_empty-case_rules()
+retain source-word provenance on every graph and kernel operation
+\end{verbatim}
+
+Map fusion, scalar extension, and eliminating inverse reshape pairs can be legal. Reduction fusion needs the exact identity, order, rank, and empty-array behavior. Common-subexpression elimination is safe for pure verbs, but not for foreign conjunctions or other operations that observe external state. Copy elimination must respect aliasing if the implementation exposes mutable arrays.
+
+Validation compares rank, shape, element values, and errors over scalars, higher-rank arrays, singleton dimensions, and empty arrays. A useful compiler test interprets the original train and normalized graph independently. For floating reductions it uses the language's specified or permitted order rather than an idealized real-number equality. This validates preservation across the tacit-to-graph handoff while still permitting different loop nests and vector instructions in the final output.
+
+\section{Read a Fork Over Cells, Not Just Over a Flat Vector}
+
+For the monadic fork \texttt{+/ \% \#}, the shared argument supplies both the sum and the tally. To take row means of a matrix, use the fork at rank one, so each vector row is passed to both branches. For a \(2\)-by-\(3\) matrix with rows \([2,4,6]\) and \([10,20,30]\), the means are \(4\) and \(20\). The whole-array fork is different: \texttt{+/} on that matrix inserts addition along its leading axis and \texttt{\#} tallies two leading-axis items.
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+Cell & Sum branch & Tally branch & Division \\
+\hline
+First row & 12 & 3 & 4 \\
+Second row & 60 & 3 & 20 \\
+Whole matrix & \(12,24,36\) & 2 & \(6,12,18\) \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+apply_fork_monad(f, g, h, argument, cell_rank):
+    frame, cell_shape := split_shape(argument.shape, cell_rank)
+    if frame_has_no_cells(frame):
+        return empty_result_using_language_prototype(frame, cell_shape)
+    results := []
+    for cell in cells_in_frame_order(argument, cell_rank):
+        left := apply_monad(f, cell)
+        right := apply_monad(h, cell)
+        append(results, apply_dyad(g, left, right))
+    return assemble_with_source_shape_rules(frame, results)
+\end{verbatim}
+
+This model leaves prototype and assembly rules to the array language; those rules are not inferred from the first successful nonempty run. A frame with zero cells and a frame with nonzero cells whose shapes contain zero are different cases. In the latter, the branches must implement their own treatment of an empty argument; returning a completely empty frame may skip observable outcomes. Test non-square inputs to distinguish frames from cell axes, then add empty-axis cases. Keep rank and cell-boundary information through fusion, even when a scalar backend ultimately emits only loops and arithmetic.
+
+\section{Test Frames Independently of Reduction Identities}
+
+For cell rank one on a \(0\)-by-\(3\) argument, there are no row cells.
+On a \(2\)-by-\(0\) argument, there are two row cells, each empty.
+The same total element count does not justify merging these paths in
+the compiler. For the zero-cell frame, derive the output cell shape
+using the source's prototype rule. For the two empty cells, apply the
+specified empty reduction and division rules to each cell. In
+particular, the identity for addition does not by itself define a
+meaning for division by a tally of zero.
+
+When replacing a fork with a reduction kernel, make its lowering
+report both the frame shape and where it obtained the empty-case rule.
+Run a normalized-graph interpreter and a source interpreter on each
+shape, comparing an error if the operator is undefined rather than
+filling an arbitrary default value. That test locates a shape mistake
+before a more complicated downstream computation obscures it.

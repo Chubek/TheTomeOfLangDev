@@ -1,0 +1,72 @@
+% Source: ir-il-for-datapath-gen.txt
+
+\section{Balance Clock Intervals, Not Source Lines}
+
+One cycle must accommodate the slowest path between sequential boundaries, including register overhead. Putting a register after a fixed number of source operators is not a useful metric: a multiply, a mux, and a wire do not take the same time. Not all delays even come from operators; a short expression can drive a long, heavily loaded net. Balance is about the delay between actual endpoints, measured after mapping and revisited after routing.
+
+Pipelining introduces clock boundaries, often changing interface latency while keeping or improving throughput. Retiming instead redistributes existing registers in a synchronous graph. If the register counts on input-to-output paths are to stay fixed, the interface vertices must be held at the same retiming offset. At forks and joins, a move must be applied to the related edges, not just to a convenient long path. Kasprzyk and colleagues' datapath IR makes data and predicates explicit; the same discipline is essential below the IR, where a predicate can be a valid flag or a selector that must arrive with its matching data.
+
+% Annotated walkthrough
+\section{Move One Boundary and Carry the Valid Bit}
+
+Let a feed-forward path consist of combinational vertices \(A,B,C\), with nominal delays \(4,3,2\) ns. The original internal register is after \(B\), so the intervals are \(7\) and \(2\) ns. Move it before \(B\), and they are \(4\) and \(5\) ns. If each interval has another \(1\) ns of clock-to-Q plus setup and no skew, the illustrative minimum setup period falls from \(8\) to \(6\) ns. This is an abstract calculation, not a characterization of the operators in the example. \Cref{fig:visual-315} shows what does not change: there are still two clock intervals from the launch register to the output register.
+
+An example of the revised schedule in SystemVerilog \cite{ieee1800systemverilog}, with eight-bit modular operations and no backpressure:
+
+\begin{verbatim}
+logic [7:0] mid, y;
+logic vmid, vout;
+always_ff @(posedge clk) begin
+    if (rst) begin
+        vmid <= 1'b0;
+        vout <= 1'b0;
+    end else begin
+        vmid <= vin;
+        vout <= vmid;
+        mid <= x + 8'd3;                  // A
+        y <= (mid ^ 8'h55) + 8'd7;        // C(B(mid))
+    end
+end
+\end{verbatim}
+
+The contract checks \(y\) only when \texttt{vout} is high. At an edge accepting \(x=254\), \(A\) gives \(1\); the next edge gives \(C(B(1))=84+7=91\). Reset clears both valid flags and cancels any pending observation. If reset must also set the visible payload irrespective of valid, it is not sufficient to ignore it in the implementation or in a miter.
+
+Graph retiming pseudocode, with \(w(u,v)\) the original register count on an edge and integer \(r(v)\) a retiming offset:
+
+\begin{verbatim}
+r = choose_offsets_with_fixed_io()       # anchors at the interface
+for each edge (u, v):
+    moved[u,v] = w[u,v] + r[v] - r[u]    # counts, not time units
+    require moved[u,v] >= 0
+require max_zero_register_path_delay() <= target
+require equivalent_reset_and_observations() # beyond graph legality
+\end{verbatim}
+
+For the example choose \(r(B)=1\) and all other offsets zero. The original edge counts \(w(A,B)=0,\ w(B,C)=1\) become \(1,0\). Around a directed cycle all offsets cancel, so the total number of registers on that cycle is invariant; they cannot be removed from the recurrence by retiming. Along an input-to-output path only the endpoint offsets remain, and the fixed endpoints preserve the count there too.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=east] at (0,0) {Before};
+  \node[anchor=east] at (0,-1.4) {After};
+  \node[tome box] (ab) at (2,0) {\(A,B\): 7 ns};
+  \node[tome box dark] (r1) at (4.8,0) {Register};
+  \node[tome box] (c) at (7.6,0) {\(C\): 2 ns};
+  \node[tome box] (a) at (2,-1.4) {\(A\): 4 ns};
+  \node[tome box dark] (r2) at (4.8,-1.4) {Register};
+  \node[tome box] (bc) at (7.6,-1.4) {\(B,C\): 5 ns};
+  \draw[tome arrow] (ab) -- (r1);
+  \draw[tome arrow] (r1) -- (c);
+  \draw[tome arrow] (a) -- (r2);
+  \draw[tome arrow] (r2) -- (bc);
+\end{tikzpicture}
+\caption{With launch and capture registers implicit at the ends, moving the internal register shifts the three-nanosecond operation to the shorter interval while preserving interface latency.}
+\label{fig:visual-315}
+\end{figure}
+
+\section{Where the Graph Model Stops Being Enough}
+
+The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/cmd/abc.html}{Yosys ABC command reference} distinguishes its normal combinational invocation from \texttt{abc -dff}, which can pass supported flip-flops to ABC and partitions clock domains. An enabled sequential flow is not a license to move a register through asynchronous resets, clock-domain crossings, RAM ports, or user-observable protocol state. Even within one clock domain, imitating an initial state after a move can require an initialization value that has no inverse image through the intervening function.
+
+For stalls, the data, selector, and valid registers must advance under compatible enables or be managed by a protocol designed to preserve order despite independent stalls. Shortened paths can also expose hold problems. Neither the graph invariant nor a sequential equivalence proof checks placement or electrical timing, so repeat static timing for maximum and minimum delay. If an indivisible hard primitive or a feedback cycle sets the bottleneck, further improvement may need a different algorithm or a new interface contract, not another local register move.

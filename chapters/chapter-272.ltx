@@ -1,0 +1,68 @@
+% Source: blindel-instrselect-book.txt
+
+\section{What a Greedy Rewrite Promises}
+
+A practical selector can rank its matching rules, try them in order, and commit to the first legal one. Blindell's account of LLVM's SelectionDAG selector describes an historical implementation: TableGen expands the instruction descriptions into tree patterns, and the matcher generator orders them lexicographically by decreasing pattern complexity, increasing cost, and increasing size of the replacement graph. Complexity includes a priority adjustment, so it is not merely the number of nodes. The ordered tests become a matcher table. A successful rewrite replaces part of the program DAG and changes the choices at later nodes \cite[chapter~4]{blindell2016instruction}.
+
+The ordering is a strategy for selection. The matcher can correctly recognize every candidate in a toy region and still return inferior code if it commits without considering the alternatives. In an implementation that interleaves matching and selection, this distinction helps debugging: log whether the missed instruction failed a test or was made unavailable by an earlier rewrite. The survey's description of one LLVM version does not imply that every modern target uses the same patterns, priorities, or multi-result support.
+
+A useful invariant for a greedy rewrite is that all uses outside the removed operations still have definitions. Before committing, inventory the outgoing uses, including live-outs of the region. Redirect only those that the replacement can supply with the correct meaning and operand class. If an internal result is still needed and not exported, either reject the rewrite or model a separate computation where that is legal. Also preserve required ordering edges: finding an opcode match is no license to hide an ordering constraint. A deterministic priority scheme makes a poor choice reproducible, but reproducibility is not evidence of optimality.
+
+\section{Local Savings Do Not Add Across Overlaps}
+
+Consider a toy target with pure eight-bit operations. The input $x$ is already available. Let $u$ be a one-bit left rotation of $x$. One arm computes $v=u\mathbin{\&}15$, $w=v\mathbin{\mathtt{xor}}3$, and $y=w+1$ modulo 256; the other computes $p=u\gg2$ with zero fill and $q=p\mathbin{\mathtt{xor}}15$. Both $y$ and $q$ are live-outs. Singletons exist for all operations: $u,p,q$ cost three each, and $v,w,y$ cost two each. They produce ordinary registers.
+
+In addition, candidate $A$ owns $u,v,w,y$, exports $u,y$, and costs three. Candidate $B$ takes $u$ as input, owns $v,w,y$, exports $y$, and costs two. Candidate $C$ owns $u,p,q$, exports $u,q$, and costs four. These are all the non-singleton candidates. We require exact ownership, and each candidate handles its own internal dependencies. The exported $u$ makes both $A$ and $C$ legal on this DAG, but they cannot both be selected. $B$ and $C$ can coexist: their only connection is the ordinary register $u$ from $C$ to $B$.
+
+Relative to the all-singleton baseline, $A$ saves six units, $B$ saves four, and $C$ saves five. A rule that always takes the largest remaining match chooses $A$ first. So does a rule that takes the largest immediate singleton saving. Both ignore the fact that $A$ blocks two candidates that might otherwise be used together. A first-fit root traversal can also go either way: with a preference for the largest match at a root, visiting $y$ first can commit $A$, whereas visiting $q$ first can commit $C$ and leave $B$ available at $y$. The example isolates the commitment error: both outcomes use candidates from the same list.
+
+\Cref{fig:visual-272} separates the shared data dependence from the match conflicts that drive the greedy decision.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[ast leaf] (in) at (0,0) {$x$};
+  \node[ast node] (u) at (1.5,0) {$u$};
+  \node[ast node] (v) at (3,0.65) {$v$};
+  \node[ast node] (w) at (4.5,0.65) {$w$};
+  \node[ast node] (y) at (6,0.65) {$y$};
+  \node[ast node] (p) at (3,-0.65) {$p$};
+  \node[ast node] (q) at (4.5,-0.65) {$q$};
+  \foreach \from/\dest in {in/u,u/v,v/w,w/y,u/p,p/q}
+    \draw[tome arrow] (\from) -- (\dest);
+  \node[anchor=west] at (6.55,0.65) {live-out};
+  \node[anchor=west] at (5.05,-0.65) {live-out};
+  \node[tome box,minimum width=3.3cm] (a) at (4,-2.2) {$A$ owns $u,v,w,y$};
+  \node[tome box,minimum width=3.3cm] (b) at (0.05,-2.2) {$B$ owns $v,w,y$};
+  \node[tome box,minimum width=3.3cm] (c) at (7.95,-2.2) {$C$ owns $u,p,q$};
+  \draw (b.east) -- (a.west) (a.east) -- (c.west);
+  \node at (4,-3.05) {Lines between matches mean overlap; $B$ and $C$ do not overlap.};
+\end{tikzpicture}
+\caption{The IR DAG (top) and the conflicts among its fused candidates (bottom). Choosing \(A\) excludes both alternatives; choosing \(C\) leaves \(B\) available to consume \(u\).}
+\label{fig:visual-272}
+\end{figure}
+
+% Annotated walkthrough
+\section{Trace the Commitment, Then Enumerate Its Alternatives}
+
+\begin{verbatim}
+choose A by largest footprint
+remove B and C from consideration     # Overlap is ownership.
+fill uncovered operations with P,Q   # A exports their input u.
+
+x = 0xA6 -> u = 0x4D
+left:  v = 0x0D, w = 0x0E, y = 0x0F
+right: p = 0x13, q = 0x1C
+baseline: U,V,W,Y,P,Q          cost 15
+greedy:   A,P,Q                cost  9
+          # C also owns u, so A blocks it.
+compare:  C,B                  cost  6
+          # C must issue first because B reads its u.
+\end{verbatim}
+
+An exact reference can branch on the three ways to produce $y$: $A$, $B$, or singleton $Y$. If it chooses $A$, then $P,Q$ are forced, so the minimum in that branch is nine. If it chooses $B$, the cheapest way to supply $u$ and $q$ is $C$ at cost four; the singletons for $u,p,q$ would cost nine. That branch reaches six. With singleton $Y$, neither $A$ nor $B$ can be used, so $V$ and $W$ are required. They cost four on top of the two for $Y$, even before supplying the right arm, which costs at least four more. This exhausts the candidates and certifies six as the optimum. The identical hexadecimal results establish what each plan must compute at the test input; the ownership and operand checks establish why the two chosen instructions can be composed at all inputs.
+
+\section{Use Search Where Commitments Matter}
+
+Blindell distinguishes greedy techniques from exhaustive methods that prune combinations rather than commit immediately. A useful compromise is to run the greedy selector first, keep its verified cover as an upper bound, and search only a budgeted set of competing matches. A sound lower bound for each unfinished branch tells the selector when that branch cannot beat the incumbent; a ranking score need not have this property. In the example, reserving $A$'s singletons merely because their remaining cost looks small says nothing about branches that never selected $A$. Even a two-choice lookahead should check availability of all external operands and retain a legal fallback. If the time budget expires, reporting the best known legal solution is useful, but it does not certify a negative answer to a tighter decision budget. For example, cost nine says nothing about feasibility at budget seven; cost six is an explicit witness.

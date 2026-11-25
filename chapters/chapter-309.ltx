@@ -1,0 +1,69 @@
+% Source: introduction-to-computer-organization-an-under-the-hood-look-at-hardware-and-x86-64-assembly-robert-g.-plantz-.txt
+% Source: ir-il-for-datapath-gen.txt
+
+\section{Make the Output a Total Function of the Inputs}
+
+In chapter~6 of \emph{Introduction to Computer Organization}, Robert G. Plantz distinguishes combinational circuits, whose outputs depend on present inputs, from sequential circuits, whose outputs can depend on previous inputs. A procedural HDL block can describe either one. The syntax of a conditional is not enough to tell a synthesis tool which one was intended: it must determine whether an execution path leaves any output holding its old value.
+
+Consider a word selector with a two-bit opcode. Encodings \texttt{00} and \texttt{01} select operands, \texttt{10} selects their XOR, and \texttt{11} is reserved. The reserved code is still a physically possible binary input, so this interface specifies \texttt{valid=0} and a zero result for it. It makes the same choice for simulator-only meta-values without claiming that the manufactured circuit can detect a simulator's \texttt{x}. The choice of zero is an interface decision, not an instruction to the mapper that the output is a don't-care.
+
+\section{Write the Reserved Case, Not Just the Happy Path}
+
+The following SystemVerilog module is simulatable and normally synthesizable as combinational RTL \cite{ieee1800systemverilog}. It uses ordinary exact-match \texttt{case}, not wildcard matching.
+
+\begin{verbatim}
+module select_op (
+    input  logic [1:0] op,
+    input  logic [3:0] a, b,
+    output logic [3:0] y,
+    output logic       valid
+);
+    always_comb begin
+        y     = 4'b0000;
+        valid = 1'b1;
+        case (op)
+            2'b00: y = a;
+            2'b01: y = b;
+            2'b10: y = a ^ b;
+            default: valid = 1'b0;
+        endcase
+    end
+endmodule
+\end{verbatim}
+
+Defaults run first on every activation. The matching branch can override them, but there is never a path on which they are missing. Blocking assignments express these within-block data dependencies in order. The assignments from the three valid cases can be viewed as candidate inputs to a multiplexer. Kasprzyk, Koch, Golze, and Rock's \emph{An Improved Intermediate Representation for Datapath Generation}, section~6, similarly maps control-selected alternatives to multiplexers and discusses how changing their structure can affect depth. A source conditional describes selection; it need not map to a literal chain of physical switches.
+
+Now remove only the initial assignment to \texttt{y}. The reserved and unknown-selector paths no longer assign it. Under simulation they preserve its previous value, and honoring this behavior for the binary reserved case requires level-sensitive storage. Tools may diagnose the latch as inconsistent with \verb|always_comb| and stop rather than emit it. Changing sensitivity syntax will not fix an assignment missing from a path. Compare the two meanings in \Cref{fig:visual-309}.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (op) at (0,0) {Reserved code \texttt{11}};
+  \node[tome box] (def) at (-2.8,-1.55) {With default for \texttt{y}};
+  \node[tome box] (miss) at (2.8,-1.55) {Without default for \texttt{y}};
+  \node[tome box accent] (zero) at (-2.8,-3.05) {\(\texttt{y}=0000\)\\no old value needed};
+  \node[tome box accent] (old) at (2.8,-3.05) {Keep previous \texttt{y}\\requires storage};
+  \draw[tome arrow] (op) -- (def);
+  \draw[tome arrow] (op) -- (miss);
+  \draw[tome arrow] (def) -- (zero);
+  \draw[tome arrow] (miss) -- (old);
+\end{tikzpicture}
+\caption{Two versions agree on every legal opcode. They disagree on the reserved code because one computes a result and the other must remember one.}
+\label{fig:visual-309}
+\end{figure}
+
+% Annotated walkthrough
+\section{Test a Reserved Code After Two Different Histories}
+
+\begin{verbatim}
+drive a=3, b=10
+for (legal, legal_y) in [(00,3), (01,10), (10,9)]:
+    drive op=legal; settle and check (valid=1, y=legal_y)
+    drive op=11; settle and check (valid=0, y=0)
+    # A forgotten default preserves a different old y each time.
+drive op=X0; settle and check (valid=0, y=0)
+    # Exact match: X0 is not 00 or 10.
+\end{verbatim}
+
+The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/proc.html}{Yosys process conversion guide} distinguishes mux lowering from latch extraction. Inspect both simulation and diagnostics: a functional test can miss a latch if it never visits the unassigned branch, while a clean combinational netlist does not prove that the chosen reserved behavior matches the interface. Once the reserved output is explicitly zero, it is observable behavior rather than a synthesis don't-care; only an enclosing specification that declares it irrelevant could permit a tool to exploit that freedom. Avoid using wildcard \texttt{casex} to make a failing X test pass; it can treat a real modeling defect as a match and select a legal operation.

@@ -1,0 +1,71 @@
+% Source: linkers-loaders-ocr.txt
+% Source: writing-a-c-cc-compiler-full-book.txt
+
+\section{One Command, Several Contracts}
+
+The command that builds a C program is usually a driver, not just the program that translates C. In Section~1.4 of \emph{Linkers \& Loaders}, John R. Levine traces a two-file UNIX build: preprocess, compile, and assemble each file on its own, then link both objects with the system C library \cite[chapter~1]{levine2000linkers}. The important boundary is between independent translation and joint linking. The compiler need not see the definition of every function it calls; the object file must carry enough information for a later stage to finish the reference.
+
+Treat the diagram as a description of work, not a required process tree. A current GCC driver may have its compiler executable do preprocessing and compilation in one invocation. Clang on many targets uses an integrated assembler rather than starting an external \texttt{as}. Some implementations can send machine-code bytes to an object writer without serializing assembly text. None of these choices eliminates the need to encode instructions, assign symbols, and represent unresolved references. Nor does an ordinary driver invocation decide which sources are stale: the build system commonly makes that decision, although Levine uses a broader sense of ``driver'' that includes build orchestration.
+
+A description of the pipeline should identify its artifact boundaries. On a typical GNU/Linux ELF target, C preprocessing yields a translation unit in text form; compilation to assembly yields target-specific mnemonics and directives; assembly yields a relocatable object. A default final link through the C driver usually adds startup objects, runtime support, and the standard C library according to the toolchain's defaults. The result may use shared libraries and be position independent. Linking produces the file; launching it is another operation. Levine's separate account of loading explains why mapping the program and selecting any remaining run-time bindings are not jobs the driver performs by launching the executable.
+
+\section{Request an Artifact, Not a Particular Subprocess}
+
+Nora Sandler's \emph{Writing a C Compiler} exposes these boundaries in a teaching driver: it borrows GCC's preprocessor and assembler/linker and later adds the option to stop at an object file. With GCC, \texttt{-E} selects preprocessed output, \texttt{-S} stops at assembly, and \texttt{-c} stops at the object. The inputs also determine the start: a \texttt{.i} file is already preprocessed C, a lowercase \texttt{.s} file is ordinary assembly, and a \texttt{.o} file goes straight to the linking step. GCC conventionally preprocesses an uppercase \texttt{.S} assembly input. These conventions belong to the tool, not to ELF or to the C language.
+
+The distinction matters when reproducing a failure. A compiler diagnostic about a missing declaration is not the same as a linker diagnostic about a missing definition. An assembly error can be isolated by retaining the compiler's assembly output and assembling it separately. If that works but the combined link fails, inspecting the actual object symbols and link inputs is more useful than adjusting the assembler's options.
+
+% Annotated walkthrough
+\section{Trace a Definition Across Two Translation Units}
+
+In a scratch directory on GNU/Linux, use the following shell transcript with GCC and GNU Binutils. The caller expects a result of $5+7=12$; it returns a status of zero exactly when it gets that value.
+
+\begin{verbatim}
+printf '#define DELTA 7\n' > delta.h
+printf '#include "delta.h"\n' > bias.c
+printf 'int bias(int x) { return x + DELTA; }\n' >> bias.c
+printf 'int bias(int);\n' > main.c
+printf 'int main(void) { return bias(5) != 12; }\n' >> main.c
+
+# The header substitution is visible before code generation.
+gcc -E -P bias.c -o bias.i
+cat bias.i
+gcc -S bias.i -o bias.s
+gcc -c bias.s -o bias.o
+gcc -c main.c -o main.o
+
+# A valid object can name a function it does not define.
+nm main.o bias.o
+gcc main.o bias.o -o check
+./check
+test "$?" -eq 0
+\end{verbatim}
+
+The preprocessed body contains \verb|return x + 7;|. The \texttt{nm} output shows \texttt{U bias} in \texttt{main.o} and \texttt{T bias} in \texttt{bias.o}, using GNU \texttt{nm}'s letters for an undefined symbol and a definition in text. For a negative test, run \verb|gcc main.o -o incomplete|: it fails to link even though \texttt{main.o} was successfully assembled. Alternatively, change the macro to eight and rebuild the provider: the link still succeeds, but the program returns status one since $5+8\ne12$. Successful binding finds a definition; it does not prove the definition implements the intended computation.
+
+\Cref{fig:visual-279} shows the object files as the boundary where independent translation gives way to joint resolution.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (bc) at (0,0) {\texttt{bias.c}};
+  \node[tome box] (bi) at (2.6,0) {\texttt{bias.i}\\\texttt{-E}};
+  \node[tome box] (bs) at (5.2,0) {\texttt{bias.s}\\\texttt{-S}};
+  \node[tome box,minimum width=2.55cm] (bo) at (8.1,0) {\texttt{bias.o}\\\texttt{-c}, \texttt{T bias}};
+  \node[tome box] (mc) at (0,-1.5) {\texttt{main.c}};
+  \node[tome box,minimum width=2.55cm] (mo) at (8.1,-1.5) {\texttt{main.o}\\\texttt{-c}, \texttt{U bias}};
+  \node[tome box dark] (exe) at (11.2,-0.75) {Link\\\texttt{check}};
+  \foreach \from/\dest in {bc/bi,bi/bs,bs/bo,bo/exe,mo/exe}
+    \draw[tome arrow] (\from) -- (\dest);
+  \draw[tome arrow] (mc) -- node[above] {Intermediate files not retained} (mo);
+\end{tikzpicture}
+\caption{The stop options expose intermediate artifacts, not necessarily separate subprocesses. The final link can resolve the undefined \texttt{bias} in \texttt{main.o} because \texttt{bias.o} defines it.}
+\label{fig:visual-279}
+\end{figure}
+
+\section{Compare the Plans as Well as the Results}
+
+Run \verb|gcc -### main.o bias.o -o check| to print the planned commands without executing them, and compare that with a trace of \verb|gcc -### main.c bias.c -o check|. The latter also includes the work needed to produce each object. The exact startup objects, paths, and choice of link helper vary with installation and options. Replacing the driver with a bare \texttt{ld} call without recreating its inputs does not normally reproduce a hosted C link: the presence of a C function named \texttt{main} is not by itself a machine entry point.
+
+The useful regression invariant is behavioral: with the same source, headers, target, and relevant options, splitting the build at stable artifact boundaries should preserve the observable result. Temporary filenames, debug metadata, and other incidental bytes need not agree. When moving output between toolchains, check the target ABI as well as the file format. Two objects can both be ELF and still target different machines or incompatible calling conventions.

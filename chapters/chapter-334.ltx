@@ -1,0 +1,62 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Lower Once, Then Generate Different Artifacts}
+
+A functional instruction set simulator (ISS) can execute one architectural transition at a time. A cycle model must also represent intermediate state, and synthesizable hardware must realize that state and its connections as circuits. VADL shares an intermediate microarchitecture synthesis pass between its cycle-accurate simulator (CAS) and hardware backends. Sections~4.7--4.9 describe how the pass resolves instruction mappings, implements decoders, assigns resource ports, lowers control logic, and makes stage connections explicit in the VADL intermediate representation (VIR) \cite{himmelbauer2024vadl}. A same-cycle connection can become a wire; a value that must survive an edge needs state. This shared lowering is distinct from the downstream synthesis that maps generated RTL to technology cells.
+
+Listing~11 of the paper contains this actual VADL excerpt (with spacing normalized). It obtains an instruction after execute and maps its memory effects onto one stage. The surrounding ISA defines \texttt{MEM}. The excerpt does not specify a C++ call order, module interface, or RAM primitive.
+
+\begin{verbatim}
+stage MEMORY -> (ir: Instruction) = {
+  let instr = EXECUTE.ir in {
+    instr.write(@MEM)
+    instr.read(@MEM)
+    ir := instr
+  }
+}
+\end{verbatim}
+
+These mappings are requests to realize applicable instruction operations, not instructions to perform a write and a read for every instruction that passes through. The lowered representation must carry the conditions and data of actual reads and writes. Figure~\ref{fig:visual-334} distinguishes that shared description from the generated products. When debugging a discrepancy, identifying which side of the fork introduced it is more useful than comparing source lengths.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (src) at (0,0) {ISA + MiA};
+  \node[tome box] (vir) at (3.7,0) {Lowered VIR};
+  \node[tome box] (cas) at (8,0.85) {C++ cycle model};
+  \node[tome box] (hdl) at (8,-0.85) {Chisel $\to$ Verilog};
+  \draw[tome arrow] (src) -- (vir);
+  \draw[tome arrow] (vir.east) -- (cas.west);
+  \draw[tome arrow] (vir.east) -- (hdl.west);
+\end{tikzpicture}
+\caption{Two backends consume shared lowered timing and resource information. The C++ driver advances modeled clocks; the HDL branch still needs elaboration and, for hardware, technology mapping.}
+\label{fig:visual-334}
+\end{figure}
+
+\section{Represent Simultaneous Behavior in Sequential Code}
+
+Section~4.8 describes generating C++ classes for resources and stages. Stage evaluation carries out the lowered operations; multi-step execution can keep an explicit finite-state machine and report a busy condition. Sequential host code must not accidentally publish an edge-triggered update early just because the producer's method happened to run first. In contrast, a modeled same-cycle wire must be visible before the edge to the logic that consumes it. Those requirements favor a distinction between evaluating combinational dependencies and publishing clocked updates, rather than a rule such as ``all stages run in reverse order.''
+
+On the hardware branch, the HDL generator makes formerly global resource port references into explicit module ports and connections, emits Chisel, and lets the Chisel toolchain produce Verilog. The design can be simulated or passed to synthesis. Section~4.9 notes that arithmetic such as addition need not be assembled from a generator's library of fixed datapaths: ordinary operators can be left to synthesis. It also explains why control that cannot be eliminated can become an FSM, with busy and enable signals, rather than always fitting in one clock. A change in this control schedule may preserve ISA results while changing cycle traces and throughput. The generated HDL must still give every combinational output a value on every path and must represent an unavailable memory response as a held transaction, not as an arbitrary combinational value.
+
+% Annotated walkthrough
+\section{Check Edge Visibility in Both Backends}
+
+Consider a teaching datapath with one clocked E-to-W slot, an always-ready write-back stage, and a combinational sum. The following is pseudocode for a tick; it is not a transcription of generated C++.
+
+\begin{verbatim}
+tick(execute):
+    prev = ew                          # clocked state at cycle start
+    candidate = add_and_tag(execute)   # combinational; invalid if idle
+    write = prev if prev.valid else none
+    at_edge:
+        if write is not none: X[write.dest] = write.value
+        ew = candidate                 # cannot feed W until next cycle
+\end{verbatim}
+
+With \texttt{ew} invalid at reset and an execute input of \(3+4\) for \(x_6\) in cycle 1, the first edge installs \((x_6,7)\) in the slot but cannot change \(x_6\). If execute is idle in cycle 2, the second edge writes \(7\) and empties the slot. With two consecutive valid inputs, W still writes precisely the previous E output at each edge. The invariant is that a valid clocked payload causes one write at its designated edge. An in-place C++ assignment before the W read could move that write one cycle earlier even though a benchmark inspecting only the final register value would still pass.
+
+If W can refuse an input, the slot can no longer be overwritten each tick. It must hold its payload until W accepts it and either block E or buffer the new result elsewhere. In a test with two refused cycles followed by acceptance, count one write, not three. Validity signals alone do not distinguish a prepared effect from an accepted one.
+
+Test this with an edge-aligned CAS versus Verilog trace, then compare the committed result against an ISA reference. The paper's Section~5.7 comparison with Verilator is evidence about the reported RV32IM configurations, not proof of universal cycle equivalence. Section~5.8 also reports structural measurements with Yosys on a five-stage comparison; a mapped area estimate under a demo library is not a routed chip, a clock measurement, or an assessment of power.

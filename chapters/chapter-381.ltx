@@ -1,0 +1,103 @@
+% Source: lucid-book.txt
+% Source: dataflow-impl-of-lucid-like.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: analysis-dataflow-programs.txt
+
+\section{Start from Intensional Stream Equations}
+
+Lucid treats variables as streams and uses operators such as \texttt{fby}, \texttt{first}, and \texttt{next} to express iteration without assignments. Ashcroft and Wadge give equations such as counters and running calculations in this style \cite{wadge1985lucid}. Consider a small Lucid-like program:
+
+\begin{verbatim}
+where
+  n   = 1 fby n + 1;
+  sum = 0 fby sum + input;
+  avg = (next sum) / n;
+end
+\end{verbatim}
+
+At time \(0\), \texttt{n} is \(1\) and \texttt{sum} is \(0\). A demand for \texttt{avg} at context \(t\) asks for \texttt{sum} at \(t+1\), which recursively reaches \texttt{sum} at \(t\) and \texttt{input} at \(t\). The exact alignment of \texttt{next sum} and \(n\) is part of the language semantics. Treating \texttt{fby} as an ordinary eager binary operator would demand its recursive tail while constructing time zero and fail to represent the intended stream.
+
+\section{Build a Demand Graph Before Choosing Streaming Code}
+
+The Lucid-like IR design starts by resolving equations to stable definition IDs and lowering each expression to an intensional graph. A demand key contains node ID and context, here a time index. \texttt{fby} dispatches on that context: its initial branch at zero and its tail branch at successor times. Memoization turns repeated demands for \((\texttt{sum},t)\) into one evaluation. Input is an effectful demand whose sequence contract must be retained.
+
+\Cref{fig:visual-381} follows a request for \(\texttt{avg}@2\) to earlier state and the current input.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (avg) at (0,0) {\(\texttt{avg}@2\)};
+  \node[tome box] (s3) at (3,.8) {\(\texttt{sum}@3\)};
+  \node[tome box] (n2) at (3,-.8) {\(\texttt{n}@2\)};
+  \node[tome box accent] (s2) at (6,.8) {\(\texttt{sum}@2\)};
+  \node[tome box] (i2) at (6,-.2) {\(\texttt{input}@2\)};
+  \node[tome box] (base) at (9,.8) {\(\cdots\ \texttt{sum}@0=0\)};
+  \draw[tome arrow] (avg) -- (s3);
+  \draw[tome arrow] (avg) -- (n2);
+  \draw[tome arrow] (s3) -- (s2);
+  \draw[tome arrow] (s3) -- (i2);
+  \draw[tome arrow] (s2) -- (base);
+\end{tikzpicture}
+\caption{Demand travels through context shifts and recurrence until it reaches initial values and indexed input demands.}
+\label{fig:visual-381}
+\end{figure}
+
+The initial output artifacts are a resolved demand graph, context-transfer functions, memo schema, and an interpreter. Analysis then recognizes forward-only affine time demands and finite recurrence state. It can emit a streaming loop, state layout, input/output protocol, and provenance from loop variables back to equations. Unsupported multidimensional or noncausal demands remain on the eductive runtime.
+
+% Annotated walkthrough
+\section{Specialize the Demand Graph to a Streaming Loop}
+
+\begin{verbatim}
+n := 1
+sum := 0
+for each input_token:
+    next_sum := sum + input_token
+    avg := next_sum / n
+    emit avg
+    sum := next_sum
+    n := n + 1
+\end{verbatim}
+
+This loop is legal because the demanded contexts advance monotonically, each recurrence needs only the preceding state, and the output at an iteration uses exactly the corresponding \texttt{next sum}. The state slots implement delayed stream values; they are not mutable source variables. Common demand elimination and memoization are legal in the pure graph. In generated streaming code, fusion with an upstream actor, vectorization, or eliminating memo tables additionally requires preserving input order, division behavior, overflow, and output timing. Parallel prefix techniques need an associative state-composition law and a compatible numerical contract.
+
+Validation first compares the demand interpreter and stream loop for every prefix of finite input sequences, including the empty prefix and division or overflow edge cases. It checks that loop state after \(k\) firings equals the graph values needed for context \(k\). A trace records demand keys, memo hits, consumed input index, and emitted output; translation validation maps each loop update to its defining \texttt{fby} equation. Thus the final artifacts---streaming code, state layout, and protocol---are justified by the Lucid-like demand semantics rather than by superficial resemblance to a pipeline.
+
+\section{Replay Prefixes and Test the Specialization Boundary}
+
+For input \(3,5,10\), the graph answers demands for \texttt{avg} at indices \(0,1,2\) with \(3,4,6\). The loop's state at the start of index \(k\) is the pair \((n[k],\texttt{sum}[k])\); the result uses \texttt{sum} at index \(k+1\) and \texttt{n} at index \(k\). This distinction avoids a common off-by-one error where the loop increments the denominator before dividing.
+
+\begin{center}
+\begin{tabular}{crrrr}
+\hline
+Index & Old sum & Input & Divisor & Output \\
+\hline
+0 & 0 & 3 & 1 & 3 \\
+1 & 3 & 5 & 2 & 4 \\
+2 & 8 & 10 & 3 & 6 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+check_prefix(input):
+    reference := new_demand_graph(input)
+    actual := run_loop_from_seed(input)
+    require count(actual.outputs) == count(input)
+    for k in 0 .. count(input)-1:
+        require actual.before[k] == (reference.at(n,k),
+                                      reference.at(sum,k))
+        require actual.outputs[k] == reference.at(avg,k)
+    require actual.final == (reference.at(n,count(input)),
+                              reference.at(sum,count(input)))
+\end{verbatim}
+
+Run the checker on the empty prefix too; its final state must be the seed pair, and neither evaluator needs an input token. Add a fixture with a nonintegral average to exercise the chosen language's division semantics. A final state record suffices to resume the next sequential index, but cannot answer arbitrary old requests without retaining results or replaying input. If clients can request index 100 and then index 2, document how the API answers the second demand or do not apply this specialization. Sustained streaming throughput does not justify replacing a more general demand interface.
+
+\paragraph{Check resumption against an uninterrupted run.}
+Split \(3,5,10\) after the second token. Save the post-step state
+\((3,8)\), start the next invocation from that state, and expect
+the suffix output to be \(6\). Resetting either field would fail
+the check. If the runtime serializes state at a checkpoint, include
+the consumed input position in the protocol so replay does not
+accidentally feed the last item of the preceding chunk twice.

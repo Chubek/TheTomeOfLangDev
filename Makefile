@@ -12,17 +12,18 @@
 ##   make index      — Regenerate index only
 ##   make bib        — Regenerate bibliography only
 ##   make count      — Count words/pages
+##   make chapter-lengths — Measure chapters with Pandoc
 ##   make lint       — Check for common LaTeX issues
-##   make check-expansion — Check chapter walkthroughs, dossier links and source catalogue
+##   make check-expansion — Check chapter walkthroughs, visuals, dossier links and source catalogue
 ##   make help       — Show this help
 ##
 
-.PHONY: all pdf xelatex pdflatex watch clean distclean index bib count lint check-expansion help
+.PHONY: all pdf xelatex pdflatex watch clean distclean index bib count chapter-lengths lint check-expansion help
 
 MAIN    := the-tome-of-langdev
 CLASS   := $(MAIN).cls
 LTX     := $(MAIN).ltx
-EXTENSIONS := tome-extensions.ltx
+EXTENSIONS := tome-extensions.ltx tome-native-toolchain.ltx tome-description-languages.ltx tome-alternative-languages.ltx
 PDF     := $(MAIN).pdf
 BIB     := references.bib
 SUPPORT := $(wildcard support/*.sty)
@@ -90,6 +91,9 @@ lint:
 	@comm -23 /tmp/refs.txt /tmp/labels.txt | head -20 || true
 	@echo "=== Lint complete ==="
 
+chapter-lengths:
+	@python3 -B support/chapter_lengths.py
+
 check-expansion:
 	python3 -B support/check_expansion.py
 
@@ -107,6 +111,7 @@ help:
 	@echo "  make index      Regenerate index only"
 	@echo "  make bib        Regenerate bibliography only"
 	@echo "  make count      Count words and chapters"
+	@echo "  make chapter-lengths   Measure chapter plaintext lengths with Pandoc"
 	@echo "  make lint       Check for common LaTeX issues"
-	@echo "  make check-expansion  Check chapter walkthroughs, dossier links and source catalogue"
+	@echo "  make check-expansion  Check chapter walkthroughs, visuals, dossier links and source catalogue"
 	@echo "  make help       Show this help"

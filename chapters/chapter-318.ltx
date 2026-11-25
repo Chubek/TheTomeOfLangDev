@@ -1,0 +1,64 @@
+% Source: c-to-async-dataflow.txt
+
+\section{Give the Timing Graph an External Contract}
+
+Static timing analysis (STA) computes arrival and required times on paths without enumerating input vectors. The graph includes cell arcs and interconnect; its endpoints include register data pins and constrained ports. Clock definitions decide which launch and capture edges to compare. A Liberty library provides characterized arcs; extracted interconnect such as SPEF supplies resistance and capacitance after routing. Earlier estimates can guide synthesis, but do not substitute for checking the routed interconnect and relevant process, voltage, and temperature corners.
+
+Input and output delays model the external paths relative to a reference clock. A port with no delay constraint is not thereby promised to have zero off-chip delay. A generated clock related to the original should describe the hardware's real edge relationship, not be replaced by an arbitrary independent clock of the same nominal frequency. Audit unconstrained endpoints and inspect which paths an exception changes. A fast report from a partly unconstrained design is not timing closure.
+
+% Annotated walkthrough
+\section{Check Both Sides of the Capture Window}
+
+Suppose \(T=5.00\) ns, with clock arrivals at the launch and capture registers of \(0.15\) ns and \(0.25\) ns relative to their nominal edges. For setup the max clock-to-Q is \(0.35\) ns, max data path is \(4.40\) ns, setup is \(0.20\) ns, and setup uncertainty is \(0.20\) ns. For hold take min clock-to-Q and data path to be \(0.10\) and \(0.12\) ns, hold time \(0.12\) ns, and hold uncertainty \(0.03\) ns. These are illustrative numbers, not characterization. \Cref{fig:visual-318} shows the timing requirements that the same data path has to meet.
+
+Pseudocode for the simple same-clock check, omitting effects such as common-path pessimism removal:
+
+\begin{verbatim}
+latest = launch + tcq_max + path_max
+setup_by = period + capture - setup - setup_uncertainty
+setup_slack = setup_by - latest      # soon enough for next edge?
+
+earliest = launch + tcq_min + path_min
+hold_until = capture + hold + hold_uncertainty
+hold_slack = earliest - hold_until   # late enough for current edge?
+\end{verbatim}
+
+The late arrival is \(4.90\) ns and its deadline \(4.85\) ns, for setup slack of \(-0.05\) ns. The early arrival is \(0.37\) ns and must wait until \(0.40\) ns, for hold slack of \(-0.03\) ns. Increasing the period by \(0.05\) ns would fix setup only in this simplified model; it does not change this same-edge hold check. Delaying the capture clock helps setup but worsens hold, while adding delay to the data path has the opposite tradeoff.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (launch) at (0,0) {Launch flop\\clock at \(0.15\) ns};
+  \node[tome box] (wire) at (3.55,0) {Data path\\earliest \(0.37\) ns\\latest \(4.90\) ns};
+  \node[tome box dark] (capture) at (7.35,0) {Capture flop\\clock at \(0.25\) ns};
+  \draw[tome arrow] (launch) -- (wire);
+  \draw[tome arrow] (wire) -- (capture);
+  \node[align=center] at (7.35,-1.5) {Hold until \(0.40\) ns\\Set up by \(4.85\) ns};
+\end{tikzpicture}
+\caption{A same-clock path can fail both checks: its earliest arrival violates the current edge's hold window and its latest arrival violates the next edge's setup window.}
+\label{fig:visual-318}
+\end{figure}
+
+\section{Write Constraints, Then Inspect Their Reach}
+
+The following is an OpenSTA Tcl script with SDC timing commands. It assumes a characterized library whose time unit is the nanosecond, a mapped module \texttt{top}, and synchronous data ports \texttt{din} and \texttt{dout}. The I/O delays here are examples, not timing obligations inferred from RTL.
+
+\begin{verbatim}
+read_liberty slow.lib
+read_verilog top_stdcell.v
+link_design top
+create_clock -name core -period 5.00 [get_ports clk]
+set_clock_uncertainty -setup 0.20 [get_clocks core]
+set_clock_uncertainty -hold  0.03 [get_clocks core]
+set_input_delay  -clock core -max  1.0 [get_ports din]
+set_input_delay  -clock core -min  0.2 [get_ports din]
+set_output_delay -clock core -max  0.8 [get_ports dout]
+set_output_delay -clock core -min -0.1 [get_ports dout]
+check_setup
+report_checks -path_delay min_max
+\end{verbatim}
+
+The \href{https://opensta.readthedocs.io/en/latest/Commands/}{OpenSTA command reference} documents these reports and the supported exceptions. The script is one view; signoff needs appropriate min and max corners, propagated clocks where applicable, and parasitics matching the final implementation. In particular, inspect \texttt{report\_checks} for the actual launch and capture clocks, and run the tool's unconstrained-path report: a port omitted from \texttt{get\_ports din} is not covered by the example merely because another port is. Check setup and hold even when the logic passed equivalence. A multicycle exception changes the checked edges and requires a real sampling protocol and a review of both setup and hold. A false-path exception just removes a check; it does not add a synchronizer or make a wire safe.
+
+Absence of a shared clock does not mean absence of timing constraints. In Venkataramani and colleagues' asynchronous flow, bundled data goes with a matched control delay: the request must not arrive too early for the data. That is a relative-timing obligation, not the periodic setup calculation above. In either setting, optimization can improve only paths it models. Validate the constraints and their coverage before using a report to claim improvement.

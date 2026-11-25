@@ -1,0 +1,86 @@
+% Source: c-to-async-dataflow.txt
+
+\section{Define a Transfer Before Encoding States}
+
+A finite-state machine has state, a rule for its next state, and a rule for its outputs. In a Moore model outputs depend only on state; Mealy outputs may also depend on current inputs. For an interface controller, neither label says what counts as delivery. Define that first. Here a source offers a word with \texttt{valid}, a destination advertises capacity with \texttt{ready}, and a transfer occurs on a rising edge sampling both high. Once offered, the source must keep validity and data stable until the transfer. Reset is a separate flush event: this module masks both handshakes while reset is asserted, and a rising edge with reset clears the slot.
+
+Venkataramani, Budiu, Chelcea, and Goldstein's \emph{C to Asynchronous Dataflow Circuits}, section~4, offers a useful contrast. Their clockless bundled-data protocol places data, raises a ready wire, waits for acknowledgment, and then returns both controls to zero. The similarly named wires in our synchronous example do not implement that four-phase protocol: consecutive rising edges may each perform a transfer without an intervening return to zero. Both designs need explicit timing rules relating the data to the control signals.
+
+\section{A One-Entry Buffer with Same-Edge Replacement}
+
+This SystemVerilog model is simulatable and normally synthesizable RTL \cite{ieee1800systemverilog}. The control states are empty and full. The word held in the slot is datapath state. When full, the buffer can accept a new word on the same edge that consumes the old one.
+
+\begin{verbatim}
+module elastic1 (
+    input  logic       clk, rst,
+    input  logic       in_valid,
+    input  logic [7:0] in_data,
+    output wire        in_ready,
+    output wire        out_valid,
+    output wire  [7:0] out_data,
+    input  logic       out_ready
+);
+    logic full;
+    logic [7:0] saved;
+    wire push, pop;
+
+    assign out_valid = !rst && full;
+    assign in_ready  = !rst && (!full || out_ready);
+    assign out_data  = saved;
+    assign push = in_valid && in_ready;
+    assign pop  = out_valid && out_ready;
+
+    always_ff @(posedge clk) begin
+        if (rst) full <= 1'b0;
+        else begin
+            case ({push, pop})
+                2'b10: full <= 1'b1;
+                2'b01: full <= 1'b0;
+                default: ;      // keep state on 00 or 11
+            endcase
+            if (push) saved <= in_data;
+        end
+    end
+endmodule
+\end{verbatim}
+
+Outside reset, \texttt{out\_valid} depends on occupancy, not on the consumer. The producer can therefore observe it even if the consumer is not ready. By contrast, \texttt{in\_ready} depends on \texttt{out\_ready} when full. That combinational path is the price of accepting a replacement immediately; composing a chain of such stages increases the ready path length, and wiring feedback can create combinational loops. A buffer with no combinational ready path needs a different capacity or throughput policy. The output data path here never bypasses the slot: an input accepted while empty cannot also be consumed on that same edge.
+
+\Cref{fig:visual-311} shows the control transitions for known values and inactive reset. The slot memory is written only on a push, including a simultaneous push and pop.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (empty) at (-2.25,0) {EMPTY};
+  \node[tome box accent] (full) at (2.25,0) {FULL};
+  \draw[tome arrow] (empty.north east) to[bend left=21]
+    node[above] {push (10)} (full.north west);
+  \draw[tome arrow] (full.south west) to[bend left=21]
+    node[below] {pop (01)} (empty.south east);
+  \node[align=center] at (-2.25,-1.25) {Hold on 00};
+  \node[align=center] at (2.25,-1.25) {Hold on 00 or 11};
+\end{tikzpicture}
+\caption{Labels \texttt{10}, \texttt{01}, and so on are \texttt{(push,pop)}. In the FULL-to-FULL replacement \texttt{11}, the state is unchanged but the payload changes. Reset returns either state to EMPTY.}
+\label{fig:visual-311}
+\end{figure}
+
+% Annotated walkthrough
+\section{Check Occupancy and Data, Including a Stall}
+
+\begin{verbatim}
+reference = empty
+at each sampled edge with reset inactive:
+    old = reference                 # pre-edge head
+    check out_valid == old.present
+    if out_valid: check out_data == old.word
+    pop  = out_valid and out_ready
+    push = in_valid and in_ready
+    if pop: reference = empty       # check the OLD payload
+    if push:
+        assert reference == empty   # never overwrite an unread word
+        reference = some(in_data)
+# On reset: check neither handshake is advertised, then clear.
+\end{verbatim}
+
+After reset, send \(A\) while the consumer is stalled. Hold it stalled for another edge: \texttt{out\_valid} and \(A\) must persist, without another push. Then have the consumer accept \(A\) while the producer offers \(B\), so the next observable word is \(B\) with no validity gap. Also assert the readiness equation independently: the reference's data-order checks alone would not notice a device refusing all legal input. An unknown control is a simulation error to diagnose with the testbench, not a fifth case in the binary protocol.

@@ -1,0 +1,96 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{Follow a Value Rather Than a Compiler Driver}
+
+This case study builds a freestanding x86-64 GNU/Linux program that exits with status \(42\). It has two hand-written assembly inputs and no C runtime, shared objects, or dynamic interpreter. The first object supplies the entry point and calls a function in the second; the second reads an initialized word and adds a zero-initialized word. That is enough to separate three activities: the assembler records symbolic intent, the link editor resolves and encodes displacements, and the kernel establishes the memory image. Levine treats these at different levels: machine addressing, object-file representation, relocation, and loading \cite[chapter~2]{levine2000linkers}\cite[chapter~3]{levine2000linkers}\cite[chapter~7]{levine2000linkers}\cite[chapter~8]{levine2000linkers}.
+
+% Annotated walkthrough
+\section{Assemble Two Files and Read What Is Still Unresolved}
+
+Save the following as \texttt{start.s}, using GNU assembler's AT\&T syntax:
+
+\begin{verbatim}
+.text
+.globl _start
+.type _start,@function
+_start:
+    call value               # distance is unknown in this file
+    mov %eax,%edi            # function result becomes exit argument
+    mov $60,%eax             # Linux x86-64 syscall number for exit
+    syscall
+.size _start, .-_start
+.section .note.GNU-stack,"",@progbits
+\end{verbatim}
+
+Save the second input as \texttt{value.s}:
+
+\begin{verbatim}
+.text
+.globl value
+.type value,@function
+value:
+    mov count(%rip),%eax     # target is in a different section
+    add scratch(%rip),%eax   # reads memory that must start at zero
+    ret
+.size value, .-value
+.data
+.balign 4
+count: .long 42
+.bss
+.balign 4
+scratch: .zero 4             # reserve space, no four-byte file payload
+.section .note.GNU-stack,"",@progbits
+\end{verbatim}
+
+\begin{verbatim}
+as --64 -o start.o start.s
+as --64 -o value.o value.s
+readelf -Ws -Wr start.o value.o
+objdump -dr start.o value.o
+\end{verbatim}
+
+The objects are ELF relocatables, not images that the kernel will start. The assembler knows that the instruction \verb|call value| uses the five-byte encoding \texttt{e8} followed by a four-byte displacement. In the local build it leaves zeros in the field, records \texttt{value} as undefined in \texttt{start.o}, and emits \texttt{R\_X86\_64\_PLT32} at \texttt{.text} offset \(1\), with addend \(-4\). In \texttt{value.o}, offset \(2\) has a \texttt{PC32} relocation against \texttt{.data}, and offset \(8\) has one against \texttt{.bss}, both also with addend \(-4\). Even those local data symbols need fixups: belonging to the same input file does not fix the distance between two sections.
+
+\section{Link, Then Check the Displacements by Hand}
+
+\begin{verbatim}
+ld -m elf_x86_64 -static -e _start \
+   -Ttext=0x401000 -Tdata=0x404000 -o demo start.o value.o
+objdump -d demo
+readelf -h -lW -r demo
+\end{verbatim}
+
+Here the link editor puts \texttt{\_start} at \texttt{0x401000} and, in the checked build, \texttt{value} immediately after its fourteen bytes at \texttt{0x40100e}. The \texttt{PLT32} relocation permits using a procedure linkage entry, but the linker can bind directly to \texttt{value} inside this static executable; the relocation type does not imply the presence of a PLT in the output. With field address \(P=\texttt{0x401001}\), addend \(A=-4\), and target \(S=\texttt{0x40100e}\), the encoded value \(S+A-P\) is \(9\). The disassembly shows \texttt{e8 09 00 00 00}. The CPU adds \(9\) to the address of the next instruction, \texttt{0x401005}, so it lands at \texttt{0x40100e}. For the load of \texttt{count}, the same calculation gives \texttt{0x404000} minus \texttt{0x401014}, or \texttt{0x2fec}. This uses the x86-64 psABI's relocation conventions: \(P\) is the address of the field, not the following instruction, and the signed displacement must fit in 32 bits.
+
+For a negative test, omit \texttt{value.o} from the link. The local GNU linker rejects the strong undefined reference at \texttt{start.o:(.text+0x1)}; the assembler did not have to reject it. For a contrasting file convention, Levine's historical \texttt{a.out} examples encode the PC-relative property in a relocation flag and obtain the addend from the field being adjusted. The ELF64 \texttt{.rela.text} records here carry an explicit addend.
+
+\section{Load Segments and Execute}
+
+The header reports \texttt{ET\_EXEC} and entry \texttt{0x401000}. The locally observed executable \texttt{PT\_LOAD} begins at file offset \texttt{0x1000}, virtual address \texttt{0x401000}. The writable load segment starts at \texttt{0x404000} with file size \(4\) and memory size \(8\). The kernel maps initialized bytes and supplies zeros for the extra four, so \texttt{scratch} starts at zero. It acts on program headers, not the names \texttt{.data} and \texttt{.bss}, and it does not resolve the three object-file relocation records: they have already done their work. Other segment details can vary with linker defaults. There is no \texttt{PT\_INTERP}; a dynamically linked executable would instead arrange for the ELF interpreter to take control first \cite[chapter~10]{levine2000linkers}.
+
+At entry there is no C caller to return to. \texttt{value} returns \(42+0\) in \texttt{\%eax}; the entry code passes it in \texttt{\%edi} and invokes the Linux exit system call, whose register convention is specified separately from the ordinary function-call convention in the psABI's Linux appendix. Use \verb|rc=0; ./demo || rc=$?; test "$rc" -eq 42| to check the result. A nonzero status is intentional here; \(42\) checks the arithmetic and the stages that made its operands available.
+
+\Cref{fig:visual-302} traces both the call field and the data used to compute the exit status.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=2.6cm] at (0,0) {Stage};
+  \node[tome box dark,minimum width=4.25cm] at (3.85,0) {Call to \texttt{value}};
+  \node[tome box dark,minimum width=4.25cm] at (8.4,0) {Inputs to \texttt{value}};
+  \foreach \lev/\stage/\call/\payload in {
+    -1.25/{Assemble}/{\texttt{.text}+1: \texttt{PLT32}\\addend \(-4\)}/{\texttt{count}: four bytes for 42\\\texttt{scratch}: reserve four},
+    -2.65/{Link}/{Field at \texttt{0x401001}\\\texttt{09 00 00 00}}/{Writable \texttt{PT\_LOAD}\\file size 4, memory size 8},
+    -4.05/{Load and run}/{Next RIP \(+9\)\\lands at \texttt{0x40100e}}/{Read \(42+0\)\\exit status 42}} {
+    \node[tome box,minimum width=2.6cm] at (0,\lev) {\stage};
+    \node[tome box,minimum width=4.25cm] at (3.85,\lev) {\call};
+    \node[tome box,minimum width=4.25cm] at (8.4,\lev) {\payload};
+  }
+\end{tikzpicture}
+\caption{The static linker settles the call's displacement. The loader supplies the segment's zero tail, not another round of symbol resolution; the CPU reads the two values only after both tasks are complete.}
+\label{fig:visual-302}
+\end{figure}
+
+For a controlled variation, change \verb|count: .long 42| to \verb|count: .long 41|, reassemble \texttt{value.o}, and relink. The displacement, relocation kinds, and segment sizes should stay the same; the first four bytes of the writable segment change from \texttt{2a 00 00 00} to \texttt{29 00 00 00}, and the shell should report \(41\). This separates the payload supplied by the assembler from the layout chosen by the linker and the initialization performed by the loader.

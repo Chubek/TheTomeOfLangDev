@@ -1,0 +1,121 @@
+% Source: analysis-dataflow-programs.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+
+\section{Put Rates in the Program Graph}
+
+In synchronous dataflow (SDF), every actor firing consumes and produces fixed integer numbers of tokens on each port. ``Synchronous'' here concerns statically related token counts, not necessarily a global wall-clock tick. Balance equations seek positive repetition counts \(q\) such that, for each channel from \(A\) to \(B\), \(q_A p=q_B c\), where \(p\) is production and \(c\) consumption \cite{lee1987sdf}.
+
+A solution gives how many times actors fire in one graph iteration; it does not by itself provide a legal order. A periodic schedule must also avoid consuming unavailable tokens. Initial tokens on feedback edges can make a cycle schedulable, and schedule choice affects peak buffer occupancy while preserving token sequences for deterministic actors.
+
+\section{Solve and Schedule a Two-Actor Graph}
+
+Use an SDF declaration in which bracketed numbers are per-firing rates:
+
+\begin{verbatim}
+actor Split  in x[2]  out y[3]
+actor Sum3   in y[3]  out z[1]
+channel Split.y -> Sum3.y initial 0
+\end{verbatim}
+
+The balance equation is \(3q_{\text{Split}}=3q_{\text{Sum3}}\), so the minimal repetition vector is \((1,1)\). One iteration may schedule \(\texttt{Split; Sum3}\), consumes two input tokens, and produces one output token. If \texttt{Sum3} were declared to consume one token, the minimal vector would be \((1,3)\). \Cref{fig:visual-356} separates rates from the chosen sequential order.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (-3,0) {Split\\consume 2};
+  \node[tome box] (q) at (0,0) {FIFO\\produce/consume 3};
+  \node[tome box accent] (b) at (3,0) {Sum3\\produce 1};
+  \node[tome box] (s) at (0,-1.8) {period: Split; Sum3};
+  \draw[tome arrow] (a) -- node[above]{3} (q);
+  \draw[tome arrow] (q) -- node[above]{3} (b);
+  \draw[tome arrow] (a) -- (s);
+  \draw[tome arrow] (b) -- (s);
+\end{tikzpicture}
+\caption{Rates determine the repetition vector. Token availability then validates a particular periodic schedule and yields a buffer bound.}
+\label{fig:visual-356}
+\end{figure}
+
+% Annotated walkthrough
+\section{Construct a Periodic Admissible Schedule}
+
+\begin{verbatim}
+q := smallest_positive_integer_solution(balance_equations)
+remaining := q
+tokens := initial_tokens
+while some remaining actor count is nonzero:
+    choose actor a with remaining[a] > 0
+        and enough tokens on every input
+    if no such actor exists: reject this schedule search
+    fire_symbolically(a, tokens)
+    remaining[a] := remaining[a] - 1
+emit periodic_schedule_and_peak_fifo_sizes()
+\end{verbatim}
+
+Failure of one greedy choice is not proof that no admissible schedule exists; a complete scheduler must backtrack or use a method with an appropriate completeness argument. Inconsistent balance equations, by contrast, rule out a bounded periodic steady state with the declared rates.
+
+\section{Compile Rates as Verified Metadata}
+
+An SDF IR contains actor nodes, typed FIFO edges, fixed consumption and production rates, initial tokens as explicit state, actor effects, repetition-vector and schedule annotations, and provenance to port declarations. Clocks may record deployment periods, but must not be conflated with SDF token rates. Compilation can produce a looped static schedule, preallocated circular buffers, multicore tasks, or statically sized hardware FIFOs.
+
+Legal optimizations include schedule compaction, actor fusion, vectorization, and buffer sharing when they preserve FIFO token order, rates, initial state, and observable effects. Semantic-preservation risks include a wrong repetition vector that causes drift, an omitted initial token that deadlocks, and buffer sharing across overlapping live ranges. Preserve actor-level numeric semantics too: fusing a reduction must not silently reassociate floating-point operations.
+
+\section{Show Why Balance Is Not Readiness}
+
+Add a feedback edge to the two actors. Let \texttt{Split} consume one feedback token per firing as well as its two external inputs, and let \texttt{Sum3} send one token back per firing as well as sending its external output. Both internal edges remain balanced at one firing per actor. With zero initial tokens on both edges, however, neither actor can start even when external input is available in abundance. The scheduler is not missing an ordering trick; the specified graph has no first firing.
+
+\begin{center}
+\begin{tabular}{lcc}
+\hline
+Schedule prefix & Forward tokens & Feedback tokens \\
+\hline
+Empty, no initial feedback & 0 & 0 \\
+Empty, with initial feedback & 0 & 1 \\
+\texttt{Split} & 3 & 0 \\
+\texttt{Split; Sum3} & 0 & 1 \\
+\hline
+\end{tabular}
+\end{center}
+
+The initial feedback token is program data, not synthetic permission to run. A graph that starts with a zero-valued token can differ from one starting with a one-valued token, despite identical liveness. The table records only occupancy. A separate functional test must propagate the actual token value through the two actor implementations.
+
+\Cref{fig:visual-356-a} shows why the balance equations and the startup test use different facts about the same graph.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (split) at (-2.7,0) {\texttt{Split}};
+  \node[tome box accent] (sum) at (2.7,0) {\texttt{Sum3}};
+  \draw[tome arrow] (split.north east) to[bend left=22]
+    node[above]{three tokens per firing} (sum.north west);
+  \draw[tome arrow] (sum.south west) to[bend left=22]
+    node[below,align=center]{one token per firing\\one initial token} (split.south east);
+\end{tikzpicture}
+\caption{The seeded feedback edge lets \texttt{Split} run first. Its initial occupancy matters to readiness but not to the repetition vector. External input and output are omitted.}
+\label{fig:visual-356-a}
+\end{figure}
+
+\begin{verbatim}
+certify_period(graph, period):
+    count := graph.initial_occupancy.copy()
+    peak := count.copy()
+    for actor in period:
+        for edge in actor.inputs:
+            require count[edge] >= actor.consume[edge]
+            count[edge] -= actor.consume[edge]
+        for edge in actor.outputs:
+            count[edge] += actor.produce[edge]
+            peak[edge] := max(peak[edge], count[edge])
+    require count == graph.initial_occupancy
+    return peak
+\end{verbatim}
+
+Assume that external input and output are available on demand and account for them separately. For the two seeded firings the capacities are three forward and one backward. The same certificate does not automatically apply to a schedule that overlaps actors or reserves all output slots before releasing its own input slots. For such an implementation, simulate the actual reservation and release order rather than counting only at firing boundaries. A replay that starts from the empty, unseeded row should fail on its first firing regardless of which actor is tried.
+
+\paragraph{Keep the checker independent of the scheduler.}
+Persist the period as actor IDs, not only as the repetition vector.
+A checker can recalculate consumption and production from the graph and
+compare both firing counts and peak occupancy against the compiler's
+certificate. Prefix readiness alone does not prove that all required
+actors fired: the empty schedule passes an occupancy-return test.

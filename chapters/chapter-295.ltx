@@ -1,0 +1,66 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Decide which parts of the library are a contract}
+
+Levine's historical static shared-library design binds clients to addresses in advance. Its stub library supplies absolute symbol definitions, and preserving an indexed jump table lets routine implementations move while keeping entry addresses stable. Exported data is harder to evolve because it lacks that automatic level of indirection \cite[chapter~9]{levine2000linkers}. In the dynamic ELF design, consumers normally record dependence on a library identity and use dynamic symbols; implementations can move without preserving absolute addresses \cite[chapter~10]{levine2000linkers}. But a symbol name in a new release is not evidence that it still takes the same arguments, follows the same layout and ownership rules, or returns compatible results.
+
+On a GNU/Linux toolchain, compile the implementation with \texttt{-fPIC} and link it with \texttt{-shared} to produce an ELF shared object. Its output sections are packaged in load segments suitable for mapping; it is not simply an archive of relocatable members. Specify the public interface deliberately. Internal helpers and storage can be hidden, while exported functions can front opaque state. Keeping structure definitions out of the public layout and mutable storage out of the export list makes implementation changes less likely to surprise already-linked clients. Use an explicit export list or visibility defaults; do not treat every externally linked C name as part of the intended ABI.
+
+\section{Separate the filename, dependency name, and symbol version}
+
+There can be three filenames involved in an ordinary release: the linker-facing name \texttt{libmeter.so}, the runtime dependency name \texttt{libmeter.so.1}, and the release file \texttt{libmeter.so.1.4}. With \texttt{-Wl,-soname,libmeter.so.1} when building the provider, the second name is stored as \texttt{DT\_SONAME}. The link editor uses it as the consumer's \texttt{DT\_NEEDED} entry when the dependency is retained. In conventional installations symlinks connect the names. The runtime loader does not infer numerical compatibility by comparing version strings embedded in arbitrary filenames. The publisher decides when to keep that SONAME and when to change it.
+
+GNU ELF symbol versions solve a different problem. A provider can label an interface with a version node, and a consumer can record a requirement for that version. An added interface may get a new node while existing clients still reference the old node. A compatible addition does not require a new SONAME if the old contracts remain intact. Conversely, keeping a SONAME and its version labels cannot repair a changed calling convention or structure layout; republishing an incompatible implementation under those labels only makes it harder for the loader to notice the mistake. GNU version scripts can assign exports to nodes and localize other names. Supporting multiple versions of \emph{one} symbol requires deliberate definitions of those versions, not just declaring more nodes.
+
+% Annotated walkthrough
+\section{Build a compatible addition and check both clients}
+
+In a private scratch directory, have \texttt{meter.c} define \texttt{int step(int x)\{return x+1;\}} and \texttt{int triple(int x)\{return 3*x;\}}. Make the two public symbols explicit in \texttt{meter.map}; the second node inherits from the first, without moving \texttt{step} to that second node.
+
+\begin{verbatim}
+METER_1 { global: step; };           /* retain the old version */
+METER_2 { global: triple;
+          local: *; } METER_1;       /* other definitions stay private */
+\end{verbatim}
+
+For the first release use only the first function and the script \texttt{METER\_1 \{ global: step; local: *; \};}. Build each release in its own subdirectory. In the second, use:
+
+\begin{verbatim}
+cc -fPIC -shared meter.c -Wl,--version-script=meter.map \
+   -Wl,-soname,libmeter.so.1 -o libmeter.so.1.4
+ln -s libmeter.so.1.4 libmeter.so.1
+ln -s libmeter.so.1 libmeter.so
+\end{verbatim}
+
+Create a client doing \texttt{return step(4) != 5;} and link it against release one. Then link a second client doing \texttt{return triple(4) != 12;} against release two. These expressions go in the clients' \texttt{main} functions; declare the appropriate prototype before each one, as the public header would. In each build put the source before \texttt{-L. -lmeter} and pass \verb|-Wl,-rpath,'$ORIGIN'|. Run copies of the clients next to each release's library in those private directories; each run's executable and library are artifacts of this exercise. \texttt{readelf -dW} on either client should record \texttt{libmeter.so.1}. \texttt{readelf -VW} should show that the first requires \texttt{METER\_1} and the second requires \texttt{METER\_2} from that dependency, in addition to any separate runtime requirements.
+
+The arithmetic supplies the behavioural check: the original caller still gets $4+1=5$ against both releases, and the new caller gets $3\cdot4=12$ against release two. Against release one the second client instead fails the version check even though a library with the requested filename is present. The invariant is that an old client must keep both its binary contract and its advertised behaviour; checking version nodes alone only tests part of that invariant.
+
+\Cref{fig:visual-295} highlights that both clients share a library identity but require different versioned interfaces.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=4.6cm] (dep) at (5.6,0)
+    {Both need \texttt{libmeter.so.1}};
+  \node[tome box,minimum width=4.35cm] (old) at (2.5,-1.5)
+    {Existing client\\\texttt{step@METER\_1}};
+  \node[tome box,minimum width=4.35cm] (new) at (8.7,-1.5)
+    {New client\\\texttt{triple@METER\_2}};
+  \node[tome box,minimum width=4.35cm] (oa) at (2.5,-3)
+    {Release 1 or 2\\\(4\mapsto5\)};
+  \node[tome box,minimum width=4.35cm] (na) at (8.7,-3)
+    {Release 2 only\\\(4\mapsto12\)};
+  \draw[tome arrow] (dep.south) -- (old.north);
+  \draw[tome arrow] (dep.south) -- (new.north);
+  \draw[tome arrow] (old) -- (oa);
+  \draw[tome arrow] (new) -- (na);
+\end{tikzpicture}
+\caption{The common dependency name selects a provider file, not a promise that every release contains \texttt{METER\_2}. A release test also checks the returned values.}
+\label{fig:visual-295}
+\end{figure}
+
+\section{Treat compatibility as a release test}
+
+If a new release changes the only available \texttt{step} implementation to an incompatible interface, do not silently keep its old label. Preserve the old interface behind an adapter if possible, or ship a new major SONAME alongside the old one. Compare dynamic export lists, and run real clients compiled against prior headers without rebuilding them. Rebuilding may make an incompatible change look harmless because the compiler immediately adapts the new clients.

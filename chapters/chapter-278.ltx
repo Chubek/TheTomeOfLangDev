@@ -1,0 +1,67 @@
+%% chapter-278.ltx -- Evaluating and Validating an Instruction Selector
+% Source: blindel-instrselect-book.txt
+% Source: blindel-practical-instrselect.txt
+
+\section{Turn the selector's promises into tests}
+
+Hjort Blindell sets a priority: first implement the behavior of the IR, then seek good assembly \cite[chapter~1]{blindell2016instruction}. Test those promises separately. A faster result with the wrong behavior is not a performance win, and an assignment with a low objective is not necessarily a legal lowering. For a compiler prototype, define the supported IR, target features, and observations before comparing selectors. The observations might include return values, memory effects in their required order, and the presence and kind of a trap; instruction counts and temporary register contents are not semantic observations unless an interface exposes them.
+
+At the matcher interface, check that operand permutations, immediates, types, and feature flags agree with the rule's preconditions. At the cover interface, require that every live operation is accounted for, any allowed duplication is explicit, and all external uses are supplied. Check placement and edge obligations separately, including the sources of \(\phi\)-operands. At emission, check that register classes, ties, clobbers, branch targets, and encodings obey the target contract. Correctness testing should compare the resulting program against an independent interpreter or a reference lowering, not just against another implementation of the same declarative rules. On small instances, exhaustively enumerate legal covers as an oracle for a claim of minimum modeled cost. That oracle checks optimization, not semantics.
+
+% Annotated walkthrough
+\section{Audit a paired add from matcher through allocation}
+
+A toy byte machine implements four-input, two-output \texttt{PAIRADD8} as two independent wrapping sums, left result first. Inputs \(a,b,c,d\) enter in \texttt{r0} through \texttt{r3}. The return interface requires the ordered results in \texttt{r0,r1}. The pair instruction has fixed outputs \texttt{r4,r5}, both caller-clobbered. Ordinary three-operand \texttt{ADD8} reads its operands before writing its destination and can write the return registers directly. The initial objective charges one per selected add instruction and omits result moves. In this deliberately small example each machine instruction occupies four bytes; the common return is excluded from both counts.
+
+\begin{verbatim}
+# Reference: compare ordered results, including the byte wrap.
+inputs: (255,1,4,7) -> want (0,11)
+
+# Pair matches the two adds, but allocation must honor the ABI.
+PAIRADD8 r4,r5 <- r0,r1,r2,r3
+MOV8 r0 <- r4
+MOV8 r1 <- r5
+check: (0,11), model=1, encoded bytes=3*4=12
+
+# Separate adds can write the return registers directly.
+ADD8 r0 <- r0,r1
+ADD8 r1 <- r2,r3
+check: (0,11), model=2, encoded bytes=2*4=8
+
+# Mutation: swap the sources of the pair's two output moves.
+check: (11,0) != (0,11); reject regardless of cost
+\end{verbatim}
+
+The scalar sequence reads the original \texttt{r1} before overwriting it. For either lowering, the semantic invariant is that the first result depends on \(a,b\) and appears in \texttt{r0}, while the second depends on \(c,d\) and appears in \texttt{r1}. Exhausting inputs from 0 through 15 checks \(16^4=65{,}536\) combinations of that subset, not all byte values; the explicit 255 case checks a wrap that the subset cannot trigger. Ensure tests force each lowering so a selector that never emits the paired instruction cannot appear to validate it. The model prefers the pair, but the encoded block is four bytes larger. Neither count determines which block takes fewer cycles on a physical implementation.
+
+\Cref{fig:visual-278} traces just the result locations, where an ostensibly cheaper cover picks up extra instructions.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=3.45cm] at (0,0) {Selected form};
+  \node[tome box dark,minimum width=3.45cm] at (4.05,0) {Results produced};
+  \node[tome box dark,minimum width=3.45cm] at (8.1,0) {ABI return};
+  \node[tome box,minimum width=3.45cm] (pair) at (0,-1.35) {\texttt{PAIRADD8}\\model cost 1};
+  \node[tome box,minimum width=3.45cm] (fixed) at (4.05,-1.35) {fixed \texttt{r4,r5}};
+  \node[tome box,minimum width=3.45cm] (post) at (8.1,-1.35) {\texttt{r0,r1} after 2 moves\\12 bytes in all};
+  \node[tome box,minimum width=3.45cm] (scalar) at (0,-2.8) {Two \texttt{ADD8}s\\model cost 2};
+  \node[tome box,minimum width=3.45cm] (chosen) at (4.05,-2.8) {chosen \texttt{r0,r1}};
+  \node[tome box,minimum width=3.45cm] (direct) at (8.1,-2.8) {\texttt{r0,r1} directly\\8 bytes in all};
+  \foreach \from/\dest in {pair/fixed,fixed/post,scalar/chosen,chosen/direct}
+    \draw[tome arrow] (\from) -- (\dest);
+\end{tikzpicture}
+\caption{Both lowerings can return the correct ordered pair. The bytes needed to satisfy the ABI reverse the selector's initial ranking, even though they do not determine execution time.}
+\label{fig:visual-278}
+\end{figure}
+
+\section{Account for the gap between score and cost}
+
+Hjort Blindell's discussion of optimality distinguishes the instruction set and representation under consideration from the code quality attained after scheduling and allocation. His conclusion highlights flag lifetimes, register classes and rematerialization as reasons to distrust isolated optima \cite[chapter~6]{blindell2016instruction}. In the example, a move cost can be incorporated once the result locations are known, but a general selector may not know them. Record how much post-selection work came from class transfers, spills, copies and scheduling delays. A mismatch between the score and the executable outcome is evidence about the cost model, not automatically a solver defect. If the model predicts one score and the exhaustive cover oracle finds a lower one under identical constraints, that is a separate result.
+
+Distinguish a verified feasible incumbent from a proven optimum, an incomplete search with no incumbent, and an infeasible model. On a timeout, report the achieved score and the best bound when available; if a fallback was used, time it too. In \emph{Complete and Practical Universal Instruction Selection}, Hjort Blindell et al.\ use timeouts for constraint solving and explain that their exact-cover formulation excludes recomputation. Optimality in that formulation cannot rule out a faster result from a selector that recomputes a value instead of keeping it live. Their evaluation also identifies the target and how medium-sized benchmark functions were sampled, details that matter when interpreting what the results generalize to.
+
+\section{Measure changes as controlled comparisons}
+
+Hold input IR, target options, later passes, and workload constant when comparing candidate selectors. Report the search budget, match coverage, compiler time and peak memory as well as final code size and execution time. Log the target and inputs; for timing, interleave repeated runs with equal work and report uncertainty. Include workloads stressing the advertised advantage and workloads where late copies or scheduling can reverse it. If a new matcher broadens the candidate set, compare it with the baseline on the old shared set as well; that separates better search from better instruction support. Report correctness failures and timeouts alongside performance rather than discarding them. A useful final claim is specific: the candidate preserves the tested contract and improves a named metric on a named workload at a stated compilation cost.

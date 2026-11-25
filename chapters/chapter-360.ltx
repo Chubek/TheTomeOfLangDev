@@ -1,0 +1,110 @@
+% Source: thesis-yagh-lucid-better-mayber.txt
+% Source: lucid-eductive-cc.txt
+% Source: lucid-book.txt
+
+\section{Start From a Demand}
+
+Eduction evaluates an intensional program by requesting a value of an identifier or expression at a context. The evaluator rewrites that demand into subsidiary demands, combines returned values, and normally warehouses completed results. This is demand-driven dataflow: demands can move upstream while values return downstream. It is an operational strategy for obtaining the Lucid denotation, not a replacement denotation.
+
+Demand avoids computing irrelevant stream elements, but does not guarantee termination or small space. A future-dependent recurrence can create an unending chain of demands. A warehouse can retain a large context-indexed history, while omitting memoization can repeat expensive work. Parallel demand evaluation also needs a protocol for duplicate in-flight requests.
+
+\section{Demand One Lucid Value}
+
+Consider the Lucid equations:
+
+\begin{verbatim}
+x + y
+where
+  x = 0 fby x + 5;
+  y = 1 fby y * 2;
+end
+\end{verbatim}
+
+Demanding the result at index \(2\) creates demands for \(x@2\) and \(y@2\). They recursively reach their initialized cases and return \(10\) and \(4\), so the answer is \(14\). It does not require producing an infinite result stream. \Cref{fig:visual-360} distinguishes demand messages from returned values.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (root) at (0,0) {demand \((x+y)@2\)};
+  \node[tome box] (x) at (-2.7,-1.5) {demand \(x@2\)};
+  \node[tome box] (y) at (2.7,-1.5) {demand \(y@2\)};
+  \node[tome box accent] (xv) at (-2.7,-3) {return 10};
+  \node[tome box accent] (yv) at (2.7,-3) {return 4};
+  \node[tome box dark] (ans) at (0,-4.3) {return 14};
+  \draw[tome arrow] (root) -- (x);
+  \draw[tome arrow] (root) -- (y);
+  \draw[tome arrow] (x) -- (xv);
+  \draw[tome arrow] (y) -- (yv);
+  \draw[tome arrow] (xv) -- (ans);
+  \draw[tome arrow] (yv) -- (ans);
+\end{tikzpicture}
+\caption{A demand fans out according to expression dependencies. Values return under the same context tag and may be stored for later demands.}
+\label{fig:visual-360}
+\end{figure}
+
+% Annotated walkthrough
+\section{Use a Warehouse and an In-Flight Table}
+
+\begin{verbatim}
+demand(node, context):
+    key := (node, project_context(node, context))
+    if warehouse contains key: return warehouse[key]
+    if key is in_flight: wait for that computation
+    mark key in_flight
+    deps := expand_by_operator(node, context)
+    values := demand dependencies, possibly in parallel
+    result := apply_operator(node, values)
+    publish warehouse[key] := result; clear in_flight
+    return result
+\end{verbatim}
+
+The projected context is valid only when dimensional analysis proves that omitted dimensions cannot affect the node. Cyclic in-flight demands require semantic handling; simply waiting on oneself turns an unproductive definition into an opaque runtime deadlock.
+
+\section{Preserve Demands Through Compilation}
+
+An eductive IR needs equation/operator nodes, demand-dependency edges with context transforms, tag and value types, explicit index-shift state relationships, effect and partiality annotations, clock/dimension metadata, and source provenance. Compilation can produce an interpreter graph, bytecode for demand workers, warehouse schemas, or specialized memoized functions.
+
+Legal optimizations include memoization, demand coalescing, parallel subsidiary demands, and context-key projection for pure expressions under their proven dependencies. Semantic-preservation risks include speculation that exposes otherwise undemanded errors or nontermination and caching effectful input that suppresses observations; eviction is denotationally safe for purity but can alter termination under finite resource limits. Validation should query the same expression/context pairs and compare values, errors, and definedness, rather than compare internal task order.
+
+\section{Distinguish Shared Work From Circular Waiting}
+
+For the preceding \texttt{x}, workers requesting \((x,2)\) and \((x,1)\) can share \((x,1)\). That dependency descends in time, so using the same node twice is not itself a cycle. By contrast, the equation \(z=z+1\) at a fixed context produces a wait from a key back to itself. Two equations can create the same problem indirectly: \((p,0)\) can ask for \((q,0)\), which asks for \((p,0)\) on another worker.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Request edge & In-flight relation & Treatment \\
+\hline
+\((x,2)\) to \((x,1)\) & Strictly earlier index & Share or start work \\
+Two clients to \((x,1)\) & Common descendant & Join one promise \\
+\((z,0)\) to \((z,0)\) & Self-loop & No productive result \\
+\((q,0)\) to \((p,0)\) & Closes an existing path & Circular wait \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+await_dependency(parent, child):
+    if ready(child): return result(child)
+    atomically:
+        if ready(child): return result(child)
+        if parent == child or reachable(wait_graph, child, parent):
+            return unresolved_cycle(parent, child)
+        install_edge(wait_graph, parent, child)
+        promise := start_or_join(child)
+    try:
+        return await_without_holding_graph_lock(promise)
+    finally:
+        remove_edge(wait_graph, parent, child)
+\end{verbatim}
+
+Treat the reported cycle as a diagnostic about this evaluation model, not as permission to return an arbitrary value for an unproductive source demand. If the source represents such a demand by undefinedness, tests should compare defined prefixes rather than mistake the diagnostic for a data token. A runtime must also publish completion before waking waiters and coordinate cancellation: dropping one client must not abandon a key another client still awaits. Finally, test a strictly descending recurrence at several indices in parallel. A detector keyed only by expression identity rejects that valid case even though each full demand key differs.
+
+\paragraph{Distinguish a cycle from an unbounded chain.}
+A demand for \((z,k)\) that requests \((z,k+1)\) repeatedly may not
+terminate even though there is no cycle in the active wait graph.
+Report a resource limit separately; cycle detection alone is not a
+termination checker. For regression tests that deliberately exceed a
+budget, prefer a deterministic bound on expanded keys over a wall-clock
+timeout, since the latter can vary with the scheduler.

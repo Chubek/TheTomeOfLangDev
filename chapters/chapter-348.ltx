@@ -1,0 +1,73 @@
+% Source: contraint-language-for-semantic-analysis.txt
+
+\section{Name Resolution Starts with Occurrences}
+
+Consider a toy statically typed language with nested lexical scopes, no imports or overloads, and no use-before-declaration restriction. Each reference and declaration has its own identity even when spelled identically. The parser supplies an AST. A syntax-directed extractor then emits parent edges, declaration names and types, and each reference's scope, spelling, and expected type. For instance, the expected type can come from the parameter type of an already resolved built-in. Source spans stay in a host map keyed by occurrence ID. The analysis should produce a name-resolution result; it should not itself decide how to render a diagnostic or which AST node to rewrite.
+
+Van Antwerpen and colleagues distinguish constraints on scope graph structure, reference resolution, and typing. Their framework can express interactions between binding and types and uses unification for type terms. Here we deliberately resolve names before checking type equality, with all declaration types already known. This is a small rule-based front end inspired by that separation, not an implementation of their published constraint language.
+
+\section{Select the Nearest Declaration, Then Check Its Type}
+
+The following is stratified, function-free Datalog with uppercase variables, lowercase constants, and safe \texttt{not} and \verb|!=| built-ins. A single synthetic scope tree contains a root declaration \(d_0\) for \texttt{x:int} and a nested declaration \(d_1\) for \texttt{x:bool}. Three references in the nested scope request an integer \texttt{x}, a boolean \texttt{x}, and an integer \texttt{y}, respectively.
+
+\begin{verbatim}
+scope(root). scope(inner). parent(inner,root).
+decl(d0,root,x,int). decl(d1,inner,x,bool).
+ref(r1,inner,x,int). ref(r2,inner,x,bool).
+ref(r3,inner,y,int).
+
+above(A,B) :- parent(A,B).
+above(A,C) :- parent(A,B), above(B,C).
+visible(A,A) :- scope(A).
+visible(A,B) :- above(A,B).
+
+cand(R,D,S,T) :- ref(R,A,N,E), visible(A,S), decl(D,S,N,T).
+hidden(R,D) :- cand(R,D,S,T), cand(R,C,U,V), above(U,S).
+best(R,D,T) :- cand(R,D,S,T), not hidden(R,D).
+has_best(R) :- best(R,D,T).
+ambiguous(R) :- best(R,D,T), best(R,C,U), D != C.
+binding(R,D) :- best(R,D,T), not ambiguous(R).
+
+unknown(R) :- ref(R,A,N,E), not has_best(R).
+wrong_type(R,E,T) :- ref(R,A,N,E), binding(R,D),
+                     decl(D,S,N,T), E != T.
+\end{verbatim}
+
+The positive relation \texttt{cand} is intentionally generous: it contains both declarations for each reference to \texttt{x}. Then \texttt{hidden} removes the candidate in a strict ancestor, not merely any candidate with a different scope ID. The result is \verb|binding(r1,d1)| and \verb|binding(r2,d1)|, with \verb|wrong_type(r1,int,bool)| and \verb|unknown(r3)|. No type comparison can resurrect the hidden outer declaration. In this language, changing the type needed by the context does not change lexical resolution. A language with type-directed name lookup would need a different rule system.
+
+\Cref{fig:visual-348} makes the ambiguous-looking candidate set for \(r_1\) explicit before shadowing and type checking.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (inner) at (0,0) {inner scope\\\(d_1:\) \texttt{x:bool}};
+  \node[tome box] (root) at (4.5,0) {root scope\\\(d_0:\) \texttt{x:int}};
+  \node[tome box dark] (use) at (0,-2.1) {\(r_1:\) needs \texttt{x:int}};
+  \draw[tome arrow] (inner) -- node[above]{parent} (root);
+  \draw[tome arrow] (use) -- node[left]{select} (inner);
+  \draw[tome dashed] (use) -| node[pos=.26,below]{hidden candidate} (root);
+\end{tikzpicture}
+\caption{Both declarations match the spelling. The inner one wins on scope distance, even though its type is incompatible with the context of \(r_1\).}
+\label{fig:visual-348}
+\end{figure}
+
+% Annotated walkthrough
+\section{Make Shadowing and Ambiguity Regression Tests}
+
+\begin{verbatim}
+facts := extract_occurrences(ast)  # preserve IDs and spans
+verify_scope_forest(facts)         # reject parent cycles first
+closure := settle_ancestors_and_candidates(facts)
+nearest := candidates_without_closer_competitors(closure)
+for ref in source_order:
+    choices := nearest[ref.id]     # diagnostics inspect settled sets
+    if size(choices) != 1: diagnose_missing_or_ambiguous(ref)
+    else: annotate_binding_and_compare_types(ref, only(choices))
+\end{verbatim}
+
+Delete \verb|decl(d1,inner,x,bool).| from the input. On recomputation, both \texttt{x} references bind to \(d_0\); \verb|wrong_type(r1,int,bool)| disappears and \verb|wrong_type(r2,bool,int)| appears. The missing \texttt{y} is unchanged. In a separate edit to the original input, add \verb|decl(d2,inner,x,int).|. The engine now reports \verb|ambiguous(r1)| and \verb|ambiguous(r2)|, but no binding or wrong-type fact for either reference. The front end may separately report a duplicate-declaration error at the declaration sites. It must not choose \(d_2\) just to make the integer reference pass.
+
+The ancestor and candidate computations are monotone in accumulating facts on a fixed input; selection is not monotone across declaration insertions because a new nearer candidate can hide an old one. Even if a resolver uses negative tests to find the nearest match, those tests should only read completed inputs and lower strata. A production editor that allows incomplete files must also decide what it means to mark a scope complete. Absence in a partially extracted scope is not yet a user-facing ``unknown name.'' Test the extracted facts as well as the diagnostics: a missing parent edge and a genuinely unknown identifier can otherwise generate identical errors.
+
+The front-end output is a mapping from occurrence IDs to declaration IDs (or a diagnostic), not an AST mutation performed during search. Keeping spans and rewrite policy outside the rules lets later compiler phases consume a settled binding result.

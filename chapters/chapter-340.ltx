@@ -1,0 +1,82 @@
+% Source: semantics-of-pred-logic-proglang.txt
+% Source: algo-ds-in-prolog-lisp-java.txt
+
+\section{A Resolution Step Is Not a Search Strategy}
+
+In selective linear definite-clause resolution (SLD resolution), start with a list of goals and select one. Rename the variables of a candidate clause to fresh ones, unify its head with the selected goal, then replace the goal with the clause body. Apply that unifier to the \emph{whole} resulting goal list. With a fact the body is empty, so the selected goal simply disappears. Reaching the empty list yields a proof. The computed answer composes the substitutions along the successful branch and projects them onto the original query variables.
+
+The same goal-list transformations occur even if the implementation represents them as stack frames and variable cells. Van Emden and Kowalski's account of procedure invocation by resolution supplies the distinction between a proof step and the resulting proof. Prolog normally selects goals left to right, considers matching clauses in source order, and explores each branch depth first. Luger and Stubblefield's Prolog search examples make the consequence clear: when an attempted conjunction fails, a retry must restore the bindings made after the choice being retried. A failure on one branch is not a proof that every branch fails.
+
+\section{An Executable Dependency Query}
+
+Read \verb|dep(X, Y)| as ``the toy compiler stage \texttt{X} directly needs \texttt{Y}.'' The recursive relation describes paths with at least one edge.
+
+\begin{verbatim}
+dep(obj, asm).
+dep(obj, dbg).
+dep(asm, ir).
+dep(dbg, ir).
+
+depends(X, Y) :- dep(X, Y).
+depends(X, Y) :- dep(X, Z), depends(Z, Y).
+\end{verbatim}
+
+Query \verb|?- depends(obj, Y).| and request more answers after the first proof. The ordinary order is \texttt{asm}, \texttt{dbg}, \texttt{ir}, \texttt{ir}. The two copies of \texttt{ir} describe paths through different intermediate stages. To see why substitutions must propagate past the first subgoal, query \verb|?- depends(obj, Y), dep(Y, ir).|. Each proposed \texttt{Y} is now the first argument of the second goal. The direct answers survive; the recursive proofs with \verb|Y = ir| do not, since there is no outgoing edge from \texttt{ir}.
+
+Freshening a clause is essential even when the recursive call uses the same textual predicate and variable names. In the outer recursive clause the local intermediate stage can be \texttt{asm}; on a subsequent recursive call its intermediate stage can independently be \texttt{ir}. Reusing one storage cell for these two activations would accidentally require the different stages to coincide. Implementations with environments obtain fresh local variables by allocating or safely reusing slots, not by generating printable names for them.
+
+% Annotated walkthrough
+\section{Walkthrough: Follow a Branch, Then Unwind It}
+
+This reference interpreter uses immutable substitutions, so a failed branch is undone by discarding its local version. A destructive implementation needs explicit rollback instead.
+
+\begin{verbatim}
+solve(goals, bindings):
+    if goals is empty:
+        yield project(bindings, original_query_variables)
+        return
+    selected, rest := first(goals), remaining(goals)
+    for rule in matching_predicate_clauses_in_source_order:
+        head, body := fresh_copy(rule)
+        next := try_unify(selected, head, bindings)
+        if next succeeds:
+            yield all from solve(body ++ rest, next)
+            # retry with bindings, not next
+\end{verbatim}
+
+Here the list stores unexpanded terms; each lookup dereferences them under the current bindings. The invariant is that the pending goals under those bindings are the outstanding obligations along the current proof prefix. In the second query, the direct clause first produces \verb|Y = asm|; the final goal is then \verb|dep(asm, ir)|, which succeeds. Retrying produces \verb|Y = dbg| from the same direct clause. On a recursive branch the first \texttt{dep} can bind the fresh \texttt{Z} to \texttt{asm}, and the recursive call binds \texttt{Y} to \texttt{ir}. The last obligation becomes \verb|dep(ir, ir)| and fails. At no point may the failed \verb|Y = ir| binding leak into the alternative through \texttt{dbg}. \Cref{fig:visual-340} shows why the shorter proofs are encountered first.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (root) at (0,0) {\texttt{depends(obj,Y)}};
+  \node[tome box] (direct) at (-2.9,-1.6) {Direct clause\\\texttt{dep(obj,Y)}};
+  \node[tome box] (rec) at (2.9,-1.6) {Recursive clause\\\texttt{dep(obj,Z), depends(Z,Y)}};
+  \node[tome box accent] (a) at (-2.9,-3.2) {\texttt{asm}, then \texttt{dbg}};
+  \node[tome box accent] (b) at (2.9,-3.2) {\texttt{ir} via \texttt{asm}, then via \texttt{dbg}};
+  \draw[tome arrow] (root) -- (direct);
+  \draw[tome arrow] (root) -- (rec);
+  \draw[tome arrow] (direct) -- (a);
+  \draw[tome arrow] (rec) -- (b);
+\end{tikzpicture}
+\caption{A compressed SLD tree. Depth-first traversal drains the direct clause before trying the recursive one; it does not start both branches together.}
+\label{fig:visual-340}
+\end{figure}
+
+\section{A Proof May Exist Beyond an Infinite Branch}
+
+Add this alternative formulation to the same Prolog file:
+
+\begin{verbatim}
+late_depends(X, Y) :- late_depends(X, Z), dep(Z, Y).
+late_depends(X, Y) :- dep(X, Y).
+\end{verbatim}
+
+This is also the nonempty transitive closure, now extending a path at its last edge. Nevertheless \verb|?- late_depends(obj, Y).| keeps selecting a recursive call before it checks any \texttt{dep} goal. Even an acyclic input graph cannot prevent this divergence; the graph is never consulted. The proof using the fact for \verb|dep(obj, asm)| exists but standard depth-first traversal never reaches it.
+
+Fair exploration can avoid starving finite proofs, but does not in general turn a nonterminating search into finite failure. Another option is tabling: add \verb|:- table late_depends/2.| before the two clauses in SWI-Prolog. Repeated variant calls, equal up to variable renaming, share answers instead of endlessly expanding the same subgoal. For this finite program the table reaches completion and the distinct values are \texttt{asm}, \texttt{dbg}, and \texttt{ir}, without promising their order. Swift and Warren describe the role of tabling in XSB \cite{swift2012xsb}. On a program with unbounded term construction, tabling alone does not guarantee a finite set of calls or answers.
+
+A practical test therefore separates finding a first answer from exhausting all answers. Moving the direct clause first in \texttt{late\_depends/2} gives immediate direct results; it does not remove the left-recursive search. A test that stops as soon as it sees \texttt{asm} misses this difference. Test the expected answer set under an evaluator known to complete, and use a separate resource budget when checking the operational behavior of the untabled implementation.
+
+For a compiler dependency pass, this is an output requirement rather than a presentation detail: an incomplete traversal must not be cached as a complete dependency set. Select tabling, a bottom-up closure, or an explicitly bounded query before handing the result to an invalidator or build scheduler.

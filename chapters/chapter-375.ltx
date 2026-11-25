@@ -1,0 +1,106 @@
+% Source: finkel-advanced-proglang-design.txt
+% Source: formal-pattern-language-for-refactor-lisp-prog.txt
+% Source: dataflow-graph-repr.txt
+
+\section{Rules Describe Matches and Consequences}
+
+Rewrite systems transform terms; production systems match facts in a working memory and execute rule actions. Both use patterns, but their conflict and effect semantics differ. This representative Maude module defines Peano addition as equations:
+
+\begin{verbatim}
+fmod NAT-ADD is
+  sort Nat .
+  op 0 : -> Nat .
+  op s : Nat -> Nat .
+  op _+_ : Nat Nat -> Nat .
+  vars N M : Nat .
+  eq 0 + M = M .
+  eq s(N) + M = s(N + M) .
+endfm
+\end{verbatim}
+
+For ground natural-number terms these equations orient a terminating reduction. A production rule that retracts a fact, prints output, or asserts new facts is not equivalent to such a pure equation. Rule priority, salience, agenda strategy, refraction, matching modulo algebraic laws, and whether rewriting is innermost or outermost can all affect results.
+
+\section{Separate Pattern Networks from Rewrite Semantics}
+
+An IR for term rewriting needs signatures, typed variables, left- and right-hand sides, conditions, equations or directed rules, strategy, and algebraic attributes such as associativity and commutativity. A production-system IR additionally needs fact schemas, agenda policy, priorities, and explicit actions. A discrimination or Rete-like network is a compiled matcher artifact; it should not silently choose semantics omitted from the rule layer.
+
+\Cref{fig:visual-375} separates candidate discovery from conflict resolution and commit.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (wm) at (0,0) {term or facts};
+  \node[tome box dark] (match) at (3,0) {pattern matches};
+  \node[tome box accent] (agenda) at (6,0) {strategy / agenda};
+  \node[tome box] (fire) at (9,0) {rewrite or fire};
+  \draw[tome arrow] (wm) -- (match);
+  \draw[tome arrow] (match) -- node[above]{candidates} (agenda);
+  \draw[tome arrow] (agenda) -- node[above]{one choice} (fire);
+  \draw[tome arrow] (fire) to[bend right=35] node[below]{updated input} (wm);
+\end{tikzpicture}
+\caption{Efficient matching can share tests, but the strategy or agenda still determines which candidate is committed next.}
+\label{fig:visual-375}
+\end{figure}
+
+Output artifacts include a normalized rule set, matcher automaton, strategy tables, generated evaluator, and optional proof or trace of rewrites. Critical-pair and termination reports are analysis artifacts; neither is guaranteed merely because compilation succeeded.
+
+% Annotated walkthrough
+\section{Compile Shared Tests Without Changing Rule Choice}
+
+\begin{verbatim}
+rules := typecheck_patterns_conditions_and_replacements(source)
+network := share_constructor_and_constant_tests(rules.left_sides)
+while execution has not halted:
+    matches := network.update(changed_terms_or_facts)
+    enabled := evaluate_conditions(matches, current_snapshot)
+    chosen := apply_declared_strategy_priority_and_refraction(enabled)
+    atomically commit chosen replacement or production actions
+\end{verbatim}
+
+Legal optimizations include sharing repeated pattern tests, indexing by top constructor, precomputing pure conditions, and eliminating unreachable rules. Reordering rules is legal for a confluent strategy-independent system or when the declared strategy says order is irrelevant; otherwise it can change the normal form or effects. Folding a rule requires capture-avoiding substitution and preservation of matching modulo declared equations.
+
+Validation checks variable binding, sort preservation, replacement construction, agenda metadata, and source-rule provenance. For pure terminating examples, compare source and generated normal forms and record the applied rule sequence when strategies are observable. For production systems, compare working-memory updates and ordered external actions. Critical-pair exploration can support a confluence claim but bounded testing alone cannot prove it. The preservation contract therefore names both the rule theory and its operational strategy.
+
+\section{Expose a Critical Pair Before Sharing Tests}
+
+Add two rules to a separate toy term system: \(f(0)\to a\) and \(f(x)\to b\), with no rules for \(a\) or \(b\). Both rules match at the root of \(f(0)\). A decision tree can share the test for constructor \(f\), but it must not drop one of the two matches unless the operational strategy says which one wins. There is no common reduct of \(a\) and \(b\), so arbitrary matching order changes the possible results.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Subject & Applicable root rules & Outcome \\
+\hline
+\(f(0)\) & specific and general & \(a\) or \(b\) without priority \\
+\(f(0)\) & specific preferred & \(a\) with that priority \\
+\(f(1)\) & general only & \(b\) \\
+\(a\) & none & normal form \(a\) \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+candidates(term):
+    if constructor(term) != f: return []
+    x := only_argument(term)
+    result := [(general, {x_formal: x})]
+    if x == 0: append(result, (specific, {}))
+    return result
+
+rewrite_at_root(term, strategy):
+    matches := candidates(term)
+    enabled := filter_conditions(matches)
+    return apply_strategy_and_instantiate(strategy, enabled)
+\end{verbatim}
+
+The candidate order in that sketch is not the strategy. A deterministic first-rule strategy needs source-priority metadata; a nondeterministic relation can enumerate both results. When patterns overlap below the root, compare the two resulting terms after applying the same unifying substitution at the overlap. Additional rules may join them, but finding a shared reduct for this one example does not establish confluence for a larger system. Regression tests should distinguish one match, multiple matches without priority, and multiple matches with declared priority. That last case catches a matcher that returns whichever successful discrimination branch finishes first.
+
+\paragraph{Do not reuse a match after its subject changes.}
+In an incremental production system, a shared pattern network may
+retain partial matches for facts that have not changed. When it
+retracts a fact, it must also remove agenda entries that relied on
+it, even if their terminal tests are cached. Include the matching
+fact identities in each activation. To test invalidation, insert a
+fact, form a match, retract it before the rule fires, and check that
+no consequence occurs. This tests a different contract from root
+pattern overlap: it is about the lifetime of evidence for a match.

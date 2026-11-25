@@ -1,0 +1,110 @@
+% Source: sync-funprog-in-lucid.txt
+% Source: leroy-a-verif-cc-compiler-backend-for-lustre.txt
+
+\section{Type Both Values and Temporal Behavior}
+
+Lucid Synchrone combines synchronous streams with ML-style functions, algebraic data, pattern matching, and higher-order programming. Ordinary \texttt{let} definitions are combinational; \texttt{let node} marks sequential stream functions that may depend on history. The compiler infers value types and clock types, and separately checks initialization and causality \cite{pouzet2006lucidsynchrone}.
+
+A clock type describes presence, not an execution frequency in hertz. If \(x\) and boolean \(c\) have base clock \(\alpha\), then \texttt{x when c} has subclock \(\alpha\ \texttt{on}\ c\). Sampling the input of a stateful function is generally not equivalent to sampling its output, because the former changes how often state advances.
+
+\section{Define and Sample a Stream Function}
+
+Real Lucid Synchrone syntax distinguishes the stateful node:
+
+\begin{verbatim}
+let node sum x = s where
+  rec s = x -> pre s + x
+
+let node sampled_sum x c =
+  sum (x when c)
+\end{verbatim}
+
+\texttt{sum} has one initialized delay. In \texttt{sampled\_sum}, that delay advances only when \(c\) is present and true. By contrast, \verb|(sum x) when c| computes the base-clock running sum and merely hides some outputs. \Cref{fig:visual-365} shows why the two placements of \texttt{when} differ.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (x) at (-4,0) {\(x:\alpha\)};
+  \node[tome box] (sample) at (-1.5,0) {\texttt{when c}};
+  \node[tome box accent] (sumslow) at (1.2,0) {sum state\\clock \(\alpha\) on \(c\)};
+  \node[tome box] (sumfast) at (-1.5,-2) {sum state\\clock \(\alpha\)};
+  \node[tome box accent] (outslow) at (1.2,-2) {\texttt{when c}};
+  \draw[tome arrow] (x) -- (sample);
+  \draw[tome arrow] (sample) -- (sumslow);
+  \draw[tome arrow] (x) -- (sumfast);
+  \draw[tome arrow] (sumfast) -- (outslow);
+\end{tikzpicture}
+\caption{Sampling before a sequential node slows its state transitions; sampling after it only restricts which already-computed outputs are present.}
+\label{fig:visual-365}
+\end{figure}
+
+% Annotated walkthrough
+\section{Infer Clocks Before Lowering State}
+
+\begin{verbatim}
+value_type := infer_ml_type(expression)
+clock_type := infer_presence_type(expression)
+unify clock(x), clock(c)
+set clock(x when c) := clock(x) on c
+check every pre is initialized on its own clock
+check instantaneous dependency graph is causal
+classify function as combinational or node
+\end{verbatim}
+
+Initialization is clock-sensitive: an initial value is needed at the first occurrence of the stream's own clock, not necessarily at the system's first base instant.
+
+\section{Specialize Without Losing Clock Polymorphism}
+
+The IR should have stream-function, application, pattern, and operator nodes; value and instantaneous/delayed edges; delay state; symbolic clock types and sampling relations; ML value types and combinational/sequential effects; and source provenance through specialization. Compilation can monomorphize selected higher-order uses, normalize delays, schedule equations, and emit clock-guarded OCaml, C, or automata-like step code.
+
+Legal optimizations include inlining and specialization when inferred clocks are instantiated consistently, stream fusion, and moving pure combinational functions within a clock domain. Semantic-preservation risks include moving sampling across state, duplicating a node instance, or erasing the distinction between \(\to\) and \(\Rightarrow\)-style function classes. Preserve typed, clocked output traces and per-instance state; matching unclocked value lists is insufficient.
+
+\section{Observe Why Sampling Does Not Commute With State}
+
+Feed \texttt{sum} the base stream \(2,90,3,80,4\), and use a Boolean stream that is true at the even instants. Compare \texttt{sum (x when c)} with \texttt{(sum x) when c}. Both expressions are present at the same instants and both have integer values, but their states advance on different clocks. The first sums only accepted samples; the second sums every sample and then suppresses some reports.
+
+\begin{center}
+\begin{tabular}{crlrr}
+\hline
+Instant & x & c & Sample then sum & Sum then sample \\
+\hline
+0 & 2 & true & 2 & 2 \\
+1 & 90 & false & --- & --- \\
+2 & 3 & true & 5 & 95 \\
+3 & 80 & false & --- & --- \\
+4 & 4 & true & 9 & 179 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+tick(x, c, on_sample, on_base):
+    base_result := sum_step(x, on_base)
+    if not c:
+        return (Absent, Absent)
+    sample_result := sum_step(x, on_sample)
+    return (Present(sample_result), Present(base_result))
+
+sum_step(x, state):
+    if not state.initialized: result := x
+    else: result := state.previous + x
+    state.previous := result
+    state.initialized := true
+    return result
+\end{verbatim}
+
+Let the two state records be independent. The trace also distinguishes initialization when the first base instant is absent on the sampled clock: \texttt{on\_sample} must remain uninitialized until the first true \texttt{c}. A compiler cannot infer that selecting on the same Boolean stream makes the two accumulator instances interchangeable. If it wants to move a sampling operation across a pure total combinational function instead, it can prove the function is applied to the same present tuple at every selected instant and that evaluation on dropped instants is unobservable. That proof has no corresponding state transition to account for. Use both fixtures when testing the rewrite: one should be accepted by the legality check and the stateful counterexample must be rejected.
+
+\paragraph{Instantiate each application on its own clock.}
+When a node has a polymorphic input clock, two applications may bind
+that clock variable differently. Clone or freshly instantiate the
+scheme before unifying it with the actual stream. Unifying the two
+applications through a shared mutable clock variable can reject a legal
+program, or make one generated application advance on the wrong clock.
+For the fixture above, instrument the calls and expect five updates on
+the base and three on the subclock. Repeat with the first sample at
+instant two: the two instants before it must not count as initializations
+of the sampled accumulator.
+If each application has its own cached clock ID, test that those IDs
+are distinct whenever the parent and sampled presence traces differ.

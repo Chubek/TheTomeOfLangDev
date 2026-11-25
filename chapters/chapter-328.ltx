@@ -1,0 +1,79 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Make Binary Interoperation an Explicit Contract}
+
+The ISA may make it possible to pass an argument in any general-purpose register; two separately compiled functions can interoperate only if they select the same one. The ABI fixes shared choices about argument locations, return locations, register preservation, stack alignment, and other details that no instruction enforces by itself. The February 2024 VADL preprint, arXiv:2402.09087v1, describes a work-in-progress ABI section in Section~3.5; Sections~3.7 and~4.5.4 explain additional information used at the assembly and link boundaries \cite{himmelbauer2024vadl}.
+
+These are normalized VADL excerpts from Listings~19--20. They assume the relevant register file and surrounding ABI declarations:
+
+\begin{verbatim}
+alias register ra = X(1)
+alias register sp = X(2)
+alias register a0 = X(10)
+return address = ra
+[alignment: Bits<128>]
+stack pointer = sp
+\end{verbatim}
+
+Here the alignment is 128 bits, or 16 bytes on a byte-addressed machine. An alias gives a name to an existing cell; it does not allocate another register. Section~3.5 also describes \texttt{caller saved} and \texttt{callee saved} groups and the \texttt{[preferred alias]} annotation. The compiler must treat a live caller-saved value differently across a call from a live callee-saved value; choosing a preferred name alone does not change either rule.
+
+The preservation rule is an interface promise at the call boundary: a caller that needs a caller-saved value afterwards must preserve it itself, whereas a callee that changes a callee-saved value must restore it before returning. Stack alignment is likewise a property at each externally visible call point, not merely at function entry. A prologue may temporarily adjust the stack, but any nested call and any ABI-required aligned access must satisfy the applicable contract.
+
+\section{Describe the Sequences That Carry ABI Meaning}
+
+The \texttt{call sequence} example in Listing~21 uses the following VADL, with whitespace normalized. This is the paper's sample for an absolute address, not a claim that all RISC-V calls use this sequence.
+
+\begin{verbatim}
+call sequence (symbol: Address) = {
+  LUI { rd = 1, imm20 = hi20(symbol) }
+  JALR { rd = 1, rs1 = 1, imm = lo12(symbol) }
+}
+\end{verbatim}
+
+The first instruction prepares the high part in register 1. The second consumes that value to form the target and writes the return address to the same register. The compiler can infer some simple operational patterns, but deciding that a particular sequence implements the agreed call convention requires ABI information. A position-independent call or a call via a stub would add further agreements about address computation and symbol resolution. The address-sequence discussion in Section~3.5 explicitly limits the presented address-load facility to absolute addresses; that statement does not imply that the paper's relocation system lacks relative relocations.
+
+% Annotated walkthrough
+\section{Resolve a Symbol Without Changing the Call's Meaning}
+
+In this teaching trace, assume the target symbol eventually resolves to \texttt{0x12f90} and both instructions have four bytes. Abstractly, a relocation connects a patch site, a transformation such as ``high'' or ``low,'' and the symbol (with any applicable addend). This is an explanation of the contract, not a specification of ELF relocation IDs or storage fields.
+
+\begin{verbatim}
+emit LUI and JALR plus unresolved fixups for "helper"
+layout: S = 0x12f90, A = 0
+low bits = 0xf90 -> signed -112    # JALR extends the low part
+high     = 0x13                   # round up to compensate
+patch LUI with 0x13, JALR with 0xf90
+
+execute:
+  LUI  -> X(1) = 0x13000
+  JALR -> target = 0x13000 - 112 = 0x12f90
+        -> X(1) = address of instruction after JALR
+\end{verbatim}
+
+The JALR computation must read its base before writing \texttt{rd}; here both happen to name register~1. If an implementation writes the link first and then reads the base, it calls through the return address instead. If the high part is independently truncated to \texttt{0x12}, the assembled bits still look like two valid instructions but the call lands one page too low. Test a symbol just below and at the signed low-part boundary as well as the negative case. \Cref{fig:visual-328} shows where symbol identity must survive even when placeholder bytes contain no useful target.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (call) at (0,0) {Call sequence};
+  \node[tome box accent] (obj) at (4,0) {Object bytes\\and relocations};
+  \node[tome box] (link) at (4,-1.85) {Link layout\\and patching};
+  \node[tome box] (out) at (8,-1.85) {Resolved\\instruction bytes};
+  \node[tome box] (sym) at (0,-1.85) {Symbol definitions};
+  \draw[tome arrow] (call) -- node[above] {emit} (obj);
+  \draw[tome arrow] (obj) -- (link);
+  \draw[tome arrow] (sym) -- (link);
+  \draw[tome arrow] (link) -- (out);
+\end{tikzpicture}
+\caption{The relocation tells the linker how a symbol contributes to already-chosen machine instructions; the instruction fields alone do not identify the symbol.}
+\label{fig:visual-328}
+\end{figure}
+
+\section{Keep the File Format and Target Policy Apart}
+
+ELF supplies general machinery for sections, symbols, and relocation records; it does not tell the linker how to patch a particular processor's split immediate. Section~4.5.4 describes reusing LLVM's object infrastructure while generating architecture-specific relocation declarations and behavior, including generic relocations for immediate fields. A PC-relative fixup may need the patch location in addition to the symbol. Even if both absolute and relative values fit the same bit layout, swapping their relocation meanings changes the program.
+
+For a relative fixup, vary the distance between the section containing the patch and the section defining the symbol in a regression test. Moving both sections by the same amount cannot expose some address-base errors. Also check the offset at which the relocation is applied; patching a neighboring instruction with a legal immediate can leave the file readable while changing the wrong operation.
+
+When changing an ABI, rebuild both sides of a call, and test new code against an independently built callee that checks incoming arguments, stack alignment, and preserved registers. A change to object conventions also needs tests on unresolved relocations and final linked bytes. For a proposed relaxation, check that the shorter form still reaches the symbol and preserves ABI-visible effects, including where the caller resumes. Section~5.5 exercises the prototype on RISC-V test executables. It does not establish arbitrary compatibility with external objects or validate all possible ABI optimizations.

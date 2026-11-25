@@ -1,0 +1,75 @@
+% Source: blindel-instrselect-book.txt
+
+\section{Put the Cost Calculation in the Transition}
+
+In ``Faster Pattern Selection with Offline Cost Analysis,'' Blindell distinguishes a shape matchset from a state that contains winning rules and relative costs \cite[section~3.6.3]{blindell2016instruction}. For an eager generated selector, a transition table maps the current opcode and ordered child state IDs to a new state ID. A separate rule table maps that state and a requested goal to a single winning rule. The runtime labels nodes bottom-up, then follows the recovered frontier goals from the root. The recurrence from Chapter~\ref{ch:ext-267} still determines the winners, but its candidate comparisons take place when a transition is generated, not at every node it labels.
+
+The normalization argument is easiest for a \emph{linear-form} grammar in Blindell's sense: every base rule consumes one terminal and requires one goal from each of its immediate children. If a nested pattern is factored into such rules, the synthetic goals must preserve its operand bindings; the auxiliary rules do not emit additional machine instructions. For a child with finite costs, subtract its minimum finite cost $b$ from each finite entry, leaving unreachable entries infinite. Every viable base rule at the parent uses one contribution from that child, so removing $b$ subtracts the same amount from all those candidates. Same-node chain closure on the resulting costs, if needed, preserves that common shift. An all-infinite vector instead has a distinguished dead state; there is no finite offset to subtract.
+
+\section{Generate a Small Closure}
+
+Consider two register banks $W$ and $X$, both storing the same word bits. Argument values arrive in $W$. $\mathrm{inv}$ computes bitwise complement. The costs model several complement instructions with different source and destination banks.
+
+\begin{center}
+\begin{tabular}{clrr}
+Rule & Production & Weight \\
+$a$ & $W\gets\mathrm{arg}$ & 0 \\
+$b$ & $X\gets\mathrm{arg}$ & 3 \\
+$c$ & $W\gets\mathrm{inv}(W)$ & 2 \\
+$d$ & $W\gets\mathrm{inv}(X)$ & 5 \\
+$e$ & $X\gets\mathrm{inv}(W)$ & 4 \\
+$f$ & $X\gets\mathrm{inv}(X)$ & 3
+\end{tabular}
+\end{center}
+
+In goal order $(W,X)$ the argument gives state $q_0$ with deltas $(0,3)$ and rules $(a,b)$. Applying $\mathrm{inv}$ to that state gives costs $(\min(2,8),\min(4,6))=(2,4)$, hence state $q_1$ with deltas $(0,2)$ and rules $(c,e)$. Applying $\mathrm{inv}$ again to $q_1$ gives $(\min(2,7),\min(4,5))=(2,4)$ in the child's coordinate system. The transition leads back to $q_1$. Its normalized result does not change with nesting depth.
+
+This is a two-state instance of the work queue described in Blindell's discussion of Proebsting and BURG: seed from nullary symbols, combine queued states with known states for the operators' child positions, and enqueue only a new state. Any resulting fixpoint contains every reachable state, by induction on tree height. Store the reachability mask, deltas, and rule IDs as the state key with a deterministic tie policy. Rule IDs matter even when deltas agree: reduction needs the actual winning rule, not just its price. For this grammar and cost model, equal state keys are interchangeable in every parent transition.
+
+% Annotated walkthrough
+\section{Fill the Same Table on Demand}
+
+Blindell's ``Generating States Lazily'' describes Ertl and colleagues' alternative: compute transitions as they are needed and reuse the resulting states \cite[section~3.6.4]{blindell2016instruction}. Here is the trace for three successive complements of one argument, starting with an empty cache.
+
+\begin{verbatim}
+occurrence     transition key     result    absolute (W,X)
+arg            (arg, ())          q0 miss    (0,3)
+inv(arg)       (inv, q0)          q1 miss    (2,4)  [1]
+inv(inv(arg))  (inv, q1)          q1 miss    (4,6)  [2]
+third inv      (inv, q1)          q1 hit     (6,8)
+
+On a miss:
+  compute candidates from child deltas and local weights
+  remember winning rule per goal
+  normalize; intern the result; memoize the transition
+\end{verbatim}
+
+\noindent\textbf{[1]} Interning $q_1$ stores a state shared by complements at several depths. It does not store $2$ as the absolute cost of implementing those complements in $W$. If absolute totals are useful for diagnostics, store an offset at each occurrence: sum the children's offsets and the minimum finite cost computed by this transition.
+
+\noindent\textbf{[2]} A known result state is not a known transition. The key $(\mathrm{inv},q_1)$ still misses on its first appearance. The next complement hits that key; for final goal $X$ its rule is $e$, whose child needs $W$, regardless of the absolute cost at that child.
+
+\section{When to Keep the Explicit Cost Pass}
+
+\Cref{fig:visual-268} separates the transition keys from the costs of their individual occurrences. Three complements use just two distinct \texttt{inv} keys.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box,minimum width=2.9cm] (q0) at (0,0) {\(q_0:(0,3)\)\\Winners \(a,b\)};
+  \node[tome box,minimum width=2.9cm] (q1) at (6,0) {\(q_1:(0,2)\)\\Winners \(c,e\)};
+  \draw[tome arrow] (q0)--node[above,font=\footnotesize]{\(\mathrm{inv}\)} (q1);
+  \draw[tome arrow] (q1.north east) to[out=55,in=125,looseness=3]
+    node[above,font=\footnotesize]{\(\mathrm{inv}\)} (q1.north west);
+  \foreach \x/\seq/\cost/\stat in {-0.9/{arg}/{(0,3)}/{seed miss},1.85/{first inv}/{(2,4)}/{new key},4.6/{second inv}/{(4,6)}/{new key},7.35/{third inv}/{(6,8)}/{cache hit}} {
+    \node[align=center,font=\footnotesize] at (\x,-1.75) {\seq\\\(\cost\)\\\stat};
+  }
+  \draw[tome arrow] (-1.65,-1.11)--(8.1,-1.11);
+\end{tikzpicture}
+\caption{The normalized automaton loops at \(q_1\), even as the absolute costs \((W,X)\) increase. The second complement finds an existing state but still adds a transition to a lazy cache.}
+\label{fig:visual-268}
+\end{figure}
+
+Normalization preserves choices; it does not make every grammar finite-state. Change the example so both goals cost zero at the leaf, no cross-bank complement is legal, and each complement adds one in $W$ and two in $X$. At depth $n$ the normalized vector is $(0,n)$. For a grammar exposing both goals, eager enumeration of these exact vectors cannot terminate. A lazy cache only visits observed vectors but may still grow without useful reuse.
+
+Costs that change with context also need care. If $f$ costs one rather than three under a different target mode, the same child $q_1$ now makes $f$ beat $e$ for $X$. Include such context in the cache key, or recompute the affected transitions. An explicit per-node cost pass is both a useful reference for differential tests and a sensible fallback when a cache would exceed its budget.

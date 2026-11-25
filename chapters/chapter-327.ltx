@@ -1,0 +1,64 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Use One Instruction Representation at the Center}
+
+A register name in a text file, a five-bit field in an instruction, and an operand of an instruction in a compiler are different representations of the same architectural choice. An assembler validates text and emits bytes, a decoder identifies an instruction and extracts its fields from bytes, and a disassembler then prints those decoded operands. In the February 2024 VADL preprint, arXiv:2402.09087v1, Section~4.5 describes these paths in the LLVM Compiler Backend (LCB) prototype \cite{himmelbauer2024vadl}. One internal instruction may be constructed by the compiler backend or by the assembler parser; parsing is unnecessary when the compiler calls the emitter directly.
+
+The following VADL clauses are the ADDI instance obtained by substituting arguments into the model in Listing~3. They use its \texttt{Itype} layout and register file, and are not a complete specification.
+
+\begin{verbatim}
+encoding ADDI = { opcode = 0b001'0011, funct3 = 0b000 }
+assembly ADDI = (mnemonic, " ", register(rd), ", ",
+                 register(rs1), ", ", decimal(imm))
+\end{verbatim}
+
+The two clauses supply different evidence. \texttt{encoding} tells the binary tools which fields are fixed for this instruction. \texttt{assembly} tells the printer which pieces of the internal instruction contribute to its textual form. Neither describes the arithmetic performed when ADDI executes. \Cref{fig:visual-327} puts the parser, emitter, decoder, and printer on their respective edges; link-time fixups are a separate part of the object path.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (text) at (0,0) {Source text};
+  \node[tome box accent] (inst) at (4.1,0) {Internal\\instruction};
+  \node[tome box] (bytes) at (8.2,0) {Word bytes};
+  \node[tome box] (print) at (4.1,-2) {Canonical text};
+  \draw[tome arrow] (text) -- node[above] {parse} (inst);
+  \draw[tome arrow] (inst.east) to[bend left=30] node[above] {emit} (bytes.west);
+  \draw[tome arrow] (bytes.west) to[bend left=30] node[below] {decode} (inst.east);
+  \draw[tome arrow] (inst) -- node[right] {print} (print);
+\end{tikzpicture}
+\caption{Compiler output can enter at the internal instruction without going through the parser. Disassembly follows the decode and print edges.}
+\label{fig:visual-327}
+\end{figure}
+
+\section{Generate the Table, Then Choose the Search}
+
+Section~4.5.3 explains that LLVM can synthesize a decoder from the format and constant fields expressed in TableGen. Section~4.5.4 uses the same infrastructure for machine-code emission. Section~4.6 describes a different consumer of decoding information: the functional simulator reuses its decoder from VIR. A generator does not have to make all targets use the same runtime algorithm; it has to make them agree on which words and operands those algorithms recognize.
+
+For fixed-width instructions, a simple reference implementation tests a word against one mask and fixed value per instruction, then applies any additional field constraints. An optimized one might first dispatch on the primary opcode, then inspect the function bits only for encodings in that group. A mask match alone may not prove that a candidate satisfies its constraints. If two candidates accept the same word and the architecture does not define an alias policy, optimization must not introduce a winner by accidentally reordering the tests. Variable-length instructions introduce another question: can the decoder determine which additional bytes to read, and can it report an incomplete instruction without reading them?
+
+Record the number of bytes consumed as part of a decode test. A disassembler that identifies the right first mnemonic but advances by the wrong length will decode every subsequent instruction from the wrong boundary. On a variable-length target, a short instruction followed by a longer one makes a better basic test than two instructions that happen to be the same size.
+
+% Annotated walkthrough
+\section{Walk Bytes in Both Directions}
+
+This independent teaching calculation uses the Listing~3 fields and a simple immediate to avoid ambiguities about spelling signed constants.
+
+\begin{verbatim}
+input: addi x5, x6, 7
+  parse -> ADDI(rd=5, rs1=6, imm=7)  # validate operands first
+  encode: (7<<20) | (6<<15) | (5<<7) | 0x13
+  word = 0x00730293
+  emit little-endian: 93 02 73 00
+
+decode 93 02 73 00:
+  word & 0x0000707f = 0x00000013   # opcode and funct3
+  extract rd=5, rs1=6, imm=7
+  print canonical ADDI spelling
+\end{verbatim}
+
+If \texttt{funct3} becomes binary 110 while all other fields stay fixed, the word becomes \texttt{0x00736293}; Listing~3 assigns that pattern to ORI. This paired test actually detects a decoder that ignores the function bits. Retain it when changing the generated decision structure. Also supply unsupported words, register aliases, and boundary immediates. The useful identities are decode-after-encode on legal instructions and parse-after-print on the printer's representable domain. Neither implies that printing can reconstruct comments, whitespace, or unresolved symbol names from a raw word.
+
+\section{Test the Object Path Independently}
+
+A parser change can affect accepted text while a format change can affect bytes without affecting the accepted mnemonic. A symbolic operand also creates metadata that must travel through the emitter to the linker; checking only the bytes with a zero placeholder will miss incorrect relocation kinds or symbols. Section~5.5 reports RISC-V tests building executables with generated assembler and linker components for use in simulator testing. The paper also describes syntax experiments on MIPS IV and AArch64. Those experiments are evidence about the prototype, not about every object-format feature or language combination; independent expected bytes and expected fixup records are still useful when tools generated from the same mistaken specification agree with one another.

@@ -1,0 +1,74 @@
+% Source: c-to-async-dataflow.txt
+% Source: vienna-arch-desc-lang.txt
+
+\section{Make Connectivity Real}
+
+Placement assigns cells to legal sites, and routing assigns resource paths that connect their terminals. In an FPGA, a packer first groups primitives into legal clusters; a site has a fixed set of available local connections, clock inputs and compatible primitives. Routing then claims programmable switches and tracks. In an ASIC, macros and I/O are floorplanned, standard cells are placed in rows, clock trees are built, and signal wires are routed subject to design rules. Other phases address power distribution, antenna effects, filler cells, and manufacturability. Two legal placements of the same mapped netlist can lead to very different route lengths and congestion.
+
+The asynchronous CASH paper gives a useful staging example: its back end emits structural Verilog, the synthesis stage produces a gate-level circuit, and place-and-route yields layout and wire information. The updated timing characterization belongs to the physical stage, not to the source. In the Vienna architecture-description work, synthesizable HDL is one of several generated outputs. A cycle-accurate simulator from the same description is useful for checking the architecture, but does not supply the wires or package pins.
+
+% Annotated walkthrough
+\section{Take an iCEstick Example Through Device Configuration}
+
+Assume the iCEstick evaluation board with its HX1K in the TQ144 package and 12 MHz oscillator. Save the following Verilog-2005 as \texttt{blink.v}; the register initialization depends on the target synthesis and configuration flow.
+
+\begin{verbatim}
+module blink(input clki, output led1);
+    reg [23:0] q = 24'd0;
+    always @(posedge clki) q <= q + 24'd1;
+    assign led1 = q[23];
+endmodule
+\end{verbatim}
+
+After \(n\) edges the counter is \(n\bmod2^{24}\), so the LED's drive changes every \(2^{23}\) edges and has a full period of \(2^{24}/12{,}000{,}000\approx1.398\) s. That is a functional calculation at the nominal input frequency, not the maximum clock rate. The PCF pin syntax below follows the \href{https://github.com/YosysHQ/nextpnr/blob/main/ice40/examples/blinky/blinky.pcf}{nextpnr iCEstick example}. Verify any substitute board against its schematic; a package name alone identifies no oscillator or LED.
+
+\begin{verbatim}
+set_io clki 21
+set_io led1 99
+\end{verbatim}
+
+With those lines saved as \texttt{blink.pcf}, the native command-line flow is:
+
+\begin{verbatim}
+yosys -p 'read_verilog blink.v; synth_ice40 -top blink -json blink.json'
+nextpnr-ice40 --hx1k --package tq144 --freq 12 \
+  --pcf blink.pcf --json blink.json --asc blink.asc \
+  --report blink_report.json
+icepack blink.asc blink.bin
+\end{verbatim}
+
+The \href{https://github.com/YosysHQ/nextpnr/blob/main/docs/constraints.md}{nextpnr constraint documentation} describes the default frequency target and architecture-specific pin files. Physical-flow pseudocode separates the obligations:
+
+\begin{verbatim}
+require clock_and_pin_constraints_match_board()  # before routing
+pack_and_place(mapped_cells)                     # legal clusters/sites
+route_all_nets()                                 # connectivity first
+review_timing_and_resource_reports()             # not only exit status
+encode_routed_configuration()                    # separate from report
+\end{verbatim}
+
+\Cref{fig:visual-319} shows the point where device and ASIC deliverables diverge. The JSON netlist is the input to FPGA implementation, and the JSON report is a different file with different semantics.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (map) at (0,0) {Mapped\\netlist};
+  \node[tome box] (fpga) at (3.65,0.9) {FPGA\\routed ASC};
+  \node[tome box] (bin) at (7.25,0.9) {Device\\bitstream};
+  \node[tome box] (asic) at (3.65,-0.9) {ASIC\\routed layout};
+  \node[tome box] (gds) at (7.25,-0.9) {Fabrication\\layout stream};
+  \draw[tome arrow] (map.east) -- (fpga.west);
+  \draw[tome arrow] (map.east) -- (asic.west);
+  \draw[tome arrow] (fpga.east) -- (bin.west);
+  \draw[tome arrow] (asic.east) -- (gds.west);
+\end{tikzpicture}
+\caption{The mapped netlist is different for each technology. FPGA routing describes settings for programmable switches; ASIC implementation describes geometry that will be fabricated.}
+\label{fig:visual-319}
+\end{figure}
+
+\section{Accept a Delivered Artifact Only with Its Checks}
+
+The IceStorm binary encodes configuration for a particular device, rather than a program for a processor. Loading it into volatile configuration memory versus an external boot flash is a board-level decision. The report and logs are evidence to review, not payloads to program. They should identify utilization, routed timing and violated paths under the recorded constraints. A design can fit by total LUT count but fail to route around a congested region, or close an internal clock target while leaving significant I/O timing unchecked.
+
+ASIC deliverables include signoff reports, extracted parasitics and layout such as GDSII (or OASIS), not an FPGA bitstream. Design-rule checks assess legal geometry; layout-versus-schematic compares extracted connectivity with the intended circuit. Neither is interchangeable with RTL equivalence, and none substitutes for setup and hold analysis. A physical result is acceptable only when all required nets are routed, the intended pins and clock constraints were read, utilization and congestion are within the project limits, and the routed min/max timing reports cover the intended endpoints. Routability and timing heuristics are not proofs of optimality. For a meaningful comparison, hold the target, constraints and reporting stage fixed and record tool versions and seeds. Fix real congestion or interface assumptions rather than hiding a failure by changing what a report checks.

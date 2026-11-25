@@ -1,0 +1,65 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Read an Instruction Backwards, from Effect to Pattern}
+
+An instruction definition answers ``what does this opcode do?'' Instruction selection asks ``which opcode can implement this operation?'' The second question is not simply decoding in reverse. An opcode can have several recognizable effect patterns, and several opcodes might implement the same operation under different operand restrictions. Sections~3.3, 4.3, and~4.4 of the February 2024 VADL preprint, arXiv:2402.09087v1, present a prototype that extracts patterns from operational semantics and emits an LLVM backend \cite{himmelbauer2024vadl}.
+
+Here is Listing~27's ADDI body with normalized spacing. Its \texttt{Itype} format also defines the 12-bit field \texttt{imm} and the sign-extended access function \texttt{immS}.
+
+\begin{verbatim}
+instruction ADDI : Itype = {
+  X(rd) := ((X(rs1) as SInt) + immS) as Bits
+}
+\end{verbatim}
+
+The destination index is not an input arithmetic value; it selects the place written by the result. The source index selects a register read, whereas the immediate bits supply a value without reading the register file. From this distinction a selector can describe an ADDI pattern with a register input, an immediate input, and a register output. Additional reads of fixed registers or writes of flags cannot be thrown away because they are not explicit format operands. The instruction's usual sequential PC advance is different from a PC update implementing a source-level branch; a generator must account for that difference when characterizing behavior.
+
+\section{Refine the Graph Before Emitting Target Rules}
+
+Section~4.4.2 describes the Generic Compiler Backend (GCB). It collects information about operands, register resources, relocations, and immediate checks from the shared VADL IR, VIR. It converts instruction behavior into directed acyclic graphs (DAGs), merging simpler nodes into patterns useful for recognition. It also searches for equivalent alternative forms to improve pattern coverage, for instance when a processor need not provide all logically redundant comparisons as distinct opcodes. Such rewrites must preserve width, signedness, and the relevant effects. A signed comparison rewritten to an unsigned one is not equivalent merely because all benchmark operands happen to be small positive integers.
+
+The LLVM Compiler Backend component described in Section~4.4.3 legalizes patterns for LLVM, validates essential sequences and registers, and emits target files. This is a backend generator, not a new source-language frontend. The paper's split between generic analysis and LLVM emission keeps other backends possible as a design goal; it does not demonstrate an implementation for every framework. In \Cref{fig:visual-329}, the ABI supplies information no arithmetic graph can recover, including call conventions. The GCB can recognize some helper sequences; Section~3.5 provides explicitly specified ones such as \texttt{call sequence}.
+
+An instruction with an operand that is both read and written is a useful translation test. Section~4.4.2 describes representing such an operand in separate input and output roles where the backend requires it, with a constraint tying the two roles together. Dropping the tie would let register allocation choose operands the encoding cannot express.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (vir) at (0,0) {VIR\\typed effects};
+  \node[tome box accent] (dag) at (4,0) {GCB graphs\\and operands};
+  \node[tome box] (lcb) at (8,0) {LLVM\\legalization};
+  \node[tome box] (abi) at (0,-1.6) {ABI\\call sequences};
+  \node[tome box] (out) at (8,-1.6) {Rules and\\helper code};
+  \draw[tome arrow] (vir) -- (dag);
+  \draw[tome arrow] (abi) -| (dag);
+  \draw[tome arrow] (dag) -- (lcb);
+  \draw[tome arrow] (lcb) -- (out);
+\end{tikzpicture}
+\caption{Typed effects support pattern derivation, but prescribed calling sequences supply information the generic analysis cannot infer from an arithmetic expression.}
+\label{fig:visual-329}
+\end{figure}
+
+% Annotated walkthrough
+\section{A Match Is Incomplete Until the Operands Fit}
+
+Here is a teaching reconstruction of an ADDI selector decision, not a literal VADL or LLVM rule. The IR operation is an ordinary 32-bit addition with a constant operand; only legal destinations for a real result are considered.
+
+\begin{verbatim}
+match: result32 = add32(source32, K)
+if -2048 <= signed_value_32(K) <= 2047:
+    emit ADDI(result_reg, source_reg, low12(K))
+    # Selector checks the value before the encoder truncates it.
+else:
+    materialize K and use register ADD if legal
+    # One possible fallback, not the only valid sequence.
+
+K = -2048 -> ADDI with immediate 0x800
+K = +2048 -> not this ADDI; the same bits decode as -2048
+\end{verbatim}
+
+The test is on the mathematical value represented by the IR constant, not on whether its low 12 bits happen to fit. The selector must also carry the source operation's width and any defined exceptional or flag effects; replacing a wider add by ADDI merely because a particular constant fits can otherwise discard behavior. If a spec revision widens the immediate, the change affects this predicate, the extraction used by the simulator, and emission. Compare the selected machine words against an independent encoding and execute them with boundary register values. To test any alternative match or more profitable sequence, compare live results and side effects, not just whether the output is shorter. Scheduling choices or instruction costs may change what is profitable without changing what is legal.
+
+\section{Separate Pattern Coverage from End-to-End Results}
+
+Testing direct patterns can expose a width mistake even if a backend compiles small programs. Testing fallback paths can reveal that a legal operation has no implemented lowering. Section~5.4 reports that the prototype completed four of 22 Embench programs using LLVM 10 and unoptimized settings; unsupported selection patterns were a major reason for failures, but linking and execution failures also occurred. Only the completed programs entered the reported cycle comparison, which used the generated cycle-accurate simulator. This demonstrates a backend pipeline for those cases, not comprehensive pattern coverage, production optimization, or current performance.

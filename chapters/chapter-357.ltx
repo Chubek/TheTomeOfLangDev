@@ -1,0 +1,106 @@
+% Source: analysis-dataflow-programs.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+
+\section{Let Firing Rules Depend on Data}
+
+Dynamic dataflow permits token rates or enabled actions to depend on runtime values or actor state. The compiler can know the set of ports and actions without knowing a complete periodic schedule. A guard is part of the firing rule: inspecting an input to test a guard must not accidentally consume it if another action is selected. If several actions are enabled, priority declarations or a specified choice semantics determine whether the actor is deterministic.
+
+Tags solve a different problem. In a reentrant or iterative graph, a token can carry a frame, iteration, or invocation identity so that a matching node combines operands from the same dynamic context. A tag does not choose a guarded action, and a guard does not identify which invocation produced a token. Conflating them creates cross-iteration matches.
+
+\section{Route Values With CAL Guards}
+
+This CAL actor has two actions with complementary guards:
+
+\begin{verbatim}
+actor Split() int I ==> int O1, int O2 :
+  A: action I:[val] ==> O1:[val]
+     guard val >= 0 end
+  B: action I:[val] ==> O2:[val]
+     guard val < 0 end
+end
+\end{verbatim}
+
+Each firing consumes one input token, but the selected output port depends on its value. Thus no fixed nonzero production rate exists for either output individually. If dynamic instances are tagged, input \(({-3},k)\) must produce \(({-3},k)\) on \texttt{O2}; the guard changes the route, not the context tag. \Cref{fig:visual-357} displays both decisions.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (in) at (-3.8,0) {token \((v,k)\)};
+  \node[tome box] (g) at (-1,0) {test \(v\)};
+  \node[tome box accent] (p) at (2,1.1) {\(v\geq0\): O1};
+  \node[tome box accent] (n) at (2,-1.1) {\(v<0\): O2};
+  \node[tome box] (tag) at (4.7,0) {preserve tag \(k\)};
+  \draw[tome arrow] (in) -- (g);
+  \draw[tome arrow] (g) -- (p);
+  \draw[tome arrow] (g) -- (n);
+  \draw[tome arrow] (p) -- (tag);
+  \draw[tome arrow] (n) -- (tag);
+\end{tikzpicture}
+\caption{The guard selects an action from the token value, while the tag maintains dynamic-instance identity across the selected route.}
+\label{fig:visual-357}
+\end{figure}
+
+% Annotated walkthrough
+\section{Choose an Action Atomically}
+
+\begin{verbatim}
+snapshot := peek_required_input_prefixes(actor)
+candidates := actions_whose_patterns_match(snapshot)
+enabled := [a for a in candidates if evaluate(a.guard, snapshot, state)]
+a := select_by_declared_priority_or_choice_semantics(enabled)
+atomically:
+    consume(a.input_pattern)
+    update(a.explicit_state)
+    emit(a.output_pattern, preserving_context_tags)
+\end{verbatim}
+
+The atomic region is a semantic event even if a lock-free implementation realizes it differently. Evaluating every action body speculatively would be wrong when bodies update actor state or perform effects.
+
+\section{Retain Dynamic Evidence in the IR}
+
+The IR should contain actor and action nodes, typed FIFO edges, input/output patterns, guard and priority edges, tag schemas, actor state, variable rates, effects, and source provenance. Clocks or rate intervals may be recorded, but unknown dynamic rates must not be replaced by convenient constants. Compilation may produce a guarded actor runtime, state-machine code, hardware arbitration, or profiling instrumentation and execution-trace graphs.
+
+Legal optimizations include folding a proven guard, deleting an unreachable action, or fusing actors when the composed action rules preserve all token sequences. Semantic-preservation risks include consuming a token while probing a losing guard, dropping tags, reordering state updates, and treating a profiled action frequency as a semantic rate. Dynamic traces can guide optimization, but one trace does not prove that an unobserved guard is impossible.
+
+\section{Match Dynamic Instances Before Firing a Join}
+
+Downstream from a router, suppose two channels each carry responses for several concurrently active requests. A join must pair responses for the same request, not necessarily the first arrivals. Represent a tag as \((\text{activation},\text{iteration})\), with an activation shared by its branches but distinct across independent calls. The following trace assumes a matching store that accepts arrivals in any order, exactly one contribution per port and tag, and no requirement that completed joins publish in tag order.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Arrival & Partial matches after arrival & Output tags \\
+\hline
+Left, tag 1 & Left 1 & none \\
+Right, tag 2 & Left 1; right 2 & none \\
+Left, tag 2 & Left 1 & 2 \\
+Right, tag 1 & none & 2, 1 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+on_arrival(port, tag, value):
+    record := partial.get_or_create(tag)
+    require record[port] is missing
+    record[port] := value
+    if record.has_left and record.has_right:
+        pair := (record.left, record.right)
+        if can_publish(tag):
+            publish_once(tag, pair)
+            remove partial[tag]
+\end{verbatim}
+
+If publication may block, retain the complete record and retry publication without replaying the arrival. In a concurrent implementation, installing a contribution and claiming the complete record must be coordinated. A bounded store needs an admission or credit policy; evicting a live partial match is not a legal cache miss. If the interface promises output order, add a separate reorder stage and make it part of the memory budget. For a regression, give both tags distinct arithmetic operands and send the right channel in reverse order. Correct output values prove that tags survived matching; correct tag order alone would not catch swapped operands.
+
+\paragraph{Specify when a tag can be recycled.}
+Removing a partial-match record is not enough to make a tag reusable.
+An old contribution might still be in flight on either port. The simple
+sketch assumes producers send once and no contribution arrives after its
+tag completes. If the transport retries messages or reuses activation
+numbers, attach a generation or reject stale messages using a retirement
+protocol. A generation field affects equality and therefore must survive
+serialization through every edge of the graph. A counterexample fixture
+starts two successive requests with equal user-visible identifiers, but
+delivers one stale response between them; no new match should consume it.

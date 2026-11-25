@@ -1,0 +1,73 @@
+% Source: c-to-async-dataflow.txt
+% Source: vienna-arch-desc-lang.txt
+
+\section{One Description, Two Consumers}
+
+A CPU executes an instruction stream on hardware that already exists. A hardware description can instead specify the hardware that will exist: which interfaces connect, which values are computed in parallel, and which old values survive a clock edge. A simulator executes a model of this description on a host computer. A synthesis tool turns a supported subset into a network of logic and storage cells. These are not interchangeable meanings of ``run.'' Simulation can also execute a testbench that drives clocks, generates stimuli, and prints observations; none of this makes the testbench part of the circuit.
+
+The distinction is visible in Venkataramani, Budiu, Chelcea, and Goldstein's \emph{C to Asynchronous Dataflow Circuits}. Their compiler produces structural Verilog from a dataflow representation, then passes that Verilog to commercial synthesis and place-and-route tools. The Verilog is an intermediate deliverable, not a layout. In \emph{The Vienna Architecture Description Language}, Himmelbauer and colleagues distinguish a processor's ISA from its microarchitecture; they generate both cycle-accurate simulation and synthesizable HDL using microarchitecture information. An instruction's arithmetic meaning alone does not tell us how many pipeline stages its implementation has.
+
+Register-transfer level (RTL) names a useful level of description, not a file format. An RTL author typically chooses the state boundaries and the logic relating each boundary to the next. A structural HDL description can instead instantiate individual gates or library cells, and a behavioral model can omit the implementation structure altogether. A statement valid for simulation at any of these levels is not automatically a recipe for a circuit. For instance, a testbench printing a value every ten nanoseconds says nothing about which device resource would perform the printing.
+
+\Cref{fig:visual-303} separates the artifacts of a conventional digital implementation flow. The fork describes the distinction between the two consumers, not a requirement that both use the same frontend.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (hdl) at (0,0) {HDL source};
+  \node[tome box] (elab) at (0,-1.2) {Elaborated design};
+  \node[tome box] (sim) at (-2.75,-2.65) {Simulator + stimulus};
+  \node[tome box] (syn) at (2.75,-2.65) {Synthesis + libraries};
+  \node[tome box accent] (trace) at (-2.75,-4.05) {Trace and assertions};
+  \node[tome box] (net) at (2.75,-4.05) {Mapped netlist};
+  \node[tome box accent] (impl) at (2.75,-5.45) {Place and route};
+  \draw[tome arrow] (hdl) -- (elab);
+  \draw[tome arrow] (elab) -- (sim);
+  \draw[tome arrow] (elab) -- (syn);
+  \draw[tome arrow] (sim) -- (trace);
+  \draw[tome arrow] (syn) -- (net);
+  \draw[tome arrow] (net) -- (impl);
+\end{tikzpicture}
+\caption{Simulation reports the model's behavior under stimulus. A mapped netlist describes connected target cells; physical implementation determines where those cells and their wires go.}
+\label{fig:visual-303}
+\end{figure}
+
+% Annotated walkthrough
+\section{Follow a Conditional Register Update}
+
+This Verilog-2005 module uses constructs normally supported by RTL synthesis and has a corresponding event-driven simulation model \cite{ieee1364verilog}. It has no reset; the example's contract begins after an enabled, known input has been sampled.
+
+\begin{verbatim}
+module mix_capture (
+    input  wire       clk, en,
+    input  wire [3:0] a, b,
+    output reg  [3:0] q
+);
+    wire [3:0] mixed;
+    assign mixed = a ^ b;
+    always @(posedge clk)
+        if (en) q <= mixed;
+endmodule
+\end{verbatim}
+
+For this abstract walkthrough, assume binary inputs that are stable around each capture edge. ``Between edges'' describes a logical relationship, not a guarantee of zero physical propagation time.
+
+\begin{verbatim}
+between edges:
+    mixed = bitwise_xor(a, b)  # four results, no stored state
+at each rising edge:
+    next_q = q                 # holding is the default
+    if en == 1: next_q = mixed # select what will be captured
+    commit(next_q)             # update all four state bits
+\end{verbatim}
+
+With \(a=1010_2\), \(b=1100_2\), and \texttt{en} high, the next rising edge captures \(0110_2\). Changing the inputs with \texttt{en} low still changes \texttt{mixed}, but no rising edge with \texttt{en} low can change \texttt{q}. There is no loop over the four bits in the implemented machine. There is one logical XOR per bit, and there are four state bits sampled together. Before the first enabled capture, the four-state simulation starts \texttt{q} at \texttt{x}; no physical power-up value is specified by the module.
+
+\section{Inspect the Handoffs}
+
+Analysis checks syntax and what names mean. Elaboration chooses a top, specializes parameters, and connects instances, yielding a concrete hierarchy. That hierarchy can still contain processes. In synthesis those processes are lowered to combinational logic and state elements. One possible lowering places a mux before each flip-flop and feeds the old output back to one mux input. A target mapper might instead use a cell with a built-in enable. The Verilog says when the old value survives; it does not specify which of those implementations to use. If the enable is proven constant, or if the captured value cannot reach an observable output, later optimization may simplify or remove logic while preserving the selected design's observable behavior.
+
+The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/proc.html}{Yosys process-conversion documentation} describes how its \texttt{proc} pass lowers processes, including mux and register extraction. Reading its output after that pass is useful for checking storage inference, but it is not evidence that the design meets a clock period. Timing closure requires target cells, constraints, and a physical implementation model. Conversely, a trace from an RTL testbench can establish that this particular stimulus produced the expected capture and hold, but it neither measures cell timing nor covers all input sequences.
+
+Each handoff answers a different debugging question. If an enabled capture consistently produces the wrong XOR, start at the RTL boundary and check the bit-level function. If the XOR is correct but the output follows input edits without a rising edge, inspect state inference and how the waveform was sampled. If logical tests pass and an implementation still misses its period, inspect the reported physical paths and the constraints used to analyze them. Turning up the simulated clock rate in a zero-delay RTL test does not reproduce a timing violation; the test model has no propagation delay to exceed.

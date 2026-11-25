@@ -1,0 +1,59 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Shared Generation Is Not an Independent Oracle}
+
+A generated assembler, simulator, and processor may all agree for the wrong reason. If a description places an immediate in the wrong bits, an assembler and a decoder generated from it might agree on incorrect bytes. Likewise, if an ISA model gets a sign extension wrong, two backends that consume the same model can reproduce the error. Agreement is useful for finding differences between backends, but it does not settle whether the common source is correct. A test plan needs an external check for each shared assumption that matters.
+
+Sections~4.6 and~7 of the VADL paper describe trace generation and co-simulation, and Section~5 gives separate evaluations for the generated components \cite{himmelbauer2024vadl}. Adopt that separation in the test harness. Encoding tests should compare bytes against independently specified fields; execution tests can feed an independent binary to both the generated machine and a reference model. Compiler tests should start with source programs of defined behavior and compare their results, not insist that two compilers select the same instructions. \Cref{fig:visual-337} shows where an independent byte check sits relative to the execution check.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (bytes) at (0,0) {Known bytes};
+  \node[tome box] (as) at (4,1.12) {Generated encoder};
+  \node[tome box] (ref) at (4,-0.62) {ISA reference};
+  \node[tome box] (dut) at (4,-1.92) {Generated machine};
+  \node[tome box,align=center] (align) at (8.4,-1.27) {Compare\\commits};
+  \draw[tome arrow,dashed] (as.west) -- (bytes.north east);
+  \draw[tome arrow] (bytes.east) -- (ref.west);
+  \draw[tome arrow] (bytes.south east) -- (dut.west);
+  \draw[tome arrow] (ref.east) -- (align.north west);
+  \draw[tome arrow] (dut.east) -- (align.south west);
+\end{tikzpicture}
+\caption{Check encoder output against an independent byte fixture (dashed). Feed the same fixture to both execution models (solid) to avoid relying on the generated encoder for the execution test.}
+\label{fig:visual-337}
+\end{figure}
+
+\section{Make Small Fixtures That Check More Than Round Trips}
+
+The following VADL macro invocation is from the RV32I appendix, Listing~29, with spacing normalized:
+
+\begin{verbatim}
+$ItypeInstr(ADDI; +; 0b000; SInt)
+\end{verbatim}
+
+The model behind the invocation groups instruction behavior, encoding, and assembly syntax. That makes it easy to keep them synchronized, but also makes them a poor source of independent expected values. For \texttt{addi x5, x0, -1}, take the ADDI format from the \href{https://docs.riscv.org/reference/isa/unpriv/rv32.html}{RISC-V ISA manual}. Placing the 12-bit immediate \texttt{0xfff} at bits 31--20, source index 0 at bits 19--15, function bits 0 at bits 14--12, destination index 5 at bits 11--7, and opcode \texttt{0x13} at bits 6--0 gives word \texttt{0xfff00293}. In a little-endian image the bytes are \texttt{93 02 f0 ff}. Testing the disassembler may compare decoded operands or normalized text rather than demanding the same alias spelling in every tool. Include the immediate endpoints \(-2048\) and \(2047\): testing only small positive values can miss both an incorrect signed range and a bad sign extension.
+
+A linker fixture should likewise check the effect, not just that the generated executable loads. A small table that refers to a symbol in a second object can be inspected before linking for the expected relocation and after linking for the resolved address. Repeat with the symbol moved to catch a missing or double-applied adjustment. An ABI fixture can call a separately compiled function with distinct argument values and verify a callee-saved register afterward. Simply calling generated code from generated code risks letting the same calling-convention mistake pass at both ends.
+
+% Annotated walkthrough
+\section{Find the First Architectural Disagreement}
+
+Commit comparison is useful for a deterministic, single-core test with matched initial state and scripted external inputs. Ignore extra pipeline cycles at this boundary, but keep architectural effects. The pseudocode is illustrative, not a VADL test language.
+
+\begin{verbatim}
+ref = reference(load_fixture(), initial_state)
+dut = generated_core(load_fixture(), initial_state)
+for i in range(expected_events):
+    a = ref.next_event_within_limit()
+    b = dut.next_event_within_limit()
+    require equal(pc, outcome, register_delta, stores, a, b)
+require ref.done() and dut.done()     # no missing or extra effects
+\end{verbatim}
+
+Here an event is a committed instruction or a synchronous trap, and \texttt{outcome} includes the next PC and any trap cause. Its store record should include address, byte enables, and data; any architecturally visible control or status update belongs in the event too. Start at \texttt{0x100} with mutable registers zeroed and run the ADDI fixture, then \texttt{addi x0, x0, 9}, then \texttt{addi x6, x0, 0}. The first event writes all ones to \(x_5\); a missing sign extension instead yields \(4095\). The second must not change \(x_0\), and the third must write zero to \(x_6\). The invariant is equality of observable event prefixes. A separate cycle-aligned comparison between the CAS and HDL can then find, for example, an early write that did not change that sequence.
+
+\section{Report Coverage and Its Limits}
+
+Section~5.5 of the paper reports use of compliance cases, handwritten assembly, and small C programs with the generated tools. Section~5.8 reports Embench and compliance validation of the simulated generated hardware. Neither covers all legal states, all devices, or every permitted memory behavior. Section~5.4 is narrower still for the compiler: four of 22 Embench programs completed successfully with the generated setup, and comparison was at \texttt{-O0}. Label that as end-to-end evidence for those programs, not general compiler validation. Preserve the failing input, versions, configuration, and first divergent event when a test does fail; the smallest reliable mismatch is often more valuable than another successful benchmark.

@@ -1,0 +1,70 @@
+% Source: handbook-of-sat.txt
+
+\section{Separate Graph Simplification from Cell Selection}
+
+Inside a combinational cone, the implementation problem is to compute a Boolean function at an acceptable cost. A Boolean network is a directed acyclic graph whose leaves are primary inputs or state bits and whose internal nodes compute local functions. When optimizing an ordinary synchronous design, a first boundary is often a register: the optimizer can treat its output as a leaf and its input as a sink. A change to the boundary itself is a sequential transformation, not ordinary Boolean rewriting.
+
+An AND-inverter graph (AIG) uses two-input AND nodes and possibly complemented edges. It makes negation cheap in the representation, not necessarily in the physical circuit. Structural hashing can reuse a node whenever its canonical pair of input literals already exists. It does not, by itself, identify different graph shapes that compute the same function. Balancing changes an association to reduce depth; rewriting replaces a small subgraph with an equivalent one; resubstitution tries to express a result using functions already present. The \href{https://people.eecs.berkeley.edu/~alanmi/abc/}{Berkeley ABC project} documents a synthesis and verification system built around such representations. The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/abc.html}{Yosys ABC documentation} explains its own interface: it invokes ABC on extracted logic, not as a substitute for the whole HDL frontend and implementation flow.
+
+% Annotated walkthrough
+\section{Factor a Shared Cone and Prove the Boundary}
+
+The following Verilog-2005 \cite{ieee1364verilog} module exposes the original and rewritten outputs at once. Its \texttt{equivalent} output is an explicit one-bit miter: it is one exactly when the two outputs agree.
+
+\begin{verbatim}
+module factor(input a, b, c, output original, rewritten, equivalent);
+    assign original  = (a & b) | (a & c);
+    assign rewritten = a & (b | c);
+    assign equivalent = ~(original ^ rewritten);
+endmodule
+\end{verbatim}
+
+For known bits, \(a=0\) forces both results to zero regardless of \(b,c\); \(a=1\) reduces both to \(b\lor c\). This covers all eight combinations. If this is the only output using the products, factoring replaces two ANDs and one OR with one OR and one AND, both with a worst-case depth of two two-input gates. The delay from \(a\) changes from two gates to one, but the delay from \(b,c\) is still two. If another output uses \(a\land b\), one eliminated node was not dead. Even the small gate count needs the context of the surrounding graph.
+
+Pseudocode for evaluating such a rewrite:
+
+\begin{verbatim}
+leaves = choose_small_cut(root)          # freeze this cone's inputs
+before = function_of(root, leaves)       # cache its local truth table
+after = factor_common_literal(before)    # one candidate expression
+if SAT(before XOR after): reject         # witness shows a wrong bit
+delta = estimate_cost_change(after)      # count only newly dead nodes
+if delta meets policy: splice(after)     # preserve every observed sink
+\end{verbatim}
+
+The \emph{Handbook of Satisfiability}, in its circuit and hardware-verification discussions, motivates turning the difference between two networks into a SAT query. The XOR is the one-output comparison, or \emph{miter}. With Yosys, a compact check on the module above is:
+
+\begin{verbatim}
+read_verilog factor.v
+prep -top factor
+sat -verify -prove equivalent 1 -show-inputs
+\end{verbatim}
+
+This proves that the miter is one for all represented Boolean inputs. It assumes neither a latency change nor four-state simulation equivalence. A care condition such as a proved one-hot invariant can make more rewrites legal; simply assuming that a troublesome input cannot occur would be a specification change.
+
+\Cref{fig:visual-314} shows why counting nodes alone does not describe the transformation: the path from \(a\) changes differently from the paths from \(b\) and \(c\).
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (ab) at (0,0.7) {\(a\land b\)};
+  \node[tome box] (ac) at (0,-0.7) {\(a\land c\)};
+  \node[tome box dark] (or) at (2.65,0) {OR};
+  \node[tome box] (bc) at (5.45,0.7) {\(b\lor c\)};
+  \node[tome box] (a) at (5.45,-0.7) {\(a\)};
+  \node[tome box dark] (and) at (8.1,0) {AND};
+  \draw[tome arrow] (ab.east) -- (or.west);
+  \draw[tome arrow] (ac.east) -- (or.west);
+  \draw[tome arrow] (bc.east) -- (and.west);
+  \draw[tome arrow] (a.east) -- (and.west);
+\end{tikzpicture}
+\caption{Factoring trades two product nodes and an OR for a shared OR and an AND. The two cones have identical output functions on Boolean inputs.}
+\label{fig:visual-314}
+\end{figure}
+
+\section{Optimize for a Metric, Then Check That Metric}
+
+An ASIC library might provide a combined gate and multiple drive strengths; a four-input FPGA LUT can implement either entire cone. Ranking expressions by AIG node count or logic levels therefore gives a proxy, not a mapped area or delay. Gate sizing, load from fanout, and routing can even make it useful to duplicate equivalent logic near distant consumers. Switching activity and glitches introduce still different cost measures. Two equivalent steady-state truth tables need not have equal transient activity.
+
+Useful optimization scripts alternate several cheap passes rather than solving global minimization. Cut enumeration is bounded; a small cut cannot expose a simplification across a larger one. Exact SAT checks can also grow expensive and a timeout is not a proof either way. Finally, when debugging a regression, keep the same top, target, and constraints and compare the same artifact stage. Fewer generic gates before mapping is useful diagnostic information; it is not a claim about the number of placed LUTs or the timing of a routed design.

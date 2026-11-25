@@ -1,0 +1,76 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Three Different Things to Reuse}
+
+Levine distinguishes Unix relinkable output produced with \verb|-r| from the IBM linkage editor's ability to replace individual control sections in an existing linked program. In the Quong--Linton study he describes, a daemon retained the symbol table and left slack between contributions so that minor edits would often fit in the original locations. A sufficiently large displacement of later contributions triggered a clean relink. The timing results belong to the systems studied, not to current toolchains \cite[chapter~11]{levine2000linkers}.
+
+There are at least three distinct units of reuse. A partial linker reuses an intermediate object with updated symbols and relocations. A native incremental linker reuses some placement and fixup work on an already linked image. A compiler doing incremental LTO can reuse generated machine code for an IR partition and still run a fresh native link. A cache of generated objects does not guarantee stable addresses. Conversely, unchanged addresses do not guarantee that an optimized body remains valid.
+
+\section{Invalidate Results When Their Inputs Change}
+
+In a native incrementally linked image, suppose a relative data field at virtual address \verb|0x501040| addresses a label at \verb|0x501080| with addend zero. The value $S+A-P$ is \verb|0x40|. If an edit moves the label to \verb|0x50108c|, even within its original contribution's reserved space, the field must change to \verb|0x4c|. The referrer's object bytes did not change. Track incoming fixups and recompute from the original addend. Changes in the chosen definition can trigger the same repair without moving the old definition at all. A patching implementation must also account for alignment, section and segment extents, and metadata that describes addresses. If it cannot update them consistently, use a clean link rather than publishing a partially repaired output.
+
+For LTO the dependency can be less visible: an imported or inlined callee can stop appearing as a native relocation. Levine's historical Tera example notes that a change to one input can require regenerating code associated with unchanged source files because of cross-file inlining. Modern compiler IR makes those dependencies explicit before code generation. In conventional full LLVM LTO, participating IR can be merged for global analysis and optimization. The \href{https://clang.llvm.org/docs/ThinLTO.html}{Clang ThinLTO documentation} describes the alternative: combine module summaries in a global index, decide which definitions may be imported, then optimize and generate code in parallel module backends. Native objects can participate in resolution but cannot be imported as though they still carried compiler IR.
+
+% Annotated walkthrough
+\section{Compare Warm and Cold ThinLTO Results After an Edit}
+
+Use three handwritten C files with Clang and ELF LLD. Hidden visibility makes this helper a candidate for direct binding in the component; it is not a promise that any particular optimization will fire.
+
+\begin{verbatim}
+/* main.c: status 0 means the arithmetic returned 12. */
+int reported(void);
+int main(void) { return reported() != 12; }
+
+/* report.c: this source and its bitcode stay unchanged. */
+__attribute__((visibility("hidden"))) int increment(void);
+int reported(void) { return increment() + 5; }
+
+/* inc.c: change 7 to 8 in the second build. */
+__attribute__((visibility("hidden")))
+int increment(void) { return 7; }
+\end{verbatim}
+
+Build with these commands; start with an empty directory for the cache.
+
+\begin{verbatim}
+clang -O2 -flto=thin -c main.c report.c inc.c
+clang -O2 -flto=thin -fuse-ld=lld main.o report.o inc.o \
+  -Wl,--thinlto-cache-dir=warm -o before
+\end{verbatim}
+
+Check that \texttt{before} exits with status zero. Save the digest of \texttt{report.o}. Edit \texttt{inc.c} to return eight and rebuild only \texttt{inc.o}; repeat the link with the same cache and a new output name. Then repeat that link using a fresh cache, keeping the same object order and flags. Both new programs must exit with status one, and the digest of \texttt{report.o} must be unchanged. Inspect the linked functions with \verb|objdump -d| if you want to see whether the call or its result was optimized in this build. A specific cache-hit count, the absence of a symbol, or a prescribed inlining decision is not a correctness requirement. An unoptimized build gives a separate baseline for the expected exit statuses.
+
+\Cref{fig:visual-290} shows why hashing just the caller's bitcode is not a sufficient cache key.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box,minimum width=3.65cm] (report) at (0,0)
+    {\texttt{report.o}\\unchanged IR};
+  \node[tome box,minimum width=3.65cm] (inc) at (0,-1.5)
+    {\texttt{inc.o}\\result changed to 8};
+  \node[tome box,minimum width=3.65cm] (backend) at (4.2,-0.75)
+    {Report backend\\may import helper};
+  \node[tome box,minimum width=3.45cm] (warm) at (8.4,0)
+    {Warm build\\status 1};
+  \node[tome box,minimum width=3.45cm] (cold) at (8.4,-1.5)
+    {Cold build\\status 1};
+  \draw[tome arrow] (report) -- (backend);
+  \draw[tome dashed] (inc) -- (backend);
+  \draw[tome arrow] (backend) -- (warm);
+  \draw[tome arrow] (backend) -- (cold);
+  \node at (4.2,-2.6) {Dashed: a dependency if the backend uses that helper body.};
+\end{tikzpicture}
+\caption{An imported helper body can invalidate native backend output even though the caller's bitcode is unchanged. The post-edit warm and cold programs must agree regardless of whether the import occurs.}
+\label{fig:visual-290}
+\end{figure}
+
+\section{Cache the Resolution Assumptions, Too}
+
+The invariant is that a backend result can be reused only if every fact it depended on still holds: its own IR, imported bodies or summaries used for decisions, target and code generation options, and the applicable symbol resolution and export constraints. A conservative key can also carry the compiler identity to avoid reusing an artifact across incompatible toolchains. A weak definition that becomes prevailing after an input-order change can invalidate imports even if neither body was edited. A symbol now needed by native code or by the dynamic interface cannot be internalized merely because no IR caller remains. A default-visible function in a shared library may be preemptible even when the participating IR shows just one body.
+
+Test these as negative cases. Compile a new file without LTO to obtain an ordinary native object. It should define \texttt{native\_report} to return \texttt{increment()}, with the same hidden declaration as in \texttt{report.c}. Declare and call both entry points from \texttt{main.c}; after the edit, require \texttt{reported} to give 13 and \texttt{native\_report} to give 8. This native input needs a callable definition of \texttt{increment} even if the original IR callers have all inlined it.
+
+For a separate export test, rebuild just \texttt{report.c} and \texttt{inc.c} with \verb|-fPIC| in addition to the ThinLTO compile flags. Link them as a shared library with \verb|-shared| and the same LTO driver flags, then add \verb|-Wl,--version-script=exports.map| with the script \verb|{ local: *; };|. \verb|readelf --dyn-syms -W| should show \texttt{reported} before adding the script and not after; the hidden helper should not be exported in either case. Compare results between warm and clean builds of each configuration. Byte-for-byte comparisons are an additional check when builds are configured to be reproducible, not a substitute for exercising the dependency that changed.

@@ -1,0 +1,100 @@
+% Source: advances-in-dataflow.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: irdl-ir-def-lang-for-ssa-cc-compiler-opt-ir-il.txt
+% Source: dataflow-graph-repr.txt
+
+\section{Unification Requires Shared Questions, Not One Semantics}
+
+Array trains, stream actors, spreadsheet cells, stack words, rewrite rules, and spatial kernels all expose dependencies, yet they disagree about readiness, state, ordering, rates, and failure. A unified alternative-language IR should therefore share infrastructure while retaining dialect-specific contracts. MLIR demonstrates the value of extensible operations, regions, types, and attributes across abstraction levels \cite{lattner2021mlir}; it does not imply that every source language should be flattened immediately into one universal opcode set.
+
+One possible textual form keeps semantic traits visible:
+
+\begin{verbatim}
+%y = alt.node "matmul"(%x, %w)
+     {shape = ["N","K","M"], purity = "pure"}
+     : (!tensor, !tensor) -> !tensor
+alt.channel %y -> %sink
+     {order = "fifo", produce = 1, consume = 1}
+\end{verbatim}
+
+The common layer provides stable IDs, typed ports, graph edges, nested regions, symbolic attributes, effects, locations, and verification hooks. Dialects define what firing, evaluation, receive, rewrite, or spatial update means. ``Has incoming edges'' is not a sufficient common execution rule.
+
+\section{Build a Semantic Spine with Explicit Extensions}
+
+The spine should distinguish immutable values from token streams, state cells from buffers, control regions from graph topology, and effects from ordinary data. Edges name port positions and transport contracts. Operations may own regions for an actor action, spreadsheet formula, stack block, or transition rule. Interfaces expose shape inference, rate inference, purity, scheduling constraints, and provenance without requiring every operation to implement every interface.
+
+\Cref{fig:visual-377} shows progressive lowering through dialect boundaries rather than a destructive jump to machine code.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (src) at (0,0) {source dialects};
+  \node[tome box] (core) at (3,0) {common graph spine};
+  \node[tome box accent] (sched) at (6,0) {scheduled regions};
+  \node[tome box] (low) at (9,0) {loops / tasks / runtime};
+  \draw[tome arrow] (src) -- node[above]{verified conversion} (core);
+  \draw[tome arrow] (core) -- node[above]{contracts} (sched);
+  \draw[tome arrow] (sched) -- node[above]{lowering} (low);
+\end{tikzpicture}
+\caption{Each conversion discharges a local contract; unsupported semantics remain in a higher dialect instead of being guessed away.}
+\label{fig:visual-377}
+\end{figure}
+
+Output artifacts should include serialized IR at selected stages, verifier reports, schedule or demand plans, target code, runtime descriptors, and a provenance map. Versioned schemas and dialect names are part of interoperability: an unknown attribute that affects semantics must not be silently dropped by an older reader.
+
+% Annotated walkthrough
+\section{Lower Only When the Required Interface Is Proven}
+
+\begin{verbatim}
+parse source into its semantics-preserving dialect
+run dialect verifier and attach stable operation and edge IDs
+for candidate conversion:
+    query required interfaces: rates, effects, shapes, state, ordering
+    if proofs and residual guards cover every requirement:
+        rewrite to lower dialect and record proof obligations discharged
+    else:
+        retain operation or lower through its runtime fallback
+verify the mixed-dialect module after every conversion batch
+\end{verbatim}
+
+Legal common optimizations include canonicalizing pure value subgraphs, deleting unreachable regions, and composing verified adapters. Fusion or scheduling is legal only when relevant dialect interfaces establish compatible token, effect, state, and error behavior. A graph rewrite proved for fixed-rate FIFO actors cannot be applied to a selective mailbox or volatile spreadsheet cell because their shapes look alike.
+
+Preservation is validated at each dialect conversion using structural verifiers, translation validation, differential interpreters, and retained source IDs. The final test suite compares values, traces, errors, blocking, and external effects appropriate to each source contract. This layered approach yields reusable compiler machinery without erasing the distinctions that make the source languages meaningful.
+
+\section{Distinguish an Unknown Fact From a Proven Unit Rate}
+
+Suppose an extension declares a producer that sometimes emits zero tokens and sometimes emits one, depending on a guard. A scheduling interface that returns the integer \(1\) when no static rate is known will accidentally declare this actor unit-rate. Static scheduling needs an affirmative proof. Rate inference can instead return a known constant, a known interval, or an unknown fact; guard analysis may refine the interval at a particular use.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Rate fact & What is known & Unit-rate conversion \\
+\hline
+Exactly one & Every firing produces one & May proceed \\
+Zero or one & Depends on the action & Needs refinement \\
+Unknown & No valid bound supplied & Refuse by default \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+require_unit_rate(op, proof_environment):
+    fact := query_port_rate(op, proof_environment)
+    match fact:
+        Exact(1, proof): return Verified(proof)
+        Exact(other, proof): return Unsupported(other)
+        Interval(bounds): return NeedProof(bounds)
+        Unknown: return NeedRateInterface
+\end{verbatim}
+
+Even an exact fact does not establish that the surrounding graph has an admissible periodic schedule; it is just a scheduling input. Store the scope and assumptions of the proof, including which action paths it covers. If a later transformation alters the guard or introduces a new action, invalidate that evidence and query again. A useful interoperability test supplies one verified pass-through actor and one conditional producer through the same dialect boundary. Let the conditional actor emit nothing in its first tested firing; a default-to-one backend either overconsumes a queue or stalls looking for a token that the source never promises.
+
+\paragraph{Preserve operations that cannot yet be lowered.}
+If a target supports both periodic and event-driven execution, keep
+the conditional producer in a residual dynamic region. Do not just
+label its output periodic: require an explicit adapter whose queue
+and visibility policy supports the connection. If there is no such
+adapter, raise a diagnostic at the edge, with the producer location and
+the consumer's rate requirement. Unsupported lowering and malformed
+source IR should remain distinguishable errors.

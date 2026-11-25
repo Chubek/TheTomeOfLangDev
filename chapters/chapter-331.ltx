@@ -1,0 +1,75 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Describe Where Work Happens, Not What ADD Means}
+
+An instruction set architecture (ISA) gives the programmer a state transition: given an instruction and architectural state, what are the new register values, memory effects, and next program counter? A microarchitecture (MiA) explains how a particular implementation realizes that transition while other instructions are in flight. Moving register reads from decode to execute can change the timing of a dependency without changing the sum that an addition must produce. Keeping those two descriptions separate lets the same instruction definition serve several implementations, provided each can carry out all its required operations.
+
+VADL's MiA describes cyclic pipeline stages, their connections, and logic elements such as forwarding or control. Section~3.4 of the paper distinguishes the latency of a stage from its restart interval \cite{himmelbauer2024vadl}. A multiplier with latency three and restart interval one can accept independent inputs in cycles 1, 2, and 3 and finish them in cycles 4, 5, and 6 under the convention that acceptance occurs at the start of a cycle. A non-pipelined version with restart interval three must wait until cycle 4 to accept its second input. Neither choice settles when a dependent instruction can read the first result: that also depends on where the consumer needs it and what paths can deliver it.
+
+\section{Read the Stage Boundary as a Data Dependency}
+
+The following VADL excerpt is the fetch and decode pair from the paper's Listing~9, with typography normalized. It belongs inside the example MiA implementing RV32I; the ISA supplies the register file \texttt{X}.
+
+\begin{verbatim}
+stage FETCH -> (fr: FetchResult) = {
+  fr := fetchNext
+}
+stage DECODE -> (ir: Instruction) = {
+  let instr = decode(FETCH.fr) in {
+    instr.read(@X)
+    ir := instr
+  }
+}
+\end{verbatim}
+
+The reference to \texttt{FETCH.fr}, not the textual order of declarations alone, wires decode to fetch. The generator uses the ISA's encodings to implement \texttt{decode}. The \texttt{Instruction} type hides two things: which instruction was decoded and how much of its behavior has already been performed. Operations such as \texttt{read(@X)} and \texttt{compute} request portions of that behavior; they are not callbacks to execute a whole ISA instruction at once. Referring to \texttt{@X} narrows the mapping to a named resource. That gives the description more control over placement but makes it less reusable with an ISA that lacks a corresponding resource.
+
+In the remaining stages of the example, execute computes arithmetic and deals with the control path, memory maps accesses to \texttt{MEM}, and write-back maps writes to \texttt{X}. For a simple immediate addition, the memory stage can pass the pending register write onward even though it does not perform a data-memory access. The schematic in \Cref{fig:visual-331} shows payload selected for that one instruction; the real pipeline also carries control and validity information and must accommodate other instructions.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (f) at (0,0) {F};
+  \node[tome box] (d) at (2.25,0) {D};
+  \node[tome box] (e) at (4.5,0) {E};
+  \node[tome box] (m) at (6.75,0) {M};
+  \node[tome box] (w) at (9,0) {W};
+  \draw[tome arrow] (f) -- node[above] {word} (d);
+  \draw[tome arrow] (d) -- node[above] {$7,-3,5$} (e);
+  \draw[tome arrow] (e) -- node[above] {$4,5$} (m);
+  \draw[tome arrow] (m) -- node[above] {$4,5$} (w);
+  \node at (2.25,-0.75) {read $x_1$};
+  \node at (4.5,-0.75) {add};
+  \node at (6.75,-0.75) {pass through};
+  \node at (9,-0.75) {write $x_5$};
+\end{tikzpicture}
+\caption{One ADDI payload through five stages. The ALU result replaces the input operands at the execute boundary, but the register write still needs destination index 5.}
+\label{fig:visual-331}
+\end{figure}
+
+% Annotated walkthrough
+\section{Lower an Instruction by Tracking Its Remaining Work}
+
+Section~4.7.1 combines instruction dataflow in an instruction progress graph (IPG). As the generator walks stage dependencies in topological order, each mapping matches the appropriate nodes whose operands are available or become available within that mapping. Available values are retained across a stage edge only if still needed. The pseudocode shows the idea on a single projected path; it is not VADL syntax or a reproduction of the generator.
+
+\begin{verbatim}
+pending = instruction_graph(ADDI)
+live = decoded_fields(pending)
+for stage in [D, E, M, W]:
+    for mapping in stage.mappings:
+        while ready_match(mapping, pending, live) as node:
+            emit(node, stage)          # available inputs only
+            mark_done(node, pending, live)
+    live = retain_inputs_needed_by_pending_nodes(live, pending)
+    record_cross_stage_payload(stage, live)
+require no_unrealized_semantics(pending)
+\end{verbatim}
+
+Take \texttt{addi x5, x1, -3} with \(x_1=7\). After D, the later stages still need the value \(7\), the sign-extended immediate, and destination index \(5\). After E they need the sum \(4\) and index \(5\), not the original operands. No operation on data memory matches at M. W consumes both remaining values and emits the write. The invariant is that every remaining operation can get its already-produced inputs from the retained payload; there must be no required operation left after W. If \texttt{compute} is placed before the necessary register read, and no later mapping covers it, the addition remains unrealized and the generator should reject the composition rather than drop the write.
+
+Every cross-stage payload also needs a validity and control interpretation. On a stall it must be held rather than recomputed from a changing upstream instruction; on a flush it must be made unable to commit. Carrying only the arithmetic fields in the diagram would be insufficient for a branch recovery, because a numerically plausible stale payload could otherwise write its destination after it had been squashed.
+
+\section{What a Stage Description Does Not Establish}
+
+The stage graph supplies implementation choices for cycle-model and hardware generation, not a second definition of the instruction. Checking that the IPG was exhausted is a lowering check, not a proof that a stalled or mispredicted instruction cannot write a register. Those properties depend on synthesized control and require testing or proof at that level. The paper illustrates wider dispatch and out-of-order structures in Section~3.4.7 but explicitly excludes those advanced techniques from the described prototype's implemented lowering in Section~4.7.1. The RV32IM pipeline experiments in Section~5.7 establish experience with the reported configurations, not support for every graph the modeling notation can express.

@@ -1,0 +1,104 @@
+% Source: dataflow-parser-cc.txt
+% Source: arrays-in-pure-funlang.txt
+% Source: array-ssa.txt
+
+\section{Shapes Carry More Information Than Element Types}
+
+Array and tensor languages apply operations to whole collections. Their compiler must distinguish rank, extent, layout, broadcast, reduction axes, and element type. This representative NumPy-style function has a matrix multiply followed by row-wise bias broadcast and reduction:
+
+\begin{verbatim}
+def score(x, w, b):
+    y = x @ w + b
+    return y.sum(axis=1)
+# x:[N,K], w:[K,M], b:[M] -> result:[N]
+\end{verbatim}
+
+The annotation describes constraints rather than four concrete buffers. Matrix multiplication requires the two \(K\) extents to agree; broadcasting aligns \(b\)'s \(M\) with the last result dimension; reduction removes axis 1. Kienhuis's MatParser illustrates a related but distinct array-dataflow problem: deriving exact inter-iteration dependences for affine nested loops and converting them toward single assignment. Shape inference says which values fit; dependence analysis says which indexed computations constrain one another.
+
+\section{Use Shape Constraints and Index Maps in the IR}
+
+A shape-aware IR gives each tensor a ranked or unranked type, symbolic dimensions, element type, and layout. Operations carry affine or otherwise explicit index maps, broadcast dimensions, reduction identities, and alias/effect information. Views should not be confused with copies. The solver may prove \(K_x=K_w\) while leaving \(N\) and \(M\) dynamic; unresolved equalities become runtime guards.
+
+\Cref{fig:visual-371} shows the logical flow without committing to row-major storage or a particular loop nest.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (x) at (0,.7) {\(x:[N,K]\)};
+  \node[tome box] (w) at (0,-.7) {\(w:[K,M]\)};
+  \node[tome box dark] (mm) at (3,0) {matmul\\\([N,M]\)};
+  \node[tome box] (b) at (3,-1.5) {\(b:[M]\)};
+  \node[tome box accent] (add) at (6,0) {broadcast add};
+  \node[tome box] (sum) at (9,0) {sum axis 1\\\([N]\)};
+  \draw[tome arrow] (x) -- (mm);
+  \draw[tome arrow] (w) -- (mm);
+  \draw[tome arrow] (mm) -- (add);
+  \draw[tome arrow] (b) -- (add);
+  \draw[tome arrow] (add) -- (sum);
+\end{tikzpicture}
+\caption{Symbolic shape flow proves compatibility while leaving storage layout and execution tiling for later lowering.}
+\label{fig:visual-371}
+\end{figure}
+
+Output artifacts can include residual shape guards, a normalized tensor graph, optimized kernels, memory plans, and target binaries. The artifact should preserve a mapping from a failed guard to the operand and source dimension that introduced it, rather than reporting only a low-level loop bound mismatch.
+
+% Annotated walkthrough
+\section{Infer, Specialize, and Guard a Tensor Graph}
+
+\begin{verbatim}
+constraints := collect_rank_extent_and_broadcast_constraints(graph)
+solution, residual := solve_symbolic_equalities(constraints)
+rewrite tensor types with every proved dimension
+for unresolved requirement in residual:
+    insert checked runtime guard before dependent operation
+choose layouts and lower index maps to loops or library kernels
+validate guards dominate all shape-dependent memory accesses
+\end{verbatim}
+
+Fusion of the bias add into matmul or reduction can avoid an intermediate tensor when index maps compose and numerical/effect rules permit it. Tiling, vectorization, and layout conversion are legal when they cover every logical index exactly as required and preserve aliasing. Reduction reassociation is not exact for floating point unless allowed. Broadcasting must not become an allocating copy unless allocation behavior is unobservable or specified accordingly.
+
+Validation checks symbolic constraints, guard dominance, index-map bounds, and memory-plan noninterference. Differential tests include zero extents, singleton broadcast dimensions, dynamic mismatches, noncontiguous views, NaNs, and aliasing inputs. For affine loop lowering, compare the derived producer for each consumed index, echoing array dataflow analysis rather than testing only final sizes. Preservation covers values, shapes, errors, and effects; equal tensor shapes alone are insufficient.
+
+\section{Write the Broadcast and Reduction as Index Maps}
+
+In the \texttt{score} example, promotion makes \texttt{b} a logical \(N\)-by-\(M\) view without copying its contents. The output index \((i,j)\) of the broadcast maps to bias index \(j\), independently of \(i\). Reducing over axis one then keeps \(i\) and visits all \(j\). Confusing which coordinate the bias selects can survive shape checks when \(N=M\); use a rectangular fixture with distinct bias values.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Expression & Indices read & Shape \\
+\hline
+Contraction at \((i,j)\) & \(x[i,k], w[k,j]\) for each \(k\) & \(N,M\) \\
+Bias at \((i,j)\) & \(b[j]\) & \(N,M\) view \\
+Output at \(i\) & \(y[i,j]\) for each \(j\) & \(N\) \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+require columns(x) == rows(w)
+require length(b) == columns(w)
+for i in 0 .. N-1:
+    acc := reduction_identity
+    for j in 0 .. M-1:
+        dot := dot_identity
+        for k in 0 .. K-1:
+            dot := numeric_add(dot, numeric_mul(x[i,k], w[k,j]))
+        acc := numeric_add(acc, numeric_add(dot, b[j]))
+    result[i] := acc
+\end{verbatim}
+
+This is a fused loop model with explicit accumulation order; it implements a source that allows those operations and that order, not every library's contraction precision rules. For an integer fixture choose \(N=2,K=1,M=3\), with \(x=[2,4]\) as a column, \(w=[1,3,5]\) as a row, and \(b=[1,2,4]\). The results are \(25,43\). Also try \(K=0\) where zero-length contractions use the additive identity; the bias still contributes. Keeping guards outside the loops ensures an incompatible shape is diagnosed even when \(N=0\) and no result element is visited.
+
+\paragraph{Keep logical indices separate from physical addresses.}
+The map \(b[j]\) does not imply that adjacent \(j\) values occupy
+adjacent addresses. A view of a larger buffer can use a stride of
+two, and a reversed view can use a negative stride if the source
+permits it. Lower the logical lookup through the chosen layout:
+start at the view's base and apply its stride. The fused loop can
+select a contiguous fast path after guarding that layout, with a
+general path for other views. In a test, interleave unrelated values
+between the bias items and pass a view selecting only the intended
+items. The results should still be \(25,43\). Checking only the
+layout of newly allocated tensors would never exercise that path.

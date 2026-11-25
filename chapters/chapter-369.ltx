@@ -1,0 +1,97 @@
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: advances-in-dataflow.txt
+% Source: finkel-advanced-proglang-design.txt
+
+\section{A Diagram Is Syntax Only After Its Rules Are Known}
+
+LabVIEW programs are virtual instruments (VIs) with a front panel and a block diagram. Wires connect terminals; a node can execute when required inputs are available, while loops, structures, references, queues, and I/O add state and effects. The visual placement of two nodes does not impose left-to-right execution. Conversely, a sequence structure can impose order even when there is no ordinary value dependence. The survey by Johnston, Hanna, and Millar treats LabVIEW as an important visual dataflow environment while also documenting that visual dataflow languages vary in their execution models \cite{johnston2004dataflow}.
+
+A Formula Node embeds textual syntax inside the visual graph. A representative node body is:
+
+\begin{verbatim}
+y = (a * x) + b;
+if (y < 0) y = 0;
+\end{verbatim}
+
+That text has sequential statement semantics inside the node. It does not mean the surrounding VI is a C program, and ordinary wire crossings do not imply connection unless the editor's graph says so. A compiler should consume the saved graph's object and terminal identities, not reconstruct connectivity from pixels.
+
+\section{Lower Structured Pictures to Typed Regions}
+
+The frontend can represent each node instance, typed terminal, wire net, structure tunnel, shift register, effect token, and source object ID. A loop becomes a region with explicit carried values; a case structure becomes alternative regions with matching result terminals. A subVI is a call with connector-pane bindings. Front-panel controls and indicators are boundary objects, not global variables inferred from labels.
+
+\Cref{fig:visual-369} shows why an effect edge can be necessary even when two nodes have no value wire between them.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (ctl) at (0,0) {control \(x\)};
+  \node[tome box dark] (calc) at (3,0) {Formula Node};
+  \node[tome box] (ind) at (6,0) {indicator \(y\)};
+  \node[tome box accent] (open) at (3,-1.7) {open device};
+  \node[tome box accent] (write) at (6,-1.7) {write device};
+  \draw[tome arrow] (ctl) -- (calc);
+  \draw[tome arrow] (calc) -- (ind);
+  \draw[tome arrow] (open) -- node[above]{error/effect} (write);
+\end{tikzpicture}
+\caption{Value wires enable the pure calculation; a separate error or effect chain orders device operations that otherwise have no data dependence.}
+\label{fig:visual-369}
+\end{figure}
+
+Output artifacts may include a normalized graph, generated native code, subVI call tables, UI bindings, and debug metadata mapping machine locations to diagram objects. A picture or screenshot is a presentation artifact, not an adequate IR because it loses port identity, hidden configuration, and nested structure.
+
+% Annotated walkthrough
+\section{Compile a VI Without Inventing Visual Order}
+
+\begin{verbatim}
+objects, wires := decode_saved_vi(resource)
+verify every wire joins compatible terminal directions and types
+for each graphical structure:
+    create region arguments for tunnels and loop-carried shift registers
+lower nodes after their required value and effect inputs are available
+schedule independent pure nodes freely inside each region
+emit code plus object-ID-to-instruction debug map
+\end{verbatim}
+
+Constant folding inside the Formula Node and common-subexpression elimination between pure primitives are legal. Independent pure nodes may run in parallel. Loop-invariant motion must account for tunnels, shift registers, references, random generators, timing nodes, and I/O. An error wire may carry a value, but its practical ordering role must not be erased by dead-value elimination. Likewise, replacing a subVI call requires respecting reentrancy and hidden state.
+
+Preservation tests compare terminal values, selected cases, loop iteration results, and ordered effect logs under the same inputs. The validator also checks region interfaces and ensures every emitted diagnostic maps to a surviving object ID. These checks distinguish semantic equivalence from layout preservation: an optimizer may rearrange or synthesize nodes internally, yet an editor-facing artifact should preserve enough provenance to highlight the original wire or terminal responsible for an error.
+
+\section{Follow a Loop Value Through a Shift Register}
+
+Consider a For Loop that sums an input array by auto-indexing its elements and carrying the total through an initialized shift register. Use initial state zero and input \(4,-1,8\). One wire brings the current element into the body and another supplies the old total. The outgoing total returns as the next iteration's old total, not as a value available earlier within the same iteration.
+
+\begin{center}
+\begin{tabular}{crrr}
+\hline
+Iteration & Element tunnel & Old shift value & New shift value \\
+\hline
+0 & 4 & 0 & 4 \\
+1 & -1 & 4 & 3 \\
+2 & 8 & 3 & 11 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+lower_initialized_loop(diagram):
+    count := array_extent(diagram.indexed_input)
+    carry := lower(diagram.initial_shift_value)
+    for i in 0 .. count-1:
+        element := read(diagram.indexed_input, i)
+        result := eval_region(diagram.body, element, carry)
+        carry := result.next_shift_value
+    return carry
+\end{verbatim}
+
+The zero-iteration case returns the initialized value without executing the region. Do not assume that an uninitialized shift register follows the same rule: LabVIEW can retain its value between calls. If a body also emits a log record through an error or dependency wire, represent that ordering as another region dependency rather than scheduling the log by its location on screen. For a compiler fixture, move the diagram objects without rewiring, then compare the old and new compiled observations. As a negative test, rewire the addition to use the initial constant instead of the shift input. The result becomes \(8\), and the diagnostic trace should identify the incoming wire whose meaning changed.
+
+\paragraph{Preserve tunnel identities during edits.}
+A region parameter should record the original structure and tunnel,
+not just the nearest wire coordinate. Deleting and recreating a tunnel
+at the same location should not reuse a cached type or binding from
+the deleted object. Moving the same tunnel, by contrast, need not
+invalidate a semantic analysis if its terminals and wiring are
+unchanged. Check the distinction by assigning persistent object IDs
+in one fixture and comparing the editor's highlighted terminal after
+lowering reports a type mismatch.

@@ -1,0 +1,106 @@
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: lucid-book.txt
+
+\section{Compose Continuous Processes Through FIFOs}
+
+A Kahn process network consists of deterministic sequential processes connected by unbounded, lossless FIFO channels. Reading an empty channel blocks; writing does not block in the mathematical model. A process cannot test whether a channel is empty and choose a branch from that observation. Under the continuity conditions of the model, the network denotes a least fixed point of stream equations, so relative process speeds do not alter the produced streams \cite{kahn1974process}.
+
+This is a semantic model, not a claim that a machine has infinite memory. A runtime normally uses finite buffers and scheduling. Such an implementation is valid only while its blocking policy does not introduce a deadlock absent from the unbounded network or change channel histories. Faster producers may require unbounded growth even when every finite output prefix is well defined.
+
+\section{Build a Determinate Merge}
+
+The following KPN-style process syntax merges one item from each input in a fixed order:
+
+\begin{verbatim}
+process alternate(a, b -> out) {
+  forever {
+    x = read(a); write(out, x);
+    y = read(b); write(out, y);
+  }
+}
+\end{verbatim}
+
+For \(a=\langle1,2,\ldots\rangle\) and \(b=\langle10,20,\ldots\rangle\), the output is \(\langle1,10,2,20,\ldots\rangle\), regardless of which producer runs faster. Replacing the body by ``read whichever input is ready'' adds a non-Kahn observation and can make the output schedule-dependent. \Cref{fig:visual-355} marks the only legal communication paths.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (pa) at (-3,1.2) {producer \(A\)};
+  \node[tome box dark] (pb) at (-3,-1.2) {producer \(B\)};
+  \node[tome box] (q1) at (0,1.2) {FIFO \(a\)};
+  \node[tome box] (q2) at (0,-1.2) {FIFO \(b\)};
+  \node[tome box accent] (m) at (3,0) {alternate};
+  \node[tome box] (o) at (5.6,0) {FIFO out};
+  \draw[tome arrow] (pa) -- (q1);
+  \draw[tome arrow] (pb) -- (q2);
+  \draw[tome arrow] (q1) -- (m);
+  \draw[tome arrow] (q2) -- (m);
+  \draw[tome arrow] (m) -- (o);
+\end{tikzpicture}
+\caption{Processes share no store. The merge's fixed read sequence, rather than channel arrival time, determines the output order.}
+\label{fig:visual-355}
+\end{figure}
+
+% Annotated walkthrough
+\section{Execute a Finite Prefix}
+
+\begin{verbatim}
+while requested_output_prefix_not_ready:
+    p := choose_runnable_process_fairly()
+    run p until its next blocking read
+    append each write to the destination FIFO
+    if no process is runnable:
+        report implementation deadlock or missing external input
+\end{verbatim}
+
+Running to the next blocking read is one implementation grain; a runtime may preempt earlier. Fairness avoids permanently starving a runnable process, but it cannot manufacture a finite buffer bound.
+
+\section{Lower Networks Without Weakening Channels}
+
+The IR should have process nodes, typed FIFO edges with one writer and one reader, process control state, explicit external I/O effects, and provenance for process code and channel endpoints. Channel rates or clocks are generally unknown rather than silently equal to one; optional inferred bounds must be labeled as proofs or assumptions. Compilation can produce threads and queues, coroutine code with a scheduler, a sequentialized network, or communicating hardware blocks.
+
+Legal optimizations include process fusion and channel elimination when they preserve blocking reads, FIFO order, and external effects; batching is also legal if no process can observe the changed timing. Semantic-preservation risks include finite-buffer insertion, scheduler-dependent selection, and reordering writes across effects, any of which can introduce deadlock or change streams. Compare finite output prefixes and effect traces under the same external inputs; do not treat one successful schedule as proof for all schedules.
+
+\section{Interpret Waiting Without Inspecting Emptiness}
+
+Offer \(a_0,a_1\) on \(a\) and delay the first item on \(b\). The alternating merge emits \(a_0\), then waits. It cannot consume \(a_1\) as a substitute for \(b_0\); otherwise the result would depend on when a scheduler ran the producer for \(b\). Once \(b_0\) becomes available the merge emits it, then emits \(a_1\) and blocks on \(b_1\). Whether the system can finish depends on the external input protocol. The absence of a token in the runtime queue is not an end-of-stream indication.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Next request & Queue state & Legal action \\
+\hline
+Read \(a\) & \(a_0,a_1\) pending & Read \(a_0\) \\
+Read \(b\) & \(b\) empty & Suspend on \(b\) \\
+Read \(b\) & \(b_0\) arrives & Read \(b_0\) \\
+Read \(a\) & \(a_1\) still pending & Read \(a_1\) \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+resume(process):
+    for step in 1 .. quantum:
+        op := next_instruction(process)
+        if op is read and channel(op).is_empty():
+            register_waiter(process, channel(op))
+            return BLOCKED              # same instruction on resume
+        perform(op)
+        advance_instruction_pointer(process)
+    enqueue_at_end_of_ready_queue(process)
+\end{verbatim}
+
+A quantum is necessary in this sketch: an infinite writer might never encounter a blocking read. A queued reader must also be awakened when a writer supplies the required token; a concurrent runtime must avoid a lost wakeup between testing and registering. Neither scheduling detail should be visible to source code. A useful test runs schedules in which \(b_0\) is queued first and last, respectively. After both arrivals the same prefix must be available. Before \(b_0\) arrives, the merge's output ending at \(a_0\) is not a competing answer; it is a prefix of the same answer.
+
+\paragraph{Choose an explicit end-of-stream protocol.}
+The process as written has no termination instruction. To turn it into a
+finite batch operator, for example, use tagged data and end tokens and
+define what happens when the first end token is read. Stopping there,
+draining the other channel, or reporting unequal input lengths are three
+different programs. A draining version still has to specify the order of
+the remaining data and the position of its output end marker.
+Try two inputs of unequal lengths and one input whose first item is
+delayed. Neither can be handled correctly by a rule that uses an empty
+queue as the end marker: the delayed case is merely a different arrival
+schedule of the same input stream.

@@ -1,0 +1,107 @@
+% Source: leroy-a-verif-cc-compiler-backend-for-lustre.txt
+% Source: sync-funprog-in-lucid.txt
+
+\section{Compute in Logical Instants}
+
+Lustre nodes are functions from input streams to output streams, defined by equations. Pointwise operators act within one logical instant. The initialized delay \texttt{fby}, or equivalently initialization with \texttt{->} plus \texttt{pre} in common Lustre syntax, carries information between instants. A causal schedule may order same-instant equations, but delayed dependencies read memory from the preceding instant and do not form combinational cycles \cite{halbwachs1991lustre}.
+
+A clock denotes the instants at which a stream is present. Sampling with \texttt{when} creates a subclock; \texttt{merge} combines complementary subclocked values. Absence is not an arbitrary default value. Clock calculus rejects equations that combine values whose presences do not agree.
+
+\section{Write an Initialized Counter}
+
+This Lustre node resets a running sum:
+
+\begin{verbatim}
+node counter(ini, inc: int; res: bool) returns (n: int);
+let
+  n = if (true -> false) or res
+      then ini
+      else (0 -> pre n) + inc;
+tel
+\end{verbatim}
+
+At the first instant, \texttt{true -> false} selects \texttt{ini}; later, \texttt{res} does so. The delayed \texttt{n} is initialized by \(0\), so no uninitialized value reaches the output. \Cref{fig:visual-362} separates the memory read from its end-of-reaction update.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (old) at (-3,0) {memory: previous \(n\)};
+  \node[tome box] (add) at (0,0) {\(+\,inc\)};
+  \node[tome box dark] (mux) at (2.8,0) {reset mux};
+  \node[tome box accent] (out) at (5.3,0) {current \(n\)};
+  \draw[tome arrow] (old) -- (add);
+  \draw[tome arrow] (add) -- (mux);
+  \draw[tome arrow] (mux) -- (out);
+  \draw[tome arrow] (out) to[bend left=35] node[above]{commit after instant} (old);
+\end{tikzpicture}
+\caption{All current outputs are computed from current inputs and old memory. The new \(n\) becomes delay state only after the reaction.}
+\label{fig:visual-362}
+\end{figure}
+
+% Annotated walkthrough
+\section{Generate a Sequential Step Function}
+
+\begin{verbatim}
+state = { previous_n: 0, first: true }
+step(ini, inc, res, state):
+    delayed_n := state.previous_n
+    n := if state.first or res then ini else delayed_n + inc
+    next_state := { previous_n: n, first: false }
+    return (n, next_state)
+\end{verbatim}
+
+The implementation commits all next state together. Updating \texttt{previous\_n} before evaluating every equation would let same-instant code observe a future value.
+
+\section{Schedule Clocked Equations With Evidence}
+
+A Lustre IR needs equation/operator and node-instance nodes, instantaneous and delayed edges, memory cells with initial values, inferred clocks and sampling relations, stream types, effect restrictions, and provenance through normalization. Compilation may normalize delays into dedicated equations, topologically schedule instantaneous dependencies, emit one state record and step function per node, then lower to C or assembly. The verified compiler account explicitly treats nodes, sampling, delays, and modular sequential functions.
+
+Legal optimizations include equation scheduling, inlining, constant propagation, and fusing compatible clock conditionals. Retiming or delay elimination must preserve initialization and every clocked trace. Semantic-preservation risks include moving a stateful node across \texttt{when}, using a value while absent, or ordering a state write too early. Preservation compares typed input/output streams and presence clocks, not just values on instants where a test happened to print them.
+
+\section{Run a Counter Instance on a Slower Clock}
+
+Instantiate the counter on the subclock where an outer Boolean enable is true. Sample \texttt{ini}, \texttt{inc}, and \texttt{res} together on that clock. At an absent instant the counter takes no step, even if the outer reset input happens to be true. If the specification instead requires reset to be seen at every base tick, this interface is wrong: resetting the node on absence changes the stream semantics. The table starts with an instance that has not yet fired.
+
+\begin{center}
+\begin{tabular}{cccrl}
+\hline
+Base tick & Enabled & Reset & Increment & Counter observation \\
+\hline
+0 & no & no & 1 & absent, no first step \\
+1 & yes & no & 2 & \(10\), initial value \\
+2 & no & yes & 4 & absent, retains \(10\) \\
+3 & yes & no & 3 & \(13\), advances once \\
+4 & yes & yes & 7 & \(20\), new initial value \\
+\hline
+\end{tabular}
+\end{center}
+
+Set \texttt{ini} to \(10\) at tick 1 and \(20\) at tick 4. In lowering, put the condition around the step, not around the returned value. Suppressing the output alone would leave the memory advancing on the base clock. This distinction applies to the implicit first-activation bit as much as to the previous output.
+
+\begin{verbatim}
+step_on_base_tick(enable, inputs, state):
+    if not enable:
+        return (Absent, state)
+    sampled := sample_together(inputs)
+    (value, pending) := step(sampled.ini, sampled.inc,
+                             sampled.res, state)
+    return (Present(value), pending)
+
+for tick in example:
+    before := state
+    (observation, state) := step_on_base_tick(tick.enable,
+                                              tick.inputs, state)
+    require observation == expected_at(tick)
+    if observation is Absent: require state == before
+\end{verbatim}
+
+Use the same fixture with inserted absent instants. The output projected onto present instants must stay unchanged, but the full trace must have absences at the added positions. This yields two independent checks: the state advances at the right rate, and the IO protocol still exposes the specified clock. For two calls to the same node on this clock, assign independent state unless equivalence and sharing are explicitly justified; one instance's reset must not overwrite the other's previous value.
+
+\paragraph{Trace the guard of each state write.}
+An imperative emitter can keep a small map from source node instance
+and equation to the target statements that write its state. For every
+write in that map, verify that its control path implies the instance
+clock is present. For this counter, the guard must cover both the
+value register and its first-activation flag. Testing only the value
+register would miss a premature change of the initialization branch.

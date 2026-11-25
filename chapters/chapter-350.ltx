@@ -1,0 +1,61 @@
+% Source: holm-logic-programming-in-scheme.txt
+% Source: sca-pql-prog-query-lang.txt
+
+\section{Measure Joins Before Changing the Language}
+
+Suppose a compiler needs a complete may-call closure as an input to several passes, so a query-specific slice is not enough. The immediate choice is not between imperative and declarative analysis. It is between joining yesterday's tuples again and joining only because a new tuple arrived. Holm's Scheme text develops a goal-oriented engine using unification and backtracking; here we optimize a different execution model, a bottom-up engine over function-free relations. Jordan, Scholz, and Suboti\'c describe how Souffl\'e specializes evaluation machinery into generated analysis code \cite{jordan2016souffle}. A rule author need not dictate every index, but the compilation of rules to physical joins determines much of the runtime.
+
+For a toy five-function input, use positive Datalog with uppercase variables and lowercase constants. This intentionally uses a nonlinear rule with two recursive body occurrences; both can contribute fresh tuples.
+
+\begin{verbatim}
+edge(a,b). edge(a,c). edge(b,d). edge(c,d). edge(d,e).
+
+path(X,Y) :- edge(X,Y).
+path(X,Z) :- path(X,Y), path(Y,Z).
+\end{verbatim}
+
+There are nine final \texttt{path} rows: the five edges and \verb|path(a,d)|, \verb|path(b,e)|, \verb|path(c,e)|, \verb|path(a,e)|. The two derivations of \verb|path(a,d)| are not two rows. In the first composition round, four matching body assignments yield three new tuples. In round two, three joins involving a fresh row lead to \verb|path(a,e)|: through \(b\), through \(c\), and through \(d\). That is one distinct new tuple. In round three it has no matching extension or predecessor, so the delta is empty.
+
+\section{Compile a Delta Rule for Each Recursive Position}
+
+Let \(R\) be the relation known at the start of a round and \(\Delta\subseteq R\) the rows first seen in the preceding round (initially the seed edges). The old subset \(R_{\mathrm{old}}=R\setminus\Delta\) has already participated in all-old combinations. For the two recursive occurrences, compute \(\Delta\circ R\) and \(R_{\mathrm{old}}\circ\Delta\), where \(\circ\) is relational composition on the shared intermediate function. The first case includes matches in which both rows are fresh; the second does not repeat them. At least one row is new in every match. Deduplication is still needed since different intermediate functions may produce the same output pair.
+
+\Cref{fig:visual-350} partitions the combinations by the age of both body rows.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node at (0,0) {left \(\backslash\) right};
+  \node[tome box] at (3,0) {old};
+  \node[tome box] at (6,0) {fresh};
+  \node[tome box] at (0,-1.05) {old};
+  \node[tome box,draw=TomeRule] at (3,-1.05) {skip};
+  \node[tome box dark] at (6,-1.05) {second join};
+  \node[tome box] at (0,-2.1) {fresh};
+  \node[tome box dark,minimum width=5cm] at (4.5,-2.1) {first join};
+\end{tikzpicture}
+\caption{Delta evaluation joins fresh-left rows with any right row, and old-left rows only with fresh-right rows. No old--old combination is reconsidered.}
+\label{fig:visual-350}
+\end{figure}
+
+% Annotated walkthrough
+\section{Check the Same Answers With Less Repeated Work}
+
+\begin{verbatim}
+old := empty; delta := unique(edge)
+while delta is nonempty:
+    all := old union delta
+    first  := join(delta, all, shared_middle)
+    second := join(old, delta, shared_middle)
+    next := unique(project_endpoints(first union second)) - all
+    # Publish both tables together; do not expose a partial round.
+    old := all; delta := next
+return old
+\end{verbatim}
+
+Count successful body bindings before projecting and deduplicating, not failed index probes. In this example the naive all--all rounds match \(4,7,7\) bindings; the delta rounds match \(4,3,0\). The values give a small regression oracle, not a speedup claim. Remove \verb|edge(c,d).| and recompute both algorithms: \verb|path(c,e)| disappears along with the edge's own path row, but \verb|path(a,d)| and \verb|path(a,e)| still have proofs via \(b\). Deduplicating proofs during insertion does not preserve enough information to implement arbitrary deletion. For an engine without verified dynamic maintenance, discard the affected closure and rebuild it.
+
+For indexing the first join, scan fresh \((X,Y)\) rows and look up right tuples by their first column \(Y\). For the second, scan fresh \((Y,Z)\) rows and look up old left tuples by their second column \(Y\). This trades extra indexes and update costs for cheaper probes. Build recursive predicate groups from strongly connected dependencies and evaluate nonrecursive producers once before their consumers. Measure relation cardinalities, probe counts, delta sizes, and index memory separately; a dense closure can be expensive even with an optimal join order. PQL is a useful contrast: its authors report using the bddbddb deductive database with binary decision diagrams. That does not imply it stores sparse tuple indexes like the engine sketched here. Keep the logical answers fixed while comparing representations and plans.
+
+A compiler analysis should expose the completed \texttt{path} relation, not timing-sensitive intermediate deltas. This permits physical-plan experiments to optimize join work without changing the call-closure result consumed by later passes.

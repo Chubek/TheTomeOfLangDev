@@ -1,0 +1,108 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Separate the Interface from the Implementation}
+
+In VHDL, an entity declares a design boundary: generic constants configure an instance, and ports are its signal interface. An architecture names an implementation of an entity. It can contain both declarations and concurrent statements, including process statements and instances. There may be several architectures analyzed for the same entity, but each instance binds to one; the alternatives do not become parallel hardware just because both were compiled. In a large design, that distinction makes it possible to keep a boundary stable while replacing its implementation.
+
+Himmelbauer and colleagues draw a related, but not identical, distinction in \emph{The Vienna Architecture Description Language}: more than one microarchitecture can implement an ISA. A VHDL entity is not an ISA specification. Its ports and types alone do not tell us whether two implementations agree on reset, latency, or what happens on an invalid selector. State those requirements separately, then test them at the boundary.
+
+\section{Two Architectures for a Selector}
+
+This is VHDL-2008 \cite{ieee10762008}. The two architectures are simulatable and describe ordinary combinational logic for synthesis. Generic \texttt{WIDTH} uses the subtype \texttt{positive} so each legal instance has at least one bit. Input \texttt{sel} selects a lane on an exact \verb|'0'| or \verb|'1'|; any other simulation value produces zeros by design.
+
+\begin{verbatim}
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity choose_word is
+    generic (WIDTH : positive := 8);
+    port (
+        a, b : in  std_logic_vector(WIDTH-1 downto 0);
+        sel  : in  std_logic;
+        y    : out std_logic_vector(WIDTH-1 downto 0)
+    );
+end entity;
+
+architecture selected of choose_word is
+begin
+    with sel select
+        y <= a when '0', b when '1', (others => '0') when others;
+end architecture;
+
+architecture procedural of choose_word is
+begin
+    process(all)
+    begin
+        case sel is
+            when '0'    => y <= a;
+            when '1'    => y <= b;
+            when others => y <= (others => '0');
+        end case;
+    end process;
+end architecture;
+\end{verbatim}
+
+The selected signal assignment is concurrent. Inside the process the statements follow sequential rules, but the process itself is concurrent with other processes and instances. \verb|process(all)|, introduced in VHDL-2008, supplies the implicit sensitivity set; here the process reads \texttt{a}, \texttt{b}, and \texttt{sel}. Every alternative schedules an assignment to \texttt{y}, so no previous output is needed. Assigning a signal with \verb|<=| schedules a signal update rather than changing the value immediately inside the executing process. A variable assignment spelled \verb|:=| would have different semantics; in the generic declaration it supplies a default value.
+
+The vector subtype states a width through an index range, not a byte count. For width eight the element at index seven is the leftmost one and index zero is the rightmost. This interface declares a vector of logic values, not an arithmetic sign convention. Treating the leftmost bit as a sign bit would require another contract or a different port type. Keeping such decisions visible at the boundary makes architecture replacement less dependent on conventions hidden in the implementation.
+
+\section{Bind the Instance Intentionally}
+
+The next VHDL-2008 design units give a concrete parent. Both ports and generics use named association, with the formal name on the left of each arrow. The name in parentheses after \verb|work.choose_word| chooses the architecture rather than relying on default binding.
+
+\begin{verbatim}
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity route12 is
+    port (
+        x, z : in  std_logic_vector(11 downto 0);
+        s    : in  std_logic;
+        q    : out std_logic_vector(11 downto 0)
+    );
+end entity;
+
+architecture rtl of route12 is
+begin
+    u_choose : entity work.choose_word(selected)
+        generic map (WIDTH => 12)
+        port map (a => x, b => z, sel => s, y => q);
+end architecture;
+\end{verbatim}
+
+\Cref{fig:visual-305} shows the result of selecting \texttt{route12} as the root. GHDL's \href{https://ghdl.github.io/ghdl/using/InvokingGHDL.html}{command reference} distinguishes analysis (\verb|-a|), the elaboration command (\verb|-e|), and running the simulation (\verb|-r|); use \verb|--std=08| consistently for these units. With GHDL, full language-level elaboration occurs at run time; use \verb|--elab-run| with \verb|--no-run| to check it without executing the simulation. Analyze the child before the parent, because this parent directly names the child entity and its architecture. A simulation of the bare top still needs a testbench or other stimulus to exercise it.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (interface) at (0,0) {Entity \texttt{choose\_word}\\ports and generic};
+  \node[tome box accent] (s) at (-2.55,-1.65) {Architecture\\\texttt{selected}};
+  \node[tome box] (p) at (2.55,-1.65) {Architecture\\\texttt{procedural}};
+  \node[tome box] (u) at (-2.55,-3.35) {\texttt{route12.u\_choose}\\bound to \texttt{selected}, width 12};
+  \draw[tome arrow] (interface) -- (s);
+  \draw[tome arrow] (interface) -- (p);
+  \draw[tome arrow] (s) -- (u);
+\end{tikzpicture}
+\caption{Both architectures implement the entity's interface. The explicit instance chooses one architecture and fixes its generic width.}
+\label{fig:visual-305}
+\end{figure}
+
+% Annotated walkthrough
+\section{Check the Boundary After Signal Updates}
+
+\begin{verbatim}
+instantiate choose_word(selected) and choose_word(procedural), WIDTH=12
+give both instances a=ABC, b=123 # twelve-bit hexadecimal
+for (s, expected) in [('0', ABC), ('1', 123), ('X', 000)]:
+    drive sel to both instances
+    wait for signal propagation  # do not read y in the drive delta
+    assert both outputs == expected
+set sel='1'; change only b to 456
+wait for signal propagation
+assert both outputs == 456       # check data sensitivity, too
+\end{verbatim}
+
+In a VHDL testbench a positive wait between drive and check suffices here; the design has no explicit delays. The \verb|'X'| test checks agreement of the RTL models, not a promise that fabricated logic detects ambiguous voltage or metastability. Binary selection is the physical function specified by this small example. Because the two architectures give the same specified result for every \texttt{sel} value in this model, synthesis may produce indistinguishable combinational implementations; architecture names and process boundaries are not required netlist structure.
+
+A width change provides a different test of the boundary. Choose twelve bits and set only the highest bit of the selected input. This detects an accidental eight-bit intermediate that a test with small operands could overlook. If an alternative architecture adds a register, this simple settled-value test is no longer enough: it must also check the cycle in which the word appears, and the architecture may no longer satisfy this combinational interface's contract.

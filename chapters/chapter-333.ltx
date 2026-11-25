@@ -1,0 +1,67 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Separate the Meaning of Memory from Its Timing}
+
+An ISA load must return the value permitted by the architecture, with the specified width, byte order, and extension, or report the applicable fault. A microarchitecture must also decide where the bytes come from, how long to wait, and when other work may proceed. A cache miss is typically just a slower way to obtain the same bytes. An access to a memory-mapped device is different: reading it might consume input, and a write might trigger an action. Such effects cannot be treated as private cache bookkeeping. Atomicity and ordering rules, where present, also belong to the contract even though queues and interconnects implement them.
+
+Listing~13 in Section~3.4.5 of the VADL paper gives this cache declaration, with typographic spacing normalized \cite{himmelbauer2024vadl}. The address and memory names come from its surrounding specification.
+
+\begin{verbatim}
+[write through]
+[evict roundrobin]
+[entries = 1024]
+[blocks = 4]
+[n_set = 2]
+[attached_to MEM]
+cache L1 : VirtualAddress -> Bits<8>
+\end{verbatim}
+
+In this example there are 1024 lines, two ways per set, and four byte-sized addressable units per line: 512 sets and 4096 data bytes before counting tags and other metadata. The annotation \texttt{attached\_to} names the fallback storage or process. It does not itself specify what to do with a translation fault or establish that the cache observes an ISA's ordering rules. The reported simulator experiments use an idealized memory comparison, and the hardware comparison uses idealized memory for both designs (Sections~5.7--5.8). Section~7 identifies accurate memory simulation, cache protocols, consistency, atomics, and address translation as work to be developed. The cache listing shows the modeling notation, not a validation result for those features.
+
+In particular, a memory map must identify device regions before ordinary caching policy is applied. Sending a device read through a refill path can duplicate a side effect, and buffering a device write can violate software-visible ordering even when the cache is write-through. A cacheable ordinary-memory load may be replayed internally; a device access needs an explicitly defined request/acceptance protocol.
+
+\section{Name the Exception and the Environment}
+
+VADL marks exceptional instruction behavior explicitly with \texttt{raise}. Section~3.3's Listing~6 defines a MIPS overflow handler, saves the faulting instruction address as \texttt{PC - 4} under that example's next-PC convention, and redirects the PC. The same subtraction would be wrong for a convention in which PC already identifies the faulting instruction. A design that promises precise synchronous exceptions must make the trap state look as if older instructions had completed and the faulting instruction and its successors had not performed their normal effects. Computing an address or producing a value before that decision does not authorize its publication.
+
+Section~3.6 shows a separate modeling layer: user-mode emulation can map a guest \texttt{ECALL} to a host procedure, with named guest argument and result registers. Its example copies bytes out of guest memory rather than treating a guest address as a host pointer. This is configuration for the simulated environment, not behavior to synthesize into the processor. Do not mistake a host syscall adapter for either a guest trap handler running on real hardware or a full-system device model. In a test, a deterministic substitute that records guest requests and returns scripted results makes unintended duplication visible without depending on host files or interactive input.
+
+% Annotated walkthrough
+\section{Keep a Younger Store Private Until an Older Load Is Resolved}
+
+Consider an illustrative in-order retirement policy with precise faults. A load reads ordinary memory; a younger store is to a test device. The device's accepting operation in this example is atomic and cannot fault. Address preparation can happen early, but device traffic must wait. The code is explanatory pseudocode, not VADL.
+
+\begin{verbatim}
+retire_head(q, device):
+    head = q.first
+    if not head.done: return WAIT
+    if head.fault:
+        discard(q)                     # younger stores are still private
+        return take_trap(head.pc, head.cause)
+    if head.is_device_store:
+        if not device.accept(head.address, head.value):
+            return WAIT                # a refusal has no effect
+    else:
+        publish_architectural_updates(head)
+    q.pop()                            # acceptance and pop share a step
+\end{verbatim}
+
+The load at PC \texttt{0x100} waits for an access check while the store at \texttt{0x104} prepares a value of \(9\). Retirement first waits. When the load reports a fault, retirement emits a trap record for \texttt{0x100}; it does not write the load destination. The store entry is discarded, and the test device's log stays empty. The invariant is that no pending store changes the device log until it reaches the head and is accepted exactly once. The gate in \Cref{fig:visual-333} is the point at which that invariant is enforced.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (queue) at (0,0) {Load, then store};
+  \node[tome box] (gate) at (4.45,0) {Retire head};
+  \node[tome box] (dev) at (8.8,0) {Device log};
+  \node[tome box] (trap) at (4.45,-1.65) {Trap at load PC};
+  \draw[tome arrow] (queue) -- (gate);
+  \draw[tome arrow,dashed] (gate) -- node[above] {store only} (dev);
+  \draw[tome arrow] (gate) -- node[right] {load fault} (trap);
+\end{tikzpicture}
+\caption{A computed store remains private while the load is at the retirement head. On the fault path it never reaches the device.}
+\label{fig:visual-333}
+\end{figure}
+
+For a companion test, let the load succeed, let the device refuse the first store attempt, then accept the second. There must be just one log entry. A split request/response interface would need a different policy: acceptance and completion are then distinct, and an outstanding request cannot be sent again while waiting for acknowledgment. In particular, ignoring responses from squashed ordinary reads does not undo the effects of a device read. Model this distinction before comparing simulators or changing a memory schedule.

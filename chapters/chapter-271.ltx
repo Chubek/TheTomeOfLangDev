@@ -1,0 +1,58 @@
+% Source: blindel-instrselect-book.txt
+
+\section{Cut Edges at a Real Interface}
+
+Blindell calls the transformation of a program DAG into trees \emph{undagging}. Section~4.5 of his survey describes two basic choices: split the edges at shared values or duplicate the computations that produce those values. Either gives a tree selector a familiar input, but the two transformations solve different restricted selection problems \cite[chapter~4]{blindell2016instruction}.
+
+To split at a shared definition, retain the producer as a root and replace every dependent occurrence at the cut by a leaf that reads its result. The producer and leaves must agree on value identity, representation, and any placement needed for the read. A compiler can implement the connection with a virtual register; a target or algorithm may instead force a particular register bank or scratch location. In the latter case the model should price the necessary moves or accesses. Assigning an arbitrary class independently to each leaf is not a way to preserve the interface. After fixing interfaces, an additive optimum for each tree yields an optimum subject to those cuts and those fixed interfaces, not necessarily an optimum for the original DAG.
+
+Splitting is linear in the input vertices and edges if rebuilding each retained edge and making each boundary leaf costs constant time. Count operand occurrences, not just distinct consumer nodes: one instruction can use the same producer in two slots. A live-out can likewise be treated as a use when deciding what must survive. The cut forbids a match that spans it, so a cut chosen solely on fan-out may block a valuable instruction that would export the shared result as well as compute a consumer.
+
+\section{Duplicate Computation or Share a Reduction}
+
+Duplication does not insert an interface; it makes a separate occurrence of the shared computation for each use. This can expose matches that a fixed cut would hide. It is legal only when the extra evaluations preserve all relevant observations, including exceptions and effects. Full unfolding can also take exponential space: at each stage let two different operations consume the previous value and let a third combine their results. After $k$ stages there are only linearly many definitions but $2^k$ paths back to the original value. Linear tree matching means linear in the size of its input, not in the size of the DAG before that expansion.
+
+Blindell describes Ertl's alternative: price reductions by a tree-style bottom-up pass over the DAG, but emit only one reduction when several consumers request the same node reduced to the same nonterminal. Memoizing by the pair (SSA value, nonterminal) rather than by SSA value alone matters: an address operand and a general register result may require different reductions even when they denote the same bits. Reusing a reduction also assumes it remains available at the later uses. Ertl's result guarantees optimal selection only for certain grammars. Blindell also describes how Koes and Goldstein's NOLTIS estimates the price of overlaps compared with splitting, marks some nodes fixed, and reruns the dynamic program without allowing a pattern to cross those fixed nodes. That is a selection heuristic, not a complete method for matching arbitrary pattern DAGs. If a multi-result pattern is instead split for matching, the partial maps must agree on the actual program nodes they share before it becomes a single selectable candidate.
+
+% Annotated walkthrough
+\section{Trace a Cut on an Eight-Bit Splitter}
+
+Let $s$ be an eight-bit left rotation of $x$ by one bit. Take its two nibbles as $l=s\mathbin{\&}15$ and $h=s\gg4$, and return $l\mathbin{\mathtt{xor}}h$. The singleton rotation costs two units; extraction of either nibble and the final xor cost one each. The target also has two instructions costing two units each that rotate and extract just one nibble, and a different two-unit instruction that returns both $s$ and $l$. All costs are additive, all operations pure, and there are no other candidates. First assume a boundary value can travel in a virtual register without extra instructions.
+
+\begin{verbatim}
+x = 0xB3 -> s = 0x67 -> l = 7, h = 6 -> result = 1
+cut at s:      ROT + LOW + HIGH + XOR        = 2+1+1+1 = 5
+               # Both leaf uses read the same named s.
+unfold at s:   ROTLOW + ROTHIGH + XOR        = 2+2+1   = 5
+               # The two fused forms each rotate x.
+retain DAG:    ROT_AND_LOW + HIGH + XOR      = 2+1+1   = 4
+               # HIGH reads s exported by ROT_AND_LOW.
+\end{verbatim}
+
+The cover in \Cref{fig:visual-271} owns both the rotation and the low-nibble extraction, while still exporting the rotated byte for the high-nibble extraction.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram, split op/.style={tome box,minimum width=2.65cm}]
+  \node[ast leaf] (in) at (0,0) {\(x=\texttt{0xB3}\)};
+  \node[split op] (s) at (0,-1.12) {Rotate\\\(s=\texttt{0x67}\)};
+  \node[split op] (l) at (0,-2.62) {Low nibble\\\(l=7\)};
+  \node[split op] (h) at (5.25,-2.62) {High nibble\\\(h=6\)};
+  \node[split op] (r) at (2.6,-4.45) {XOR\\Result \(=1\)};
+  \begin{scope}[on background layer]
+    \node[tome group,fit=(s)(l)] (pair) {};
+  \end{scope}
+  \draw[tome arrow] (in)--(s);
+  \draw[tome arrow] (s)--(l);
+  \draw[tome arrow] (s.east)-|node[pos=0.25,above,font=\footnotesize]{export \(s\)} (h.north);
+  \draw[tome arrow] (l.south)--(r.north west);
+  \draw[tome arrow] (h.south)--(r.north east);
+  \node[anchor=east,align=right,font=\footnotesize] at (-1.85,-1.87)
+    {\texttt{ROT\_AND\_LOW}\\Cost 2};
+\end{tikzpicture}
+\caption{The four-unit DAG cover of the eight-bit splitter. The dashed tile exports both \(l\) and \(s\); cutting the shared value \(s\) away from its consumers excludes this tile.}
+\label{fig:visual-271}
+\end{figure}
+
+In a tree that unfolds $s$, the separate rotation and extraction would cost three at each consumer, so a tree selector chooses the two cost-two fused forms. A cut excludes \texttt{ROT\_AND\_LOW} because it would own both the producer and a node across the boundary. The full-DAG plan costs four and meets a lower bound: xor costs one, producing $l$ costs at least two including its rotation if necessary, and a distinct instruction must still produce $h$ for at least one more. If the cut interface instead requires one scratch store and one reload that both consumers can share, at unit cost each, the cut total rises to seven. That is a property of the chosen interface, not of edge splitting itself. The trace tests that an instruction claiming an exported $s$ really supplies it, and that neither the artificial leaf uses nor the duplicated occurrences are accidentally charged as independent materializations in the shared plan.

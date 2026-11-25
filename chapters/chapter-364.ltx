@@ -1,0 +1,108 @@
+% Source: sync-funprog-in-lucid.txt
+% Source: practical-foundations-for-proglang-2nd-ed.txt
+
+\section{Reach a Constructive Reaction}
+
+Esterel uses logical synchrony: concurrent statements react to the same input event set, exchange signals within the instant, and reach quiescence before logical time advances. A signal's present/absent status is global to the reaction. Sequential composition orders control within an instant, while \texttt{pause} crosses an instant boundary. This source semantics does not require physical zero-time execution; generated code must finish within the environment's timing budget \cite{berry1992esterel}.
+
+Constructiveness is stronger than finding a classically consistent assignment of signal statuses. The compiler must be able to justify presence from emissions or absence from the impossibility of emission without circularly assuming the conclusion. Programs whose behavior depends on ``emit \(S\) iff \(S\) is absent'' have no constructive reaction even if a Boolean equation appears to admit reasoning by cases.
+
+\section{Synchronize and Preempt With ABRO}
+
+The classic Esterel pattern waits for both inputs, emits \texttt{O}, and restarts on \texttt{R}:
+
+\begin{verbatim}
+module ABRO:
+  input A, B, R;
+  output O;
+  loop
+    [ await A || await B ];
+    emit O
+  each R
+end module
+\end{verbatim}
+
+The parallel waits remember arrivals across reactions. When both have completed, \texttt{O} is emitted in that logical reaction. The strong \texttt{each R} preemption restarts the body according to Esterel's specified priority; an implementation must not let host-thread scheduling choose whether an emission escapes. \Cref{fig:visual-364} sketches the reaction state.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (wait) at (0,0) {wait flags \(a,b\)};
+  \node[tome box] (a) at (-2.8,-1.5) {observe A};
+  \node[tome box] (b) at (0,-1.5) {observe B};
+  \node[tome box accent] (o) at (2.8,-1.5) {if \(a\land b\), emit O};
+  \node[tome box] (r) at (0,-3) {R: reset control};
+  \draw[tome arrow] (wait) -- (a);
+  \draw[tome arrow] (wait) -- (b);
+  \draw[tome arrow] (a) -- (o);
+  \draw[tome arrow] (b) -- (o);
+  \draw[tome arrow] (o) -- (r);
+  \draw[tome arrow] (r) -- (wait);
+\end{tikzpicture}
+\caption{A reaction computes signal statuses and next control state together. Preemption priority is semantic, not a race among the boxes.}
+\label{fig:visual-364}
+\end{figure}
+
+% Annotated walkthrough
+\section{Compile One Instant to a Fixed Point}
+
+\begin{verbatim}
+known_present := input_signals
+known_absent := statically_justified_absences
+repeat:
+    propagate enabled control and emissions
+    prove additional absences from disabled emitters
+until no fact changes
+if any tested signal is still unknown: reject as nonconstructive
+outputs := emitted_signals
+next_control := commit_pauses_and_preemption()
+\end{verbatim}
+
+An efficient compiler need not run this loop at runtime; it can use constructive analysis to synthesize a Boolean circuit or scheduled reaction function. The pseudocode states the evidence obligation.
+
+\section{Lower Reactions Without Creating Races}
+
+An Esterel IR should contain control, test, emit, parallel, and preemption nodes; control and signal-dependency edges; pause/register state; logical reaction clocks; pure and valued-signal types; effect summaries for host calls; constructiveness evidence; and source provenance. Compilation may produce a control automaton, Boolean circuit, C reaction function, or hardware.
+
+Legal optimizations include dead control elimination, automaton minimization, and Boolean simplification when signal status, valued-signal combination, preemption, and next state are preserved. Semantic-preservation risks include assuming absence too early, reordering effectful host calls, collapsing pauses, or translating parallelism to racing threads. Test complete reaction traces, including simultaneous inputs and reset, and retain proof diagnostics that map a causality cycle to source signal tests and emissions.
+
+\section{Check a Constructiveness Failure With a Tiny Reaction}
+
+Consider a fresh local signal whose only possible emitter is conditioned on that same signal being absent. Assuming presence disables the emitter and assuming absence enables it. There is no consistent status. Change the condition to presence: now both assignments are consistent, but the interpreter still has no constructive reason to choose either. Contrast both with a conditional emission controlled only by a known input. This distinction prevents a compiler from accepting whatever a Boolean solver happens to return for an underspecified reaction.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Only emitter fires when & Consistent statuses & Constructive evidence \\
+\hline
+Local signal absent & none & none \\
+Local signal present & present, absent & none \\
+Known input present & present & enabled emitter \\
+Known input absent & absent & sole emitter disabled \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+derive_local_signal(s, live_emitters, facts):
+    enabled := []
+    blocked := []
+    for e in live_emitters[s]:
+        truth := evaluate_guard_with_unknowns(e.guard, facts)
+        if truth == true: append(enabled, e)
+        if truth == false: append(blocked, e)
+    if enabled not empty: return Present, witness(enabled[0])
+    if length(blocked) == length(live_emitters[s]):
+        return Absent, witnesses(blocked)
+    return Unknown, unresolved_guards(s)
+\end{verbatim}
+
+This rule illustrates status inference once the compiler has accounted for control and preemption. It is not a complete Esterel checker: the set of emitters itself depends on which control can run within the instant, and valued signals may need a combination rule. Keep the reason for each fact so a stuck reaction can report the guard and emission sites that support one another. Test that running the worklist in opposite orders gives the same proved statuses, and that neither order invents a reason for either circular example.
+
+\paragraph{Keep statuses local to their instant.}
+In a trace with two instants, proving a pure signal absent in the first
+instant does not prove anything about its status in the second.
+Suspended control locations are carried between instants; inferred
+presence or absence must instead be established anew from that control
+and the next inputs.

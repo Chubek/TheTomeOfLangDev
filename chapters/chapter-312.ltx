@@ -1,0 +1,70 @@
+% Source: introduction-to-computer-organization-an-under-the-hood-look-at-hardware-and-x86-64-assembly-robert-g.-plantz-.txt
+% Source: ir-il-for-datapath-gen.txt
+
+\section{A Bit Pattern Has More Than One Interpretation}
+
+A four-bit adder produces the low four bits of the mathematical sum: it operates modulo \(16\). The same output bits serve unsigned and two's-complement addition, but what counts as overflow differs. For example, \texttt{1111} is unsigned \(15\) or signed \(-1\). Adding \texttt{0001} wraps the unsigned result to zero but is exact signed arithmetic. Conversely, adding \texttt{0111} and \texttt{0001} gives \texttt{1000} with no unsigned carry, yet signed \(7+1\) is not representable in four bits. Robert G. Plantz works through both interpretations in chapters~3 and~4 of \emph{Introduction to Computer Organization}.
+
+An HDL expression can change width and interpretation at intermediate points. In SystemVerilog, operands of binary arithmetic can acquire a width from their expression context; it is not always the width of the larger source operand. Concatenation operands, in contrast, are sized independently of the surrounding assignment. A concatenation or part-select is unsigned even when it uses bits from a signed vector. A signing cast changes interpretation, not the number of bits. These rules determine how the expression is evaluated \emph{before} the final result is assigned \cite{ieee1800systemverilog}.
+
+\section{Make the Fifth Bit Deliberate}
+
+This SystemVerilog example is simulatable and normally synthesizable. It takes two patterns and views each both ways. The extensions and cast make the intended width and interpretation visible at the point of use.
+
+\begin{verbatim}
+module sum_views (
+    input  wire        [3:0] a, b,
+    output wire        [4:0] u_exact,
+    output wire signed [4:0] s_exact,
+    output wire        [4:0] carry_lost,
+    output wire              s_overflow, s_less, u_less
+);
+    assign u_exact = {1'b0, a} + {1'b0, b};
+    assign s_exact = $signed({a[3], a}) + $signed({b[3], b});
+    assign carry_lost = {a + b};  // inner addition is only 4 bits
+    assign s_overflow = s_exact[4] ^ s_exact[3];
+    assign s_less = ($signed(a) < $signed(b));
+    assign u_less = (a < b);
+endmodule
+\end{verbatim}
+
+Both extended operands have five bits, enough to represent every exact sum in either interpretation. A signed sum fits back into four bits exactly when bit 4 is already the sign extension of bit 3. The test is thus a comparison of those bits, not a test of carry. The intentionally narrow expression for \texttt{carry\_lost} wraps \verb|a + b| before assigning to the five-bit output: the braces make the addition a self-determined concatenation operand. Removing the braces allows the five-bit assignment context to size this plain unsigned addition. Explicit widening is more robust when a later edit nests the expression inside another operator.
+
+In a relational expression, if one operand is unsigned, the comparison uses unsigned interpretation; for example \verb|$signed(a) < b| does not give the signed answer for \(a=\texttt{1111}\), \(b=\texttt{0001}\). Cast both sides for the signed comparison above. Unsized integer literals bring their own size and signedness rules; use appropriately sized constants in width-sensitive expressions, and test the sign boundary as well as small positive inputs.
+
+\Cref{fig:visual-312} follows the first addition through both exact-width paths. The modulo result is shared even though the widened representations differ.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (start) at (0,0) {\texttt{1111} plus \texttt{0001}};
+  \node[tome box] (u) at (-2.75,-1.65) {Zero extend\\\texttt{01111} + \texttt{00001}};
+  \node[tome box] (s) at (2.75,-1.65) {Sign extend\\\texttt{11111} + \texttt{00001}};
+  \node[tome box accent] (uo) at (-2.75,-3.15) {\texttt{10000}\\unsigned 16};
+  \node[tome box accent] (so) at (2.75,-3.15) {\texttt{00000}\\signed 0};
+  \draw[tome arrow] (start) -- (u);
+  \draw[tome arrow] (start) -- (s);
+  \draw[tome arrow] (u) -- (uo);
+  \draw[tome arrow] (s) -- (so);
+\end{tikzpicture}
+\caption{The low four bits coincide. Zero extension reports an unsigned carry; sign extension shows no signed overflow.}
+\label{fig:visual-312}
+\end{figure}
+
+% Annotated walkthrough
+\section{Exhaust a Small Width with an Integer Oracle}
+
+\begin{verbatim}
+for every four-bit binary pair (a,b):
+    ua, ub = decode_unsigned(a), decode_unsigned(b)
+    sa = ua - 16 if ua >= 8 else ua   # decode sign independently
+    sb = ub - 16 if ub >= 8 else ub
+    check decode_unsigned(u_exact) == ua + ub
+    check decode_signed(s_exact) == sa + sb
+    check carry_lost == (ua + ub) mod 16   # not the exact sum
+    check s_overflow == ((sa + sb) outside [-8,7])
+    check (s_less,u_less) == (sa < sb, ua < ub)
+\end{verbatim}
+
+Stimulate then sample after the combinational model settles. This oracle ranges over known binary patterns; it does not silently convert simulator X or Z to zero. Test meta-values separately if diagnostic behavior matters. Kasprzyk, Koch, Golze, and Rock's \emph{An Improved Intermediate Representation for Datapath Generation} notes that matching operator and variable widths to the data can optimize hardware. The proof obligation is to preserve all observed bits and flags, not merely the low result bits on familiar values.

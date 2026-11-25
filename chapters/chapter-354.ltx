@@ -1,0 +1,106 @@
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: finkel-advanced-proglang-design.txt
+
+\section{Make Values Once, Not Storage Repeatedly}
+
+Single assignment means that one dynamic name denotes one value. It does not mean that a loop cannot produce many values: each iteration can create a distinct instance, often represented by an SSA version, an iteration tag, or an array element. This removes write--write races on those values and exposes dependencies, but it does not by itself guarantee determinism. Nondeterministic input choice, unordered merge, exceptions, external effects, or racing stateful actors can still distinguish executions.
+
+Pure dataflow nodes create new tokens rather than modifying old ones, which supports determinate results when channels are ordered and operators are deterministic \cite{johnston2004dataflow}. State must not be hidden to recover this property. A delay, recurrence edge, state token, or explicitly encapsulated actor state says which old value a firing observes.
+
+\section{Express a Recurrence Without Mutation}
+
+This SISAL-like fragment binds each result once and constructs a new array:
+
+\begin{verbatim}
+function Scale(A : array[integer]; k : integer
+               returns array[integer])
+  for a in A
+    returns array of a * k
+  end for
+end function
+\end{verbatim}
+
+The source does not update \texttt{A}; each iteration contributes one element to the result. An accumulator can similarly be represented by a loop-carried value whose instance at iteration \(i+1\) depends on instance \(i\). \Cref{fig:visual-354} contrasts explicit recurrence with accidental shared storage.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (s0) at (-4,0) {\(s_0=0\)};
+  \node[tome box] (a0) at (-1.5,0) {\(+a_0\)};
+  \node[tome box] (a1) at (1.2,0) {\(+a_1\)};
+  \node[tome box accent] (s2) at (3.8,0) {\(s_2\)};
+  \node[tome box] (tag0) at (-1.5,-1.4) {iteration 0};
+  \node[tome box] (tag1) at (1.2,-1.4) {iteration 1};
+  \draw[tome arrow] (s0) -- (a0);
+  \draw[tome arrow] (a0) -- node[above]{\(s_1\)} (a1);
+  \draw[tome arrow] (a1) -- (s2);
+  \draw[tome arrow] (tag0) -- (a0);
+  \draw[tome arrow] (tag1) -- (a1);
+\end{tikzpicture}
+\caption{Each recurrence instance has one producer. The edge from \(s_i\) to \(s_{i+1}\), plus the iteration identity, replaces mutation of one shared accumulator.}
+\label{fig:visual-354}
+\end{figure}
+
+% Annotated walkthrough
+\section{Name Dynamic Instances in the IR}
+
+\begin{verbatim}
+for each source binding b:
+    create value node V(b, lexical_instance)
+for each loop-carried binding s:
+    create init node S0
+    create recurrence edge S(i) -> S(i+1)
+    attach iteration tag i to dynamic tokens
+reject a second producer for the same value instance
+\end{verbatim}
+
+The distinction between a static source name and a dynamic value instance is essential. Reusing one graph edge for every loop iteration without tags or a disciplined feedback protocol allows operands from different iterations to meet.
+
+\section{Carry State and Effects Explicitly}
+
+The IR should contain operation and region nodes, value and control/recurrence edges, explicit state or memory tokens, loop and branch joins, clocks or token rates where applicable, value types, effect rows, and source provenance. Compilation can produce SSA-based machine IR, parallel task graphs, vector loops, or a dataflow runtime graph. Array uniqueness information may permit in-place storage reuse even though the language-level array remains immutable.
+
+Legal optimizations include copy propagation, common-subexpression elimination, parallel evaluation, and storage reuse, but only when types, arithmetic behavior, exceptions, and effect ordering agree. Semantic-preservation risks include aliasing an old array after ``reusing'' it, merging two effectful calls, or reassociating floating-point reductions. Preservation concerns the single-assignment value graph and explicit effect order, not retaining a fresh physical allocation for every source value.
+
+\section{Decide Whether a Physical Cell Can Be Reused}
+
+Consider a value array initialized to \([4,7]\). Construct \(B\) from \(A\) by replacing its first element with \(9\), then return both \(A[0]\) and \(B[0]\). The result is \((4,9)\); it is not \((9,9)\). The replacement creates a new abstract array identity even if the runtime sometimes chooses to mutate a backing buffer. This matters for aliases as well: if \(C\) is a view of \(A\) captured before the replacement, a later read of \(C[0]\) is still a use of the old storage.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Later observation & Reuse candidate? & Reason \\
+\hline
+Only \(B[0]\) & Yes & Old element no longer live \\
+\(A[0]\) and \(B[0]\) & No & Both versions needed \\
+Old slice through a closure & Not by name alone & Alias may escape \\
+Old array in pending worker & Not yet & Worker can still read it \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+lower_replace(old, index, element, point):
+    require check_bounds(index, old.shape)
+    readers := possible_future_readers(old.storage, point)
+    if readers is empty and exclusive_owner(old.storage):
+        result_storage := old.storage
+    else:
+        result_storage := copy(old.storage)
+    write(result_storage, index, element)
+    return bind_fresh_array_value(result_storage, old.shape)
+\end{verbatim}
+
+This is a conservative whole-buffer rule; a more precise analysis can prove that no reader sees the modified part even if some reader still uses a disjoint slice. As a test, return an array and a closure capturing the original first element, then call the closure after the update. If the implementation chooses to save that one scalar separately before writing, it can optimize the storage without changing the source observation. When parallel iterations each construct a distinct result slot, the relevant proof instead relates every physical write to exactly one logical index and checks that initialization and ownership precede publishing the array.
+
+\paragraph{Track the lifetime of a pending read.}
+Suppose a task receives an immutable slice and is then suspended. A compiler
+that considers the slice dead at the call site can still be wrong: the task
+may resume after the parent has overwritten the array. Model the handoff
+as a loan that ends when the task joins or explicitly gives up its view.
+If the task can escape, do not infer that the loan ends at the lexical
+scope of the spawning expression. In a deterministic test, pause a reader
+after handing it the slice, perform the replacement, then resume it and
+check that it returns the original value. This exercises storage
+liveness separately from the single-assignment property of the graph.

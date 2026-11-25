@@ -1,0 +1,86 @@
+% Source: introduction-to-computer-organization-an-under-the-hood-look-at-hardware-and-x86-64-assembly-robert-g.-plantz-.txt
+
+\section{Time Does Not Advance for Every Update}
+
+An event-driven simulator advances the simulation clock to the next scheduled time. At that time, it can perform several rounds of work before time advances again: a signal update makes a process eligible to run, and that process can schedule another zero-delay update. In VHDL these same-time simulation cycles are called delta cycles. For example, with concurrent assignments \verb|b <= a; c <= b;| the change of \texttt{a} leads to a later delta update of \texttt{b}, which leads to a delta update of \texttt{c}, all at the same modeled physical time \cite{ieee10762008}. Delta cycles are not clock cycles and do not measure gate delay.
+
+SystemVerilog uses a time slot divided into scheduling regions rather than the VHDL simulation-cycle model. In ordinary module code, clocked processes run in the Active region; executing a nonblocking assignment in that region evaluates the right-hand side and schedules the variable update for the NBA region. A change from an NBA can in turn cause further same-time activity. The ordered regions matter even if a waveform is drawn with all the same-time changes at the same horizontal coordinate \cite{ieee1800systemverilog}.
+
+\section{A Two-Register Experiment}
+
+Robert G. Plantz's \emph{Introduction to Computer Organization} discusses clocked storage in chapter~7. The hardware intuition is that two flip-flops on a common edge sample their respective inputs; the second does not intentionally borrow the newly captured value of the first on that edge. Meeting actual setup and hold constraints is a separate physical requirement. Here is the SystemVerilog RTL model, which is simulatable and normally synthesizable:
+
+\begin{verbatim}
+module shift2 (
+    input  logic clk, d,
+    output logic first, second
+);
+    always_ff @(posedge clk) begin
+        first  <= d;
+        second <= first;
+    end
+endmodule
+\end{verbatim}
+
+This companion is simulation only. Its delays schedule deliberate stimulus, not circuitry, and the displayed time is not used as a test oracle.
+
+\begin{verbatim}
+module shift2_tb;
+    timeunit 1ns;
+    timeprecision 1ps;
+    logic clk, d;
+    wire first, second;
+    shift2 dut (.clk(clk), .d(d), .first(first), .second(second));
+    initial begin
+        clk = 0; d = 0;
+        #2 d = 1;
+        #3 clk = 1;
+        #2 clk = 0;
+        #1 d = 0;
+        #2 clk = 1;
+        #1 $finish;
+    end
+    always @(posedge clk) begin
+        $display("active: %b %b", first, second);
+        $strobe("settled: %b %b", first, second);
+    end
+endmodule
+\end{verbatim}
+
+Although the DUT and monitor may execute in either Active-region order, neither assignment updates its destination in that region. Thus \verb|$display| reads the pre-update state, while \verb|$strobe| observes the values in Postponed, at the end of the time slot. This argument relies on driving \texttt{d} before, not in competition with, the rising edge. The two observations are simulator outputs for one modelled edge; they do not imply two hardware states or a physical delay between the registers.
+
+% Annotated walkthrough
+\section{Keep the Pending Updates Separate}
+
+The following sketch models only the two interesting phases for the register assignments; it is not a complete simulator scheduler. At the second rising edge \texttt{first} starts at \(1\), \texttt{second} starts at \texttt{x}, and \(d=0\).
+
+\begin{verbatim}
+at t = 10 ns, service the rising edge:
+    pending[first]  = d       # sample 0 now
+    pending[second] = first   # sample OLD first = 1
+    active observer sees (1, X)
+apply pending writes during NBA
+postponed observer sees (0, 1) # same t, different region
+\end{verbatim}
+
+\Cref{fig:visual-307} contrasts the observations at both rising edges. The first transfer leaves \texttt{second} unknown because the design does not reset its state.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] at (0,0) {Rising edge};
+  \node[tome box dark] at (3.25,0) {Active};
+  \node[tome box dark] at (7,0) {Postponed};
+  \foreach \z/\t/\a/\b in {-1.2/5/{(X,X)}/{(1,X)},-2.4/10/{(1,X)}/{(0,1)}} {
+    \node[tome box] at (0,\z) {\(\t\) ns};
+    \node[tome box] (before) at (3.25,\z) {\texttt{\a}};
+    \node[tome box accent] (after) at (7,\z) {\texttt{\b}};
+    \draw[tome arrow] (before) -- node[above] {NBA} (after);
+  }
+\end{tikzpicture}
+\caption{Each row is one simulation time slot. The tuples are \texttt{(first, second)}; the arrow is a scheduling order, not an advance of simulation time.}
+\label{fig:visual-307}
+\end{figure}
+
+If both assignments in the DUT instead used blocking \verb|=| in that order, the second right-hand side would read the newly assigned \texttt{first}: the intended stage would disappear from the functional model. Splitting blocking assignments across concurrent clocked processes can also create simulator order dependence. Nonblocking assignment protects this old-state transfer; it does not resolve multiple processes writing one register or a testbench changing sampled data on the same edge.

@@ -1,0 +1,70 @@
+%% chapter-276.ltx -- Selecting across SSA and Dependence Graphs
+% Source: blindel-instrselect-book.txt
+% Source: blindel-practical-instrselect.txt
+
+\section{Keep value flow and execution conditions distinct}
+
+A function-wide selector can see a producer and consumer even when a block boundary separates them. It can also make choices that agree across a loop backedge, where there is no bottom-up traversal of the whole def-use graph. Hjort Blindell illustrates this with a factorial function: the loop-carried values appear through \(\phi\)-nodes and yield cycles in the SSA graph \cite[chapter~5]{blindell2016instruction}. A \(\phi\) uses the value from the edge actually taken; it does not evaluate its incoming definitions in the join block. The data-only SSA graph discussed in the book is not the entire SSA IR. It omits the transfers of control needed to select branches and decide when effectful computations execute.
+
+A program dependence graph (PDG) makes a different fact explicit: which predicate outcomes govern the execution of operations. Along with data dependencies, this can expose where moving or reordering an operation is worth considering. Control dependence is not an ordered list of blocks, however. The book's factorial example shows that some operations in different blocks share the same control condition; it also points out that emitting assembly from dependencies alone is harder when block boundaries are obscured. A selector can retain the CFG for concrete placement and use dependence information to constrain movement, rather than forcing one graph to answer both questions.
+
+\section{Selection includes a placement obligation}
+
+An ordinary SSA use must be dominated by its definition, with definitions preceding uses within a block. For a \(\phi\) operand, the relevant use site is the incoming edge: a value from one arm of a branch need not dominate the join block. Hjort Blindell et al.'s \emph{Complete and Practical Universal Instruction Selection} combines control and data in a universal function graph, with definition edges pinning values associated with \(\phi\)-nodes to appropriate blocks. Their representation leaves room to place other computations later; a definition edge is not a general license to move loads, stores, or traps.
+
+Each candidate should identify permissible locations or carry constraints from which they can be derived. Check dominance, edge-specific operands and within-block order after fixing placements. Preserve dependence on memory state and other effects: an aliasing store may make a read movable only within a smaller region than its value dependencies suggest. A potentially trapping instruction cannot be speculated onto a new path merely because its inputs are available there. A pure, total instruction may sometimes be speculated legally yet should still be kept off a hot path if moving it there increases execution frequency.
+
+Mark the backedge uses before checking order. A dependence from the body to a header \(\phi\) carries a value into the next iteration; the body does not need to precede the header in a single static schedule. Conversely, a cycle created by grouping computations that depend on each other within one iteration cannot be justified by the presence of a surrounding loop. The checker needs to preserve that distinction.
+
+% Annotated walkthrough
+\section{Sink an address calculation into a guarded load}
+
+Sum \(n\) words, returning zero if the length is zero. The count \(n\) fits in a 64-bit unsigned index; the sum wraps at 32 bits. Address formation is total, modulo \(2^{64}\). Each read may fault if its address does not designate a readable word. Assume no intervening writes and a target \texttt{LDX4} with the same access and fault semantics as the plain read, using base plus four times the index.
+
+\begin{verbatim}
+entry: goto H
+H: i = phi(entry:0, B:i1); s = phi(entry:0, B:s1)
+   a = addr64(base, 4*i)
+   if i < n goto B else goto E
+B: x = read32(a); s1 = add32(s,x); i1 = i+1
+   goto H
+E: return s
+
+# Anchor at read32: bind its address producer in H.
+# Place LDX4 in B, where the load already executes.
+n=2, words=[5,7]:
+ H(i=0,s=0) -> B(x=5) -> H(i=1,s=5)
+ H(i=1,s=5) -> B(x=7) -> H(i=2,s=12) -> E(12)
+# Negative test: n=0 and base is not readable.
+ Original and B-placement: H(i=0,s=0) -> E(0)
+ H-placement before the branch: attempts a read and traps
+\end{verbatim}
+
+In the positive case, the selected instruction covers operations from two IR blocks but is emitted only in \(B\). The address computation has no other users, the header's \(i\) dominates \(B\), and combining the two operations does not create an extra read. For \(n=2\), the separately represented address expression executes three times, including on the exit test; the selected address calculation executes twice, as part of the two reads. In the negative case the availability of \(i\) in \(H\) is unchanged. It is the control condition of the read, not dominance, that distinguishes the legal placement from the illegal one.
+
+\Cref{fig:visual-276} shows the control edge that must guard the fused instruction, even though its operands are available earlier.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (entry) at (0,0) {Entry};
+  \node[tome box,minimum width=4.4cm] (h) at (0,-1.25)
+    {\(H\): take \(\phi\) inputs, test \(i<n\)};
+  \node[tome box,minimum width=4cm] (b) at (0,-2.95)
+    {\(B\): \texttt{LDX4} and updates};
+  \node[tome box] (e) at (4.25,-1.25) {\(E\): return \(s\)};
+  \draw[tome arrow] (entry) -- (h);
+  \draw[tome arrow] (h) -- node[right] {true} (b);
+  \draw[tome arrow] (h) -- node[above] {false} (e);
+  \draw[tome arrow] (b.west) -- (-3,-2.95) --
+    node[left,align=center] {next\\iteration} (-3,-1.25) -- (h.west);
+  \node[anchor=west,align=left] at (2.4,-2.95) {Uses header \(i\);\\reads only on the true path};
+\end{tikzpicture}
+\caption{The selected load belongs in \(B\). The false edge from \(H\) reaches the exit without executing a read, including when \(n=0\).}
+\label{fig:visual-276}
+\end{figure}
+
+\section{An edge is also a place to do work}
+
+After the cover is selected, PHI lowering may require copies on incoming edges. Treat them as parallel assignments: two locations that exchange values cannot be updated sequentially without a temporary or a swap. If a predecessor has multiple successors and a successor has multiple predecessors, a copy intended solely for their connecting edge generally needs edge splitting rather than unconditional insertion in either block. Recheck edge identities and instruction order after splitting. For the loop above, initialization and the backedge supply different values to both \(\phi\)-nodes; moving a backedge-only copy to entry would change the first iteration regardless of the quality of the cover. A local selector is a useful fallback, but its boundary rules must agree with global selection about which values and effects cross each edge.

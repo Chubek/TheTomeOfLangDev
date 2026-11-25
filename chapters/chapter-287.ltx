@@ -1,0 +1,79 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Place Contributions, Then Describe Mappings}
+
+Levine separates the calculation of offsets within each storage class from the placement of those classes in the program address space. His text, data, and BSS example shows why the linker cannot just treat an object as one contiguous contribution and append the next one. The BSS still needs addresses even though its initial contents are not stored as bytes. His GNU linker script example describes a historical System V COFF target; the corresponding ELF distinction today is between input sections, output sections, and loadable segments \cite[chapter~4]{levine2000linkers}. Link editing assigns sections; an ELF loader ordinarily uses the program headers, not the section headers, to establish mappings.
+
+For an output section that simply concatenates input contributions, keep a cursor in virtual addresses. If the cursor is $c$ and the next input alignment is $a>0$, start that contribution at $b=a\lceil c/a\rceil$. Its half-open interval is $[b,b+n)$ for size $n$, and the next cursor is $b+n$. Align the \emph{start of the next input}, not the length of the preceding input as though all inputs shared the same required alignment. For ELF, zero and one in \verb|sh_addralign| impose no constraint. Check addition and round-up for overflow before forming an address. The interval view also avoids the off-by-one ambiguity of saying which byte is ``the end.''
+
+A linker script chooses input patterns, ordering, output addresses, and sometimes the program headers. Matching a section name does not change its contents or lower its input alignment; imposing a smaller alignment explicitly is an ABI decision, not a size optimization to apply blindly. GNU \texttt{ld} may place an unmatched input as an orphan, so inspect the map for unexpected contributions instead of assuming a replacement script discarded everything it did not mention. In a controlled build where every relevant section has an owner in the script, GNU \texttt{ld}'s \verb|--orphan-handling=error| can help detect a newly emitted input section. Before enabling it, account for conventional empty sections and metadata that the toolchain supplies as well as the sections carrying application data.
+
+% Annotated walkthrough
+\section{Lay Out a Read-Only Table and a Zero-Filled Buffer}
+
+Assemble the first block as \texttt{layout.s} on an x86-64 ELF target. The fixtures are storage only; inspect the linked image rather than running it.
+
+\begin{verbatim}
+# Two read-only inputs with different alignment requirements.
+.section .rodata.a,"a",@progbits
+.p2align 2
+table_a: .space 0x13, 0xa1
+.section .rodata.b,"a",@progbits
+.p2align 5
+table_b: .space 0x0b, 0xb2
+# Eight file bytes, then a buffer with no input file bytes.
+.section .data.seed,"aw",@progbits
+seed: .quad 17
+.section .bss.scratch,"aw",@nobits
+.p2align 4
+scratch: .space 0x28
+\end{verbatim}
+
+Use GNU \verb|ld.bfd -T layout.ld -Map=layout.map -o layout layout.o| with this script. The \texttt{FLAGS} values designate read-only and read/write load segments, respectively.
+
+\begin{verbatim}
+PHDRS { ro PT_LOAD FLAGS(4); rw PT_LOAD FLAGS(6); }
+SECTIONS {
+  /* Explicit order makes the alignment gap reproducible. */
+  .rodata 0x402000 : { *(.rodata.a) *(.rodata.b) } :ro
+  .data   0x403000 : { *(.data.seed) } :rw
+  /* Still part of the memory image, not initialized data. */
+  .bss (NOLOAD) : { *(.bss.scratch) } :rw
+  ASSERT(SIZEOF(.rodata) <= 0x40, "rodata budget exceeded")
+}
+\end{verbatim}
+
+The first table ends at the exclusive address \verb|0x402013|. Aligning to \verb|0x20| puts the second table at \verb|0x402020|, with \verb|0x0d| padding bytes between the inputs; its end is \verb|0x40202b|. The budget therefore counts \verb|0x2b| bytes, not the \verb|0x1e| bytes of table payload. In the writable segment the seed ends at \verb|0x403008|; alignment advances the buffer start to \verb|0x403010|, and the buffer ends at \verb|0x403038|. Here \verb|p_filesz=0x8| and \verb|p_memsz=0x38|. The zero-filled part starts immediately after the file-backed eight bytes and thus includes the eight-byte gap before \texttt{scratch}.
+
+\Cref{fig:visual-287} distinguishes padding stored in the file from the zero tail supplied in memory.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=west] at (0,0.6) {Read-only segment at \texttt{0x402000}: all shown bytes are file-backed};
+  \node[anchor=west] at (0,-2.05) {Writable segment at \texttt{0x403000}: only the seed is file-backed};
+  \foreach \lev/\leftedge/\rightedge/\body in {
+    0/0/4.25/{Table A},0/4.25/7/{Pad},0/7/10.9/{Table B},
+    -2.65/0/2.8/{Seed},-2.65/2.8/5.4/{Gap},-2.65/5.4/10.9/{Scratch}} {
+    \draw (\leftedge,\lev) rectangle (\rightedge,\lev-0.75);
+    \node at ({(\leftedge+\rightedge)/2},\lev-0.375) {\body};
+  }
+  \foreach \x/\off in {0/00,4.25/13,7/20,10.9/2b}
+    \node[anchor=north] at (\x,-0.82) {\texttt{+\off}};
+  \foreach \x/\off in {0/00,2.8/08,5.4/10,10.9/38}
+    \node[anchor=north] at (\x,-3.47) {\texttt{+\off}};
+  \draw (2.8,-4.05) -- (2.8,-4.27) -- (10.9,-4.27) -- (10.9,-4.05);
+  \node[below] at (6.85,-4.27) {Zero-filled by the loader};
+\end{tikzpicture}
+\caption{Segment-relative hexadecimal endpoints, not to scale. Read-only padding counts toward \texttt{.rodata}'s file size. The writable alignment gap is part of the zero tail but not part of \texttt{scratch}.}
+\label{fig:visual-287}
+\end{figure}
+
+\section{Test Alignment, File Offsets, and the Budget}
+
+Use \verb|readelf -SW -lW layout| to distinguish the BSS section's \verb|NOBITS| type from the writable segment's file and memory lengths. Compare the addresses of labels and the section map to the half-open intervals. The \href{https://gabi.xinuos.com/elf/07-pheader.html}{ELF program header rules} require a loadable segment's file offset and virtual address to be congruent modulo the page size, and modulo the segment's stated alignment when it is greater than one. They do not require those coordinates to be equal. To find the second table in the file, add \verb|0x20| to the read-only segment's file offset, because the table starts \verb|0x20| bytes from that segment's virtual base and lies within its file-backed extent. The BSS is not represented by reading bytes at its section header's printed offset.
+
+Change the size of \texttt{table\_a} to \verb|0x20|; the gap disappears without moving the second table. Grow it to \verb|0x21| instead; the second table starts at \verb|0x402040|, so the section size is \verb|0x4b| and the assertion must fail. The invariant is that every placed input starts on its own alignment, occupies a disjoint interval in its output section, and, for this non-overlapping load layout, has the prescribed file-backed or zero-filled memory representation. Distinguish the virtual memory address (where a reference addresses the section) from a GNU script's load memory address, which can be set with \verb|AT(...)|. For example, an embedded initialized data section may run in RAM but obtain its initial bytes from a ROM image; startup then has to copy those bytes. Changing the latter address is not a general way to change the former.
+
+For a second boundary test, reverse the two input matches in \texttt{.rodata} while keeping the original sizes. The more strictly aligned table starts at \verb|0x402000| and ends at \verb|0x40200b|; the first table then starts at \verb|0x40200c| and ends at \verb|0x40201f|. The total payload is the same, but the padding drops to one byte. This change is legal for independent inputs like these, not for a table whose iteration order is part of the program's interface.

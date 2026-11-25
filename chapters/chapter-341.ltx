@@ -1,0 +1,96 @@
+% Source: algo-ds-in-prolog-lisp-java.txt
+% Source: holm-logic-programming-in-scheme.txt
+
+\section{Cut Commits to Choices Already Made}
+
+A toy compiler driver may list all supported back ends or pick one default. Those are different interfaces. The following Prolog code deliberately includes two versions of the default operation:
+
+\begin{verbatim}
+candidate(native, c).
+candidate(native, llvm).
+candidate(wasm, wasm).
+
+first_naive(Target, Backend) :-
+    candidate(Target, Backend),
+    !.
+
+default_backend(Target, Backend) :-
+    once(candidate(Target, Chosen)),
+    Backend = Chosen.
+\end{verbatim}
+
+A direct cut (\verb|!|) succeeds immediately but discards the alternatives created since this invocation of its containing predicate began, including alternatives for goals to its left and later clauses for the invocation. It does not discard the caller's older choice points. Goals to its right may still create new choices. Luger and Stubblefield illustrate this with a search in which a cut freezes the first move while leaving alternatives for a later move. Holm's Scheme presentation also treats pruning separately from ordinary conjunction and disjunction.
+
+With \texttt{native} supplied and the second argument unbound, both default implementations report \verb|B = c|. Calling \verb|first_naive(native, llvm)|, however, binds the second argument before \texttt{candidate} is called. Only the \texttt{llvm} fact matches, and cut commits to it. Calling \verb|default_backend(native, llvm)| instead fails. \texttt{once/1} seeks the first success of its argument goal and suppresses its remaining answers; the fresh \texttt{Chosen} ensures the request is checked against the default \emph{after} the choice. This driver documents the mode with \texttt{Target} provided. It does not offer this predicate as an enumerator of defaults across multiple targets.
+
+The cut in \texttt{first\_naive/2} is not a mere optimization of the candidate relation: it removes the second answer when the output is free. A \emph{green cut} is one that prunes branches without changing the intended answers for the supported calls, for instance when the engine would otherwise retry unreachable clauses. Such a claim depends on the mode and the other clauses. Adding a fallback fact or allowing more general queries can invalidate it, so test those assumptions rather than naming every cut in a deterministic-looking predicate green.
+
+% Annotated walkthrough
+\section{Walkthrough: Save a Boundary Before Committing}
+
+For a direct cut in an ordinary clause body, the following pseudocode uses conceptual choice-stack depths. The second procedure makes the boundary of the first-answer operation explicit.
+
+\begin{verbatim}
+enter_predicate:
+    cut_boundary := current choice-stack depth
+    # later clause and subgoal alternatives are above this depth
+execute_direct_cut:
+    discard alternatives above cut_boundary
+    succeed                            # keep current bindings
+
+first_success(goal):
+    boundary := current choice-stack depth
+    run goal until it fails or succeeds
+    on success: discard alternatives above boundary
+    return goal status
+\end{verbatim}
+
+Trace \verb|default_backend(native, llvm)|: the first candidate binds \texttt{Chosen} to \texttt{c}. The \texttt{once} boundary is older than the pending \texttt{llvm} candidate, which is discarded. The comparison \verb|llvm = c| then fails. The invariant is that a commit preserves the bindings of the selected success and the ability to retry preexisting caller alternatives; it does not itself roll back either. If the caller uses \verb|(default_backend(native, llvm) ; B = fallback)|, the right-hand disjunct is still available. \Cref{fig:visual-341} puts the two alternatives on opposite sides of the boundary.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (new) at (0,1.45) {Retry the candidate \texttt{llvm}};
+  \node[tome box] (old) at (0,-1.35) {Try the caller's fallback};
+  \node[align=center] at (0,0.34) {\texttt{once/1} boundary};
+  \draw[dashed] (-2.55,0) -- (2.55,0);
+  \node[anchor=west] at (2.65,1.45) {discarded};
+  \node[anchor=west] at (2.65,-1.35) {retained};
+\end{tikzpicture}
+\caption{Alternatives newer than the first-answer operation are pruned; failure after that operation can still reach an older caller alternative.}
+\label{fig:visual-341}
+\end{figure}
+
+\section{Negation Tests for Finite Failure}
+
+Prolog's \verb|\+ G| attempts \texttt{G}. The first success of \texttt{G} makes the test fail; finite failure of \texttt{G} makes the test succeed. If the attempt diverges, the test can diverge too. The test exports no bindings from \texttt{G}. It is not classical negation and does not enumerate the complement of a relation.
+
+\begin{verbatim}
+blocked(wasm).
+
+available(Target, Backend) :-
+    candidate(Target, Backend),
+    \+ blocked(Backend).
+\end{verbatim}
+
+Here all candidate facts are ground, so the negative goal probes a particular back end. The bare query \verb|?- \+ blocked(B).| fails because some back end is blocked. It does not yield \texttt{B} values other than \texttt{wasm}. Swapping the two body goals would change the executable behavior for an unbound \texttt{Backend}. The data also have to be complete for the intended policy: if an entry is missing because a configuration file was not read, treating absence as permission would be wrong.
+
+For this driver the complement is relative to the separately listed candidates. Adding \verb|blocked(llvm).| removes a previously available answer without touching the candidate facts. That is a nonmonotone policy, unlike the positive rules used for reachability later in this part. An alternative interface is to store explicit status facts when an unknown status must not be confused with permission. It can then distinguish ``blocked'', ``allowed'', and ``no status available'' without asking Prolog to infer a classical negative proposition.
+
+\section{Backtracking Does Not Rewind the Outside World}
+
+In SWI-Prolog, \verb|format/2| writes output immediately:
+
+\begin{verbatim}
+report_llvm(Target, Backend) :-
+    candidate(Target, Backend),
+    format('trying ~w~n', [Backend]),
+    Backend = llvm.
+\end{verbatim}
+
+For \verb|?- report_llvm(native, B).| it prints \texttt{trying c} and then \texttt{trying llvm}, even though only the latter branch returns an answer. Undoing a variable binding does not erase printed bytes. Running a side-effecting goal inside negation does not erase its effects either. A driver that wants a report only for the selected result should first obtain the result through a query without those effects, then report it once outside the search. Tests can check the answer substitution and the emitted log independently.
+
+The same boundary matters when a driver updates a configuration table: ordinary Prolog database updates do not automatically roll back on failure. Rather than using a failed branch to represent a dry run, compute a list of proposed changes as data. A caller can inspect or discard that list, or apply it after committing to a selected build plan.
+
+This gives a compiler driver a useful output discipline: search produces an inert plan, and a separate committed phase performs logging, file writes, or configuration updates exactly once.

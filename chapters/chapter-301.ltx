@@ -1,0 +1,73 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Start with What Is Already Executable}
+
+A normal program loader assumes that code can already run, memory has an established interpretation, and some mechanism supplies the bytes to load. Bootstrap loading supplies those prerequisites in stages. In Levine's account of early PC booting, firmware can start a small fixed-size disk bootstrap, but that bootstrap cannot contain the disk, configuration, executable-format, and memory-management support of a full operating system loader. Each stage can establish a slightly stronger contract for the next \cite[chapter~8]{levine2000linkers}. This is a description of a historical boot path, not a format requirement for x86 machines: for example, UEFI firmware can load a PE/COFF EFI application, not just a legacy boot-sector program.
+
+The important boundary is the handoff. A stage must know where it can place the next image, how the entry point is interpreted, and what stack, processor mode, and input metadata that entry expects. Even a header with a load address, a byte count, and an entry offset requires checking all three: a short read cannot establish the claimed initialized extent, and an entry offset outside the loaded code cannot begin the next stage. Passing a pointer to a memory map is also an ownership decision. If the next stage reuses its storage before reading it, the pointer is worthless even though its numerical value has not changed.
+
+There is a second, less literal bootstrap in a dynamically linked GNU/Linux process. The kernel already exists; it can map the program and the ELF interpreter designated by \texttt{PT\_INTERP}. The interpreter runs first, completes the required relocation and dependency work, and transfers toward the program's entry. Its earliest code cannot rely on symbolic references that only its own relocation will make usable \cite[chapter~10]{levine2000linkers}. The interpreter bootstraps the user's process, not the machine.
+
+\section{Overlays Give the Same Address Several Meanings}
+
+In the tree-structured overlay systems Levine describes, used on mainframes such as OS/360 and later by some DOS linkers, a program can be larger than the program memory available to it. Its root stays resident; different descendants can occupy the same address range at different times. A linker places code using its eventual memory address but gives each overlay its own location in the executable file. It records a descriptor with the file location, memory destination, length, and parent, and redirects downward calls through glue code to ensure that the callee's path is resident.
+
+This differs from demand paging. Two virtually distinct pages can share a physical frame at different times without changing the meaning of either virtual address. If overlays A and B use the same program address, by contrast, a raw pointer to that address cannot distinguish the two. A root-level descriptor identifying an overlay and an entry offset can make that distinction; a function pointer into an evictable overlay cannot safely be saved and invoked without ensuring the correct overlay is loaded. Mutable state that must survive an eviction belongs in resident storage, or must be explicitly saved and restored.
+
+% Annotated walkthrough
+\section{Switch Branches Only When the Stack Permits It}
+
+Consider a single-threaded teaching machine with a \(1024\)-byte code budget, disjoint from stack and resident data. The root occupies bytes \([0,256)\). Its children A and B start at \(256\) and occupy \(384\) and \(512\) bytes respectively. A's child C occupies \(256\) bytes starting at \(640\). With these placements the deepest path ends at \(896\), whereas separate storage for all four code bodies would take \(1408\) bytes. The linker has already relocated each body for its assigned address. The resident manager makes the switch; loading never overwrites its own text.
+
+\begin{verbatim}
+call_overlay(target):
+    if target.overlay in resident_path:
+        jump target.load_address + target.entry_offset
+    wanted = path(root, target.overlay)
+    prefix = common_prefix(resident_path, wanted)
+    victims = resident_path after prefix
+    # Include the return address of the current call.
+    require no live return PC belongs to any victim
+    forget victims                  # do not claim old bytes on error
+    for node in wanted after prefix:
+        copy_exactly(node.file_extent, node.load_address)
+        synchronize_instruction_fetch_if_needed(node)
+        append node to resident_path  # only after a successful copy
+    jump target.load_address + target.entry_offset
+\end{verbatim}
+
+From the root, a call to C at entry offset \(16\) loads A and then C, leaving execution to begin at address \(656\). Once that synchronous call returns to the root, a call from the root to B can discard A and C. B's bytes cover \([256,768)\), overwriting all of A and part of C. Even if some bytes of C happen to survive, none of C remains callable as a resident overlay.
+
+\Cref{fig:visual-301} compares the resident paths and the intervals that they overlay.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (root) at (0,0) {Root};
+  \node[ast node] (a) at (-1.25,-1.25) {A};
+  \node[ast node] (b) at (1.25,-1.25) {B};
+  \node[ast node] (c) at (-1.25,-2.5) {C};
+  \draw[tome arrow] (root.south west) -- (a.north);
+  \draw[tome arrow] (root.south east) -- (b.north);
+  \draw[tome arrow] (a) -- (c);
+  \node[anchor=west] at (3.5,0) {Resident intervals (bytes, schematic)};
+  \foreach \lev/\lo/\hi/\piece in {
+    -0.65/3.5/5.15/{Root},-0.65/5.15/7.8/{A},-0.65/7.8/10/{C},
+    -1.95/3.5/5.15/{Root},-1.95/5.15/8.9/{B}} {
+    \draw (\lo,\lev) rectangle (\hi,\lev-0.65);
+    \node at ({(\lo+\hi)/2},\lev-0.325) {\piece};
+  }
+  \foreach \x/\off in {3.5/0,5.15/256,7.8/640,10/896}
+    \node[anchor=north] at (\x,-1.33) {\off};
+  \foreach \x/\off in {3.5/0,5.15/256,8.9/768}
+    \node[anchor=north] at (\x,-2.63) {\off};
+  \draw[dashed] (8.9,-1.33) -- (8.9,-1.95);
+\end{tikzpicture}
+\caption{Each resident path contains the root. Switching from the A--C path to B overwrites all of A and the first 128 bytes of C, so neither overlay may still have a live return address.}
+\label{fig:visual-301}
+\end{figure}
+
+For a failure test, give C a normal returning call to B. It would replace code containing a live return address in C. A tree overlay linker should reject that cross-branch call; the resident-path check illustrates why. An upward call is different: the ancestor is already resident. But if it then tries to load another branch, it must still account for the suspended descendant's return address. The invariant is that each live return lands in the same code that was present when the call was made.
+
+The same capacity calculation yields different costs depending on execution order. Calling C twice from the root can reuse A and C after the first load. Calling C, then B, then C must load \(640+512+640=1792\) bytes, even though only \(896\) bytes are needed to accommodate any one path. This is why the overlay tree reflects the program's call patterns and not just its module sizes. Like the PLT, its glue mediates a transfer without changing the calling convention; unlike a PLT slot that remains bound, an overlay's residency can disappear after a different call.

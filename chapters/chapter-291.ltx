@@ -1,0 +1,67 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{Three descriptions of the same bytes}
+
+A relocatable ELF object describes its contents primarily as \emph{sections}. A compiler and assembler put instructions, constants, writable data, and bookkeeping into sections such as \texttt{.text}, \texttt{.rodata}, \texttt{.data}, and \texttt{.symtab}. The static linker combines input sections, places output sections, and constructs program headers describing the resulting \emph{segments}. A running process, in turn, has page-granular \emph{virtual mappings}. A segment is a request encoded in the file; a mapping is the address-space state that implements all or part of that request. Neither the line count in a memory map nor the count of sections tells us the number of loadable segments.
+
+Levine makes the distinction explicit in his description of ELF storage allocation \cite[chapter~4]{levine2000linkers}. His compact 32-bit example maps one file page twice, once for the end of text and once for the beginning of data, at different virtual addresses and with different permissions \cite[chapter~3]{levine2000linkers}. That is a possible layout, not a prescription for two segments or executable data. Current GNU toolchains on Linux commonly emit separate read-only, executable, and writable ranges. A single \texttt{PT\_LOAD} can contain several sections or bytes, such as the ELF header, that belong to no section. Conversely, nonallocated debugging sections need not appear in any mapping. The runtime linking metadata is also located through program headers, not through the section names printed by a file inspector \cite[chapter~10]{levine2000linkers}.
+
+\section{Offsets, addresses, and page permissions}
+
+In a loadable program header, \texttt{p\_offset} is a file offset; \texttt{p\_vaddr} is a link-time virtual address. Write $B$ for the load bias: a link-time address $v$ in this image corresponds to runtime address $B+v$. A conventional Linux \texttt{ET\_EXEC} main image uses its linked addresses, whereas a PIE can be \texttt{ET\_DYN} with a nonzero bias chosen at execution. Each loadable segment in a given image uses the same bias. Applying a different bias to each segment would break distances that the static linker already fixed.
+
+Let $F$ and $M$ be the file and memory sizes. ELF requires $F\leq M$. The first $F$ bytes come from the file; the remaining $M-F$ bytes start as zero. Loadable offsets and virtual addresses are congruent modulo the page size, as the AMD64 ABI's program-loading discussion explains. A nontrivial \texttt{p\_align} additionally specifies alignment as a power of two, with corresponding offset/address congruence. Rounding down the file and virtual starts therefore preserves the translation between initialized bytes. The \texttt{PF\_R}, \texttt{PF\_W}, and \texttt{PF\_X} flags describe requested permissions, applied by the operating system at page granularity; neighboring bytes on one virtual page cannot independently have different permissions.
+
+% Annotated walkthrough
+\section{Plan an initialized range and its zero tail}
+
+For a teaching model, take one writable load segment with $F>0$, $M>F$, a page-aligned bias, and no overlapping virtual pages. Validate file bounds and arithmetic before making the plan. Let \texttt{down} and \texttt{up} round to page boundaries; all ranges below are half-open. This models the result for the segment, not the order of Linux kernel calls.
+
+\begin{verbatim}
+o = p_offset; a = B + p_vaddr
+f = a + p_filesz; m = a + p_memsz
+require o mod page == a mod page   # preserve byte positions
+map [down(a), up(f)) privately from file offset down(o)
+clear [f, min(m, up(f)))           # discard unwanted file bytes
+map [up(f), up(m)) as zero pages   # no file payload for this part
+\end{verbatim}
+
+Use 4 KiB pages and hexadecimal values. Let $B=\texttt{0x400000}$, the file offset be \texttt{0x2800}, the link address be \texttt{0x3800}, and $F,M$ be \texttt{0x900}, \texttt{0x2500}. Both starts have low bits \texttt{0x800}. Map file pages starting at \texttt{0x2000} into \texttt{[0x403000,0x405000)}. The initialized bytes occupy \texttt{[0x403800,0x404100)}. Clearing the part-page interval ending at \texttt{0x405000} and adding a zero page up to \texttt{0x406000} supplies zeros through the logical end \texttt{0x405d00}, exclusive. The page-rounded padding beyond that end is not part of the segment's logical payload.
+
+For every initialized byte at offset $i<F$, the invariant is that runtime address $a+i$ has the original file byte at $o+i$ before program writes. Test the boundary with nonzero fixture bytes at file offsets \texttt{0x30ff} and \texttt{0x3100}: the first is preserved at \texttt{0x4040ff}; the second does not appear at \texttt{0x404100}, which must read as zero. The same file need not be changed on disk: a write to a private file-backed mapping can create a private copy of the page.
+
+\Cref{fig:visual-291} shows the logical segment laid over page-granular mappings in the teaching model.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=west] at (0,1.35) {Runtime address, hexadecimal (not to scale)};
+  \foreach \x/\addr in {0/403000,4/404000,8.1/405000,12/406000} {
+    \node at (\x,0.6) {\texttt{\addr}};
+    \draw (\x,0.34) -- (\x,-0.82);
+  }
+  \draw (0,0) -- (12,0) (0,-0.75) -- (12,-0.75);
+  \node at (2,-0.375) {Private file page};
+  \node at (6.05,-0.375) {Private file page};
+  \node at (10.05,-0.375) {Anonymous zero page};
+  \draw (2,-1.6) rectangle (4.9,-2.35);
+  \draw (4.9,-1.6) rectangle (8.1,-2.35);
+  \draw (8.1,-1.6) rectangle (11.1,-2.35);
+  \node at (3.45,-1.975) {Initialized};
+  \node at (6.5,-1.975) {Cleared};
+  \node at (9.6,-1.975) {Zero};
+  \foreach \x/\addr in {2/403800,4.9/404100,11.1/405d00}
+    \node[anchor=north] at (\x,-2.4) {\texttt{\addr}};
+  \draw[dashed] (8.1,-0.82) -- (8.1,-1.6);
+\end{tikzpicture}
+\caption{The segment's initialized bytes end partway into the second page. The loader must clear the rest of that page in this example; the final page also contains padding beyond the logical segment end.}
+\label{fig:visual-291}
+\end{figure}
+
+\section{Inspect a linker-produced image}
+
+Compile \texttt{unsigned char sample[8192];} together with \texttt{int main(void)\{return sample[0];\}} using \texttt{cc -fPIE -pie map.c -o map}. Use \texttt{readelf -SW map} for sections and \texttt{readelf -lW map} for program headers and their section-to-segment correspondence. Find \texttt{.bss} with type \texttt{NOBITS} and locate it in a writable \texttt{LOAD} whose memory size exceeds its file size. Do not expect the difference to equal exactly 8192: alignment and other zero-initialized objects can contribute. In a running process, a zero tail can split into a private file-backed part and an anonymous part, and later permission changes can further split a range. These are differences between views of one image, not evidence that the loader invented more sections.
+
+Mapping a range establishes what the process will observe when it accesses those addresses, not that every page has already been read. Demand paging can defer reads, and two processes mapping the same unmodified file bytes can share physical pages even when their virtual addresses differ.

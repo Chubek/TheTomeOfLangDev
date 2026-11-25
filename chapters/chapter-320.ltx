@@ -1,0 +1,67 @@
+% Source: handbook-of-sat.txt
+
+\section{Choose Evidence That Answers the Question}
+
+Simulation compares behavior on chosen traces. Property checking asks whether all behaviors in a model obey a specification. Equivalence compares two representations, not their correctness against an independent requirement. For example, synthesis can accurately preserve an RTL counter that saturates at the wrong value. Conversely a counter that meets its specification can differ from a reference's defined reset trace. Name the compared ports, the reset and unknown-state model, and the permissible input sequences before calling either result a pass.
+
+The \emph{Handbook of Satisfiability} distinguishes bounded model checking, which unfolds a transition relation for a chosen number of steps, from proof techniques such as induction. A bounded counterexample disproves the checked property under the model. No counterexample to depth \(k\) excludes only those modeled traces up to \(k\), unless another argument establishes completeness. Induction requires both a base case and a sufficiently strong step; strengthening a property can be necessary to exclude impossible states.
+
+% Annotated walkthrough
+\section{Check a Saturating Counter at Its Boundaries}
+
+The following IEEE SystemVerilog \cite{ieee1800systemverilog} uses a synchronous reset. All values of the three-bit counter fit in the specified state space \(0\) through \(7\).
+
+\begin{verbatim}
+module sat_count(input logic clk, rst, en,
+                 output logic [2:0] q);
+    always_ff @(posedge clk)
+        if (rst) q <= 3'd0;
+        else if (en && q != 3'd7) q <= q + 3'd1;
+endmodule
+\end{verbatim}
+
+An independent scoreboard pseudocode uses mathematical integers and separates sampling from evaluation:
+
+\begin{verbatim}
+require first sampled edge has reset asserted
+for each rising edge:
+    capture rst and en                # stimulus is already stable
+    if rst: expected = 0
+    else if en: expected = min(7, expected + 1)
+    wait until registered updates settle
+    compare q with expected           # unknown q also fails
+\end{verbatim}
+
+In an ordinary clocked simulation testbench one can drive \texttt{rst} and \texttt{en} at falling edges, then compare just before driving again at the following falling edge. This avoids racing a nonblocking register update at the rising edge. With reset followed by eight enabled edges, the expected visible values are \(0,1,2,3,4,5,6,7,7\). Also check a disabled edge at a nonsaturated value, reset while enabled, and a fresh sequence after reset. The eighth increment attempt distinguishes saturation from wraparound.
+
+One concurrent assertion, written in SystemVerilog inside a checker or bound module with these signals, reads:
+
+\begin{verbatim}
+assert property (@(posedge clk)
+    (!rst && en && q == 3'd7) |=> (q == 3'd7));
+\end{verbatim}
+
+The consequent is sampled on the next rising edge before that edge's updates; it observes the result of the antecedent edge. This property alone does not show that \(7\) is reachable or that any lower state increments. A cover property or the directed saturation test checks that the antecedent is exercised. A particular formal frontend may support only a subset of SVA; consult the \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/more_scripting/model_checking.html}{Yosys model-checking guide} for its own supported flow rather than assuming every simulator assertion can be read by every synthesizer.
+
+\section{Compare the Correct Level of Behavior}
+
+For a combinational miter, share the inputs and OR the XORs of corresponding outputs. If asking whether the miter can be true is unsatisfiable, the Boolean functions agree over the input domain represented in the model. A sequential miter also has state on both sides, as in \Cref{fig:visual-320}. Here an inductive relation to the scoreboard is \(q=e\), where \(e\) is the integer reference state and \(0\le e\le7\). Reset establishes it. Below \(7\), the enabled sum is at most \(7\), so the HDL's fixed-width addition cannot wrap; at \(7\) and on disabled edges both states hold. This relation proves agreement after any reset, not only along the directed tests.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (in) at (0,0) {Clock, reset, enable};
+  \node[tome box] (gold) at (4.05,0.9) {Integer reference\\state \(e\)};
+  \node[tome box] (gate) at (4.05,-0.9) {RTL or netlist\\state implementing \(q\)};
+  \node[tome box accent] (bad) at (8.35,0) {\(q\ne e\)?};
+  \draw[tome arrow] (in.east) -- (gold.west);
+  \draw[tome arrow] (in.east) -- (gate.west);
+  \draw[tome arrow] (gold.east) -- (bad.west);
+  \draw[tome arrow] (gate.east) -- (bad.west);
+\end{tikzpicture}
+\caption{A sequential comparison shares input history and checks an output relation after reset. Internal state need not use the same representation in both versions.}
+\label{fig:visual-320}
+\end{figure}
+
+An RTL-versus-mapped proof needs models for primitives, memory collision behavior, and relevant reset and initialization features. A retimed design can need a nontrivial state relation; a design with changed interface latency needs an explicitly realigned comparison. Abstracting a black box is sound only within its stated assumptions. Solver runtime, abstraction precision, and inadequate test coverage all limit the evidence. Finally, logical equivalence cannot rule out hold violations, electrical faults, or metastability. In particular, an equivalence miter treats a CDC synchronizer as ordinary Boolean state unless its clock and analog-resolution assumptions are modeled; it is not a CDC review. Keep timing, physical checks, and protocol verification as separate release criteria.

@@ -1,0 +1,101 @@
+% Source: dataflow-anaylsis-book-theory-practice.txt
+% Source: sca-pql-prog-query-lang.txt
+
+\section{Find a Dead Result Without Erasing a Live Effect}
+
+Compile the toy function below using an instruction-level control-flow graph (CFG). The parameters are an integer \(k\) and a boolean flag. Addition wraps, while division can trap on zero. The locals have no aliases and cannot be inspected from outside the function; normal returns and traps are observable. There are no exception handlers or callbacks. Our goal is to remove assignments whose values are dead without changing those observations.
+
+\begin{verbatim}
+10: x := 7
+20: y := x + 1
+30: t := 2
+40: q := 4 / k
+50: if flag goto 60 else goto 70
+60: return 0
+70: return 1
+\end{verbatim}
+
+The extractor supplies normal CFG edges, the variables an instruction reads and writes, and an independent \texttt{discardable} certificate. Here it issues the certificate only for assignments with a single fall-through successor, guaranteed to finish normally and to have no observable effects other than writing their one local result. In particular, it never certifies instruction \(40\). This is the same kind of extractor/consumer boundary that makes a declarative pass replaceable: change the extractor when target semantics change, and validate the assumptions made by the consumer. Khedker, Sanyal, and Karkare describe liveness as a backwards dataflow analysis; the certificate is an additional condition for removal, not part of liveness.
+
+\section{Compute Liveness Before Testing Absence}
+
+The executable Souffl\'e encoding uses number IDs for instruction sites and symbols for variables. The final negation reads the settled \texttt{live\_out} relation. Negation of \texttt{def} is also safe: it reads a fixed input relation, and the pair tested is bound by \texttt{live\_out}.
+
+\begin{verbatim}
+.decl edge(s:number, t:number)
+.decl use_at(s:number, v:symbol)
+.decl def(s:number, v:symbol)
+.decl discardable(s:number)
+.decl live_in(s:number, v:symbol)
+.decl live_out(s:number, v:symbol)
+.decl removable(s:number, v:symbol)
+.output live_out
+.output removable
+
+edge(10,20). edge(20,30). edge(30,40). edge(40,50).
+edge(50,60). edge(50,70).
+def(10,"x"). def(20,"y"). def(30,"t"). def(40,"q").
+use_at(20,"x"). use_at(40,"k"). use_at(50,"flag").
+discardable(10). discardable(20). discardable(30).
+
+live_in(S,V) :- use_at(S,V).
+live_out(S,V) :- edge(S,T), live_in(T,V).
+live_in(S,V) :- live_out(S,V), !def(S,V).
+removable(S,V) :- discardable(S), def(S,V), !live_out(S,V).
+\end{verbatim}
+
+In the baseline, the \texttt{live\_out} facts, grouped by instruction, are:
+
+\begin{verbatim}
+10: {"flag","k","x"}
+20: {"flag","k"}
+30: {"flag","k"}
+40: {"flag"}
+50,60,70: {}
+removable(20,"y"). removable(30,"t").
+\end{verbatim}
+
+Instruction \(20\) uses \(x\) even if \(y\) is subsequently unused. Instruction \(40\) reads \(k\), and has no live result \(q\), yet can still trap. Removing it would turn the call with \(k=0\) from a trap into a return. If the language supported local handlers, their CFG edges and use summaries would also need to be modeled. The fixed-input transfer \(U\cup(S\setminus D)\) is monotone in \(S\); the final absence test is not monotone in added live-out facts. It is therefore unsound to issue removal decisions from a partially saturated liveness relation.
+
+\Cref{fig:visual-351} marks which original CFG nodes the pass can remove, which it must retain, and where an edit can create a new use.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (x) at (0,0) {10: \texttt{x:=7}};
+  \node[tome box accent] (y) at (2.9,0) {20: \texttt{y:=x+1}};
+  \node[tome box accent] (t) at (5.8,0) {30: \texttt{t:=2}};
+  \node[tome box dark] (q) at (8.7,0) {40: \texttt{q:=4/k}};
+  \node[tome box] (b) at (8.7,-1.5) {50: flag?};
+  \node[tome box] (r) at (5.8,-3) {60: return 0};
+  \node[tome box] (s) at (8.7,-3) {70: return 1};
+  \draw[tome arrow] (x) -- (y);
+  \draw[tome arrow] (y) -- (t);
+  \draw[tome arrow] (t) -- (q);
+  \draw[tome arrow] (q) -- (b);
+  \draw[tome arrow] (b) -- (r);
+  \draw[tome arrow] (b) -- (s);
+\end{tikzpicture}
+\caption{The outlined assignments at 20 and 30 are removable in the initial snapshot. The dark division may trap; a new use at return 70 would make the result of 20 live.}
+\label{fig:visual-351}
+\end{figure}
+
+% Annotated walkthrough
+\section{Apply One Certified Rewrite, Then Repeat}
+
+\begin{verbatim}
+repeat:
+    facts := extract(current_ir)          # all rows from one snapshot
+    choices := run_to_completion(facts).removable
+    if choices is empty: stop
+    site := first_in_source_order(choices)
+    bypass(site)                         # reconnect predecessors
+    validate_cfg_and_entry()             # update entry if needed
+\end{verbatim}
+
+The first rewrite bypasses \(20\), so its use of \(x\) is no longer in the input. The next analysis emits \verb|removable(10,"x")| and \verb|removable(30,"t")|; eventually only \(40,50,60,70\) remain. Each successful rewrite removes an instruction, so the outer loop terminates for this finite IR. This loop is not the inner fixed point: a rewrite deletes facts and can change both the starting point and the transfer functions. For a direct end-to-end test, run the initial and final IR with both flag inputs at \(k=2\) (returns \(0\) or \(1\)) and at \(k=0\) (traps for both).
+
+As a second input, change instruction \(70\) to \texttt{return y}, adding \verb|use_at(70,"y").| to the original facts. Now \verb|live_out(20,"y")| holds because at least one successor path uses the value, and only \verb|removable(30,"t")| remains. With \(k=2\) and a false flag the result is \(8\), not \(1\). Compare the rule output with a simple backwards worklist on both snapshots. PQL demonstrates a different user of program facts: its authors translate a static approximation into Datalog for bddbddb and use analysis results to reduce runtime instrumentation. Our case study uses neither its query language nor its engine; the shared idea is to keep the evidence separate from the compiler action it permits.
+
+The optimizer's actionable output is therefore \texttt{removable} together with its extractor certificate and IR version, not liveness alone. Revalidate those inputs after each edit before emitting the rewritten function.

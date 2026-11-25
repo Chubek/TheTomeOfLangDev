@@ -1,0 +1,81 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{Keep the Coordinate Systems Separate}
+
+Levine distinguishes adjusting a target for its placement from resolving a reference to a symbol, and shows how a section symbol allows a linker to express both operations uniformly. His historical \texttt{a.out} examples have tentative segment bases in the input; they are not a recipe for decoding ELF records. For relinkable output, his key observation is that combining sections moves the relocation place within the new section and can change the representation of its target \cite[chapter~7]{levine2000linkers}.
+
+In an ELF relocatable object, the relocation's \verb|r_offset| is an offset in the section being patched. The symbol field indexes the associated symbol table, not the table of input sections. A section-defined symbol's value in this kind of object is also section-relative, but it is relative to \emph{its own} section. ELF \verb|RELA| stores the addend separately; for \verb|REL| the ABI tells the linker how to recover an implicit addend from the field. The \emph{System V AMD64 Architecture Processor Supplement}, Table 4.10 in the draft cited here, specifies $S+A-P$ for the four-byte \verb|R_X86_64_PC32| and $S+A$ for the eight-byte \verb|R_X86_64_64|. In the final static executable below, $S$ and $P$ are both virtual addresses and $A$ is a signed byte adjustment. The file offset of a field is not its $P$.
+
+\section{Rebase the Place and Preserve the Target Expression}
+
+If an input's field is at offset $p$ and that input section begins at offset $u$ in its new section, emit the record at $p'=u+p$. Independently, if a relocation names an input section symbol of value zero and its contribution starts at offset $v$ in the new target section, a reference expressed against the new section symbol needs $A'=A+v$. If the linker instead preserves an ordinary named symbol with its value adjusted by $v$, the addend should not also receive $v$. The two representations describe the same target; adjusting both counts the target movement twice. Preserve the relocation type unless there is a justified transformation. In particular a reference to an undefined symbol, or to a definition whose selection can change at the final link, cannot just be baked into the bytes because it happens to have a known value during a partial link.
+
+% Annotated walkthrough
+\section{Partial-Link a Data Displacement and a Pointer}
+
+Use these inputs with GNU \texttt{as} for x86-64 ELF. The displacement is relative to the field itself; this is a data convention and has no instruction-length bias.
+
+\begin{verbatim}
+# prefix.s: move the source and target contributions differently.
+.section .idx,"a",@progbits
+.space 0x0c
+.section .records,"a",@progbits
+.space 0x20
+
+# delta.s: offsets 5 and 9 in this input's .idx section.
+.section .idx,"a",@progbits
+.space 5
+.long .Lrecord + 3 - .      # Field start is the consumer's base.
+.quad .Lrecord + 3          # Same target, but no subtraction.
+.section .records,"a",@progbits
+.space 7
+.Lrecord: .space 8, 0x5a
+\end{verbatim}
+
+Assemble separately and inspect \verb|readelf -rW delta.o|. The section symbol \texttt{.records} has an addend of \verb|0xa| for both entries: seven to reach the record and three more to select a byte within it. Run \verb|ld.bfd -r -o packed.o| with \texttt{prefix.o} followed by \texttt{delta.o}. The place offsets in \texttt{.idx} should become \verb|0x11| and \verb|0x15|, respectively, while the addend becomes \verb|0x2a| for the rebased section symbol. Nothing here treats section-relative offset \verb|0x11| as the final virtual address of a field.
+
+Use this final placement script with \verb|ld.bfd -T delta.ld -o packed packed.o|, then link the two original inputs in the same order under the same script into a second image.
+
+\begin{verbatim}
+SECTIONS {
+  .records 0x407080 : { *(.records) }
+  .idx     0x407100 : { *(.idx) }
+}
+\end{verbatim}
+
+The relative entry now has $S=\mathtt{0x407080}$, $A=\mathtt{0x2a}$, and $P=\mathtt{0x407111}$. Thus $S+A-P=-\mathtt{0x67}$, encoded as \verb|99 ff ff ff| in little-endian. The absolute entry holds $S+A=\mathtt{0x4070aa}$, encoded as \verb|aa 70 40 00 00 00 00 00|. Compare the \texttt{.idx} bytes in both images with \verb|objdump -s -j .idx|; the input offset, intermediate offset, and final virtual address explain three views of the same field.
+
+\Cref{fig:visual-288} follows the four-byte field and its target through two independent coordinate conversions.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=3.9cm] at (3.45,0) {Place in \texttt{.idx}};
+  \node[tome box dark,minimum width=4.45cm] at (8.3,0) {Target in \texttt{.records}};
+  \node[anchor=east] at (1.1,-1.1) {Input};
+  \node[anchor=east] at (1.1,-2.65) {Partial};
+  \node[anchor=east] at (1.1,-4.2) {Final};
+  \node[tome box,minimum width=3.9cm] (p0) at (3.45,-1.1) {\texttt{0x05}};
+  \node[tome box,minimum width=3.9cm] (p1) at (3.45,-2.65) {\texttt{0x11}};
+  \node[tome box,minimum width=3.9cm] (p2) at (3.45,-4.2) {\(P=\texttt{0x407111}\)};
+  \node[tome box,minimum width=4.45cm] (t0) at (8.3,-1.1) {\(A=\texttt{0x0a}\)};
+  \node[tome box,minimum width=4.45cm] (t1) at (8.3,-2.65) {\(A'=\texttt{0x2a}\)};
+  \node[tome box,minimum width=4.45cm] (t2) at (8.3,-4.2) {\(S+A'=\texttt{0x4070aa}\)};
+  \draw[tome arrow] (p0) -- node[right] {+\texttt{0x0c}} (p1);
+  \draw[tome arrow] (t0) -- node[right] {+\texttt{0x20}} (t1);
+  \draw[tome arrow] (p1) -- node[right] {+\texttt{0x407100}} (p2);
+  \draw[tome arrow] (t1) -- node[right] {+\texttt{0x407080}} (t2);
+\end{tikzpicture}
+\caption{Offsets in separate sections receive different adjustments during the partial link. Only after placing both sections does the linker subtract \(P\) from the target to obtain the signed field value.}
+\label{fig:visual-288}
+\end{figure}
+
+\section{Test the Algebra, Not Just the Hex Dump}
+
+Raise both output section bases by \verb|0x1000| and repeat. $S$ and $P$ change by the same amount, so the relative field is unchanged and the absolute field increases by \verb|0x1000|. Instead, move \texttt{.records} to \verb|0x90000000| without moving \texttt{.idx}; the signed displacement exceeds the four-byte range and the final link must diagnose it. A partial object still carries information for that check; it has not promised a valid placement.
+
+The invariant is that, under equivalent final placement and binding, directly linking a retained relocation and routing it through a partial link evaluate to the same expression at the same final field. It is not a promise that arbitrary one-stage and two-stage link lines have identical layouts or admission decisions. The partial link can already have selected archive members, folded contributions together, or chosen a prevailing group. Compare explicit inputs and known section placements first so the test isolates coordinate conversion rather than those policy changes.
+
+In an implementation, this rebasing rule is a special case of mapping each input byte offset to its output offset. Concatenation with fixed padding gives one constant per contribution. If the linker merges individual string entries or rewrites instructions to new sizes, a constant may no longer suffice. Apply the source mapping to the field and the target mapping to the referenced location; do not assume the two mappings are identical just because the original references were both section-relative. GNU \texttt{ld}'s \verb|--emit-relocs| on a final executable can retain records for inspection or post-link tools; it does not turn the executable back into an \verb|ET_REL| input.

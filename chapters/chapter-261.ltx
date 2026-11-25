@@ -1,0 +1,62 @@
+%% chapter-261.ltx -- The Instruction Selection Problem
+% Source: blindel-instrselect-book.txt
+
+\section{What a selection must preserve}
+
+In \emph{Instruction Selection: Principles, Methods, and Applications}, Gabriel Hjort Blindell follows one function through three backend tasks: first choose instructions, then decide when they can execute, and finally assign their operands to machine registers (\cite[chapter~1, section~1.1]{blindell2016instruction}). These boundaries describe responsibilities rather than independent problems. A selected instruction can require two operands to share a register, which gives the allocator a constraint it did not have before. A selected sequence can also impose an order the scheduler cannot remove.
+
+The input to a selector has a contract. For a block region, specify the values available at entry, the values demanded at exit, and any effects the surrounding program can observe. In a pure arithmetic region this can be just a mapping between live values, with no traps or memory events. In a region that may fault or communicate with memory, comparing only returned data is insufficient: the target must preserve the relevant effects and the conditions under which control continues. A selected instruction need not resemble the IR operation syntactically. A single instruction can implement several IR operations; a single IR operation can also need several instructions.
+
+\section{Find candidates before comparing them}
+
+Blindell distinguishes \emph{pattern matching}, which finds the instructions applicable to parts of the IR, from \emph{pattern selection}, which decides on a combination of candidates (\cite[chapter~1, section~1.1.4]{blindell2016instruction}). For a given input, a candidate should identify the part it implements, the inputs and outputs at its boundary, and any remaining obligations. A structural match can name a promising form without settling those obligations: the opcode might require a target feature, a particular operand class, or a copy to satisfy a register tie. If an obligation cannot be met, the candidate is unavailable; increasing its estimated cost does not make it legal.
+
+Consider a target with flag-free instructions for eight-bit registers. The region computes a mask $r=\neg(x\mathbin{\oplus}y)$, with complementation limited to eight bits. The target can use a two-byte \texttt{XOR3} with a separate destination and a one-byte in-place \texttt{INV}. It also offers a two-byte \texttt{XNOR2 a,b} that overwrites \texttt{a} with the complemented XOR of the two old operands. The remaining instruction is a two-byte \texttt{COPY}. Assume enough registers for the described plans and no placement constraints except the destination ties; these forms have no other side effects. Both inputs are needed inside the region, but the continuation dictates whether either value may be overwritten.
+
+% Annotated walkthrough
+\section{Price a destructive match at the boundary}
+
+Suppose $x$ is initially in \texttt{A}, $y$ in \texttt{B}, and \texttt{C} is available. Compare the costs of complete plans, including any copy needed to keep an input live. Since XOR is commutative, the tied destination can use either input when that input dies. With both inputs live, merely swapping them cannot solve the problem.
+
+\begin{verbatim}
+Inputs: A = 0xD6, B = 0x3C.  Result required at exit.
+XOR3 C,A,B; INV C       # 2 + 1 bytes; preserve both inputs
+    C: 0xEA -> 0x15
+XNOR2 A,B               # 2 bytes; valid if old A is dead
+    A: 0xD6 -> 0x15
+COPY C,A; XNOR2 C,B     # 2 + 2 bytes; pay for the tie
+    C: 0xD6 -> 0x15
+\end{verbatim}
+
+The calculation uses \texttt{0xD6} XOR \texttt{0x3C} equal to \texttt{0xEA}; the eight-bit complement is \texttt{0x15}. In the case where $x$ dies, choose the two-byte plan over the three-byte plan. With both inputs live, choose the three-byte plan over the four-byte plan. In particular, a continuation that returns $x$ as well as $r$ is a negative test for the bare destructive match: it would return \texttt{0x15} in place of \texttt{0xD6}. The invariant is that every value demanded at the boundary, including a value that merely passes through the region, is available in its recorded location. A symbolic value match for $r$ alone does not establish that invariant.
+
+In a virtual-register backend, a destructive form can be represented by a tie between an input and an output, not by assigning register \texttt{A} immediately. Copies the selector expects to disappear may survive allocation; conversely, a dying source may let the allocator satisfy a tie without an emitted copy. Record which bytes are part of the selection and which depend on a later placement decision.
+
+\section{Say what the optimum is relative to}
+
+\Cref{fig:visual-261} compares code size only after checking whether each displayed plan preserves the required live values.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[font=\footnotesize] at (5.55,0.78) {Old \(x\) dies};
+  \node[font=\footnotesize] at (8.9,0.78) {Both inputs live};
+  \foreach \y/\plan/\cost in {0/{XOR3; INV}/3,-0.86/{XNOR2 A,B}/2,-1.72/{COPY; XNOR2 C,B}/4} {
+    \node[anchor=east,font=\footnotesize] at (4.1,\y) {\texttt{\plan}};
+    \draw[fill=TomeBgAlt] (4.4,\y-0.21) rectangle ({4.4+0.45*\cost},\y+0.21);
+    \node[anchor=west,font=\footnotesize] at ({4.4+0.45*\cost},\y) {\cost};
+  }
+  \foreach \y/\cost in {0/3,-1.72/4} {
+    \draw[fill=TomeBgAlt] (7.85,\y-0.21) rectangle ({7.85+0.45*\cost},\y+0.21);
+    \node[anchor=west,font=\footnotesize] at ({7.85+0.45*\cost},\y) {\cost};
+  }
+  \node[anchor=west,font=\footnotesize] at (7.85,-0.86) {Clobbers \(x\)};
+\end{tikzpicture}
+\caption{Encoded bytes for the three XNOR plans at the stated placements. The middle plan is unavailable, not merely expensive, when the continuation needs the old value in \texttt{A}.}
+\label{fig:visual-261}
+\end{figure}
+
+Blindell's definition of optimal selection fixes an instruction set and minimizes the sum of instruction costs among implementations. He makes two qualifications: the supported forms and IR representation limit what can be found, and costs may not compose additively when scheduling and allocation matter (\cite[chapter~1, section~1.2.2]{blindell2016instruction}). In the example, the claimed minima are over the displayed plans and the stated placements, measured in bytes before any other backend changes. A smaller plan may slow execution, and abundant scratch registers in the example do not justify assuming the same availability in a larger block.
+
+To compare selectors, hold target features and the input representation fixed and state which cost is optimized. Measure final bytes or execution separately from the selector's predicted score. Also compare against a legal baseline so that a failure to select does not masquerade as a cheap result. Chapter~\ref{ch:ext-263} starts with a baseline that handles one normalized operation at a time. Its speed comes from limiting the decision, not from solving the unrestricted optimization problem.

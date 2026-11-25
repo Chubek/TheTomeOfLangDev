@@ -1,0 +1,110 @@
+% Source: formal-defn-of-dataflow-graph-models.txt
+% Source: advances-in-dataflow.txt
+% Source: analysis-dataflow-programs.txt
+
+\section{A Cycle Needs an Initial Semantic Fact}
+
+A directed cycle is only topology. It can denote recurrence, a FIFO feedback path, mutually recursive demand, a cyclic spreadsheet error, or an instantaneous inconsistency. To execute a token-flow cycle, some actor often needs an initial token or delay; otherwise every actor may wait forever. In synchronous dataflow, rates and initial tokens determine whether a periodic admissible schedule exists \cite{lee1987sdf}.
+
+Consider this small feedback-region notation:
+
+\begin{verbatim}
+region @accumulate(%input) {
+  %old = delay %next initial(0)
+  %next = add %old, %input
+  yield %next
+}
+\end{verbatim}
+
+The \texttt{delay} means the first output is \(0\), and subsequent outputs are prior \texttt{\%next} values. Replacing it with an ordinary identity creates an instantaneous cycle, not an optimized recurrence. Tagged-token models may allow multiple activations on an arc; FIFO models order tokens; demand graphs memoize values by context. Those choices belong in the IR.
+
+\section{Regions Give Cycles Interfaces and Ownership}
+
+A graph region has typed inputs and outputs, internal nodes and edges, and a declared execution model. Backedges carry delay count, initial values, FIFO order, tag space, or demand context as applicable. Region boundaries identify which state is private and which effects cross outward. Strongly connected components are analysis results, not automatically schedulable loop bodies.
+
+\Cref{fig:visual-378} shows the feedback token that makes the first addition ready.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (in) at (0,0) {input token};
+  \node[tome box dark] (add) at (3.2,0) {add};
+  \node[tome box] (out) at (6.4,0) {output token};
+  \node[tome box accent] (delay) at (3.2,-1.7) {delay\\initial 0};
+  \draw[tome arrow] (in) -- (add);
+  \draw[tome arrow] (add) -- (out);
+  \draw[tome arrow] (add) -- (delay);
+  \draw[tome arrow] (delay) -- (add);
+\end{tikzpicture}
+\caption{The delay owns one initial token and breaks instantaneous dependence; each later feedback token carries the preceding sum.}
+\label{fig:visual-378}
+\end{figure}
+
+Compiler artifacts may include region schedules, initial-token tables, buffer capacities, state layouts, deadlock diagnostics, and runtime code for dynamic SCCs. A cycle report should identify the edges and missing semantic resource rather than merely saying ``graph is cyclic.''
+
+% Annotated walkthrough
+\section{Analyze a Feedback Region Before Scheduling It}
+
+\begin{verbatim}
+sccs := strongly_connected_components(region.graph)
+for scc in sccs:
+    classify each backedge by FIFO, delay, tag, or demand semantics
+    reject unsupported instantaneous cycles
+    solve rate balance and simulate readiness from initial tokens
+    derive periodic schedule and peak occupancy when possible
+    otherwise emit dynamic scheduler with explicit blocking checks
+\end{verbatim}
+
+Retiming a delay, rotating a periodic schedule, or fusing actors inside a cycle can be legal, but only if initial values, token order, latency observations, and effects are preserved. Removing an apparently redundant buffer can introduce deadlock. Increasing capacity is usually behavior-preserving for unobservable internal FIFOs in deterministic networks, but can alter scheduling and externally visible races in a nondeterministic model.
+
+Validation checks that every scheduled firing has its required tokens, that a period restores occupancy, and that the first outputs agree with initial-state semantics. Differential tests emphasize empty input, the first few firings, wraparound between periods, and bounded-buffer backpressure. For demand graphs, validation compares memo keys and cycle detection instead of pretending tokens exist. Preservation is parameterized by the region's model of computation.
+
+\section{Check That a Delayed Value Is Read Before Its Replacement}
+
+Run the accumulation region with inputs \(3,5,-2\). The region's output at each firing is the newly computed sum, while the delay's output inside that firing is the previous sum. A lowering that returns the delay's output at the boundary instead of the yielded value will produce \(0,3,8\) rather than \(3,8,6\). Both traces are reasonable feedback programs, but only one implements this particular region.
+
+\begin{center}
+\begin{tabular}{crrr}
+\hline
+Firing & Old delay & Region input & Yield and next delay \\
+\hline
+0 & 0 & 3 & 3 \\
+1 & 3 & 5 & 8 \\
+2 & 8 & -2 & 6 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+try_region_step(input, output, state):
+    if not has_input(input): return BLOCKED
+    if not can_accept(output): return BLOCKED
+    old := state.delay
+    item := peek(input)
+    next := old + item
+    commit_composite_step(pop(input), publish(output, next),
+                          write_delay(state, next))
+    return FIRED
+\end{verbatim}
+
+Here commit denotes staged operations, not eager arguments to an ordinary call. A bounded runtime must treat the entire logical firing as committed once, even if the host uses separate instructions. If a write to the output cannot occur, the logical delay must remain untouched. Test by stalling the consumer after the first firing and retrying with item \(5\). The second accepted output stays \(8\), not \(13\). Also test a clone of the region: its delay starts at zero, rather than inheriting the most recent result of a different region instance. The recurrence therefore constrains both scheduling and state ownership.
+
+\section{Do Not Turn an Initial Token Into a Region Argument}
+
+A region argument is supplied on each invocation. An initial
+delay token is supplied once per instance or reset. Conflating
+the two produces an accumulator that always adds its input to zero,
+which passes the first firing from the table but fails every
+nontrivial continuation. Classify boundary values by lifetime:
+constant for the instance, supplied for this firing, or inherited
+from the previous committed state.
+
+If the scheduler batches two firings together, model the second
+copy as reading the first copy's next delay. The mathematical
+recurrence is unchanged even though the target stores that
+intermediate value only temporarily. An external consumer may
+still be entitled to observe both outputs, so only batch across
+a boundary that permits both firings and both publications.
+These checks prevent representation changes from erasing the
+distinction between a carried dependency and an ordinary input.

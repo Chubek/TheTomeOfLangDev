@@ -1,0 +1,121 @@
+% Source: finkel-advanced-proglang-design.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: dataflow-graphs-program.txt
+
+\section{A Cell Formula Defines a Dependency, Not a Command}
+
+In a spreadsheet, changing an input cell causes dependent formulas to be recalculated. Finkel observes that the internal representation resembles a dataflow graph, while the grid-oriented programming language differs sharply from an ordered text of commands. Consider this small sheet:
+
+\begin{verbatim}
+A2: 12
+B2: =A2*1.20
+C2: =IF(B2>10, "high", "low")
+D2: =SUM(A2:A10)
+\end{verbatim}
+
+\texttt{B2} depends on \texttt{A2}; \texttt{C2} depends on \texttt{B2}; \texttt{D2} depends on a range whose membership can change if rows are inserted. Recalculation order may differ as long as pure formulas observe a consistent dependency state. Volatile functions, external data, macros, iterative circular calculation, and errors complicate that claim. A spreadsheet is reactive, but it is not automatically a pure deterministic dataflow language \cite{blackwell2001spreadsheet}.
+
+\section{Make References and Invalidations First-Class}
+
+A spreadsheet IR should give every cell and formula occurrence a stable identity. Formula nodes retain relative, absolute, and mixed references rather than prematurely converting all references to coordinates; copy and insertion semantics depend on those forms. Range nodes, dynamic lookup, volatility, error values, locale-sensitive parsing, spill arrays, and external effects also need explicit representation. The dependency graph is derived from resolved references and may include conservative dynamic edges.
+
+\Cref{fig:visual-370} distinguishes dependency reachability from the smaller dirty set after an edit.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (0,0) {\texttt{A2} edited};
+  \node[tome box] (b) at (3,0) {\texttt{B2}};
+  \node[tome box] (c) at (6,0) {\texttt{C2}};
+  \node[tome box accent] (d) at (3,-1.5) {\texttt{D2} range sum};
+  \node[tome box] (z) at (6,-1.5) {unrelated cell};
+  \draw[tome arrow] (a) -- (b);
+  \draw[tome arrow] (b) -- (c);
+  \draw[tome arrow] (a) -- (d);
+  \draw[tome dashed] (d) -- (z);
+\end{tikzpicture}
+\caption{Only transitive dependents of the edit become dirty; the dashed nondependency must not trigger needless recomputation.}
+\label{fig:visual-370}
+\end{figure}
+
+The compiler or runtime can emit a recalculation plan, cached cell values, dependency and reverse-dependency indexes, diagnostics for cycles, and provenance explaining each value. For an interactive system, the invalidation index is as important an output artifact as generated code.
+
+% Annotated walkthrough
+\section{Recalculate a Pure Acyclic Slice}
+
+\begin{verbatim}
+changed := commit_user_edits_with_new_version()
+dirty := transitive_reverse_dependencies(changed)
+order := topological_order(induced_graph(dirty))
+for cell in order:
+    args := read_values_from_committed_version(cell.dependencies)
+    new[cell] := evaluate_formula(cell, args)
+publish new values atomically with dependency-version stamps
+\end{verbatim}
+
+Constant folding and algebraic simplification are legal under the spreadsheet's numeric, date, blank, and error rules. Common subexpressions may be shared when evaluation is pure and error/volatility behavior agrees. Incrementalization may skip a dependent if both its dependency identities and values are unchanged, but not if it is volatile or observes time, randomness, external state, or evaluation count. Reordering effectful user functions is unsafe.
+
+Validation reparses emitted formulas, checks that each reference resolves as before under copy and structural edits, and compares cell values and error codes against full recalculation. For circular models, the artifact must retain the configured iteration order, tolerance, and limit; topological evaluation is then inapplicable. Provenance should name source cells and versions so a cached value cannot silently survive a changed workbook. Preservation means the same visible grid and ordered external effects under the declared recalculation policy, not the same internal visit order.
+
+\section{Invalidate Across a Formula Edit, Not Just a Value Edit}
+
+Start with \(A1=2\), \(A2=3\), \(B1=A1\), and \(C1=2B1\). Edit \texttt{B1} to reference \texttt{A2}, then change the two input cells separately. Updating only the cached value of \texttt{B1} is not enough: a later edit of \texttt{A2} must reach it, and the old edge from \texttt{A1} must not remain in the reverse dependency index. Assume pure formulas and recalculate the affected acyclic slice on a consistent staged snapshot.
+
+\begin{center}
+\begin{tabular}{lrrl}
+\hline
+Edit & B1 & C1 & Cells to reevaluate \\
+\hline
+B1 references A2 & 3 & 6 & B1, C1 \\
+A1 becomes 9 & 3 & 6 & neither B1 nor C1 \\
+A2 becomes 4 & 4 & 8 & B1, C1 \\
+\hline
+\end{tabular}
+\end{center}
+
+The reverse-dependency index follows the direction of the arrows in \Cref{fig:visual-370-a}: an edit travels from a referenced cell toward the formulas that read it.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a1) at (-3,1) {\texttt{A1}};
+  \node[tome box accent] (a2) at (-3,-1) {\texttt{A2}};
+  \node[tome box dark] (b1) at (0,0) {\texttt{B1}};
+  \node[tome box] (c1) at (3,0) {\texttt{C1}};
+  \draw[tome dashed] (a1) -- node[above,sloped]{remove} (b1);
+  \draw[tome arrow] (a2) -- node[below,sloped]{add} (b1);
+  \draw[tome arrow] (b1) -- (c1);
+\end{tikzpicture}
+\caption{Replacing a formula removes one reverse-dependency edge and adds another. The dependent of \texttt{B1} stays connected across both versions.}
+\label{fig:visual-370-a}
+\end{figure}
+
+\begin{verbatim}
+replace_formula(cell, formula, workbook):
+    staged := begin_version(workbook)
+    old := staged.direct_dependencies(cell)
+    new := resolve_static_references(formula, at=cell)
+    for dep in old - new: remove_reverse_edge(dep, cell, staged)
+    for dep in new - old: add_reverse_edge(dep, cell, staged)
+    staged.install_formula_and_dependencies(cell, formula, new)
+    dirty := {cell} union descendants(cell, staged)
+    recalculate_or_apply_cycle_policy(dirty, staged)
+    publish(staged)
+\end{verbatim}
+
+This sketch uses static references only. A formula that computes an address needs a runtime dependency record or a conservative invalidation strategy. If recalculation discovers new edges, revalidate affected caches before publishing the version. Test both the grid and the index: the stale-edge bug can produce correct values while causing extra recalculation, whereas a missing new edge silently produces an obsolete value. Comparing against full recalculation after each edit, including the unrelated edit, distinguishes the two failures.
+
+\paragraph{Batch edits that would otherwise create a transient cycle.}
+Suppose \(A1\) references \(B1\), and \(B1\) is a literal. A user's
+batch makes \(A1\) literal and \(B1\) reference \(A1\). The committed
+graph is acyclic in both versions, but applying the new \(B1\) formula
+first would temporarily produce a cycle. Build a staged graph from
+the whole batch and apply the cycle policy only to the graph that will
+be evaluated. The transactions used by the editor need not coincide
+with the formula engine's node-by-node internal updates. Include a
+control fixture that changes only \(B1\): there the resulting cycle is
+real and must be diagnosed or handled by the configured iteration
+policy. This pair of tests catches a checker that either rejects
+valid edits prematurely or suppresses all cycle diagnostics.

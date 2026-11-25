@@ -1,0 +1,65 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{Find an object, then find a definition}
+
+The loader's file search answers which object supplies each dependency name. Symbol search answers which eligible definition satisfies a reference from one of the mapped objects. These are separate operations. Seeing a library in a dependency list does not mean that every unqualified symbol in that library is bound to it. Levine explains the historical ELF model as a chain of per-object symbol tables rather than a freshly merged run-time table \cite[chapter~10]{levine2000linkers}. The tables can be searched efficiently with per-object hashes. A hash only finds candidates within an object; it cannot say which candidate wins between objects.
+
+At runtime the dynamic linker obtains symbol data from \texttt{PT\_DYNAMIC} and its tags. \texttt{DT\_SYMTAB} and \texttt{DT\_STRTAB} denote the dynamic symbol and string tables, commonly represented as sections named \texttt{.dynsym} and \texttt{.dynstr}. The ordinary \texttt{.symtab} can contain private or diagnostic information and may be absent without affecting dynamic lookup. Current GNU/Linux objects can use a GNU hash table as well as or instead of the classic System V hash table in Levine's account. The lookup key can also include a symbol version. A name match is insufficient when the reference requires a particular version.
+
+\section{Scope belongs to a reference}
+
+A search scope is an ordered set of objects considered for a given operation. For a simple glibc startup with no special policies, the base global scope begins with the main program and lists dependencies in breadth-first order. They are visited in the order of the dependency lists at each depth, with duplicates suppressed. Not every operation searches this same list. A normal \texttt{dlsym} call with a handle returned by \texttt{dlopen} searches the named object and its dependency tree breadth-first. A newly loaded local group need not contribute its definitions to the global search list used by unrelated objects. The term \texttt{RTLD\_LOCAL} concerns visibility to other objects, not isolation or a restriction on what code in that group can do.
+
+Under normal lookup rules, a default-visible definition in a shared library may be preempted, even for an internal use of its public name. Hidden symbols, in contrast, do not supply definitions to other objects and references to a library's own hidden definitions need no external search. Protected visibility permits an export while requiring references inside the defining object to bind there. These are reasons to build a small public interface; no amount of hash acceleration compensates for unintentionally publishing an internal helper's name.
+
+% Annotated walkthrough
+\section{Trace an ordered lookup and a failed match}
+
+Model ordinary startup resolution for a graph in which the main image needs A then B and A needs C. Assume all candidates in the table are ordinary global definitions, any unrelated system libraries provide none of these names, and this reference requires the version \texttt{METER\_1}.
+
+\begin{verbatim}
+for obj in [main, A, B, C]:       # breadth-first, not recursive DFS
+    for def in hash_candidates(obj, "meter_read"):
+        if def.name != "meter_read": continue
+        if not defined_visible_version_1(def): continue
+        return obj.bias + def.value  # use the provider's bias
+report unresolved required symbol
+\end{verbatim}
+
+Let A export \texttt{meter\_read} only at \texttt{METER\_2}. Let B and C each export \texttt{meter\_read} at \texttt{METER\_1}. With B's bias \texttt{0x71000000} and linked symbol value \texttt{0x1230}, the startup lookup returns \texttt{0x71001230}. A depth-first traversal would reach C before B and get the wrong answer. C at bias \texttt{0x72000000} with value \texttt{0x1480} would return \texttt{0x72001480} instead. Test the invariant that a lookup returns the earliest eligible definition in \emph{its own} scope: removing B's eligible export causes selection of C, and removing C's as well causes a required lookup to fail. This deliberately simple fixture does not model weak undefined references or GNU-specific symbol types; in particular, an unresolved weak reference can instead have a zero symbol value.
+
+\Cref{fig:visual-296} distinguishes the dependency branches from the order in which candidate definitions are considered.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (m) at (0,0) {Main};
+  \node[tome box] (a) at (-1.25,-1.2) {A};
+  \node[tome box] (b) at (1.25,-1.2) {B};
+  \node[tome box] (c) at (-1.25,-2.4) {C};
+  \draw[tome arrow] (m.south west) -- (a.north);
+  \draw[tome arrow] (m.south east) -- (b.north);
+  \draw[tome arrow] (a) -- (c);
+  \draw[dashed] (2.75,0.46) -- (2.75,-3.1);
+  \node[anchor=west,font=\sffamily\small\bfseries] at (3.05,0.34)
+    {Scope order for \texttt{meter\_read@METER\_1}};
+  \foreach \lev/\desc in {-0.45/{1.\ Main: no definition},
+    -1.1/{2.\ A: wrong version},
+    -1.75/{3.\ B: return \texttt{0x71001230}},
+    -2.4/{4.\ C: not reached}} {
+    \node[anchor=west] at (3.05,\lev) {\desc};
+  }
+\end{tikzpicture}
+\caption{Breadth-first lookup considers both direct dependencies before C. A's version mismatch does not make its child C the next object to search.}
+\label{fig:visual-296}
+\end{figure}
+
+In a local GNU ELF test, keep the \texttt{METER\_1} version node present in B while removing its \texttt{meter\_read} export. If the executable recorded a version requirement from B, removing the node could trigger a dependency version error before name lookup runs. Keeping a separate export in that node isolates the lookup test.
+
+\section{Binding time changes when failure is observed}
+
+Levine traces a classic i386 PLT path in which an unresolved jump slot calls the linker with enough information to identify the referencing image and relocation. The x86-64 ABI supplement gives its own sequence, with RIP-relative slot access. Conceptually, the resolver consults the proper scope, updates the slot, and transfers control to the resolved target. A subsequent call can use the slot without repeating the search. The selection rules and the time of selection are different concerns. Eager binding, requested for example through the GNU linker's \texttt{-z now}, resolves applicable PLT slots before handing control to the program; a deferred unresolved call can instead fail at first use. Do not infer that all dynamic references can be lazy: ordinary data addresses must already be available to the code that reads them.
+
+When a locally built library returns an unexpected result, first verify the mapped dependency identity, then inspect its exported name, binding, visibility, and version with \texttt{readelf --dyn-syms -W} and \texttt{readelf -VW}. Compare the search you expected with the reference's actual scope. A missing definition, an out-of-scope definition, and a version mismatch can all defeat lookup, but they imply different fixes.

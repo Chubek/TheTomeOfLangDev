@@ -1,0 +1,100 @@
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: analysis-dataflow-programs.txt
+
+\section{Bounding a Queue Changes When a Write Can Finish}
+
+\Cref{ch:ext-355} gives processes blocking reads and semantically unbounded FIFO channels. The survey by Johnston, Hanna, and Millar describes the mismatch between unbounded arcs and finite token storage and notes that the implementation can deadlock where the abstract model would not \cite{johnston2004dataflow}. This matters after \Cref{ch:ext-381}: a valid streaming specialization can still be embedded in a runtime that introduces a new wait. A capacity bound needs a justification for the chosen schedule or an explicit change to the source contract.
+
+\section{Diagnose a Deadlock Introduced by Capacity One}
+
+Use two single-producer, single-consumer channels, \texttt{data} and \texttt{ready}. A producer writes \(7\) and \(9\) to \texttt{data} and then writes a marker to \texttt{ready}. The consumer reads the marker first and then reads two data values. This program is not polling either channel. The producer can finish its writes on unbounded channels regardless of when the consumer first tries to read. With one data slot and ordinary blocking writes, the producer cannot enqueue \(9\). The consumer cannot read \(7\) until the producer publishes the marker. Making the marker queue larger does not help; at deadlock it is empty.
+
+\Cref{fig:visual-384} distinguishes the waits from the data transfer edges: a write waits for space, and a read waits for a token. This cycle follows from the concrete process positions and capacities, not from the existence of a cycle in the static actor graph. In fact both of the program's data channels point in the same direction.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (p) at (-3,0) {Producer\\blocked on write};
+  \node[tome box accent] (c) at (3,0) {Consumer\\blocked on read};
+  \draw[tome arrow] (p.north east) to[bend left=32]
+    node[above]{needs space in \texttt{data}} (c.north west);
+  \draw[tome arrow] (c.south west) to[bend left=32]
+    node[below]{needs token on \texttt{ready}} (p.south east);
+\end{tikzpicture}
+\caption{With one data slot, each process waits for an operation that only the other can perform.}
+\label{fig:visual-384}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+Data slots & Producer position & Consumer position & Outcome \\
+\hline
+1 & Second write blocked & Marker read blocked & Deadlock \\
+2 & Marker can be written & Marker can be read & Progress \\
+Unbounded & No write blocks & Marker can be read & Progress \\
+\hline
+\end{tabular}
+\end{center}
+
+Two slots suffice for these finite, one-shot processes when the marker queue has one slot and scheduling is fair. Do not infer that the same capacities suffice for every loop built around the same body. A producer permitted to start another batch before the consumer finishes the current one introduces different reachable occupancies. Analyze the loop or design a batch protocol that provides the missing bound.
+
+% Annotated walkthrough
+\section{Replay a Chosen Schedule With a Bound}
+
+For a fixed schedule over a closed fixture, record a peak, then replay with the proposed allocation. Reject a step if its precondition fails instead of quietly deferring it and accepting a different schedule. The proof is then about this order of atomic operations, not all possible process interleavings.
+
+\begin{verbatim}
+replay(operations, capacity):
+    queues := empty_queues()
+    peak := zero_per_channel()
+    for operation in operations:
+        q := queues[operation.channel]
+        if operation is Write(value):
+            if q.count >= capacity[q.id]:
+                return BlockedWrite(operation, q.count)
+            q.push(value)
+            peak[q.id] := max(peak[q.id], q.count)
+        else if operation is Read(expected):
+            if q.empty(): return BlockedRead(operation)
+            require q.pop() == expected
+    return peak
+\end{verbatim}
+
+In the successful replay, the writes to \texttt{data} precede the marker write, then the marker read precedes both data reads. The peak vector is two data tokens and one marker. Order matters more than the sum of peaks: swapping those capacities still blocks the second data write. If the implementation can schedule dynamically, explore reachable states with the intended capacities and collect states where unfinished processes cannot step. Include externally blocked states in the result, but distinguish them from internal deadlock by identifying which external event could make progress possible. Bounded exploration of a finite fixture is evidence for that fixture, not for arbitrary programs.
+
+\section{Choose What Backpressure Means at the Boundary}
+
+A strictly synchronous driver might prevent the next external arrival until the consumer acknowledges the current batch. A continuous producer may instead require a capacity proof, a documented drop policy, or memory that can grow. Dropping or reordering data is not a transparent implementation of unbounded FIFO semantics. A library that exposes backpressure can make it part of its API; clients then reason about which events must drain buffers and what a failed write means. Test both progress and the transferred sequence \(7,9\), including a stalled consumer. Success on small queues is not just reaching termination: it is reaching termination with the promised observations intact.
+
+\section{Explore Schedule Choices for the Finite Fixture}
+
+The replay accepts one schedule. For the finite processes above we
+can do more: enumerate every reachable pair of instruction pointers
+and queue contents under each allocation. The initial state has empty
+queues and both processes at their first instruction. A successor
+advances just one enabled process. Retain concrete queue contents in
+the state so the same exploration can check the consumer's reads.
+
+\begin{verbatim}
+visit(state):
+    if state in seen: return
+    add state to seen
+    if all processes complete:
+        require state.consumer_values == [7, 9]
+        return
+    next := legal_one_process_steps(state)
+    if next is empty:
+        report_stuck(state, blocked_operations(state))
+    for successor in next:
+        visit(successor)
+\end{verbatim}
+
+With capacity one, the stuck state has exactly one queued value, no
+marker and neither process at completion. With capacity two, every
+nonterminal state of this fixture has at least one legal successor.
+There are no cycles because the instruction pointers only move
+forward. The same test for a looping network also needs a progress
+criterion: a run can continue forever without delivering a required
+output. A deadlock-free result alone would not rule that out.

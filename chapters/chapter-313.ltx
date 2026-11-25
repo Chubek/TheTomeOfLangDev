@@ -1,0 +1,78 @@
+% Source: ir-il-for-datapath-gen.txt
+% Source: vienna-arch-desc-lang.txt
+
+\section{Elaboration Makes the Circuit Finite}
+
+A hardware description language can describe a circuit, a simulation environment, or both. Register-transfer level (RTL) names a level of description, not a file extension: it specifies what state is stored, when it changes, and how combinational logic computes the next state. A synthesizable VHDL architecture and a synthesizable SystemVerilog module can describe the same RTL. A testbench with explicit time delays can be legal HDL without describing any circuit the synthesis tool can build.
+
+Elaboration resolves the top-level design, binds instances, evaluates parameters or generics, expands constant-bound generate constructs, and determines widths and types. A generate loop creates multiple instances once; a clocked counter changes state every time its clock arrives. Similarly, a bounded loop in a combinational process can describe many copies of logic, not a series of clock cycles. To perform one iteration per clock, the RTL must express the iteration state, or a higher-level compiler must schedule it and emit that state.
+
+Kasprzyk and colleagues' datapath-generation paper proposes a data-flow-controlled SSA variant for hardware generation from C. It makes data dependencies and predicates available together, for instance when deciding which definition supplies an operand. That is upstream of ordinary RTL synthesis: a compiler must still decide where values live across clock edges. The Vienna Architecture Description Language makes a related division at a different level: its ISA and microarchitecture descriptions can drive both cycle-accurate simulation and synthesizable HDL generation. The emitted HDL is an input to a further hardware flow, not evidence that an implementation has been physically realized.
+
+% Annotated walkthrough
+\section{Trace a Clocked Assignment into a Feedback Path}
+
+This is IEEE SystemVerilog \cite{ieee1800systemverilog}; the fragment is also within the subset of the Yosys Verilog frontend selected by \texttt{read\_verilog -sv}.
+
+\begin{verbatim}
+module acc #(parameter integer W = 4) (
+    input  logic clk, rst, en,
+    input  logic [W-1:0] x,
+    output logic [W-1:0] q
+);
+    always_ff @(posedge clk)
+        if (rst)     q <= '0;
+        else if (en) q <= q + x;
+endmodule
+\end{verbatim}
+
+The following lowering pseudocode is a semantic model, not an HDL frontend implementation:
+
+\begin{verbatim}
+bind W to the instance parameter       # require W >= 1
+old = register_output(q)              # read pre-edge state
+sum = truncate_W(old + x)             # overflow is discarded
+held_or_sum = mux(en, sum, old)        # no assignment means hold
+d = mux(rst, zero_W, held_or_sum)      # reset wins over enable
+connect_register(q, d, rising(clk))   # commit once at the edge
+\end{verbatim}
+
+With \(W=4\), \(q=13\), \(x=6\) and \(\texttt{en}=1\), the next value is \(19\bmod16=3\), unless \texttt{rst} is asserted, in which case it is zero. With neither control asserted it remains \(13\). The nonblocking assignment reads the previous state; it does not feed the sum back repeatedly during the same edge. An enable without an assignment is intentional here. The same omission in a process meant to be combinational can require a latch, because the output still has to remember something.
+
+\Cref{fig:visual-313} isolates the two choices ahead of the register. A later pass may absorb them into the register representation, but the priority is observable at the interface.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (add) at (0,0) {\(q+x\)};
+  \node[tome box] (en) at (2.8,0) {Enable mux};
+  \node[tome box] (rst) at (5.6,0) {Reset mux};
+  \node[tome box dark] (reg) at (8.4,0) {Register \(q\)};
+  \draw[tome arrow] (add) -- (en);
+  \draw[tome arrow] (en) -- (rst);
+  \draw[tome arrow] (rst) -- (reg);
+  \draw[tome arrow] (reg.south) -- ++(0,-1) -| (add.south);
+  \draw[tome arrow] (2.8,-1.4) -- node[right] {\(q\) when disabled} (en.south);
+  \draw[tome arrow] (5.6,1) -- node[right] {zero on reset} (rst.north);
+\end{tikzpicture}
+\caption{The enable selects the sum or old state. The synchronous reset has the last choice of the value captured at the rising edge.}
+\label{fig:visual-313}
+\end{figure}
+
+\section{Inspect the Intermediate Artifact}
+
+With the example saved as \texttt{acc.sv}, these are Yosys script commands:
+
+\begin{verbatim}
+read_verilog -sv acc.sv
+hierarchy -check -top acc
+proc
+opt
+stat
+write_rtlil acc.rtlil
+\end{verbatim}
+
+The \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/using_yosys/synthesis/proc.html}{Yosys documentation on process conversion} distinguishes extraction of multiplexers and flip-flops from later optimization. Here the output is RTLIL with connectivity and word-level cells, not a target netlist. Inspect the cell parameters for width, reset polarity and priority: the resulting register may have explicit reset and enable ports rather than two separate mux cells. The important test is what survives at the pins, not whether the normalized graph matches the drawing node for node.
+
+Different boundaries answer different questions. In VHDL-2008 \cite{ieee10762008}, the \href{https://ghdl.github.io/ghdl/using/InvokingGHDL.html}{GHDL invocation guide} distinguishes analysis, elaboration and execution; for a supplied testbench named \texttt{tb}, \verb|ghdl -a --std=08 tb.vhd| and \verb|ghdl -r --std=08 tb| analyze and simulate, not map logic to a device. In synthesis, technology mapping chooses real primitives or standard cells. Placement and routing come after that choice; a logical netlist has no routed delay or pin assignment by itself. No default optimization pass can decide to retain a fifth carry bit or insert another externally visible cycle without changing this design's contract. Diagnose the width and edge behavior before arguing about how fast a particular implementation can run.

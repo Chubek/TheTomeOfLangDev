@@ -1,0 +1,63 @@
+%% chapter-263.ltx -- Macro Expansion and Table-Driven Emission
+% Source: blindel-instrselect-book.txt
+
+\section{Expand an operation with a known interface}
+
+In Blindell's account of macro expansion, a selector traverses a program, matches a template, and invokes the associated macro on the match. The simplest implementations select the first applicable template. Early systems took strings or source trees, but moving the interface to an intermediate representation let the expander handle the same operation independently of which frontend produced it. Blindell describes Wilcox's PL/C compiler as mapping source language machine instructions to one or more target instructions using macros (\cite[chapter~2, sections~2.1--2.2.1]{blindell2016instruction}). A macro here is an emission procedure or recipe, not a source-language text substitution.
+
+In a small compiler, start by normalizing the IR so that each admitted operation has a known fallback. Let one operation be \texttt{store8(addr,v)} on a toy target. The IR has already placed \texttt{addr} in a general virtual register. Its value operand is either a literal byte or a general virtual register whose low eight bits are to be stored. This obligation comes from the IR type and operation, not from the machine's cheapest instruction. Each expansion must issue exactly one byte store to the given address and preserve the fault behavior of that store. Temporary registers are private and the instruction that materializes a byte neither affects flags nor faults.
+
+\section{Index a table by an operand signature}
+
+The target provides a two-byte \texttt{STB} that stores a register's low byte, a two-byte \texttt{MOV8} that places a literal byte in a full register, and an optional two-byte \texttt{STN} that stores a zero-extended four-bit unsigned immediate. A literal such as \texttt{0xE0} belongs to the fallback, not the compact form. The distinction is checked at compile time: \texttt{STN} has no encoding for that literal.
+
+Blindell describes Lowry and Medlock's Fortran H compiler as matching bit strings called \emph{coding skeletons}, whose bits express mode restrictions and whose wildcard bits permit either value (\cite[chapter~2, section~2.2.3]{blindell2016instruction}). A direct modern analog for this toy case is a signature with three bits: $I$ for a literal byte, $F$ for a literal fitting in four unsigned bits, and $C$ for the target feature that enables \texttt{STN}. For registers, $F$ is always zero; the compiler is not trying to predict the register's runtime contents. In a larger expander the opcode can select a group of rows, while these bits select the recipe within that group. Neither the row nor the signature has to hold the actual address or byte.
+
+% Annotated walkthrough
+\section{Generate the rows and trace dispatch}
+
+An ordered list of mask/value pairs can serve as the specification for a direct dispatch table. A row matches exactly when \verb|(key & mask) == value|. Generate the table by trying the pairs in source order on each valid signature. Keep the temporary allocation in the recipe, and invoke only the selected recipe on the original operands.
+
+\begin{verbatim}
+key = (I << 2) | (F << 1) | C
+mask value recipe                   # first applicable row wins
+111  111   STN [addr],v              # compact form needs both guards
+100  100   MOV8 t,v; STB [addr],t   # t is fresh, not the address
+100  000   STB [addr],v
+
+0x0E, feature on:   111 -> STN                  2 bytes
+0xE0, feature on:   101 -> MOV8; STB            4 bytes
+0x0E, feature off:  110 -> MOV8; STB            4 bytes
+register, feature on: 001 -> STB               2 bytes
+\end{verbatim}
+
+For key \texttt{101}, masking with \texttt{111} keeps \texttt{101}, so the first row fails. Masking with \texttt{100} gives \texttt{100}, so the literal fallback succeeds. At runtime it stores \texttt{0xE0}, not the \texttt{0x00} that would result from truncating the literal to four bits. Swapping the first and second rows still produces the right value for key \texttt{111} but selects four bytes instead of two. A table-generation test should catch this shadowing, independently of a test of semantic correctness.
+
+The invariant is that every admitted key selects an encodable recipe that stores exactly the required byte and does not overwrite the address before the access. Test generation over all six admitted keys, and reject \texttt{010} and \texttt{011}: a register operand cannot have the literal-fit bit set. Also compare the two legal paths on a faulting address: both perform the same one attempted store and report the same store fault, with no new observation from the private temporary.
+
+\section{Keep the fast path small}
+
+\Cref{fig:visual-263} shows the literal half of the generated table. Either missing guard sends a literal to the same fallback.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram, recipe/.style={tome box,text width=3.15cm}]
+  \node[recipe] (k100) at (0,0) {\texttt{100}\\Neither guard};
+  \node[recipe] (k101) at (4.05,0) {\texttt{101}\\Feature only};
+  \node[recipe] (k110) at (0,-1.75) {\texttt{110}\\Fit only};
+  \node[recipe] (k111) at (4.05,-1.75) {\texttt{111}\\Fit and feature};
+  \node[recipe] (wide) at (0,-3.75) {\texttt{MOV8; STB}\\4 bytes};
+  \node[recipe] (short) at (4.05,-3.75) {\texttt{STN}\\2 bytes};
+  \draw[tome arrow] (k100.west)--(-2.55,0)|-(wide.west);
+  \draw[tome arrow] (k101.west)--(2.025,0)|-([yshift=2mm]wide.east);
+  \draw[tome arrow] (k110)--(wide);
+  \draw[tome arrow] (k111)--(short);
+\end{tikzpicture}
+\caption{With \(I=1\), only signature \texttt{111} selects the immediate store. A register operand takes the separate \texttt{STB} row.}
+\label{fig:visual-263}
+\end{figure}
+
+The generated table can hold recipe IDs rather than duplicate emitter code. For $k$ Boolean signature tests a flat array has $2^k$ slots, so an opcode with many sparse tests may be better served by ordered rows or a small decision tree. To test a generator, compare its table entries with an independent linear scan of the ordered rules; to test the rules themselves, compare the emitted behavior to the IR. An unsupported opcode or an impossible signature is a compiler error, not permission to silently omit the operation.
+
+Blindell notes that naive expanders were limited principally by visiting one node at a time, not by an inability to dispatch faster (\cite[chapter~2, sections~2.2.3--2.2.4]{blindell2016instruction}). The table in this example cannot tell whether the producer of a register argument and the store could merge, because the producer is absent from its key. More context could be added, but ad hoc state shared between macros can invite backtracking and make coverage harder to audit. Chapter~\ref{ch:ext-264} shows another design: emit a legal baseline, then combine compatible effects across a bounded window.

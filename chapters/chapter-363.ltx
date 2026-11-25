@@ -1,0 +1,104 @@
+% Source: sync-funprog-in-lucid.txt
+% Source: leroy-a-verif-cc-compiler-backend-for-lustre.txt
+
+\section{Relate Clocks Instead of Choosing One Master}
+
+SIGNAL's polychronous model describes values and relations among the instants at which signals are present. Components need not begin with one universal clock. Equations constrain clock equality, subclocking, union, and exclusion; compilation solves those relations and may discover several independent clock domains. A feasible implementation still needs communication protocols where domains interact.
+
+This differs from treating absence as a stored boolean flag at every global tick. A signal has values only on its clock. The \texttt{when} operator samples on a condition's true occurrences, \texttt{default} combines signals by presence priority, and delay carries the previous present value on its relevant clock.
+
+\section{State Clock Relations in SIGNAL Syntax}
+
+A representative SIGNAL process samples and retains values:
+
+\begin{verbatim}
+process SAMPLE =
+  (? integer x; boolean c;
+   ! integer y; integer held; )
+  (| y := x when c
+   | held := x $ init 0
+   | x ^= c
+  |)
+where
+end;
+\end{verbatim}
+
+The clock-equality relation \texttt{x \^{}= c} requires \texttt{x} and \texttt{c} to be present together; \texttt{y} is present only when that shared-clock condition is true. The delay for \texttt{held} advances on occurrences of \texttt{x}, not on an invented faster master clock. \Cref{fig:visual-363} shows the derived clock inclusion.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (cx) at (-3,0) {\(\widehat{x}=\widehat{c}\)};
+  \node[tome box] (test) at (0,0) {\(c=\texttt{true}\)};
+  \node[tome box accent] (cy) at (3,0) {\(\widehat{y}=\widehat{x}\,[c]\)};
+  \node[tome box] (h) at (0,-1.7) {\(\widehat{held}=\widehat{x}\)};
+  \draw[tome arrow] (cx) -- (test);
+  \draw[tome arrow] (test) -- (cy);
+  \draw[tome arrow] (cx) -- (h);
+\end{tikzpicture}
+\caption{The sampled output clock is a true-conditioned subclock of the shared \(x/c\) clock; the delayed signal follows \(x\)'s occurrences.}
+\label{fig:visual-363}
+\end{figure}
+
+% Annotated walkthrough
+\section{Solve Before Scheduling}
+
+\begin{verbatim}
+constraints := collect_clock_relations(equations)
+classes := unify_clock_equalities(constraints)
+derive_subclock_and_exclusion_relations(classes)
+if relations are inconsistent: reject program
+partition equations into clock domains
+for each domain:
+    schedule instantaneous dependencies
+insert protocol only at a proven cross-domain relation
+\end{verbatim}
+
+Clock solving establishes when equations may react. It does not impose a total order between independent domains, and an arbitrary total order must not become externally observable.
+
+\section{Keep Polychrony in the IR}
+
+The IR should contain relation/operator nodes and signal-dependency edges, delay state with initialization, symbolic clock variables and solved equality/subclock relations, value types and effects, and source provenance for equations and inferred constraints. Rates may be unknown or nonperiodic; do not replace clock relations by numeric frequencies unless separately proved. Compilation can produce clock-guarded C tasks, a multiclock circuit, or a distributed schedule plus synchronization code.
+
+Legal optimizations include fusing clock-equivalent equations, removing redundant clock tests after proof, and running independent domains in parallel. Semantic-preservation risks include assigning a total order that changes effect order, sampling on condition presence rather than truth, advancing delay on absent instants, and crossing domains without buffering. Preservation requires the same partial-clock traces and relation constraints, not merely the same values after resampling everything onto a convenient test clock.
+
+\section{Build a Trace With Both Absence and Falsehood}
+
+The equality \verb|x ^= c| requires \texttt{x} and \texttt{c} to be present together. The clock of \texttt{y} is smaller: it selects only those occurrences of \texttt{c} whose value is true. The clock of \texttt{held} is that of \texttt{x}; it reports the previous present input rather than holding a value out on a wire at all instants. A test fixture may express these constraints in rows without claiming that independent domains share a physical clock.
+
+\begin{center}
+\begin{tabular}{crlrr}
+\hline
+Fixture row & x & c & y & held \\
+\hline
+0 & 8 & false & --- & 0 \\
+1 & --- & absent & --- & --- \\
+2 & 11 & true & 11 & 8 \\
+3 & 14 & false & --- & 11 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+presence := present(x)
+require presence == present(c)
+if not presence:
+    emit(Absent, Absent)
+else:
+    old := memory
+    sampled := Present(x.value) if c.value else Absent
+    emit(sampled, Present(old))
+    memory := x.value
+\end{verbatim}
+
+Initialize \texttt{memory} to zero. At row 0 the selector is false, but memory advances because its own clock occurs. At row 1 neither equation advances. Both rows yield an absent \texttt{y}; inspecting \texttt{held} distinguishes their effects. At row 2 the returned delay must still be \(8\). A mistaken lowering that updates memory before emitting the delayed value instead prints \(11\). A fixture that repeatedly sends the same number cannot detect that ordering error.
+
+In a wider SIGNAL process the solver may find independent clock classes. A backend that puts everything into one host loop can simulate each class with explicit presence flags, but it must not introduce extra relations just because the flags are available simultaneously in the host. If external IO ties two classes together, put the corresponding synchronization in the boundary contract and test it there.
+
+\paragraph{Validate an inconsistent input separately.}
+Give the harness a row with \texttt{x} present but \texttt{c} absent.
+It violates the declared equality; substituting false for the absent
+value would hide the configuration error and advance the delay anyway.
+For static connections, report the two equated clocks and the boundary
+facts that conflict. For dynamic inputs, retain a check at admission.

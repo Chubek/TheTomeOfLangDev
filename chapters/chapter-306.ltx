@@ -1,0 +1,89 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Shape Is Decided Before Simulation Time}
+
+Elaboration converts already analyzed design units into a specific design instance. It resolves constants, binds instances, expands generate constructs, and determines the types and widths of their connections. Simulation begins with that design and advances signals through time. Synthesis reduces and maps the design for a target. A tool can combine these operations internally, but the concepts are distinct: one can inspect an elaborated design without knowing which physical cells will implement it.
+
+Himmelbauer and colleagues' \emph{The Vienna Architecture Description Language} distinguishes reusable specification mechanisms and generated deliverables, including synthesizable HDL \cite{himmelbauer2024vadl}. An upstream generator can emit a whole HDL design with a chosen microarchitecture, but it can also leave parameters for the downstream HDL elaborator. Changing such a parameter is a new build of the hardware, not a command issued to a running instance.
+
+Parameters therefore describe a family of designs. A port declares what a member of that family can receive or produce while it operates. Documentation belongs at both levels: for a parameter, specify its permitted values and what changes with it; for a port, describe its protocol, timing, and validity. A local parameter can express an invariant derived inside the module, whereas a public parameter invites the instantiating design to choose a value. Treat publicly supported configurations as separate verification cases rather than assuming that the defaults stand for all of them.
+
+\section{Generate a Wire Path or a Register Bank}
+
+These SystemVerilog modules (IEEE 1800-2023) use a constant conditional generate and a generate loop \cite{ieee1800systemverilog}. They are simulatable and use ordinary synthesizable RTL. The design contract is \verb|W >= 1|; SystemVerilog packed ranges with reversed bounds do not represent an empty vector. Neither module specifies a reset or a defined power-up value for the registered taps.
+
+\begin{verbatim}
+module tap #(
+    parameter int W = 8,
+    parameter bit REGISTERED = 1'b0
+) (
+    input  wire         clk,
+    input  wire [W-1:0] d,
+    output wire [W-1:0] q
+);
+    if (REGISTERED) begin : g_reg
+        for (genvar i = 0; i < W; i++) begin : g_lane
+            logic sample;
+            always_ff @(posedge clk) sample <= d[i];
+            assign q[i] = sample;
+        end
+    end else begin : g_direct
+        assign q = d;
+    end
+endmodule
+
+module two_taps (
+    input  wire       clk,
+    input  wire [2:0] d3,
+    input  wire [4:0] d5,
+    output wire [2:0] q3,
+    output wire [4:0] q5
+);
+    tap #(.W(3)) u_direct (.clk(clk), .d(d3), .q(q3));
+    tap #(.W(5), .REGISTERED(1'b1))
+        u_reg (.clk(clk), .d(d5), .q(q5));
+endmodule
+\end{verbatim}
+
+The unselected branch contributes neither a driver nor any structure. Each iteration of \verb|g_lane| introduces a scoped declaration and process; for example, its highest index in the five-bit specialization is \verb|u_reg.g_reg.g_lane[4].sample|. The index is fixed for that instance. No register increments it at run time. The unused \texttt{clk} port of the direct tap remains part of its declared interface despite having no effect on its result.
+
+\Cref{fig:visual-306} shows what differs between instances even before optimization or technology mapping.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (top) at (0,0) {\texttt{two\_taps}};
+  \node[tome box] (left) at (-2.8,-1.55) {\texttt{u\_direct}\\\(W=3,\ R=0\)};
+  \node[tome box] (right) at (2.8,-1.55) {\texttt{u\_reg}\\\(W=5,\ R=1\)};
+  \node[tome box accent] (wires) at (-2.8,-3.05) {\texttt{g\_direct}\\three connected bits};
+  \node[tome box accent] (lanes) at (2.8,-3.05) {\texttt{g\_reg.g\_lane[0..4]}\\five clocked processes};
+  \draw[tome arrow] (top) -- (left);
+  \draw[tome arrow] (top) -- (right);
+  \draw[tome arrow] (left) -- (wires);
+  \draw[tome arrow] (right) -- (lanes);
+\end{tikzpicture}
+\caption{Two instances specialize the same module differently. \(R\) denotes \texttt{REGISTERED}; neither instance contains the other instance's generate branch.}
+\label{fig:visual-306}
+\end{figure}
+
+% Annotated walkthrough
+\section{Inspect Elaboration, Then Check Behavior}
+
+\begin{verbatim}
+choose top two_taps
+for each tap instance:
+    substitute that instance's W and REGISTERED
+    constrain d and q to W bits       # shape before behavior
+    keep exactly one generate branch
+    if REGISTERED:
+        create W indexed lane scopes  # independent concurrent work
+check that q3 follows d3 after settling
+check that q5 changes after a rising edge, then holds
+\end{verbatim}
+
+One can read the file in SystemVerilog mode and use the Yosys \href{https://yosyshq.readthedocs.io/projects/yosys/en/latest/cmd/index_passes_hierarchy.html#cmd-hierarchy}{\texttt{hierarchy} pass} with \verb|-check -top two_taps| to select and check a root and derive the parameterized variants. The tool's internal names need not match the spelling of every source scope; subsequent lowering or flattening can erase entire boundaries. Inspect one result before process lowering to understand specialization and another after lowering to understand register inference. A mapper can also replace the five individual bit registers with an equivalent vector register or target-specific storage primitive. Neither representation alone predicts cell count after optimizations, routing, or timing.
+
+Replacing \verb|if (REGISTERED)| with a generate condition that reads an input port is illegal: the required condition is constant during elaboration. If the functional requirement is run-time selection between direct and captured data, describe both paths and a run-time mux. That circuit contains state even in direct mode, and switching modes requires its own timing and data-validity contract.
+
+Do not confuse a generate loop with every other HDL loop. A procedural loop with constant bounds inside a clocked block can assign an entire bank on one edge; it does not imply an extra clock per iteration. But it does not create named scopes for separately instantiated modules and processes as this generate loop does. Conversely, to process one lane per cycle with a shared resource, describe the changing index as actual register state, provide phase or completion logic, and specify when results become available. That is a third design, not another spelling of the same hardware.

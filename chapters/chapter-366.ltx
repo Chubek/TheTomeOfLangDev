@@ -1,0 +1,111 @@
+% Source: finkel-advanced-proglang-design.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+
+\section{Expose Parallelism Through Values}
+
+Val and its descendant SISAL use single-assignment, side-effect-free values to expose independent work. Arrays are values rather than collections of independently mutable cells. A parallel loop can construct array elements or reduce contributions without alias races; a recurrence loop instead creates new loop-parameter bindings from the previous iteration. SISAL extended this family with recursion, streams, and richer loop forms \cite{feo1990sisal}.
+
+Parallel syntax does not promise unlimited simultaneous hardware. It states independence and a result-combination rule; a compiler may chunk, vectorize, distribute, or sequentialize iterations. Reduction order needs particular care. Associativity in mathematical reals does not make machine floating-point addition associative.
+
+\section{Construct and Reduce in a Val \texttt{forall}}
+
+This Val-style loop returns a tuple containing a sum and an array:
+
+\begin{verbatim}
+forall i in [1, 100] do
+  area: real := width[i] * height[i];
+  okay: Boolean := acceptable(area);
+  accumulate + if okay then area else 0.0 end;
+  construct if okay then area else 0.0 end;
+end
+\end{verbatim}
+
+Each iteration binds its own \texttt{i}, \texttt{area}, and \texttt{okay}. \texttt{construct} fixes array position by iteration identity; \texttt{accumulate +} declares a combining operation. A SISAL compiler can represent similar loops as parallel graph regions and apply array storage optimizations while preserving value semantics. \Cref{fig:visual-366} separates independent production from the merge.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (range) at (0,0) {indices \(1\ldots100\)};
+  \node[tome box] (i1) at (-3,-1.5) {iteration 1};
+  \node[tome box] (i2) at (0,-1.5) {iteration 2};
+  \node[tome box] (in) at (3,-1.5) {iteration 100};
+  \node[tome box accent] (arr) at (-1.8,-3.1) {array construct};
+  \node[tome box accent] (red) at (1.8,-3.1) {reduction tree};
+  \draw[tome arrow] (range) -- (i1);
+  \draw[tome arrow] (range) -- (i2);
+  \draw[tome arrow] (range) -- (in);
+  \draw[tome arrow] (i1) -- (arr);
+  \draw[tome arrow] (i2) -- (arr);
+  \draw[tome arrow] (in) -- (arr);
+  \draw[tome arrow] (i1) -- (red);
+  \draw[tome arrow] (i2) -- (red);
+  \draw[tome arrow] (in) -- (red);
+\end{tikzpicture}
+\caption{Iteration bodies are independent. Array construction preserves index identity, while reduction uses an explicitly chosen combination structure.}
+\label{fig:visual-366}
+\end{figure}
+
+% Annotated walkthrough
+\section{Lower a Parallel Loop Region}
+
+\begin{verbatim}
+region := create_parallel_region(index_range)
+for each body binding:
+    create typed single-assignment node in region
+array_result := gather_by_index(region.contributions)
+reduction_result := reduce(region.terms, declared_operator,
+                           required_numeric_order)
+analyze_array_uniqueness_and_last_use()
+choose sequential, vector, threaded, or distributed schedule
+\end{verbatim}
+
+The chosen schedule is not embedded in the source value graph. If the language fixes only an associative reduction and the operator truly satisfies that contract, a tree is legal; otherwise the IR must retain a required order.
+
+\section{Reuse Arrays Without Exposing Mutation}
+
+The IR should contain operation, loop-region, gather, and reduction nodes; value, index, and recurrence edges; explicit loop-carried state; iteration domains and any rates; array shapes and element types; numeric and I/O effects; and provenance from generated nodes to loop clauses. Compilation can produce vector loops, fork--join tasks, distributed kernels, or ordinary machine code with preallocated arrays.
+
+Legal optimizations include fusion, loop interchange, tiling, vectorization, and in-place array reuse when dependence, bounds, exception behavior, and uniqueness proofs permit them. Semantic-preservation risks include racing two contributions to one index, retaining an alias to overwritten storage, changing which error is observed, and reassociating floating-point sums. Preserve returned arrays elementwise and reductions under the language's numeric contract; physical mutation is acceptable only while observationally implementing immutable values.
+
+\section{Give the Gather and the Reduction Different Orders}
+
+Use a four-iteration slice of the loop and accept only nonnegative areas. For widths \([2,-1,4,1]\) and heights \([3,5,2,1]\), the contribution array is \([6,0,8,1]\) and the total is \(15\). A worker may finish iteration 3 first without moving its value to array slot 1. Waiting for all contributions and indexing the gather by source iteration makes that distinction explicit.
+
+\begin{center}
+\begin{tabular}{crrr}
+\hline
+Iteration & Area & Contribution & Arrival position in one run \\
+\hline
+1 & 6 & 6 & 3 \\
+2 & -5 & 0 & 2 \\
+3 & 8 & 8 & 1 \\
+4 & 1 & 1 & 4 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+parallel for i in legal_index_range:
+    value := contribution(width[i], height[i])
+    results[i] := value
+join_all_workers()
+total := identity
+for i in legal_index_range_in_source_order:
+    total := numeric_add(total, results[i])
+return (freeze(results), total)
+\end{verbatim}
+
+Even if a source reduction requires left-to-right floating-point addition, the contributions can be computed in parallel when the computations are pure and total. A tree reduction is a separate transformation. For example, on typical binary floating-point numbers \((10^{20}+(-10^{20}))+1\) retains \(1\), while \(10^{20}+((-10^{20})+1)\) yields zero. If reassociation is permitted, a balanced tree can reduce span; otherwise keep the specified reduction order. Include a zero-length range in the tests if the source permits it. The gather must be empty and the reduction must follow the specified empty-case rule; an implementation must not read the first array element to obtain a seed when there are none.
+
+\paragraph{Prove ownership of destination slices.}
+For a contiguous index range and ordinary element storage, partition
+the result into disjoint index intervals and allow each worker to write
+only its interval. That proof does not carry over to arbitrary views.
+If two logical indices map to one byte range, or two Boolean elements
+are packed into the same machine word, logical disjointness may not
+give independent physical writes. Lower packed construction by staging
+private results and packing afterward, or partition by whole storage
+words. For the four-iteration fixture, check the result both with one
+worker and with one worker per contribution; each logical index must
+be initialized exactly once before the array becomes visible.

@@ -1,0 +1,78 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{An Archive Is a Set of Candidates}
+
+An object named directly on the link line participates whether or not someone currently needs one of its definitions. A static archive normally participates selectively. Its index maps exported names to the positions of members that can define them; an index entry is not a definition in the link until the corresponding object is actually admitted. Levine describes both the older \verb|__.SYMDEF| directory and the symbol directory used for COFF and ELF-style Unix archives, then emphasizes that admission must register an entire object's symbols. A member can introduce new requirements as readily as it satisfies an old one \cite[chapter~6]{levine2000linkers}. Today \verb|ar rcs| creates or updates a normal indexed archive, and \verb|nm -s| can display its index.
+
+Distinguish choosing a library file from choosing a member in that file. \verb|-L| lists search directories, and \verb|-lpaint| asks the linker to find a suitable library file under its naming and search rules. With GNU ELF linking, a shared \texttt{libpaint.so} is normally preferred over \texttt{libpaint.a} within a search directory in dynamic search mode. Using explicit \texttt{.a} paths isolates member selection from that choice. Archive extraction is not the runtime search for a shared object and is not controlled by options governing shared-object dependencies such as \verb|--as-needed|.
+
+\section{Two Different Boundaries for Repeated Search}
+
+Levine describes older linkers that could even miss a backward dependency \emph{within} an archive, and explains why ordering members with tools such as \texttt{lorder} and \texttt{tsort} was useful. For a normal indexed archive on a GNU \verb|ld.bfd| link line, extraction can satisfy further demands that admitted members introduce within that archive. When the linker moves past the archive, however, a demand appearing later on the command line does not ordinarily reopen it. Repeating the archive or putting several archives within \verb|--start-group| and \verb|--end-group| expands the scope of the search. A group is repeatedly searched until it produces no more extractions, not until the whole link has no undefined symbols.
+
+This command-line policy is not a law of ELF. ELF LLD remembers earlier archive candidates and can satisfy later demands from them. Its \href{https://lld.llvm.org/ELF/warn_backrefs.html}{\texttt{--warn-backrefs} documentation} discusses both failure on GNU linkers and the more subtle possibility that both links succeed but choose different providers. Treat an order that happens to work on one linker as a test result, not as proof that two link commands are equivalent.
+
+% Annotated walkthrough
+\section{Trace a Library Cycle by Member}
+
+Write four small C files. All symbols except the program entry in this example return or combine local integer constants; no external package is needed.
+
+\begin{verbatim}
+/* main.c: the initial demand is paint, not binder. */
+int paint(void);
+int main(void) { return paint() != 12; }
+
+/* paint.c: extracting this member adds demand for pigment. */
+int pigment(void);
+int paint(void) { return pigment() + 2; }
+
+/* pigment.c: this is the edge back into the first archive. */
+int binder(void);
+int pigment(void) { return binder() + 3; }
+
+/* binder.c: a separate member, not admitted with paint.o. */
+int binder(void) { return 7; }
+\end{verbatim}
+
+Compile all four sources with \verb|gcc -O0 -c|. Then create the indexed archives and try the ordinary one-pass command line:
+
+\begin{verbatim}
+ar rcs libpaint.a binder.o paint.o
+ar rcs libpigment.a pigment.o
+gcc -fuse-ld=bfd -Wl,-Map=paint.map -o paint \
+  main.o libpaint.a libpigment.a
+\end{verbatim}
+
+Restrict the trace to the three fixture names: \texttt{main.o} first needs \texttt{paint}, so the first archive admits \texttt{paint.o}, introducing a demand for \texttt{pigment}. The second admits \texttt{pigment.o}, leaving \texttt{binder} undefined when the search ends. Swapping the archives does not help: now \texttt{libpigment.a} is searched before there is any need for its member.
+
+\Cref{fig:visual-286} shows which demand crosses back into an archive the GNU link has already passed.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node at (0,0.85) {Explicit input};
+  \node at (3.65,0.85) {First: \texttt{libpaint.a}};
+  \node at (8,0.85) {Second: \texttt{libpigment.a}};
+  \node[tome box] (m) at (0,0) {\texttt{main.o}};
+  \node[tome box] (p) at (3.65,0) {\texttt{paint.o}};
+  \node[tome box] (g) at (8,0) {\texttt{pigment.o}};
+  \node[tome box] (b) at (3.65,-1.55) {\texttt{binder.o}};
+  \draw[tome arrow] (m) -- node[above] {\texttt{paint}} (p);
+  \draw[tome arrow] (p) -- node[above] {\texttt{pigment}} (g);
+  \draw[tome dashed] (g.south) |- node[pos=0.75,above] {\texttt{binder}} (b.east);
+  \node at (4.1,-2.5) {Dashed: needs another visit to the first archive.};
+\end{tikzpicture}
+\caption{Each arrow is a demand from an admitted object. The demand for \texttt{binder} arrives only after the second archive admits \texttt{pigment.o}.}
+\label{fig:visual-286}
+\end{figure}
+
+Add \texttt{libpaint.a} at the end, or enclose both archives in \verb|-Wl,--start-group| and \verb|-Wl,--end-group|. Both corrected links should run with status zero: the chain returns $7+3+2=12$. Compare the map's archive-member inclusion reasons with the trace; the mere presence of \texttt{binder} in the archive index never explained why it appeared in the output. With LLD and the original order, the link should succeed; add \verb|-Wl,--warn-backrefs| to detect the backward edge.
+
+As a control, make one archive with the members in this order: \texttt{binder.o}, \texttt{pigment.o}, \texttt{paint.o}. GNU \texttt{ld} finds all three even though each newly needed member is earlier in the archive than the member that needed it. The corresponding two-archive failure therefore depends on where the linker leaves an archive behind, not on the sort order of definitions within either archive.
+
+\section{What Counts as a Demand?}
+
+An undefined ELF weak symbol by itself does not trigger extraction. Replace \texttt{main.c} with a declaration of \texttt{paint} qualified by \verb|__attribute__((weak))| and \verb|int main(void) { return paint != 0; }|. The grouped libraries alone should not extract \texttt{paint.o}, and the test should return zero. Add \verb|-Wl,-u,paint| to establish a linker demand before the group is processed: now the function is present and the test returns one. Conversely, a normal undefined global can cause extraction of a member whose definition is weak. Weakness of the incoming demand and weakness of a candidate are different facts.
+
+The invariant for this simple archive model is that every ordinary extraction has an eligible unresolved demand at the point of admission, and each successful extraction registers all of that member's definitions and requirements exactly once. Forced admission with \verb|--whole-archive| is a different policy and may introduce duplicate-definition errors; turn it off after the intended archive. Section garbage collection can subsequently remove admitted sections, but it cannot keep a registration record in an archive member that was never admitted. Use the map to diagnose extraction and the section table to diagnose retention.

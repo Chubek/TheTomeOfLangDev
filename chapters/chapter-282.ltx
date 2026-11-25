@@ -1,0 +1,81 @@
+% Source: linkers-loaders-ocr.txt
+% Source: assembly-with-ubuntu.txt
+
+\section{A Location Counter Per Input Section}
+
+A label does not denote a position in the source file or a byte offset in the eventual executable. In ordinary relocatable ELF it denotes a position in one input section. John R. Levine's Chapter~3 explains section-relative symbol values and distinguishes initialized sections from \texttt{NOBITS} storage \cite[chapter~3]{levine2000linkers}. A typical assembler therefore keeps separate location counters. Switching to a section resumes that section's counter, and updating it does not move a label in any other section. Reserving eight bytes in \texttt{.bss} increases its logical size without adding eight bytes of initialized section contents to the object.
+
+For an assembler with fixed-size instructions and directives, the location counter measures the size laid out so far in that section. A label records the current counter without advancing it. A byte directive advances it by one; an alignment directive advances it by enough padding to reach the specified boundary. With positive alignment $a$ and section offset $p$, unrestricted padding is $(-p)\bmod a$, taking the nonnegative residue. The object also needs a section alignment requirement compatible with those internal offsets. Otherwise a linker could place the section at a base that invalidates its assumed alignment.
+
+\section{Assign Positions Before Evaluating Uses}
+
+Chapter~5 of Ed Jorgensen's \emph{x86-64 Assembly Language Programming with Ubuntu} motivates two-pass assembly with a forward branch. In a simple implementation, the first pass parses and expands source, chooses fixed sizes, and records labels and declarations. The second uses the completed table to fill instruction and data fields and emit the object. A parser can read the source once and the second pass can traverse buffered fragments instead of reopening it. This retains the distinction between discovering positions and relying on positions. Levine makes the analogous distinction for linking in Chapter~1, and in Chapter~4 describes discovering the sizes that determine later placements. His linker pass assigns positions across input modules; an assembler pass works within each input section.
+
+Keep a symbol's name, location, and binding separate. An ordinary defined symbol can store a section and an offset, while an absolute equate needs no section base. A declaration with \texttt{.globl} sets global binding but by itself attaches no location; ELF visibility is a separate attribute. For ordinary labels, a second definition of the same symbol is a diagnostic, not an instruction to update every older reference. Special directives that deliberately reassign equates require their own rules.
+
+% Annotated walkthrough
+\section{Resume a Section and Settle a Forward Difference}
+
+Save this GNU \texttt{as} input as \texttt{sample.s}. The forward expression asks for a byte count, and the field that will hold that count is always four bytes wide.
+
+\begin{verbatim}
+.section .rodata
+.globl sample
+.type sample, @object
+sample:
+.Lbegin:
+    .byte 0x31
+    .balign 4, 0
+    # Reserve four bytes now; the endpoint comes later.
+    .long .Lend - .Lbegin
+.bss
+    .balign 8
+.globl scratch
+.type scratch, @object
+scratch:
+    # BSS advances its own counter without file payload.
+    .zero 8
+.size scratch, . - scratch
+.section .rodata
+    .short 0x0201
+.Lend:
+.size sample, . - sample
+\end{verbatim}
+
+The first byte puts the read-only counter at one. Alignment adds three bytes, and the four-byte field ends at offset eight. The switch to \texttt{.bss} lays out \texttt{scratch} at its own offset zero and increases only that section's size. Back in \texttt{.rodata}, the two-byte value starts at eight, so the endpoint is ten. On the second pass the forward difference is $10-0=10$, written at offset four as \texttt{0A 00 00 00}, with no object relocation. The final data bytes at offsets eight and nine are \texttt{01 02}.
+
+\Cref{fig:visual-282} follows the two counters through both section switches.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=east] at (0,0) {\texttt{.rodata}};
+  \node[anchor=east] at (0,-1.65) {\texttt{.bss}};
+  \node[tome box,minimum width=3cm] (a) at (1.7,0) {\(0\to1\to4\to8\)\\byte, pad, reserve};
+  \node[tome box,minimum width=3cm] (b) at (5.1,-1.65) {\(0\to8\)\\reserve only};
+  \node[tome box,minimum width=3cm] (c) at (8.5,0) {\(8\to10\)\\resume, emit short};
+  \draw[tome arrow] (a.south east) -- (b.north west);
+  \draw[tome arrow] (b.north east) -- (c.south west);
+  \draw[tome dashed] (a) -- node[above] {counter stays at 8} (c);
+  \node[align=center] at (5.1,-2.8) {At emission, the field reserved at \texttt{.rodata}+4\\receives \(\texttt{.Lend}-\texttt{.Lbegin}=10-0\).};
+\end{tikzpicture}
+\caption{Solid arrows follow source order across sections. A reservation in \texttt{.bss} does not change where the next bytes in \texttt{.rodata} are placed.}
+\label{fig:visual-282}
+\end{figure}
+
+\section{Check Both Layout and Emission}
+
+Assemble the object, then inspect its headers, symbols, data, and relocations:
+
+\begin{verbatim}
+as --64 -o sample.o sample.s
+readelf -SWs sample.o
+readelf -x .rodata -r sample.o
+\end{verbatim}
+
+Expect \texttt{sample} and \texttt{scratch} both to have a value of zero, but different section indices and sizes of ten and eight, respectively. The \texttt{.bss} header reports size eight and type \texttt{NOBITS}. Increasing \verb|.zero 8| to \verb|.zero 24| should change the \texttt{.bss} size and the size of \texttt{scratch}, not the other section's bytes. This checks that separate counters actually remain separate.
+
+At emission, every ordinary label should equal the offset obtained by replaying the laid-out fragments of its own section. The replay must use the same sizes and padding as layout. A forward reference in a fixed-width field has a harmless dependency on a later offset. A directive that sets the size of a fragment from a forward distance including that very fragment may not have a unique solution. A fixed-layout two-pass assembler should reject such a dependency unless it has explicit rules for solving it. Variable-size instruction forms require a different treatment, not a second pass that silently moves labels.
+
+An assembler listing can help diagnose this distinction, but compare it with the symbol table before relying on a printed number. In this example a listing could print two zero offsets on different source lines without contradiction. The complete position is a pair, not an integer. Only after a linker places each input section can an ordinary symbol acquire an address in the linked image.

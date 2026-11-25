@@ -1,0 +1,71 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Resolve an Identity Before Assigning an Address}
+
+Levine's model has two levels of symbol table: each object has its own indexed entries, and the linker builds a global table that relates definitions and references in the participating objects. His diagrams use a historical GNU \texttt{a.out} implementation, but the reason for the indirection still applies to ELF. A relocation naming symbol index 7 in one object need not refer to anything named by index 7 in another; the index is relative to the symbol table associated with that relocation. When emitting a new symbol table, the linker must remap outgoing references to its new indices \cite[chapter~5]{levine2000linkers}. Keep a record of which input supplied each candidate, even after choosing a winner: without that information, a diagnostic can name the conflicting symbol but not the conflicting files.
+
+In ELF an ordinary section-defined symbol in a relocatable object has a section identity and a section-relative value. Binding tells the linker whether that definition participates in cross-file name resolution: \verb|STB_LOCAL| is private to the input object, while \verb|STB_GLOBAL| and \verb|STB_WEAK| participate. A section-relative value of zero is perfectly normal for a definition at the start of a section. Test the section index, not the value, to distinguish \verb|SHN_UNDEF| from a definition. \verb|SHN_ABS| needs no section base, and \verb|SHN_COMMON| describes a storage request rather than an address. See the \href{https://gabi.xinuos.com/elf/05-symtab.html}{ELF generic ABI symbol table rules}.
+
+\section{Precedence, Ties, and Visibility}
+
+For ordinary symbols in explicitly included relocatable inputs, a regular global definition takes precedence over a common request, which in turn takes precedence over a weak definition. GNU ELF links combine common requests by taking the largest size and strictest alignment, independently. For example, \verb|.comm scratch,24,8| and \verb|.comm scratch,16,32| request 24 bytes at 32-byte alignment, not 24 bytes at eight-byte alignment. In ELF, size is in \verb|st_size| and the common symbol's \verb|st_value| encodes alignment. Do not use common coalescing to excuse two ordinary global definitions; GNU \verb|ld.bfd| diagnoses that conflict by default. Also do not infer common from a source declaration alone: modern GCC defaults to \verb|-fno-common| for C.
+
+Two weak definitions do not establish a portable preference. In a simple GNU \verb|ld.bfd| link of ordinary objects, the first wins, but the generic ABI does not specify this tie order. Do not encode two different intended behaviors under the same weak name and rely on a build system to preserve an incidental winner. An unresolved weak reference has value zero in the static link used here; a reference with a nonzero addend need not yield a field containing zero. The absence of a definition is also distinct from the presence of a definition whose value happens to be zero.
+
+Visibility is a separate property from binding. A hidden global in one input can satisfy a reference in another input of the same output component; it does not become an ordinary dynamic export. A protected definition can be exported, but references inside its defining component bind there. Default visibility does not by itself promise an export or imply that a definition in a fully static executable can be interposed. In a shared object, however, a default-visible exported definition may be preemptible. Visibility constraints on participating references must propagate to the selected symbol; a non-default visibility reference cannot simply be satisfied by a definition in another shared component. Choosing a definition is not sufficient grounds for eliminating dynamic indirection.
+
+% Annotated walkthrough
+\section{Check a Pointer Table Against Its Definitions}
+
+Use the following three handwritten x86-64 ELF assembly inputs. The table is inspected as data; there is no need to run the final image.
+
+\begin{verbatim}
+# survey.s: references use this object's symbol indices.
+        .data
+        .globl readings
+        .weak optional_cal
+readings:
+        .quad sample_rate, optional_cal, tag
+tag:    .byte 0x11
+
+# fallback.s: this local tag is a distinct object.
+        .data
+        .weak sample_rate
+sample_rate: .long 32000
+tag:    .byte 0x22
+
+# tuned.s: hidden across components, not across these inputs.
+        .data
+        .globl sample_rate
+        .hidden sample_rate
+sample_rate: .long 48000
+\end{verbatim}
+
+Assemble each input with \verb|as --64|. Inspect \verb|readelf -sW -rW survey.o|: GNU \texttt{as} may express the reference to the local tag with an input section symbol and an addend rather than the tag's own index. Link with \verb|ld.bfd -e readings -Map=survey.map| followed by \verb|-o survey survey.o fallback.o tuned.o|. Compare the three decoded 64-bit little-endian values from \verb|objdump -s -j .data survey| to the symbols in \verb|readelf -sW survey|. In order they must be the virtual address of the tuned definition (whose contents are 48000), zero, and the address of the byte \verb|0x11|. The third address must be exactly \verb|readings| plus 24.
+
+\Cref{fig:visual-285} distinguishes the three binding outcomes before the table is written.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[anchor=west] at (0,0.8) {Slots in \texttt{readings}};
+  \node[anchor=west] at (6.4,0.8) {Selected target or value};
+  \foreach \lev/\src/\why/\dst in {
+    0/{\texttt{sample\_rate}}/{global wins}/{\texttt{tuned.o}: 48000},
+    -1.1/{\texttt{optional\_cal}}/{weak, missing}/{zero},
+    -2.2/{\texttt{tag}}/{local identity}/{\texttt{survey.o}: \texttt{0x11}}} {
+    \node[tome box,minimum width=3.6cm] (ref) at (1.8,\lev) {\src};
+    \node[tome box,minimum width=4.25cm] (dest) at (8.525,\lev) {\dst};
+    \draw[tome arrow] (ref) -- node[above] {\why} (dest);
+  }
+\end{tikzpicture}
+\caption{The first and third slots receive addresses of the objects shown, not their contents. The middle slot is zero because its unresolved weak reference has no definition.}
+\label{fig:visual-285}
+\end{figure}
+
+Swap the last two objects and repeat: addresses may change, but the selected definition and the byte reached by the third pointer must not. Omit \texttt{tuned.o} and the first pointer must reach 32000. Turn the fallback's binding into \verb|.globl|, with both objects present, and require a multiple-definition error even though the other definition is hidden. For the weak tie, instead assemble a second weak fallback with value 44100 and reverse their order without the tuned object; inspect the selected contents, not just the symbol's name.
+
+For a negative test, declare \verb|optional_cal| with \verb|.globl| instead of \verb|.weak| and leave it undefined. The same static link must now report the missing definition instead of writing zero. This isolates the binding of the \emph{reference}, as opposed to changing the strength of competing definitions.
+
+The invariant is that a live relocation using an ordinary local identity continues to address that input's contribution, whereas a live non-local reference uses the prevailing definition under the link's binding policy, or the permitted unresolved-weak value. Neither a matching filename nor a matching printed name is a substitute for tracing the relocation to its actual target.

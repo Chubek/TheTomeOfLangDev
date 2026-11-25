@@ -1,0 +1,109 @@
+% Source: finkel-advanced-proglang-design.txt
+% Source: ertl-vm-jit-stack-machine.txt
+% Source: dataflow-graph-repr.txt
+
+\section{Composition Is Written as a Sequence of Words}
+
+Concatenative languages compose operations by placing words next to one another. Forth combines this model with a data stack, return stack, dictionary, and frequently direct access to memory. Joy emphasizes quotation values and combinators. A conventional Forth definition is:
+
+\begin{verbatim}
+: SQUARE  ( n -- n2 )  DUP * ;
+: SUMSQ   ( a b -- n ) SQUARE SWAP SQUARE + ;
+3 4 SUMSQ .
+\end{verbatim}
+
+The parenthesized text is a stack-effect comment in many Forth systems, not necessarily a checked type declaration. \texttt{DUP} and \texttt{SWAP} make data routing explicit. Dictionary lookup, immediate words, compilation state, and user-defined words mean source parsing cannot be reduced to splitting a fixed opcode list. Forth's history and implementation tradition also include details beyond pure stack calculus \cite{moore1980forth}.
+
+\section{Stack IR Is Not SSA with Names Erased}
+
+A stack IR records an ordered instruction stream and an abstract stack shape at every boundary. A verifier can assign temporary value identities when simulating pushes and pops, then translate a well-formed basic block to SSA. At joins, however, predecessor stack heights and slot types must agree, and loop-carried slots need block arguments or phi-like merging. The source stack can also contain addresses and capabilities whose effects constrain reordering.
+
+\Cref{fig:visual-373} follows \texttt{3 4 SUMSQ} through the abstract stack; the vertical order is semantic even though an SSA rendering would name values.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (s0) at (0,0) {\([3,4]\)};
+  \node[tome box] (s1) at (2.4,0) {\([3,16]\)};
+  \node[tome box] (s2) at (4.8,0) {\([16,3]\)};
+  \node[tome box] (s3) at (7.2,0) {\([16,9]\)};
+  \node[tome box dark] (s4) at (9.6,0) {\([25]\)};
+  \draw[tome arrow] (s0) -- node[above]{square} (s1);
+  \draw[tome arrow] (s1) -- node[above]{swap} (s2);
+  \draw[tome arrow] (s2) -- node[above]{square} (s3);
+  \draw[tome arrow] (s3) -- node[above]{+} (s4);
+\end{tikzpicture}
+\caption{Each word transforms an ordered stack. The same dependencies can later receive SSA names, but source stack order remains part of validation.}
+\label{fig:visual-373}
+\end{figure}
+
+Output artifacts can include verified threaded code, bytecode, native code, dictionary metadata, stack maps for calls and safepoints, and a stack-to-SSA provenance map. An SSA backend is useful, but it does not make stack shuffles or dictionary semantics retroactively irrelevant.
+
+% Annotated walkthrough
+\section{Verify a Word Before Translating It}
+
+\begin{verbatim}
+state := entry_stack_signature(word)
+for instruction in control_flow_order:
+    require state has instruction.required_prefix
+    operands := pop_abstract_values(state, instruction.pop_count)
+    results := assign_fresh_values(instruction, operands)
+    push results onto state in specified order
+    merge successor states by height, type, and slot position
+emit SSA blocks using merged stack slots as block arguments
+\end{verbatim}
+
+Peepholes such as \texttt{SWAP SWAP} elimination and inlining a pure word are legal when exceptions, return-stack use, memory, dictionary rebinding, and compilation semantics are unchanged. Translating \texttt{DUP *} into a single multiply with two uses is natural. Reordering two words merely because their net stack effects commute is unsafe if either touches memory or can fail.
+
+Validation rejects underflow and incompatible joins, then executes source and lowered forms with the same initial stacks and memory model. It compares final data and return stacks, output, memory effects, exceptions, and dictionary-visible behavior. Debug information maps native values back to logical stack slots at word boundaries. The preservation theorem relates an ordered stack machine to named SSA states; it does not assert that stack IR and SSA are the same representation.
+
+\section{Translate a Join With a Live Lower Stack Slot}
+
+Suppose a typed stack bytecode starts with \([p,x,c]\) in bottom-to-top order. A branch consumes Boolean \(c\); each arm pops \(x\) and pushes an integer. One doubles it, the other increments it. The join then multiplies the result by \(p\). Knowing only that the arms each have net stack effect zero does not establish a legal join: a variant where the second arm pushes a reference must be rejected by this bytecode's verifier.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Incoming edge & Logical stack & Join inputs \\
+\hline
+From double arm & \([p,2x]\) & p, doubled \\
+From increment arm & \([p,x+1]\) & p, increased \\
+From reference variant & \([p,\mathrm{ref}]\) & incompatible slot 1 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+merge_edge(join, predecessor, stack):
+    require length(stack) == length(join.declared_stack)
+    args := []
+    for slot in 0 .. length(stack)-1:
+        value := stack[slot]
+        require type(value) == join.declared_stack[slot]
+        append(args, value)
+    register_transfer(predecessor, join, args)
+
+join(p_slot: int, transformed_slot: int):
+    return multiply(p_slot, transformed_slot)
+\end{verbatim}
+
+An SSA simplifier can replace \texttt{p\_slot} with the dominating \(p\) after confirming all incoming arguments have that identity. It cannot do the same for the upper slot where the two definitions differ. For a concrete check, use \(p=7,x=4\) and try both conditions: the results are \(56\) and \(35\). Add a variant whose two arms intentionally swap two integer slots before a noncommutative operation. The verifier may still accept equal slot types; semantic validation must preserve that order when wiring values to block arguments. This separation explains why stack-shape checking cannot replace execution tests of the lowering.
+
+\section{Use the Same Contract at a Loop Header}
+
+Before constructing all backedges, give a loop header block
+parameters with the verified types and heights of its incoming
+stack. Translate the header using those parameters, then attach
+arguments as each backedge is emitted. In a countdown loop starting
+with one counter on the stack, the preheader supplies the initial
+value and the latch supplies the decremented one. Directly using the
+preheader's value in the header would ignore the backedge.
+
+An exit branch should receive the stack specified by the branch
+instruction, taking into account any popped condition. Test a
+zero-trip loop and a two-iteration loop using the same verifier;
+then make the latch leave one extra item on the stack and require
+rejection before SSA emission or finalization. A translator that
+accepts the mismatch by dropping an operand has silently created a
+stack operation that the bytecode never executed.

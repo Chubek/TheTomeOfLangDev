@@ -1,0 +1,95 @@
+% Source: analysis-dataflow-programs.txt
+% Source: advances-in-dataflow.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+
+\section{An Actor Chooses an Action, Not Merely an Operation}
+
+CAL describes actors with typed ports, private state, and actions. An action is enabled only when its input pattern can be satisfied, its guard is true, its finite-state-machine transition permits it, and no enabled higher-priority action excludes it. The network supplies FIFO communication; it does not turn the body of an actor into a stateless function. Brunet's account of dynamic dataflow stresses precisely these input-pattern, guard, state, and priority dimensions. They are semantic inputs to compilation, not profiling annotations.
+
+This representative actor routes nonnegative and negative tokens to separate ports:
+
+\begin{verbatim}
+actor Split() int I ==> int P, int N:
+  pos: action I:[v] ==> P:[v]
+       guard v >= 0 end
+  neg: action I:[v] ==> N:[v]
+       guard v < 0 end
+end
+\end{verbatim}
+
+Both actions inspect the same head token and consume one token if selected. Their guards are disjoint, so the result is independent of which enabled action is tested first. In a general actor, overlapping guards can make priority or scheduler choice observable. A compiler must not replace ``select one enabled action'' with ``run every enabled action.'' CAL's actor model is therefore more dynamic than synchronous dataflow with fixed rates \cite{lee1987sdf}, although restricted actors may admit a static schedule.
+
+\section{Keep Readiness, Selection, and Commit Distinct}
+
+A useful actor IR has actor instances, FIFO edges, and an ordered action table. Each action records peeked and consumed token counts by port, produced counts, a pure guard region, state reads, a body region, state writes, and successor FSM state. Priority is a relation over action IDs, not source order accidentally retained in a list. This representation makes a readiness query different from an atomic firing. \Cref{fig:visual-367} shows the three phases for the example.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (fifo) at (0,0) {FIFO head \(v\)};
+  \node[tome box dark] (test) at (3.2,0) {pattern + guards};
+  \node[tome box] (pos) at (6.4,.8) {\texttt{pos}: emit \(P\)};
+  \node[tome box] (neg) at (6.4,-.8) {\texttt{neg}: emit \(N\)};
+  \node[tome box accent] (commit) at (9.2,0) {atomic commit};
+  \draw[tome arrow] (fifo) -- (test);
+  \draw[tome arrow] (test) -- node[above]{\(v\geq0\)} (pos);
+  \draw[tome arrow] (test) -- node[below]{\(v<0\)} (neg);
+  \draw[tome arrow] (pos) -- (commit);
+  \draw[tome arrow] (neg) -- (commit);
+\end{tikzpicture}
+\caption{Testing may peek at a token, but only the selected action consumes input, changes state, and publishes output.}
+\label{fig:visual-367}
+\end{figure}
+
+The implementation may lower each actor to a dispatch loop, generate a runtime actor object, or specialize a statically schedulable subnetwork. Its output artifacts should include executable code, FIFO descriptors, an action-selection table, and machine-readable rate and effect summaries. An execution-trace graph is a useful profiling artifact, but a trace contains observed firings rather than all legal firings.
+
+% Annotated walkthrough
+\section{Lower One Atomic Firing and Check Its Contract}
+
+\begin{verbatim}
+heads := peek_required_inputs(actor)        # no consumption yet
+candidates := actions_matching_fsm_and_patterns(heads)
+enabled := [a for a in candidates if eval_guard(a, heads, state)]
+chosen := maximal_under_priority(enabled)
+if chosen exists:
+    values, next_state := run_body_in_private_staging(chosen)
+    atomically consume inputs, publish values, and install next_state
+else:
+    suspend actor until relevant input or state can change
+\end{verbatim}
+
+Guard common-subexpression elimination is legal when the expression is pure and reads the same peeked tokens and state snapshot. An action may be specialized for a known FSM state, and mutually exclusive actions may share tests. Action fusion, reordering, or speculative consumption is not legal merely because it is faster: it must preserve token order, priority, blocking behavior, and atomic state/output visibility. A guard that can trap or call an effectful routine needs an explicit effect contract before motion.
+
+Validation begins with structural checks that every referenced port, state slot, priority edge, and FSM transition exists. Differential tests run the source actor interpreter and lowered artifact on the same finite input queues, comparing consumed prefixes, output sequences, final state, and whether the actor blocks. For bounded models, selection can also be explored over all head tokens and states. These checks preserve the actor's observable firing relation; they do not claim that an arbitrary network has a unique schedule or deterministic result.
+
+\section{Implement a Priority Test That Consumes Nothing}
+
+Suppose a different actor handles one input port with two possible actions: \texttt{zero} routes the value \(0\) to a special output, and \texttt{fallback} routes any value to a general output. Give \texttt{zero} priority over \texttt{fallback} when both are enabled. The empty queue satisfies neither pattern; the fallback has an unrestricted guard, not an unrestricted input pattern.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Head & Guard-enabled set & Selection \\
+\hline
+absent & none & wait on input \\
+0 & zero, fallback & zero \\
+7 & fallback & fallback \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+fire_example(input, outputs):
+    snapshot := peek_one(input)
+    if snapshot missing: return NEED_INPUT
+    if snapshot.value == 0: choice := zero
+    else: choice := fallback
+    if not reserve_output(outputs[choice]):
+        return NEED_OUTPUT_SPACE
+    consume_exactly_one(input)
+    publish_reserved(outputs[choice], snapshot.value)
+    return FIRED
+\end{verbatim}
+
+For this example choose a bounded runtime that selects as if the output channels were unbounded and stalls only at commit. If the special output is full and the head is zero, do not fire fallback to make progress: that would change which output contains the zero. The trial must leave both the head and actor state intact until the reservation becomes available. Verify this with the input \([0,7]\), a full special queue and an empty general queue. First expect no consumption, then drain the special queue and expect one item on each output after two firings. Backends with different backpressure contracts need to document whether capacity participates in selection.

@@ -1,0 +1,68 @@
+%% chapter-275.ltx -- Matching Instruction Patterns in Graphs
+% Source: blindel-instrselect-book.txt
+% Source: blindel-practical-instrselect.txt
+
+\section{What a graph match promises}
+
+Gabriel Hjort Blindell separates finding candidate instructions from choosing a combination that implements the IR \cite[chapter~1]{blindell2016instruction}. In graph covering, a candidate is a particular embedding of an instruction pattern, not just the name of an opcode. Different embeddings of the same opcode may consume different operations, bind different operands, or have different legal placements. A matcher should report those facts without trying to decide which candidates will be selected. Hjort Blindell et al.\ make the separation explicit in \emph{Complete and Practical Universal Instruction Selection}: they identify matches using subgraph isomorphism and define coverage in terms of computation and control operations, not every vertex in the representation.
+
+Make the graph directed and labeled. For example, represent an operation by its opcode and type and distinguish operand edges by port number. Record which pattern operations an instruction implements and which value ports constitute its interface. An embedding must preserve required edges between mapped vertices, but need not preserve nonedges: a pattern input may have other users, and a pattern output may feed operations outside the pattern. Likewise, distinct internal pattern operations must map to distinct program operations. If two operand positions are allowed to name the same value, express that policy at the boundary rather than assuming that two distinct operand ports imply two distinct SSA definitions. A bijection between entire graphs would answer the wrong question.
+
+\section{Pruning the search without changing the instruction}
+
+Hjort Blindell describes Ullmann's algorithm as a search over a Boolean candidate matrix, with one row per pattern vertex and one column per program vertex \cite[chapter~5]{blindell2016instruction}. For an injective embedding, the final matrix has exactly one set bit in each row and at most one in each column. Before branching, clear entries that cannot be in any solution: if an incoming edge at a given port needs a compatible predecessor and none remains in that predecessor's row, the entry cannot survive. In contrast, VF2 extends a partial mapping and uses consistency checks and lookahead to detect dead ends. Both are ways of searching for embeddings, not algorithms for choosing a cover. General subgraph-isomorphism decision is NP-complete; keeping the target patterns small and indexing likely anchors helps in practice, without turning the general problem into a linear-time one.
+
+For an instruction matcher, filter by opcode, width and mandatory edge labels before checking more costly target predicates. For a commutative operator whose two inputs have different target restrictions, try both permitted bindings, unless canonicalization provably keeps the legal one. Port swaps are not valid for subtraction. Nor can the matcher discover semantic equivalences it was never asked to represent: Hjort Blindell gives distribution of multiplication over addition as an example of equal computations with different graph shapes, under arithmetic where distribution is valid. Normalization or an explicit alternate pattern can expose another match; neither should silently change overflow or rounding behavior.
+
+% Annotated walkthrough
+\section{Match a signed-offset load, then check the boundary}
+
+A toy target offers \texttt{LD32off}, which reads a 32-bit word at a 64-bit base plus a sign-extended six-bit immediate. Address addition wraps modulo \(2^{64}\); the plain load and the offset load have identical alignment, byte order, fault and memory-order behavior at the same address. The pattern covers the address addition and the load, accepts a base and a constant, and returns the loaded value. It does not produce the computed address. The trace elides memory-state edges, which are preserved by the replacement.
+
+\begin{verbatim}
+a = add64(base, 12);  x = load32(a);  y = xor64(a, mask)
+d = add64(base, 40);  z = load32(d)
+c = add64(base,-16);  w = load32(c)
+
+# Anchor at loads; the address port fixes the producer.
+x: {load -> x, add -> a},  12 in [-32,31] : candidate
+z: {load -> z, add -> d},  40 not in range : reject
+w: {load -> w, add -> c}, -16 in [-32,31] : candidate
+
+# Consumed definitions with external users need an output.
+x: reject this cover choice; y still needs a
+w: select if the other cover constraints hold; c has no other use
+\end{verbatim}
+
+There are three structural embeddings at the anchors and two after the immediate guard. Only the one at \(w\) can enter a no-duplication cover of this graph, assuming \(y\) is live and there are no other patterns for \(y\) that absorb the address calculation. For \(x\), a plain load and a separate add preserve \(a\); for \(z\), they also avoid misencoding 40. A matcher dedicated to a no-duplication selector can reject the \(x\) embedding early once it knows the external use cannot be satisfied. A more general implementation can report the boundary obligation and let the selector resolve it. In either case every live use must still have a definition. Counting structurally matched operations alone would miss that invariant.
+
+\Cref{fig:visual-275} makes the two load embeddings that pass the immediate check explicit. Only one can hide its address computation.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node at (0,0.75) {\(\texttt{base}+12\)};
+  \node at (6,0.75) {\(\texttt{base}-16\)};
+  \node[tome box,minimum width=3.1cm] (a) at (0,0) {add \(a\)};
+  \node[tome box,minimum width=3.1cm] (x) at (0,-1.35) {load \(x\)};
+  \node[tome box,minimum width=3.1cm] (c) at (6,0) {add \(c\)};
+  \node[tome box,minimum width=3.1cm] (w) at (6,-1.35) {load \(w\)};
+  \node[tome box] (y) at (3,-0.68) {xor \(y\)};
+  \begin{scope}[on background layer]
+    \node[tome group,fit=(a)(x)] {};
+    \node[tome group,fit=(c)(w)] {};
+  \end{scope}
+  \draw[tome arrow] (a) -- (x);
+  \draw[tome arrow] (c) -- (w);
+  \draw[tome arrow] (a.east) -- node[above,sloped] {\(a\)} (y.west);
+  \node at (0,-2.25) {Cannot hide \(a\)};
+  \node at (6,-2.25) {Can hide \(c\)};
+\end{tikzpicture}
+\caption{Dashed outlines enclose the operations that each offset-load match would consume. The left embedding would leave the external xor without a definition for \(a\).}
+\label{fig:visual-275}
+\end{figure}
+
+\section{Keep the match record inspectable}
+
+Return the identities of covered operations, ordered inputs and outputs, and any predicates not yet discharged, such as compatible register classes or legal placement. Deduplicate only records interchangeable at that interface: two embeddings covering the same operations might require different operand orders and therefore lead to different encodings. Record why rejected anchors failed, at least in a diagnostic mode. A missing edge, an unencodable immediate and a hidden external use indicate three different problems; maintaining those distinctions helps when a new rule appears to match but never reaches emitted code. Chapter~\ref{ch:ext-276} examines what happens when the candidate itself spans block boundaries.

@@ -1,0 +1,64 @@
+%% chapter-264.ltx -- Peephole Selection and Symbolic Equivalence
+% Source: blindel-instrselect-book.txt
+
+\section{Expand first, then reconsider the instructions}
+
+The simplest selector commits to one legal implementation per normalized IR operation. A peephole selector revisits that commitment within a limited region. Blindell traces one form of the technique from McKeeman's examination of adjacent machine instructions to Fraser's automatically generated Peephole Optimizer. Fraser's design drops unobservable register transfers and looks for an instruction whose transfers equal the composition of a pair; its comparisons are syntactic, not a general decision procedure for equivalence (\cite[chapter~2, section~2.3.1]{blindell2016instruction}). Forming a match from instruction effects makes it possible to recognize a useful instruction even when the incoming IR did not name it.
+
+In Blindell's account of the Davidson--Fraser selector, the expander emits register transfer lists with virtual temporaries and the combiner runs before physical register allocation. The \emph{machine invariant} is that every surviving register transfer list must be implementable by a single target instruction. Blindell contrasts this arrangement with Dias and Ramsey's use of a separate recognizer for enforcing the invariant (\cite[chapter~2, section~2.3.2]{blindell2016instruction}). Equivalence and recognition are separate: a composed effect can be correct for the window without having any single-instruction encoding. Conversely, a recognized form can be legal yet fail to preserve all observations at a particular site.
+
+\section{Compose the transitions over equal entry states}
+
+Take a target with separate eight-bit and sixteen-bit register banks. A legal baseline computes the floor of the unsigned average of two byte samples $x,y$. First \texttt{ADDW t,x,y} zero-extends both sources and writes their sum to a sixteen-bit register \texttt{t}. Then \texttt{HALF8 d,t} shifts the sixteen-bit value right by one logically and writes its low byte to \texttt{d}. The optional \texttt{AVG8 d,x,y} promises the floor average with no write to the wide bank. All forms here are two bytes and affect only their stated destinations; they have no flags, memory effects, or faults. The combiner sees a pair in a single basic block, with no entry to its second instruction from outside the window.
+
+To summarize the pair, use entry-state symbols $X,Y,T$ for the unsigned source and scratch values. Symbolically execute each instruction, using the producer's output when the next instruction reads the same register. The baseline summary has $\texttt{t}=X+Y$ and $\texttt{d}=\lfloor (X+Y)/2\rfloor$. The sum lies in $[0,510]$, so no sixteen-bit overflow occurs, and the shifted result lies in $[0,255]$, so narrowing it at the end loses no bits. The candidate has the same equation for \texttt{d} and leaves $\texttt{t}=T$. These two summaries need not be equal on the full register file. They must be equal on the states the continuation can observe.
+
+% Annotated walkthrough
+\section{Keep the wide result if a later use can see it}
+
+Find the boundary's live registers conservatively, including any reads along successor edges. For this total, effect-free arithmetic, register projection is enough: we do not have to compare traps, memory, or continuation targets. Compose full transitions first, then project; dropping \texttt{t} before composition would delete the value needed by \texttt{HALF8}.
+
+\begin{verbatim}
+original = ADDW t,x,y; HALF8 d,t
+proposal = AVG8 d,x,y
+
+derive original: t = X+Y, d = floor((X+Y)/2)
+derive proposal: t = T,   d = floor((X+Y)/2)
+  # Both summaries start with the same X, Y, T.
+prove equality on live_out for every entry state
+  # Discard t only if its value is dead at the window exit.
+require proposal recognized with current target features
+require encoded_size(proposal) < encoded_size(original)
+
+X=250, Y=10, T=0xA11C
+original: t=0x0104, d=0x82; proposal: t=0xA11C, d=0x82
+\end{verbatim}
+
+At that input, $250+10=260$ and $\lfloor 260/2\rfloor=130$. When the continuation uses only the average, replace four bytes by two if the target feature is enabled. When it also uses \texttt{t}, reject: the displayed entry state already distinguishes the pair from the proposed replacement. As a second negative test, consider a mistaken description that narrows the sum to eight bits \emph{before} shifting: it yields $4/2=2$ rather than $130$. This test catches a width error even when the wide temporary is dead. The all-input argument uses the bounds above; the concrete tests expose why those bounds and the exit projection matter.
+
+\section{Set a stopping rule for rewriting}
+
+\Cref{fig:visual-264} compares the two exits for the chapter's witness input. Inspecting only the average would miss the difference in the wide register.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram, pair/.style={tome box,text width=3.55cm}]
+  \node[above,align=center] at (3.15,0.5) {Same entry: \(X=250,\ Y=10,\ T=\texttt{0xA11C}\)};
+  \node[pair] (base) at (0,0) {\texttt{ADDW; HALF8}\\4 bytes};
+  \node[pair] (proposal) at (6.3,0) {\texttt{AVG8}\\2 bytes};
+  \node[pair] (left) at (0,-1.8) {\(\texttt{d}=\texttt{0x82}\)\\\(\texttt{t}=\texttt{0x0104}\)};
+  \node[pair] (right) at (6.3,-1.8) {\(\texttt{d}=\texttt{0x82}\)\\\(\texttt{t}=\texttt{0xA11C}\)};
+  \draw[tome arrow] (base)--(left);
+  \draw[tome arrow] (proposal)--(right);
+  \node[align=center,font=\footnotesize] at (3.15,-1.8) {\texttt{d} agrees\\\texttt{t} differs};
+\end{tikzpicture}
+\caption{The symbolic rewrite is admissible only if the wide result is dead at the window exit and the smaller instruction is available.}
+\label{fig:visual-264}
+\end{figure}
+
+A recognizer can compare normalized expressions against descriptions of legal instruction forms. A useful normalization retains widths and distinguishes logical shifts from arithmetic ones. Canonicalization catches known identities quickly but can miss equal effects with different symbolic syntax. A checker can instead ask whether some permitted entry state yields different observations. For a finite bit-vector model as above, a proof that no such state exists justifies replacement relative to that model. A counterexample rejects the candidate, and an inconclusive check keeps the baseline. In a window with memory or exceptions, a larger register mask does not substitute for modeling the missing effects.
+
+An implementation can verify the arithmetic identity once per rule and still check the site's live-out condition and feature flag at each application. The proof is about two specific transition summaries, not about all possible instructions named \texttt{AVG8}. Cache a proof against the semantics version and operand widths; do not cache applicability without the conditions under which the proof was obtained. For this rule, the registers other than \texttt{t} can be projected identically in both summaries. A separate test with the feature disabled checks that a true identity cannot bypass the recognizer.
+
+After a successful replacement, a combiner can revisit windows that overlap the new instruction, because their summaries have changed. Restricting this pass to strictly smaller encoded size makes any sequence of accepted rewrites finite on a fixed block. It does not make the result globally smallest: two attractive windows may overlap, and sometimes a useful triple cannot be reached by first combining any pair. Blindell uses this window-size trade-off to explain why adding peephole combination to expansion improves its reach without removing its locality (\cite[chapter~2, section~2.3.2]{blindell2016instruction}). Document the window and the objective before comparing the result to another selector (Chapter~\ref{ch:ext-261}).

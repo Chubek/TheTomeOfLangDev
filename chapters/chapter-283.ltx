@@ -1,0 +1,65 @@
+% Source: linkers-loaders-ocr.txt
+% Source: intel-instr-vol2a.txt
+
+\section{An Instruction's Width Can Affect Its Own Range}
+
+John R. Levine's simple storage-allocation example places each module after the lengths and alignment padding of preceding modules \cite[chapter~4]{levine2000linkers}. This is a linker example. The same dependence exists within an assembler's section, but here fragment lengths can themselves depend on the offsets computed from the layout. Chapter~2 shows why the dependence is target-specific: the range of a relative branch follows from the architecture's displacement format. In x86-64, Intel's \texttt{JMP} table provides both a two-byte short jump (\texttt{EB} plus a signed byte) and a five-byte near jump (\texttt{E9} plus a signed four-byte field). Both use the address of the next instruction as the base.
+
+An assembler may start with a short encoding for each eligible local jump. If one fails its range test, widening it moves later positions; a second jump may now fail even though it passed in the previous layout. Choosing a form and then filling the displacement without reconsidering the other instructions is not sufficient. Here \emph{relaxation} means changing encoding choices while laying out an input section. Linkers can perform their own relaxation with different information and ABI restrictions, but the local jumps below are settled before the linker sees an object.
+
+% Annotated walkthrough
+\section{Make One Widening Force Another}
+
+Save this non-executed layout fixture as \texttt{cascade.s} and assemble it with \verb|as --64 -o cascade.o cascade.s|.
+
+\begin{verbatim}
+.text
+    # A short first jump fits if the second is also short.
+    jmp .Lfirst
+    jmp .Lsecond
+    .fill 125, 1, 0x90
+.Lfirst:
+    # These bytes push only the second jump past its limit.
+    .fill 3, 1, 0x90
+.Lsecond:
+    ret
+\end{verbatim}
+
+In an all-short trial, the next-instruction offsets are two and four. The targets are $4+125=129$ and $129+3=132$, giving displacements $127$ and $128$. Only the second overflows. Widening it adds three bytes between the first jump and its target, so the first displacement becomes $130$ and it too must widen. The settled target offsets are $135$ and $138$. The jump bases are now five and ten, giving $135-5=130$ and $138-10=128$. The second displacement is unchanged by its own widening in this fixture: both its base and its forward target moved by the same amount.
+
+\Cref{fig:visual-283} tracks which short form fails after each change of layout.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node at (3.8,0) {First: base \(\to\) target};
+  \node at (9.15,0) {Second: base \(\to\) target};
+  \foreach \lev/\stage/\one/\two in {
+    -0.75/{Both short}/{\(2\to129:\ 127\)}/{\(4\to132:\ 128\), widen},
+    -1.75/{Second wide}/{\(2\to132:\ 130\), widen}/{\(7\to135:\ 128\)},
+    -2.75/{Both wide}/{\(5\to135:\ 130\)}/{\(10\to138:\ 128\)}} {
+    \node[anchor=east] at (1.2,\lev) {\stage};
+    \node[tome box,minimum width=4.45cm] at (3.8,\lev) {\one};
+    \node[tome box,minimum width=4.45cm] at (9.15,\lev) {\two};
+  }
+  \draw[tome arrow] (6.75,-0.75) -- (6.2,-1.75);
+  \node at (6.45,-3.55) {Short form permits at most \(+127\).};
+\end{tikzpicture}
+\caption{Widening the second jump increases the first jump's displacement by three. When the first then widens, its own next-instruction base and target advance together.}
+\label{fig:visual-283}
+\end{figure}
+
+Use \verb|objdump -dr cascade.o|. The first ten bytes are \texttt{E9 82 00 00 00 E9 80 00 00 00}. They are evidence of the settled layout, not of any particular internal sequence of passes in GNU \texttt{as}. The assembler does not emit a relocation for either local displacement here. As a boundary test, reduce the second fill to two bytes. Now both displacements are $127$ in the all-short layout and neither needs to grow: expect \texttt{EB 7F EB 7F} at the start. That one-byte source adjustment saves six more bytes of encoding in this fixture.
+
+\section{Prove Termination Separately from Validity}
+
+In a simple implementation, give each relaxable instruction a finite list of forms from shortest to longest. For a given vector of form choices, compute a complete layout: fragment offsets, padding, and label values. Check the current displacements against their chosen forms, promote failing sites that have wider forms available, and lay out again. Compute the checks from a consistent snapshot rather than testing some branches with old offsets and others with new ones. A round that changes a choice strictly increases the sum of form ranks. It is bounded above by the sum of maximum ranks, so there cannot be infinitely many such rounds.
+
+Termination does not prove a legal encoding exists. When no more choices change, recompute and validate every range and field under that exact layout. Diagnose any remaining overflow. A section-relative label still moves between trials, so any fixup cached as an absolute section offset must be recomputed or derived anew from a fragment and an intra-fragment position. Emission must agree with the validated layout, including the padding and any symbol or metadata offsets. If the widest form has an unresolved target outside the section, the local displacement proof does not apply; use a form and relocation permitted by the ABI or report that it cannot be represented.
+
+An independent check of the settled fixture starts by decoding the actual lengths and signed fields, not reading the assembler's former choices. Adding the decoded displacements to the two bases recovers offsets $135$ and $138$. Checking only that the output starts with two near-jump opcodes would miss a stale patch left over from the round with just one near jump.
+
+\section{Alignment Complicates Size Optimization}
+
+Suppose a two-byte branch at offset eleven ends at thirteen, followed by unrestricted sixteen-byte alignment and then its target. There are three bytes of padding and the displacement is three. Widen a different instruction earlier in the section by three bytes. The same short branch now starts at fourteen and ends at sixteen. The alignment adds nothing, so the target stays at sixteen and the displacement drops to zero. Consequently the rank argument does not prove that every displacement grows or that every promotion remains necessary. A growth-only algorithm trades possible extra bytes for a finite convergence policy. An optimizer that tries shortening again needs its own policy to avoid cycles and must validate the entire affected layout.

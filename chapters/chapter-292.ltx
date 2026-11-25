@@ -1,0 +1,63 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{The kernel chooses the first user instruction}
+
+Levine's basic loader creates the program's address space, supplies startup information, and starts execution \cite[chapter~8]{levine2000linkers}. For a dynamically linked ELF executable he adds a second image: the interpreter, usually the runtime dynamic linker. The system maps both images and begins in the interpreter, not in the executable \cite[chapter~10]{levine2000linkers}. On current Linux, the interpreter pathname comes from the file range described by the \texttt{PT\_INTERP} program header. Link editors commonly label those bytes \texttt{.interp}, but the kernel does not look up that section by name. A conventional executable with no interpreter instead begins at its own runtime entry. Having ELF type \texttt{ET\_DYN} alone does not settle the question: an ordinary dynamic PIE has an interpreter, while a static PIE can start without one and handle its own startup relocations.
+
+An ELF \texttt{e\_entry} is a link-time virtual address, not a file offset and not necessarily a language function address. A PIE and its interpreter can have different load biases. Add the executable's bias to its own entry and the interpreter's bias to the interpreter's entry. Neither calculation should use the base of the stack. A single instruction pointer selects the first instruction; separate startup data tells that code where control must go later.
+
+\section{The initial stack is an ABI record}
+
+On System V AMD64 the incoming stack pointer is 16-byte aligned, with the argument count at the address it points to. The argument pointer array follows and ends in a null pointer. Then come the environment pointers and their null terminator, followed by the auxiliary vector. Its entries are type/value pairs, terminated by a pair whose type is \texttt{AT\_NULL}. The layout and tag meanings are described in \S3.4 of the AMD64 ABI supplement. The two null pointers and the auxiliary vector's terminating tag serve different roles; a zero value attached to a different tag is not the end of the vector.
+
+For the Linux handoff, \texttt{AT\_PHDR} gives a runtime address for the executable's program headers, with \texttt{AT\_PHENT} the size of an entry and \texttt{AT\_PHNUM} the count. \texttt{AT\_BASE} describes the interpreter's load base and \texttt{AT\_ENTRY} gives the executable's already adjusted entry address. The AMD64 ABI also describes an alternate \texttt{AT\_EXECFD} interface, in which the interpreter receives a file descriptor instead of an in-memory program header location. It is not the ordinary Linux ELF handoff described here.
+
+% Annotated walkthrough
+\section{Trace the two entry addresses}
+
+Take a hypothetical 64-bit Linux process with two arguments and one environment string. Assume the main program header table starts at image virtual address \texttt{0x40}, as it would if file offset \texttt{0x40} lay in a load segment starting at file offset and link address zero. The stack and address calculations below are independent; all machine words in the two pointer vectors take eight bytes.
+
+\begin{verbatim}
+argv = sp + 8; require argv[argc] == NULL
+envp = argv + 8 * (argc + 1)    # skip the argv terminator
+auxv = word_after_env_null(envp)
+tags = scan_pairs_until_AT_NULL(auxv)
+first_pc = interp_bias + interp_e_entry
+next_pc = tags[AT_ENTRY]        # already a runtime address
+\end{verbatim}
+
+Here the argument pointers occupy stack offsets \texttt{0x08} and \texttt{0x10}, the argument terminator is at \texttt{0x18}, and the environment pointer and terminator are at \texttt{0x20} and \texttt{0x28}. The first auxiliary pair starts at \texttt{0x30}. With main bias \texttt{0x55555000} and entry \texttt{0x1060}, expect \texttt{AT\_ENTRY=0x55556060} and \texttt{AT\_PHDR=0x55555040}. Thirteen entries of 56 bytes cover \texttt{0x2d8} bytes, ending at \texttt{0x55555318}, exclusive. With interpreter bias \texttt{0x7f200000} and entry \texttt{0x1a20}, the kernel's first user instruction is at \texttt{0x7f201a20}. Confusing the two addresses would either skip initialization or reenter the interpreter.
+
+\Cref{fig:visual-292} locates the auxiliary vector without treating its offset as fixed and separates the two entry addresses.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node at (0,0.7) {Initial stack};
+  \foreach \off/\lev/\word in {00/0/{\(2\) (argc)},08/-0.6/{argv[0]},
+    10/-1.2/{argv[1]},18/-1.8/{NULL},20/-2.4/{envp[0]},28/-3/{NULL},
+    30/-3.6/{auxv pairs begin}} {
+    \draw (-1.65,\lev) rectangle ++(3.3,-0.6);
+    \node at (0,\lev-0.3) {\word};
+    \node[anchor=east] at (-1.8,\lev-0.3) {\texttt{+\off}};
+  }
+  \node[tome box,minimum width=5.2cm] (first) at (6.2,-0.75)
+    {Kernel starts interpreter\\PC = \texttt{0x7f201a20}};
+  \node[tome box,minimum width=5.2cm] (next) at (6.2,-3.32)
+    {Interpreter hands off to program\\\texttt{AT\_ENTRY} = \texttt{0x55556060}};
+  \draw[tome arrow] (first) -- node[right,align=left] {After\\startup work} (next);
+  \draw[tome dashed] (1.65,-3.9) -- node[below,sloped] {Entry from auxv} (next.west);
+\end{tikzpicture}
+\caption{Stack offsets increase from the incoming stack pointer. The program's runtime entry is passed as an auxiliary value; it is not the interpreter address at which the process begins.}
+\label{fig:visual-292}
+\end{figure}
+
+Test the invariant that the application entry lies in the application's executable load range and the first instruction lies in the interpreter's executable load range, using the respective biases. In the stack trace, change the environment to empty. The environment terminator moves to \texttt{0x20} and the auxiliary vector to \texttt{0x28}; a parser using the previous constant offset now reads the first pair incorrectly.
+
+\section{Finish bootstrap before entering the language runtime}
+
+The interpreter starts without the benefit of an already initialized dynamic linker. Its earliest code is arranged to find its own dynamic information and perform the necessary self-relocations before relying on ordinary relocated references. Levine gives one historical implementation; reserved slots and the bootstrap instruction sequence are ABI- and implementation-specific, not rules for reading the initial stack. The interpreter then discovers dependencies, relocates the loaded images, and participates in startup initialization before passing control to the executable's entry. Some initialization is left to executable-side runtime startup; do not infer the whole constructor schedule from the transfer address.
+
+The executable entry is normally a startup routine such as \texttt{\_start}. It mediates between the stack record and the normal language calling convention; the kernel has not called \texttt{main} with C arguments in registers. To inspect a local PIE, compare the linked entry from \texttt{readelf -hW} and interpreter from \texttt{readelf -lW} with the live value of \texttt{getauxval(AT\_ENTRY)} printed by that PIE. Subtracting the linked entry from the live address gives the main image's bias, not \texttt{AT\_BASE}.

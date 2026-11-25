@@ -1,0 +1,75 @@
+% Source: blindel-instrselect-book.txt
+
+\section{A Grammar for the IR, Not the Source Program}
+
+The Graham--Glanville approach starts with an intermediate representation that is already a tree and turns it into a token stream for a shift--reduce parser. In ``Expressing Instructions as a Grammar'' and ``Tree Parsing,'' Blindell describes the key move: print the IR's ordered operators and leaves in prefix notation, then let reductions stand for instruction selections \cite[section~3.3.1]{blindell2016instruction}. The grammar now describes the target's ways of implementing the IR. Its parse trees are instruction derivations, not alternative interpretations of the original program.
+
+An operator's fixed arity is enough to delimit its child expressions in the prefix stream. A nullary token can carry a payload that does not appear in the grammar: $\mathrm{ARG}(a)$ and $\mathrm{ARG}(b)$ have the same terminal class but name different incoming virtual registers. A rule consists of a production, a cost, and an action. We write $G\gets p$ to mean that the pattern $p$ can be reduced to the goal $G$. A successful parse consumes the entire stream and produces the requested root goal. Reducing a prefix to some nonterminal is not acceptance.
+
+\section{Two Parses for a Byte Pack}
+
+The IR operation $\mathrm{PACK}$ returns a word with the low byte of its first operand in bits 8 through 15, the low byte of its second operand in bits 0 through 7, and all other bits zero. $\mathrm{MASK}$ zeros all but the low byte. The machine's generic pack instruction requires its low operand to have already been masked; its immediate-high form does the low masking itself. The grammar below covers packs whose second operand has an explicit mask. $R$ means a register, $L$ a register known to hold only an unsigned byte, and $G$ the final result in a register. $\mathrm{K}$ denotes a literal already classified as an unsigned byte. We expose the fused instruction only when the low operand is an incoming register.
+
+\begin{center}
+\begin{tabular}{clrl}
+Rule & Prefix production & Cost & Action \\
+$r_1$ & $R\gets \mathrm{ARG}$ & 0 & Reuse the incoming register \\
+$r_2$ & $R\gets \mathrm{K}$ & 1 & Materialize the literal \\
+$r_3$ & $L\gets \mathrm{MASK}\ R$ & 1 & Clear the upper bits \\
+$r_4$ & $G\gets \mathrm{PACK}\ R\ L$ & 1 & Pack from two registers \\
+$r_5$ & $G\gets \mathrm{PACK}\ \mathrm{K}\ \mathrm{MASK}\ \mathrm{ARG}$ & 1
+      & Pack with immediate high byte \\
+\end{tabular}
+\end{center}
+
+For $\mathrm{PACK}(\mathrm{K}(18),\mathrm{MASK}(\mathrm{ARG}(a)))$, the fused parse consumes all four raw tokens in one reduction. The other parse reduces the high literal to $R$, the low argument to $R$, the mask to $L$, and the pack to $G$. Both are legal, with modeled costs one and three. In the fused parse the action knows the high byte and the incoming register from terminal payloads; in the generic parse it consumes the operands returned by its frontier reductions. This is ambiguity in how to implement a computation whose semantics are fixed.
+
+% Annotated walkthrough
+\section{Follow the Lookahead into a Dead End}
+
+Replace $\mathrm{ARG}(a)$ with $\mathrm{K}(52)$. The complete input is now \texttt{PACK K(18) MASK K(52)}. The table shows the stack's symbols, omitting parser states and semantic payloads. The two branches start with exactly the same stack and lookahead.
+
+\begin{verbatim}
+action                       stack                 next
+shift PACK, shift K(18)      PACK K                MASK
+[1] try shifting MASK        PACK K MASK           K(52)
+    no valid continuation    --                    --
+
+resume before [1]            PACK K                MASK
+[2] reduce r2                PACK R                MASK
+shift MASK, shift K(52)      PACK R MASK K         end
+reduce r2, then r3           PACK R L              end
+reduce r4                    G                     end
+accept                       G                     end
+\end{verbatim}
+
+\noindent\textbf{[1]} Shifting postpones commitment to the register form and keeps the longer rule available. But after that shift the longer rule needs $\mathrm{ARG}$, not $\mathrm{K}$. The first literal is now buried under $\mathrm{MASK}$, where an ordinary stack reduction cannot materialize it. Blindell calls this failure to find an existing derivation \emph{syntactic blocking}.
+
+\noindent\textbf{[2]} Reducing the first literal while it is on top of the stack rules out the fused parse but keeps the generic one viable. The four emitted operations materialize 18 and 52, mask the second value, and pack the bytes to give \texttt{0x1234}. Resuming here illustrates a second branch of the derivation, not a recovery feature of an ordinary deterministic LR parser.
+
+\section{Acceptance, Legality, and Cost}
+
+\Cref{fig:visual-265} connects the dead end to the exact lookahead that caused it. The alternative changes the parse stack, not the input.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram, stack/.style={tome box,text width=4.25cm}]
+  \node[stack] (split) at (0,0) {Stack: \texttt{PACK K}\\Lookahead: \texttt{MASK}};
+  \node[stack] (dead) at (-2.75,-2.55)
+    {\texttt{PACK K MASK}\\Next: \texttt{K(52)}, not \texttt{ARG}};
+  \node[stack] (live) at (2.75,-2.55)
+    {\texttt{PACK R}\\Next: \texttt{MASK}};
+  \node[stack] (end) at (2.75,-4.5) {Accept \(G\) via \(r_4\)\\All input consumed};
+  \draw[tome dashed] (split.south)--node[above left,font=\footnotesize]{shift \texttt{MASK}} (dead.north);
+  \draw[tome arrow] (split.south)--node[above right,font=\footnotesize]{reduce \(r_2\)} (live.north);
+  \draw[tome arrow] (live)--node[right,font=\footnotesize]{parse masked literal} (end);
+  \node[below,font=\footnotesize] at (dead.south) {Fused \(r_5\) blocked};
+\end{tikzpicture}
+\caption{The two lookahead choices for \texttt{PACK K(18) MASK K(52)}. The parser must try the generic operand reductions if it took the dashed branch first.}
+\label{fig:visual-265}
+\end{figure}
+
+After a reduction, the new stack symbol must summarize exactly the consecutive input segment consumed by that production, and its payload must satisfy the nonterminal's operand contract. In particular, a register named by $L$ must be the result of an action that clears the upper bits. An implementation that tries multiple branches can build deferred action records and run them in dependency order only after accepting, so failed parses cannot leave partially emitted code behind.
+
+Blindell's ``Resolving Conflicts and Avoiding Blocking'' distinguishes this syntactic failure from \emph{semantic blocking}: several reductions can look valid symbolically but their operand predicates may all fail. ``Extending Grammars with Semantic Handling'' discusses carrying attributes and testing predicates before running actions \cite[sections~3.3.1--3.3.2]{blindell2016instruction}. For instance, a tighter immediate encoding could use a narrower terminal class or a range test, retaining register materialization for values outside the range. Changing how conflicts are resolved may fix one input and hurt another: always reducing at the conflict above would lose the cheaper fused parse on the original input. The LR table tells a parser which reduction to try; it does not, by itself, compare complete derivations. Chapter~\ref{ch:ext-266} takes a different approach to finding candidates without committing to their reductions.

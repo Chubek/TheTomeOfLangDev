@@ -1,0 +1,71 @@
+% Source: abstract-machines-for-proglang-impl.txt
+% Source: holm-logic-programming-in-scheme.txt
+% Source: algo-ds-in-prolog-lisp-java.txt
+
+\section{Compile the Operations That Resolution Keeps Repeating}
+
+A source interpreter can copy fresh clauses, inspect their syntax, and maintain explicit substitutions at each step. Holm's \emph{Logic Programming in Scheme} is an example of building up a logic engine around substitutions as data. A Prolog implementation can instead compile head unification and body calls into instructions over mutable term cells. The Warren Abstract Machine (WAM) is the classic design. Diehl, Hartel, and Sestoft's survey \emph{Abstract machines for programming language implementation}, section~7, describes its memory areas and specialized instructions. This chapter follows the machine's obligations, not a specific implementation's bytecode.
+
+Consider this Prolog lowering pass for an imaginary instruction set:
+
+\begin{verbatim}
+encoding(add, short).
+encoding(add, long).
+encoding(sub, long).
+
+enabled(long).
+
+lower(Op, Code) :-
+    encoding(Op, Code),
+    enabled(Code).
+\end{verbatim}
+
+The query \verb|?- lower(add, Code).| tries \texttt{short}, rejects it in \texttt{enabled/1}, and then returns \verb|Code = long|. Luger and Stubblefield's account of Prolog backtracking explains the source behavior; the machine must implement that behavior without copying the entire heap each time it tests an encoding.
+
+\section{A Continuation Is Not a Choice Point}
+
+Argument registers carry terms into a predicate. Head instructions inspect or unify them: a constant in a clause can bind an unbound cell or compare against an already-bound value. Compound-term instructions can read an existing structure or construct one when the actual argument is a variable. Variables that only need to survive within an instruction sequence can live in temporary registers. Values needed across a non-tail call have to survive register reuse; a conventional WAM compilation assigns such permanent variables to an environment, which also saves the ordinary continuation. In the example, the reference for \texttt{Code} must remain available across \texttt{encoding/2} so that \texttt{enabled/1} can inspect it. Being permanent in this sense is a liveness property, not an exemption from backtracking.
+
+A continuation says where to resume if a call succeeds. A choice point says where to go if a branch fails or the caller requests another answer. A choice point captures the next alternative and the state needed to resume there, including arguments, relevant control registers, and heap and trail boundaries. A heap holds allocated variables and structures; the trail logs variable cells that must be reset on retry. The survey also describes a push-down list of pairs awaiting unification. That list is local work for solving term equations, not a list of untried clauses. \Cref{fig:visual-342} shows the two roles played by the choice point and trail in this example.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (cp) at (0,0) {Choice point\\resume at \texttt{encoding(add,long)}};
+  \node[tome box] (trail) at (-2.8,-2) {Trail entry\\address of \texttt{Code} cell};
+  \node[tome box accent] (cell) at (2.8,-2) {Older variable cell\\currently \texttt{short}};
+  \draw[tome arrow] (cp) -- node[left,align=center]{bounds\\the undo} (trail);
+  \draw[tome arrow] (trail) -- node[above]{reset on retry} (cell);
+\end{tikzpicture}
+\caption{The retry address selects different code, while the trail restores a cell that existed before the choice. Restoring the heap pointer alone would leave that cell bound.}
+\label{fig:visual-342}
+\end{figure}
+
+% Annotated walkthrough
+\section{Walkthrough: Restore the State Before Retrying}
+
+The pseudocode models retry at one choice point; finishing its final alternative also removes that choice point. It assumes binding entries for cells that were unbound before modification, as in ordinary variable trailing.
+
+\begin{verbatim}
+bind_unbound(cell, value):
+    if cell survives rollback to the latest choice:
+        trail.push(cell)                 # its binding must not survive
+    cell := value
+
+retry(choice):
+    while trail.top > choice.trail_top:
+        cell := trail.pop()
+        reset_to_unbound(cell)            # before reusing memory
+    restore_heap_top(choice.heap_top)
+    restore_arguments_and_control(choice.saved_state)
+    jump to choice.next_alternative
+\end{verbatim}
+
+At entry to \texttt{encoding/2}, the query's \texttt{Code} cell already exists. Binding it to \texttt{short} therefore records that address on the trail. The call \texttt{enabled(short)} fails, retry unbinds \texttt{Code}, and the second head binds it to \texttt{long}. The invariant at retry is that all cells that existed at the saved point again have the bindings they had there, and younger heap allocations are no longer in use by the restored computation. Heap restoration suffices for cells allocated after the choice; trailing all such cells would add unnecessary work. The machine must also respect storage lifetimes: a surviving reference cannot point into reclaimed stack or heap space.
+
+\section{Optimize Predicate Entry Without Changing the Search}
+
+First-argument indexing can skip the \texttt{sub} fact for the query with \texttt{add} known. It must permit the appropriate candidates when the argument is unbound and, for ordinary Prolog predicates, preserve the order of remaining alternatives. Last-call optimization can reuse or drop an environment when no local continuation is needed and doing so is safe with outstanding choices. A direct cut can discard choice points newer than its entry boundary; it must not undo the current successful bindings. These optimizations change the work the engine performs, not the required order or scope of retry. A regression test should force the first head to bind an older cell and a body goal to fail: if the second head then appears not to match, the problem may be a missing trail entry rather than clause selection.
+
+Thus the compiled engine is itself a compiler component: its instruction selection may change allocation and probe costs, but its observable output remains the source-level sequence of answers, failures, and permitted retries.

@@ -1,0 +1,64 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{A Register Number Does Not Identify a Value}
+
+Suppose two older instructions both write \(x_5\), and a third reads \(x_5\). It needs the value from the younger of the two older instructions, even if the older one has already produced a result and the younger one is still waiting for memory. Forwarding from the older instruction is not a productive shortcut. When the consumer finally runs, it would silently use the wrong operand. The architectural rule is a read-after-write dependence; a hardware hazard occurs when a particular implementation cannot yet satisfy it.
+
+A forwarding path lets a consumer take a value before it reaches the register file, but only if the required producer's value is ready at the point of use. A load may have computed its address and still have nothing useful to forward. A structural hazard is different: independent operations can both be ready yet contend for one port. Write-after-read and write-after-write ordering also need protection if reads or writes are allowed to pass one another; an in-order pipeline with uniformly ordered reads and commits may prevent those cases by construction. The hazard logic must reflect the implemented ordering, not infer it from the mere presence of an instruction name.
+
+\section{Declare a Path, Then Synthesize Its Control}
+
+Here is the forwarding and decode excerpt from Listing~12 of the VADL paper, with typographic spacing normalized. It presupposes the fetch stage and the ISA register file.
+
+\begin{verbatim}
+[forwarding]
+logic bypass
+
+stage DECODE -> (ir: Instruction) = {
+  let instr = decode(FETCH.fr) in {
+    instr.readOrForward(@X, @bypass)
+    ir := instr
+  }
+}
+\end{verbatim}
+
+The abstraction does not promise that every value can be forwarded. A MiA must provide the relevant producing connections as well, and a stall is still needed when no permitted path can deliver the correct value. Section~3.4.4 discusses using the logic element's semantics in synthesis so that a resolvable dependence need not stall, and describes default control and hazard detection when they are not supplied. Sections~4.7.3--4.7.4 give the ordering of the implementation analysis: assign resource ports, then synthesize logic elements using the pipeline and the program points that supply or consume their signals \cite{himmelbauer2024vadl}. This is a source for control generation, not a declaration of the resulting gates or of a compiler scheduling table.
+
+% Annotated walkthrough
+\section{Select the Producer Before Asking Whether It Is Ready}
+
+Consider an in-order issue pipeline in which D reads operands, E computes a load address, M obtains the data, and W commits the result. For this example a forwarded M result can be used by D in the \emph{following} cycle; the register file reflects all writes already committed at the start of D's operand selection. The following pseudocode is an illustrative operand rule, not VADL.
+
+\begin{verbatim}
+operand(consumer, r, cycle):
+    if hardwired(r): return constant(r)
+    p = youngest older nonsquashed uncommitted writer of r
+    if p is absent: return register_file[r]
+    if ready(p, cycle) and has_path(p, consumer, cycle):
+        return forwarded_value(p)
+    return WAIT                       # never fall back to an older value
+\end{verbatim}
+
+Begin with \(x_5=1\), then issue \texttt{addi x5, x0, 7}, \texttt{lw x5, 0(x1)}, and \texttt{addi x6, x5, 1}. The addressed word holds \(42\). In cycle 4, the first instruction is in M, the load is in E, and the consumer first attempts its D read. The first result is \(7\), but the load is the nearest writer and its data are not ready. D stays occupied through cycle 5, when the load is in M. At the start of cycle 6 the data are available on the assumed path, so D reads \(42\) and the consumer later writes \(43\). Whether \(7\) came from a bypass or was already in the register file cannot affect that decision. A flushed writer must be removed from this age order before it can block or forward; conversely, a hardwired zero register normally creates no live writer at all. \Cref{fig:visual-332} isolates the two competing values at the first decision point.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (old) at (0,0) {Older: $x_5 \gets 7$};
+  \node[tome box] (young) at (0,-1.55) {Younger: load $x_5$};
+  \node[tome box] (select) at (5,-0.78) {Select by age};
+  \node[tome box] (hold) at (8.75,-0.78) {Hold D};
+  \draw[tome arrow,dashed] (old.east) -- node[above] {ready} (select.north west);
+  \draw[tome arrow] (young.east) -- node[below] {not ready} (select.south west);
+  \draw[tome arrow] (select) -- (hold);
+\end{tikzpicture}
+\caption{A ready result loses to a younger pending definition of the same register. The solid path determines whether decode may proceed.}
+\label{fig:visual-332}
+\end{figure}
+
+\section{Give the Compiler a Cost, Not a New Semantics}
+
+A scheduler estimates when each result can feed each kind of use and when a functional unit can accept more work. A useful model distinguishes result latency from how long a resource is reserved and can account for particular bypasses. For the trace above it may put independent arithmetic between load and consumer to fill an otherwise empty issue slot, provided it preserves register and memory dependencies and observable effects. It cannot move the consumer ahead of the load or assume two memory operations are independent merely because the pipeline has two ports. On an interlocked implementation, a pessimistic latency estimate may waste opportunities; an optimistic one may cause hardware stalls rather than change the result. That distinction does not extend to machines whose ISA exposes scheduling obligations.
+
+Section~4.1 identifies scheduling as a consumer of MiA information. The reported cycle experiments in Section~5.7 and hardware comparison in Section~5.8 are not evidence that every synthesized bypass was exported into a validated compiler scheduler. A useful separate test is to run dependent pairs both adjacent and with independent instructions between them: the architectural results should agree, and the cycle traces should reveal whether the chosen schedule hid the intended stall.

@@ -1,0 +1,85 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{The Linker's View of the File}
+
+John R. Levine divides object-file contents into headers, code and data, relocations, symbols, and optional information for debugging. His ELF discussion then distinguishes sections, which organize data for linking, from segments, which describe what a loader maps \cite[chapter~3]{levine2000linkers}. A relocatable file is an input to a linker, not a program image ready to enter. For ordinary native ELF objects, start with the section headers rather than trying to infer the layout from program headers. Conversely, a loadable image's segments can cover several sections; names such as \texttt{.text} are not themselves load commands.
+
+Levine illustrates 32-bit ELF. In the ordinary AMD64 ELF64 model here, the processor supplement specifies little-endian encoding, ELF class 64, and machine identifier \verb|EM_X86_64|. Use the header to establish class, byte order, machine, and file type before interpreting the rest. A section header describes, among other things, the section's type, flags, file offset, size, and alignment. A \verb|SHT_NOBITS| section can describe storage without containing that many bytes in the file. Its header's logical size is not a bound for reading a payload. Section names and symbol names are offsets into their respective string tables, not pointers or interchangeable indices.
+
+\section{Follow Indices, Not Naming Conventions}
+
+A regular symbol table records a name offset, value, size, binding, type, visibility, and section index, with some attributes sharing a field. In an \verb|ET_REL| object, an ordinary defined symbol's value is an offset in the section indicated by its index. Undefined and absolute symbols have special indices rather than storage there. A relocation section's \verb|sh_info| names the section to modify and its \verb|sh_link| names the symbol table used by its records. Read those indices instead of deducing the target from a name such as \verb|.rela.data|. Each entry identifies its patch offset within the target section, the relocation type, and a symbol by table index.
+
+Levine's example contrasting implicit and explicit addends describes 32-bit x86 when it mentions \texttt{REL}. The AMD64 ABI in use here specifies \texttt{RELA}, whose addend is in the record. Its type selects both the calculation and field format. For the absolute \verb|R_X86_64_64| type, the calculation is $S+A$ and the field is eight bytes. Do not add the bytes that happen to be in the field to $S+A$. An assembler fixup is an internal deferred operation; only an ABI relocation left in the output is visible in this table.
+
+% Annotated walkthrough
+\section{Follow a Data Reference Through a Partial Link}
+
+Create \texttt{slot.s} with the following contents:
+
+\begin{verbatim}
+.section .data.fixture,"aw",@progbits
+    .byte 0x7e
+    # Seven bytes of padding belong to this input section.
+    .balign 8, 0
+.globl entry_slot
+entry_slot:
+    # Record a reference two bytes into another input's data.
+    .quad tone + 2
+\end{verbatim}
+
+Create \texttt{tone.s} using the same named section, with an eight-byte contribution:
+
+\begin{verbatim}
+.section .data.fixture,"aw",@progbits
+.globl tone
+tone:
+    .ascii "SALT"
+    .zero 4
+\end{verbatim}
+
+Run these commands with GNU Binutils in a scratch directory:
+
+\begin{verbatim}
+as --64 -o slot.o slot.s
+as --64 -o tone.o tone.s
+readelf -hSWsr slot.o
+ld -r -o joined.o tone.o slot.o
+readelf -hSWsr joined.o
+\end{verbatim}
+
+In \texttt{slot.o}, \texttt{tone} is undefined and \verb|entry_slot| has value eight. The relocation starts at section offset eight, uses \texttt{tone}, and has addend two. In \texttt{joined.o}, \texttt{tone} is defined at offset zero. The eight-byte prefix moves the slot and relocation site to $8+8=16$, while the addend remains two. The partial link can find the definition but cannot substitute an absolute address: the combined section is still movable. If it is eventually placed at address \texttt{0x402000}, this record would put \texttt{0x402002} into the slot, in little-endian bytes \texttt{02 20 40 00 00 00 00 00}. That number is an address into \texttt{tone}, not the section offset of the field storing it.
+
+Trace the reference without trusting the pretty-printed name in the relocation line. In the section dump, follow \texttt{Inf} to the data section and \texttt{Lk} to the symbol table. Split the relocation's ELF64 \verb|r_info| value at bit 32: the high half gives a symbol index and the low half gives the relocation type, which is one here. In one GNU Binutils run the index changed from two to six after the partial link, even though the type and addend stayed the same. Check the high half against the symbol table in \emph{each} object; the observed index values are not portable toolchain guarantees.
+
+\Cref{fig:visual-284} shows which table supplies each part of the reference in \texttt{joined.o}.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=3.8cm] (rela) at (0,0)
+    {Relocation section};
+  \node[tome box,minimum width=3.8cm] (record) at (0,-1.6)
+    {RELA entry: offset 16\\type 1, addend 2};
+  \node[tome box,minimum width=4cm] (target) at (7.2,0)
+    {\texttt{.data.fixture}\\field at offset 16};
+  \node[tome box,minimum width=4cm] (symtab) at (7.2,-1.6)
+    {\texttt{.symtab}\\entry for \texttt{tone}};
+  \node[tome box,minimum width=4cm] (strings) at (7.2,-3.2)
+    {\texttt{.strtab}\\bytes of the name};
+  \draw[tome arrow] (rela) -- node[above] {\texttt{sh\_info}} (target);
+  \draw[tome arrow] (rela) -- node[above,sloped] {\texttt{sh\_link}} (symtab.north west);
+  \draw[tome arrow] (record) -- node[above] {\texttt{r\_info} high half} (symtab);
+  \draw[tome arrow] (symtab) -- node[right] {\texttt{st\_name}} (strings);
+\end{tikzpicture}
+\caption{The relocation section header selects the patch section and the symbol table. The entry then selects a field within the former and a symbol within the latter.}
+\label{fig:visual-284}
+\end{figure}
+
+\section{Preserve Relations When Rewriting Tables}
+
+An object reader must check table extents, resolve indices against the appropriate table, and verify that each supported relocation's field fits in its target section. For example, offset sixteen with an eight-byte field fits a section of size twenty-four exactly, but does not fit one of size twenty-three. The check can compare the offset to the size minus the field width after ensuring the width fits, avoiding overflow in computing the end.
+
+Levine's Chapter~3 project calls for a round trip that preserves meaning rather than byte identity, and specifically warns to update relocation indices when reordering symbols. The invariant for a rewritten object is that each relocation still designates the same logical field and the same symbol or permitted equivalent expression after remapping. Neither an unchanged symbol-name list nor an unchanged table of numeric indices tests that invariant on its own.

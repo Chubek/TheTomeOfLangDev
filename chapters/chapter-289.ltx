@@ -1,0 +1,83 @@
+% Source: linkers-loaders-ocr.txt
+
+\section{Identify Duplicates Before Following Live References}
+
+Levine describes an approach to C++ templates in which each compiler invocation emits the copies it needs and the linker keeps just one. His examples include GNU \texttt{.gnu.linkonce.*} names and historical Windows COMDAT selection policies. Current ELF instead provides a standardized way to describe groups of sections, including groups flagged \verb|GRP_COMDAT|: duplicates are recognized by the same group signature, not merely by the same section name. At most one such group survives duplicate selection, and selecting a copy means selecting its related members together \cite[chapter~4]{levine2000linkers}. The \href{https://gabi.xinuos.com/elf/03-sheader.html#section-groups}{ELF generic ABI section group rules} specify how discarded definitions and references are represented.
+
+A reference from outside a group to a global or weak symbol in the group can resolve to the definition in a surviving copy. A local identity defined in a discarded group cannot be rebound to a same-spelled local identity from another file; ordinary external-to-group references to such locals are disallowed. Two ordinary strong definitions, with no duplicate-selection contract, remain an error. A weak-definition tie is not group selection: choosing a weak definition does not itself discard its section or associated data. Nor does ELF COMDAT selection promise to check that duplicate groups have equal bytes or behavior. The producer has to ensure that accepting any of the intended copies is valid.
+
+\section{Reachability Is a Different Decision}
+
+Levine's historical AIX example uses separate procedure sections and infers references from relocations \cite[chapter~11]{levine2000linkers}. A useful model for GNU ELF section collection is marking from roots rather than repeatedly deleting nodes with no incoming references. A dead cycle may never have zero incoming references, but no member of it is reachable. In a simplified model, mark the section of the entry symbol, any explicitly retained sections, then the targets of relocations in marked sections. Treat a retained group as a unit. Real linkers have further rules for exports, constructor arrays, unwind metadata, and similar special inputs; for example, a shared object's visible exports can be roots with GNU \texttt{ld}. In an executable, an ordinary global name is not automatically an export or a root. Hiding a definition does not prevent a live relocation from keeping it.
+
+% Annotated walkthrough
+\section{Keep a Registration Record, Not an Unreachable Cycle}
+
+Assemble the blocks separately on x86-64 ELF with GNU \texttt{as}. Assemble the first block twice, as \texttt{oak.o} and \texttt{elm.o}, substituting \texttt{elm} for the string literal in the second copy. The differing strings deliberately expose the winner; they are not a model for equivalent C++ definitions.
+
+\begin{verbatim}
+# format.s: the function and private caption must travel together.
+.section .text.format,"axG",@progbits,format,comdat
+.globl format
+format: leaq .Lcaption(%rip), %rax
+        ret
+.section .rodata.format,"aG",@progbits,format,comdat
+.Lcaption: .asciz "oak"
+\end{verbatim}
+
+\begin{verbatim}
+# roots.s: _start has no reference to the registration record.
+.section .text.start,"ax",@progbits
+.globl _start
+_start: ret
+.section .catalog,"a",@progbits
+.quad format                    # One edge if the entry is live.
+.section .text.loop_a,"ax",@progbits
+loop_a: jmp loop_b
+.section .text.loop_b,"ax",@progbits
+loop_b: jmp loop_a               # Incoming edges alone prove nothing.
+\end{verbatim}
+
+Do not execute these fixtures. Inspect the input with \verb|readelf --section-groups oak.o|. Link with \verb|ld.bfd --gc-sections --print-gc-sections| followed by \verb|-o bare roots.o oak.o elm.o|. Without an explicit root for \texttt{.catalog}, neither that section nor \texttt{format} survives, and both loop symbols disappear. Now link with \verb|-T keep.ld| as well, using the following augmentation of GNU \texttt{ld}'s default script.
+
+\begin{verbatim}
+SECTIONS { .catalog : { KEEP(*(.catalog)) } }
+INSERT AFTER .rodata;
+\end{verbatim}
+
+The catalog is now a root. Its pointer must equal the surviving \texttt{format} symbol's virtual address; the function must refer to its own caption. The dead loop still disappears. With the given order, GNU \verb|ld.bfd| keeps the \texttt{oak} copy; reverse the two objects and verify that the only caption in \verb|objdump -s -j .rodata| is now \texttt{elm}. Diagnose the result with a map (add \verb|-Map=kept.map|) and the GC log, not just a count of surviving names.
+
+\Cref{fig:visual-289} separates duplicate selection from the root walk in the kept-catalog run.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark,minimum width=2.6cm] (cat) at (0,0) {\texttt{.catalog}\\KEEP root};
+  \node[tome box,minimum width=2.7cm] (fmt) at (4.05,0) {\texttt{format}};
+  \node[tome box,minimum width=2.7cm] (cap) at (8.4,0) {Caption: \texttt{oak}};
+  \node at (6.225,0.96) {Selected COMDAT group};
+  \begin{scope}[on background layer]
+    \node[tome group,fit=(fmt)(cap)] {};
+  \end{scope}
+  \draw[tome arrow] (cat) -- (fmt);
+  \draw[tome arrow] (fmt) -- (cap);
+  \node[tome box,minimum width=2.6cm] at (0,-2.05) {\texttt{\_start}\\entry root};
+  \node[tome box] (a) at (4.05,-2.05) {\texttt{loop\_a}};
+  \node[tome box] (b) at (8.4,-2.05) {\texttt{loop\_b}};
+  \draw[tome arrow] (a.east) to[bend left=24] (b.west);
+  \draw[tome arrow] (b.west) to[bend left=24] (a.east);
+  \node at (6.225,-2.95) {Unrooted cycle: collected};
+  \node[anchor=west] at (-1.3,-3.65) {\texttt{elm} group: discarded as a duplicate before the root walk.};
+\end{tikzpicture}
+\caption{Arrows are relocation references. Roots keep the selected function and its caption, but the loop's mutual references are not a path from a root.}
+\label{fig:visual-289}
+\end{figure}
+
+\section{Know Which Operation Removed the Bytes}
+
+In the fixture the invariant is that every live catalog entry targets the selected group and that group keeps its matching caption, while no unrooted cycle survives. Add a second non-grouped strong definition of a fresh name to two ordinary inputs and expect a duplicate-definition diagnostic even with section GC enabled; GC is not a way to select an arbitrary definition.
+
+To distinguish preservation from admission, move the catalog section and its pointer into a new object, give the pointer a global label \texttt{catalog\_entry}, and put that object alone in an archive. Keep the rest of \texttt{roots.o} on the link line. With the same script, the catalog is absent until you force \texttt{catalog\_entry} with \verb|-u catalog_entry| or link the new object explicitly. \verb|KEEP| protects matching sections of admitted objects; it does not request them from an archive.
+
+Finally, identical code folding is a separate, optional operation. It can combine live sections with different names under a linker's equivalence policy. Raw bytes alone do not suffice: identical placeholders may relocate to different targets, and address equality can be observable even for otherwise equivalent functions. For an experiment on GC, leave folding disabled. Otherwise a missing contribution in the map could be evidence of folding rather than evidence that no root reached it.

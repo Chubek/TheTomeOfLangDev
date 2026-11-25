@@ -1,0 +1,100 @@
+% Source: advances-in-dataflow.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+% Source: analysis-dataflow-programs.txt
+
+\section{Rates Turn a Stream Graph into Arithmetic}
+
+StreamIt-style languages expose pipelines, split-joins, feedback loops, and filters. A filter firing consumes, peeks, and produces declared numbers of items. In the following representative syntax, \texttt{pop 1 push 1} states a steady-state rate contract; it is not a performance hint \cite{thies2002streamit}.
+
+\begin{verbatim}
+filter Gain(float k) {
+  work pop 1 push 1 {
+    push(k * pop());
+  }
+}
+pipeline Twice {
+  add Gain(2.0);
+  add Gain(0.5);
+}
+\end{verbatim}
+
+For a graph edge from actor \(u\) to actor \(v\), a periodic steady state needs positive repetition counts satisfying \(q_u p_{u,e}=q_v c_{v,e}\), where \(p\) and \(c\) are production and consumption rates. Solving these balance equations does not by itself prove that a schedule avoids deadlock or fits finite buffers. Initial tokens, peek rates, and feedback delay matter. Synchronous dataflow obtains strong scheduling results from fixed rates \cite{lee1987sdf}; dynamic rates require a weaker or runtime-checked plan.
+
+\section{Represent Rates Before Choosing a Schedule}
+
+The graph IR should retain typed channels, actor instances, work regions, rates as exact integers or symbolic affine expressions, peek windows, and initial tokens. A repetition vector and a concrete firing sequence are derived artifacts. Keeping them separate permits another scheduler without reparsing source and prevents a target-specific order from masquerading as semantics. \Cref{fig:visual-368} illustrates a legal balanced schedule for a two-rate chain.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (0,0) {A\\push 2};
+  \node[tome box accent] (q) at (3.2,0) {FIFO\\peak 2};
+  \node[tome box] (b) at (6.4,0) {B\\pop 3, push 1};
+  \node[tome box] (out) at (9.2,0) {output};
+  \draw[tome arrow] (a) -- node[above]{\(3\) firings} (q);
+  \draw[tome arrow] (q) -- node[above]{\(2\) firings} (b);
+  \draw[tome arrow] (b) -- (out);
+\end{tikzpicture}
+\caption{Three firings of A produce six items and two firings of B consume six; the FIFO occupancy within the period depends on their order.}
+\label{fig:visual-368}
+\end{figure}
+
+Possible output artifacts include a static schedule, FIFO capacities and layouts, fused loop code, actor kernels, and runtime code for dynamic boundaries. The compiler should also emit the solved balance equations and assumptions. A rejected graph deserves a useful witness: an inconsistent rate cycle, a schedule step that underflows, or a buffer bound exceeded.
+
+% Annotated walkthrough
+\section{Construct and Validate a Periodic Schedule}
+
+\begin{verbatim}
+q := solve_integer_balance_equations(graph.rates)
+remaining := q
+occupancy := graph.initial_tokens
+while some remaining actor is nonzero:
+    ready := actors_whose_consumption_fits(occupancy, remaining)
+    choose actor from ready using buffer-cost heuristic
+    append actor to schedule
+    occupancy := occupancy - consumed(actor) + produced(actor)
+    remaining[actor] := remaining[actor] - 1
+record peak occupancy as required capacities
+\end{verbatim}
+
+Adjacent stateless filters may be fused if the fused loop preserves item order, peeking, numerical behavior, and the external rate. Fission can replicate a data-parallel filter when state does not cross firings or is partitioned correctly. Schedule permutation is legal only when every prefix has enough tokens and externally visible effects keep their required order. Buffer sharing needs nonoverlapping lifetimes, not merely equal element types.
+
+Validation recomputes each edge's net token change over the period, simulates every schedule prefix for underflow and capacity, and compares source and generated streams on finite tests. Stateful filters require comparing state after corresponding logical firings. Floating-point fusion may change rounding, so it needs the language's reassociation permission. The preservation claim is trace equivalence at graph ports under the declared rate model, not equality of intermediate FIFO occupancy.
+
+\section{Budget a Lookahead Window Separately From Consumption}
+
+A moving-difference filter reads the next two tokens, pops one, and pushes one. This actor's declared peek is two, not an extra consumption. With input \(3,8,13,21\), it emits \(5,5,8\) and retains \(21\). The input rate equation still uses a consumption of one. Readiness and buffering must use the larger read footprint, or the scheduler will fire too early.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Available input & Action & Retained after firing \\
+\hline
+\([3]\) & Wait & \([3]\) \\
+\([3,8]\) & Emit \(8-3=5\) & \([8]\) \\
+\([8,13]\) & Emit \(13-8=5\) & \([13]\) \\
+\([13,21]\) & Emit \(21-13=8\) & \([21]\) \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+try_window_step(input, output):
+    if input.count < 2: return NEED_INPUT
+    if output.count == output.capacity: return NEED_OUTPUT
+    left := peek(input, 0)
+    right := peek(input, 1)
+    result := numeric_subtract(right, left)
+    pop(input)
+    push(output, result)
+    return FIRED
+\end{verbatim}
+
+Assume atomic steps in a sequential scheduler. A static implementation can prime the queue with one upstream production before beginning an alternating steady-state schedule. Simulate the prime and steady state separately: a schedule that returns occupancy to its starting value in steady state may be invalid at startup. At end of input a final retained token does not produce a result unless the source specifies padding or another flush rule. This fixture and its one-token variant check both prologue and epilogue; testing long streams alone can hide an off-by-one output count.
+
+\paragraph{Check a retained item across wraparound.}
+Implement the two-slot FIFO as a ring and compare its first three
+firings to the trace above. The retained item changes physical slot as
+the head wraps. A backend that always uses the lower-addressed slot for
+the left operand may pass the first firing and fail the second.

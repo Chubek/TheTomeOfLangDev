@@ -1,0 +1,123 @@
+% Source: ir-il-for-datapath-gen.txt
+% Source: vienna-arch-desc-lang.txt
+
+\section{Specify the Interface Before the Datapath}
+
+Build a streaming byte transform \(y=(3a+b)\bmod256\). A transaction is accepted at rising edge \(E_n\) if reset is low and \texttt{vin} is high. Its result and \texttt{vout} are visible immediately after \(E_{n+1}\), provided reset does not intervene. Bubbles travel with the data; when \texttt{vout} is low the receiver ignores the payload. There is no ready signal, so an uninterrupted stream accepts one pair per edge. Reset synchronously cancels both in-flight and outgoing transactions.
+
+Kasprzyk and colleagues' datapath IR makes operands and control predicates explicit together. Here the arithmetic dependency on \(a\) and the need to delay \(b\) are likewise separate from, but coupled to, the predicate \texttt{vin}. The Vienna architecture-description work generates synthesizable HDL and cycle-accurate models from a microarchitecture description; this example instead writes the RTL and an independent reference by hand. In either workflow, generating the RTL is where downstream synthesis begins.
+
+% Annotated walkthrough
+\section{Lower the Contract to Two Stages}
+
+This is Verilog-2005 \cite{ieee1364verilog}, saved as \texttt{byte\_pipe.v}. The port assignments are unsigned, with an eight-bit truncation at each data register.
+
+\begin{verbatim}
+module byte_pipe(input clk, rst, vin,
+                 input [7:0] a, b,
+                 output reg vout, output reg [7:0] y);
+    reg v1;
+    reg [7:0] triple, bias;
+    always @(posedge clk) begin
+        if (rst) begin
+            v1 <= 0; vout <= 0;
+            triple <= 0; bias <= 0; y <= 0;
+        end else begin
+            v1 <= vin;
+            if (vin) begin
+                triple <= (a << 1) + a;
+                bias <= b;
+            end
+            vout <= v1;
+            if (v1) y <= triple + bias;
+        end
+    end
+endmodule
+\end{verbatim}
+
+The separate reference algorithm keeps a full-width mathematical result and only narrows at comparison. This pseudocode describes a post-edge scoreboard:
+
+\begin{verbatim}
+pending = NONE
+for each sampled edge:
+    if rst:
+        pending = NONE           # flush, including the prior sample
+        assert vout == 0
+    else:
+        assert vout == has_value(pending)
+        if pending exists: assert y == pending mod 256
+        pending = 3*a + b if vin else NONE  # advance after comparison
+\end{verbatim}
+
+If \(a=200\), \(b=230\), then \(3a=600\), the first stage stores \(88\), and the second stores \((88+230)\bmod256=62\). The full calculation \(830\bmod256=62\) agrees because adding multiples of \(256\) cannot change the low byte. If that pair is followed by a bubble, it still produces a valid \(62\); a reset instead of the bubble suppresses it. \Cref{fig:visual-322} shows the path of this transaction.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (in) at (0,0) {\(\texttt{vin}=1\)\\\(a=200,\ b=230\)};
+  \node[tome box accent] (middle) at (4,0)
+    {After \(E_n\)\\\(\texttt{v1}=1,\ (88,230)\)};
+  \node[tome box dark] (out) at (8.4,0)
+    {After \(E_{n+1}\)\\\(\texttt{vout}=1,\ y=62\)};
+  \draw[tome arrow] (in) -- (middle);
+  \draw[tome arrow] (middle) -- (out);
+  \node[align=center] at (4,-1.25) {Reset at either edge cancels the transaction};
+\end{tikzpicture}
+\caption{Data, bias, and validity cross the first clock boundary together. The second boundary captures the sum of the two stored operands, not the current pins.}
+\label{fig:visual-322}
+\end{figure}
+
+\section{Compare the Mapped Design Against a Reference}
+
+Use the same ports for the independent reference, and put the complete arithmetic expression before the first register. This is \texttt{byte\_ref.v}:
+
+\begin{verbatim}
+module byte_ref(input clk, rst, vin,
+                input [7:0] a, b,
+                output reg vout, output reg [7:0] y);
+    wire [9:0] full = 10'd3 * {2'b0,a} + {2'b0,b};
+    reg v1;
+    reg [9:0] pending;
+    always @(posedge clk) begin
+        if (rst) begin
+            v1 <= 0; vout <= 0; pending <= 0; y <= 0;
+        end else begin
+            v1 <= vin;
+            pending <= full;
+            vout <= v1;
+            if (v1) y <= pending[7:0];
+        end
+    end
+endmodule
+\end{verbatim}
+
+Ten bits suffice since \(3(255)+255=1020<1024\). Unlike the scoreboard, these reference outputs also specify hold-on-bubble behavior, which is extra behavior both versions implement. The following shell commands use Yosys and the installed iCE40 primitive simulation models. Start the comparison in a fresh Yosys process so only the mapped design supplies \texttt{byte\_pipe}.
+
+\begin{verbatim}
+yosys -p 'read_verilog byte_pipe.v;
+  synth_ice40 -top byte_pipe -json byte_pipe.json;
+  write_verilog -noattr byte_pipe_mapped.v'
+yosys -p 'read_verilog -nowb +/ice40/cells_sim.v;
+  read_verilog byte_pipe_mapped.v byte_ref.v;
+  miter -equiv -make_assert byte_ref byte_pipe compare;
+  prep -top compare -flatten; opt;
+  sat -verify -seq 5 -set-at 1 in_rst 1 -prove-asserts -prove-skip 1'
+\end{verbatim}
+
+The generated Verilog keeps the target cells and their parameter values; \texttt{-nowb} lets the proof flatten the behavioral primitive models. The SAT check forces reset in its first step and compares outputs in subsequent steps, allowing arbitrary later resets, data and bubbles. With YoWASP Yosys 0.71 it returned \texttt{SUCCESS}. This is bounded logical equivalence under the primitive models, not proof of electrical behavior. An unbounded proof can instead maintain equality of the validity bits and, whenever \texttt{v1} is high, equality of the pending low byte with the sum of the stored operands modulo \(256\). This one-clock case has no CDC; a later wrapper that crosses \texttt{vin}, \(a\), or \(b\) must add a complete crossing protocol rather than synchronize the bits independently.
+
+\section{Route a Device, Not a Board}
+
+For a laboratory exercise without hardware, the shell flow can continue with nextpnr and IceStorm:
+
+\begin{verbatim}
+nextpnr-ice40 --hx8k --package ct256 --freq 12 \
+  --json byte_pipe.json --asc byte_pipe.asc \
+  --report byte_pipe_report.json
+icepack byte_pipe.asc byte_pipe.bin
+\end{verbatim}
+
+The \href{https://github.com/YosysHQ/nextpnr/blob/main/docs/constraints.md}{nextpnr constraints guide} explains the frequency target and PCF format. Here \texttt{--freq 12} is an implementation target, not evidence that every input and output has a board-level timing contract. Here the package pins are not assigned against a board schematic. Treat the route and report as an implementation exercise; do not program the binary on a board. For that use, supply an actual PCF, electrical constraints and a verified board clock and I/O interface, then confirm in \texttt{byte\_pipe\_report.json} that routing completed and the constrained clock meets both applicable timing checks. The ASC describes routed configuration; the binary encoding is a separate device-dependent artifact. Neither is an ASIC layout.
+
+The structural tradeoff is clear without a timing claim: moving the second add past a register requires preserving the bias and its validity. Actual delay depends on carry resources, enable logic, and routing. Use the report to locate the critical endpoints; assume neither that the first stage is critical nor that the arithmetic is the limiting path. Compare alternative pipelines only under matching interfaces and implementation constraints.

@@ -1,0 +1,100 @@
+% Source: finkel-advanced-proglang-design.txt
+% Source: advances-in-dataflow.txt
+% Source: dataflow-graphs-program.txt
+
+\section{Space and Neighborhood Replace a Single Control Thread}
+
+A cellular automaton updates a lattice of cells from local neighborhoods. Conway's Life uses a binary two-dimensional grid and the rule B3/S23: a dead cell is born with three live neighbors; a live cell survives with two or three \cite{toffoli1987cellular}. This actual Life RLE fragment encodes a glider; \texttt{b}, \texttt{o}, \texttt{\$}, and \texttt{!} denote dead runs, live runs, new rows, and the end:
+
+\begin{verbatim}
+x = 3, y = 3, rule = B3/S23
+bo$2bo$3o!
+\end{verbatim}
+
+The conventional Life interpretation adds a Moore neighborhood, an infinite dead background, and synchronous generations. Those are semantic assumptions, not consequences of every spatial file format. Synchronous update reads generation \(t\) and writes generation \(t+1\). Updating cells in place in traversal order yields a different system. Hexagonal neighborhoods, finite wrapping domains, stochastic transitions, mobile agents, and spatial fields need different coordinates and state models.
+
+\section{Represent Neighborhoods and Time Explicitly}
+
+A spatial IR records domain dimensionality and extents, coordinate system, boundary condition, neighborhood offsets, cell state type, transition region, random source, and update discipline. A double-buffered implementation is one lowering, not the semantics. Sparse frontiers and tiles can implement the same generation relation if absent cells and boundaries are handled consistently.
+
+\Cref{fig:visual-376} depicts the read halo for one output tile; the halo is a dependence region, not an ownership claim.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (left) at (0,0) {left halo \(t\)};
+  \node[tome box dark] (tile) at (3.2,0) {tile cells \(t\)};
+  \node[tome box] (right) at (6.4,0) {right halo \(t\)};
+  \node[tome box accent] (next) at (3.2,-1.7) {output tile \(t+1\)};
+  \draw[tome arrow] (left) -- (next);
+  \draw[tome arrow] (tile) -- (next);
+  \draw[tome arrow] (right) -- (next);
+\end{tikzpicture}
+\caption{A tile update reads its old-generation interior and neighboring halos, then writes a disjoint next-generation tile.}
+\label{fig:visual-376}
+\end{figure}
+
+Generated artifacts can include CPU or GPU kernels, halo-exchange schedules, partition maps, boundary kernels, initial-state loaders, and frame or checkpoint streams. A visualization is an output consumer; color mapping and frame skipping must not be mistaken for automaton state transitions.
+
+% Annotated walkthrough
+\section{Tile a Synchronous Generation Safely}
+
+\begin{verbatim}
+old := current_generation
+partition domain into disjoint output tiles
+parallel for tile:
+    halo := gather old cells required by neighborhood and boundary rule
+    for coordinate in tile:
+        next[coordinate] := transition(old[coordinate], halo_neighbors)
+barrier until every tile has finished
+swap(old, next)
+\end{verbatim}
+
+Tiling, vectorization, bit packing, sparse-frontier evaluation, and parallel execution are legal when every output cell reads the same logical old generation. Skipping a cell requires proof that its state and all affected neighborhoods remain unchanged. Stencil fusion across generations expands the required halo and must preserve intermediate boundary behavior. Random rules need counter-based or otherwise reproducible streams indexed by logical coordinate and generation if schedule independence is promised.
+
+Validation compares generation hashes and selected cell traces against a simple reference over finite windows, including edges, corners, empty worlds, oscillators, and patterns crossing tile boundaries. Static checks confirm that the kernel writes only its output tile and that halo widths cover every neighborhood offset. For infinite sparse domains, compare the finite live set under a declared background state. Preservation concerns logical generations and spatial coordinates, not thread order, tile shape, or rendering cadence.
+
+\section{Test a Halo With an Oscillator Across a Tile Boundary}
+
+In Life, put live cells at \((0,1),(1,1),(2,1)\) on a sufficiently large board away from its boundary, or on an infinite plane. Split the tiles between columns zero and one. The next generation has live cells at \((1,0),(1,1),(1,2)\); one more step restores the horizontal line. Birth at \((1,0)\) needs one cell from the neighboring tile, so a compiler that omits the one-cell halo will miss it.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Cell & Old neighbor count & New status \\
+\hline
+\((0,1)\) & 1 & dies \\
+\((1,1)\) & 2 & survives \\
+\((1,0)\) & 3 & born \\
+\((2,0)\) & 2 & remains dead \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+for tile in tiles in parallel:
+    for position in tile.interior:
+        count := 0
+        for offset in moore_neighbors_excluding_center:
+            count += read_old_with_boundary(position + offset)
+        if read_old(position):
+            next[position] := count in {2, 3}
+        else:
+            next[position] := count == 3
+barrier()
+swap(old, next)
+\end{verbatim}
+
+For one generation, a radius-one stencil needs a one-cell halo including corners. To execute two generations per exchange without communicating intermediate values, load enough of the previous generation for a two-cell halo and compute the intermediate results in the halo as well as the tile. A one-cell halo alone cannot supply every dependency at depth two. Test the oscillator with a reversed tile traversal, or translate it so a birth depends on a diagonal neighbor in another tile. Keep a separate edge fixture for a finite toroidal domain: the expected neighbor there wraps, whereas a fixed-dead boundary provides zero.
+
+\paragraph{Check the background before choosing a sparse representation.}
+For Life an all-dead neighborhood stays dead. A rule where the same
+neighborhood becomes alive cannot use ``omitted means dead'' in every
+generation on an infinite plane. One alternative tracks a uniform
+background for each instant and represents deviations from it. Test
+an empty initial world under both rules; the next background differs.
+The decision to store a tile, a set of live cells, or a set of
+deviations depends on the transition as well as on the initial data.
+For a changing background, derive the next background before deciding
+which computed cells differ from it.

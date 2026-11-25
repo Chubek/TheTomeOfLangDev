@@ -1,0 +1,96 @@
+% Source: analysis-dataflow-programs.txt
+% Source: dataflow-parser-cc.txt
+% Source: dataflow-graph-repr.txt
+% Source: lucid-book.txt
+
+\section{One Edge May Carry Several Independent Contracts}
+
+A graph edge can transport values while also participating in a clock domain, fixed token rate, tensor shape, state dependence, effect order, and provenance chain. These dimensions should not be compressed into a single vague ``dataflow type.'' Some compose algebraically; others are obligations or metadata. A representative typed edge might print as:
+
+\begin{verbatim}
+%samples : stream<tensor<128xf32>>
+  {clock = @audio48k, rate = 128/period,
+   state_epoch = %frame, effect = read_only,
+   origin = ["mix.lucid":12:5, "actor:fft.in"]}
+\end{verbatim}
+
+The clock says when logical periods occur, rate says how many tokens participate, shape says each token's value structure, and effect says what evaluation may observe or change. Provenance explains origin but should not change execution. State epoch can prevent a value computed from one snapshot from being reused in another.
+
+\section{Use Separate Lattices and Explicit Conversion Nodes}
+
+The IR design assigns these contracts separate fields and solvers instead of packing them into an opaque type string. Clock inference unifies domains or inserts sample/hold, resampling, or synchronization operations. Rate inference solves integer or rational balance constraints. Shape inference solves extents and broadcasts. Effects form an ordering and interference discipline. State is represented by explicit reads, writes, delays, or region-carried values. Provenance is a many-to-many graph of source occurrences and transformations, not a single line number overwritten at each pass.
+
+\Cref{fig:visual-379} shows these annotations traveling beside a value while a resampler intentionally changes clock and rate.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a) at (0,0) {audio block\\48 kHz, \(128\)};
+  \node[tome box dark] (r) at (3.4,0) {resample};
+  \node[tome box] (b) at (6.8,0) {audio block\\16 kHz, symbolic};
+  \node[tome box accent] (p) at (3.4,-1.6) {provenance + effect};
+  \draw[tome arrow] (a) -- node[above]{value/shape} (r);
+  \draw[tome arrow] (r) -- node[above]{new clock/rate} (b);
+  \draw[tome dashed] (p) -- (r);
+\end{tikzpicture}
+\caption{Clock and rate changes occur at an explicit semantic operation; provenance records why the transformed value still relates to its source.}
+\label{fig:visual-379}
+\end{figure}
+
+Output artifacts include solved annotations, residual runtime guards, clock-crossing and buffer descriptors, state layouts, effect summaries, generated code, and a provenance side table. Debug metadata may be stripped from a release binary, but stripping it must not remove effect or state contracts needed for correctness.
+
+% Annotated walkthrough
+\section{Solve Each Dimension and Check Their Interactions}
+
+\begin{verbatim}
+collect clock, rate, shape, state, effect, and origin facts per operation
+solve clocks; require explicit conversion at every unequal-domain edge
+solve rates and shapes; materialize unresolved checks at runtime
+construct effect order and assign state epochs
+propagate provenance through rewrites using source-ID sets
+cross-check buffer sizes and schedules against all solved dimensions
+\end{verbatim}
+
+Legal optimizations use the appropriate evidence: shape specialization needs dominating guards; schedule changes need rate and clock compatibility; common-subexpression elimination needs purity and the same state epoch; buffer reuse needs nonoverlapping lifetimes and compatible layout. Provenance compression may merge identical origin sets, but cannot justify a semantic rewrite. Treating ``read only'' as ``pure'' is unsafe when a read can observe changing external state.
+
+Validation runs dedicated verifiers for each annotation and cross-checks them. A clock-domain crossing must have an implementation; buffer capacity must match rates and shapes; effects must remain ordered; state reads must be dominated by initialization or delay. Translation validation compares both results and externally visible traces. Provenance tests trace a generated operation back to all contributing source sites, giving diagnostics that remain meaningful after fusion and fission. Together these checks preserve semantic contracts while allowing nonsemantic provenance storage to change.
+
+\section{Compute Storage From Slot Count and Element Layout}
+
+State the units before allocating a queue. Suppose one queue slot carries a complete frame of \(128\) samples, each stored as a four-byte float, and the scheduler proves a peak of three frame tokens. The bare contiguous payload requires \(1536\) bytes. If a rate annotation says \(128\) samples per period, it does not say \(128\) frame tokens per period. Confusing those quantities can inflate the estimate or underallocate, depending on which direction the conversion was applied.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Fact & Quantity & Unit \\
+\hline
+Shape & 128 & samples per frame \\
+Scalar layout & 4 & bytes per sample \\
+Scheduled peak & 3 & frame tokens \\
+Payload bound & 1536 & bytes before queue metadata \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+plan_queue(edge, schedule, target):
+    require schedule.token_unit(edge) == edge.element_unit
+    count := certified_peak_occupancy(edge, schedule)
+    layout := target.layout_of(edge.token_type)
+    stride := checked_align_up(layout.size, layout.alignment)
+    payload := checked_multiply(count, stride)
+    return allocate_ring(payload, count, target.metadata_size)
+\end{verbatim}
+
+In the example, if frames carry padding, views, or variable extents, use the physical layout chosen by lowering and include allocation overhead, not merely the scalar size. The count in this example also assumes a schedule, not an unconstrained arrival process. If the producer can outrun the consumer continuously, finite capacity is not sufficient without a flow policy. Run layout tests with both a packed and a padded token type, then verify that the computed wraparound accesses lie inside the allocation. The certificate, unit check, and physical size calculation discharge different obligations.
+
+\paragraph{Distinguish payload bytes from referenced storage.}
+If a slot contains a handle, the ring stores only that handle, but
+the referenced frame must stay alive until the consumer releases it.
+A byte budget that counts the ring but ignores outstanding frame
+allocations understates peak use. Conversely, counting the same backing
+buffer once per shared read-only handle can overstate it. Annotate
+who owns each buffer and when references expire. In a stress fixture,
+keep all three frame slots live, then drain the queue and verify that
+the retained buffers can be reclaimed.

@@ -1,0 +1,102 @@
+% Source: analysis-dataflow-programs.txt
+% Source: dataflow-opt-cc.txt
+% Source: structured-dataflow-analysis-arrays-opt-cc.txt
+% Source: advances-in-dataflow.txt
+
+\section{Optimization Changes Granularity and Execution Plan}
+
+Alternative-language graphs expose transformations beyond scalar instruction selection. Fusion combines adjacent computations; fission splits or replicates one computation; scheduling orders firings; buffering chooses storage between them; vectorization groups elements; incrementalization reuses prior results after a small change. These transformations interact. Fusing actors may remove a FIFO but enlarge state, reduce parallelism, and change the best schedule. Brunet's work on dynamic dataflow highlights buffer sizing and design-space exploration as first-class concerns rather than cleanup after code generation.
+
+A declarative pipeline specification might be:
+
+\begin{verbatim}
+pipeline {
+  map(scale 2.0)
+  map(clamp 0.0 1.0)
+  window(size=4, step=1)
+  reduce(sum)
+}
+\end{verbatim}
+
+The two maps are promising fusion candidates. The sliding window is stateful across items; duplicating it requires partition halos or replicated state. The reduction's associativity and numerical rules determine vectorization freedom.
+
+\section{Attach Preconditions and Cost to Every Rewrite}
+
+Optimization IR should retain graph regions, rates, shapes, state partitions, effects, order, buffer capacities, and target costs. A transform produces a new graph plus a correspondence between old and new observations. Preconditions are machine-checkable facts where possible. Profitability is separate: a legal fusion can still worsen cache behavior or parallel throughput.
+
+\Cref{fig:visual-380} shows a typical tradeoff between fewer buffers and less pipeline parallelism.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a) at (0,.8) {map scale};
+  \node[tome box accent] (buf) at (3,.8) {FIFO};
+  \node[tome box] (b) at (6,.8) {map clamp};
+  \node[tome box dark] (fused) at (3,-1.1) {fused map};
+  \draw[tome arrow] (a) -- (buf);
+  \draw[tome arrow] (buf) -- (b);
+  \draw[tome dashed] (a) -- node[left]{rewrite} (fused);
+  \draw[tome dashed] (b) -- (fused);
+\end{tikzpicture}
+\caption{Fusion removes an intermediate FIFO and traversal, but also removes an independent pipeline stage; legality and profitability are different decisions.}
+\label{fig:visual-380}
+\end{figure}
+
+Output artifacts include the optimized graph, static or dynamic schedule, buffer and memory plan, vector kernels, incremental cache schema, target code, and a transformation record. Performance profiles are versioned inputs: stale profiles must not silently certify semantics or current profitability.
+
+% Annotated walkthrough
+\section{Search Plans While Revalidating Semantics}
+
+\begin{verbatim}
+worklist := {verified baseline graph}
+while budget remains:
+    candidate := choose graph and transform
+    obligations := candidate.transform.preconditions(graph.contracts)
+    if prove(obligations):
+        rewritten := apply(candidate)
+        verify rates, shapes, effects, state, and token order
+        estimate throughput, latency, memory, and recomputation cost
+        keep nondominated verified plans
+select plan satisfying target constraints and emit transformation record
+\end{verbatim}
+
+Fusion is legal for composable operations when boundary observations and state/effect order survive. Fission needs a partition of tokens and state, plus an order-preserving join where order matters. Scheduling must avoid underflow, overflow, and forbidden effect reordering. Buffer elimination requires direct handoff compatibility. Vectorization needs alignment, tail, alias, and numerical proofs. Incrementalization needs sound invalidation and versioned dependencies; otherwise stale answers are possible.
+
+Validation combines local proof checks with end-to-end differential execution. Rate balance and occupancy simulation check stream plans; randomized shapes and aliases test vector kernels; edit sequences compare incremental and full recomputation; source and optimized runs compare values, errors, state, and ordered effects. Numerical tolerances are valid only when the source contract permits approximation. The transformation record lets a failure be bisected to the first pass whose claimed correspondence no longer holds.
+
+\section{Fuse the Stateless Prefix Without Moving the Window}
+
+Take inputs \(0.10,0.25,0.75,-0.10,0.40\) and use an idealized decimal calculation for illustration. Scaling then clamping produces \(0.20,0.50,1,0,0.80\). The two complete width-four windows sum to \(1.70\) and \(2.30\). A fused map may perform scale and clamp in one actor while preserving their order and numeric semantics. Moving clamp after the sum changes the result; likewise, emitting a partial window at startup changes the output rate at the boundary.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Candidate & First outputs & Decision \\
+\hline
+Original prefix and windows & \(1.70,2.30\) & Baseline \\
+Fused scale then clamp & \(1.70,2.30\) & Check arithmetic and effects \\
+Clamp summed window & \(1,1\) & Reject \\
+Emit on every input & Extra prefix outputs & Reject \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+push_sample(x, ring):
+    y := original_clamp(original_scale(x))
+    if ring.is_full(): ring.drop_oldest()
+    ring.append(y)
+    if ring.count < 4: return NoOutput
+    return Emit(sum_in_original_order(ring.oldest_first()))
+\end{verbatim}
+
+This eliminates an intermediate stream but retains four transformed values. Another candidate maintains a running sum and subtracts the evicted value. That rewrite changes the floating-point operation sequence and can behave differently for NaNs even after the offending sample leaves the window. If the numeric contract is exact integer arithmetic with checked overflow, prove the intermediate adds and subtracts are legal too. A small fixture with three input samples checks the prologue; a fourth sample tests the first output, and a fifth tests that eviction occurs before summation. Benchmark only candidates that survived these checks.
+
+\paragraph{Measure latency as well as traffic.}
+A fused actor can reduce intermediate writes but tie two scheduling
+decisions together. Report the time to the first complete window
+separately from steady-state throughput, and record the peak number
+of queued inputs while the consumer is stalled. Otherwise a batching
+optimization that looks faster in the aggregate may miss the source's
+latency budget on short streams.

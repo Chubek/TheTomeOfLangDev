@@ -1,0 +1,103 @@
+% Source: advances-in-dataflow.txt
+% Source: analysis-dataflow-programs.txt
+% Source: adavances-in-dataflow-langs-lucid.txt
+
+\section{Mailbox Arrival Is Not Token Matching}
+
+Actors encapsulate state and react to messages, possibly creating actors, sending messages, and choosing behavior for later messages \cite{hewitt1973actor}. Dataflow actors also communicate, but a particular model may require FIFO channels, fixed token rates, firing only when a complete pattern is present, or deterministic process behavior. The words ``actor'' and ``message'' do not supply those guarantees by themselves.
+
+This Erlang-style server is deliberately order-sensitive:
+
+\begin{verbatim}
+counter(N) ->
+  receive
+    {add, K}     -> counter(N + K);
+    {read, From} -> From ! {value, N}, counter(N)
+  end.
+\end{verbatim}
+
+Two senders racing to send \texttt{\{add,1\}} and \texttt{\{read,...\}} may cause the read to observe different states, subject to the language's delivery guarantees. A deterministic Kahn process network instead obtains a determinate stream function under its assumptions even though process execution is concurrent. CAL can express dynamic action selection and priorities; determinism must be proved for the actor or network, not inferred from graph shape.
+
+\section{Choose a Communication Contract in the IR}
+
+A concurrency IR must say whether a channel is FIFO globally, FIFO per sender, unordered, bounded, lossy, or blocking; whether receive uses patterns; and whether sends, state updates, and outputs are atomic together. Actor identity, creation, supervision, timeouts, failure, and external effects cannot be represented as ordinary pure data edges. A deterministic subdialect can carry a certificate or effect saying why schedule choice is unobservable.
+
+\Cref{fig:visual-374} contrasts an actor mailbox merge with two separate deterministic FIFOs.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (s1) at (0,.9) {sender A};
+  \node[tome box] (s2) at (0,-.9) {sender B};
+  \node[tome box dark] (mb) at (3.3,0) {mailbox\\merge order};
+  \node[tome box] (act) at (6.4,0) {stateful actor};
+  \node[tome box accent] (df) at (9,0) {typed FIFO ports};
+  \draw[tome arrow] (s1) -- (mb);
+  \draw[tome arrow] (s2) -- (mb);
+  \draw[tome arrow] (mb) -- (act);
+  \draw[tome dashed] (act) -- node[above]{not automatic} (df);
+\end{tikzpicture}
+\caption{A mailbox can merge messages whose relative arrival affects state; drawing the actor as a graph node does not establish deterministic dataflow.}
+\label{fig:visual-374}
+\end{figure}
+
+Backend artifacts may include mailbox layouts, dispatch tables, channel implementations, schedule code for deterministic regions, and a replay/event log for nondeterministic execution. The log is evidence of one run, not a canonical output stream.
+
+% Annotated walkthrough
+\section{Prove a Restricted Merge or Preserve the Choice}
+
+\begin{verbatim}
+for each receive or firing point:
+    enumerate messages or token patterns that can be simultaneously enabled
+    if every pair commutes in state, outputs, failure, and future behavior:
+        mark choice as schedule-independent
+    else:
+        retain mailbox/priority semantics and record choice in replay log
+lower certified deterministic regions to static or parallel schedules
+lower remaining actors to runtime dispatch with explicit ordering contract
+\end{verbatim}
+
+Batching messages, coalescing state updates, and parallelizing handlers are legal only with a commutativity and isolation argument. A send cannot generally move before a state update or exception. For fixed-rate pure dataflow regions, fusion and static scheduling may apply, but crossing an order-sensitive mailbox boundary invalidates those assumptions.
+
+Validation explores alternative deliveries in bounded tests and compares sets of legal traces, not only one favored schedule. Certified deterministic regions should converge to the same outputs and state under all explored schedules. General actor artifacts are checked instead for trace refinement: every generated behavior must be allowed by source ordering, delivery, and failure rules. Preservation therefore respects nondeterminism where it exists rather than ``validating'' by forcing one implementation order.
+
+\section{Use a Read to Expose Noncommuting Deliveries}
+
+Start the counter at zero. Let one sender send \texttt{add(5)} and \texttt{add(2)} in that order, and let another send one \texttt{read}. Assume reliable delivery, no failures, and ordering within each sender only. The read can arrive between the adds, before both, or after both. Every delivery ends with state seven. A checker that compares only final state would certify a rewrite that moved the read before both adds, even though this discards legal replies.
+
+\begin{center}
+\begin{tabular}{lrr}
+\hline
+Delivery order & Reply & Final counter \\
+\hline
+read, add 5, add 2 & 0 & 7 \\
+add 5, read, add 2 & 5 & 7 \\
+add 5, add 2, read & 7 & 7 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+explore(pending_by_sender, actor, trace):
+    if all sender queues empty:
+        record(trace, actor.state)
+        return
+    for sender with nonempty pending queue:
+        remaining := copy(pending_by_sender)
+        event := pop_head(remaining[sender])
+        next, visible := step(copy(actor), event)
+        explore(remaining, next, trace ++ visible)
+\end{verbatim}
+
+Under these simplified delivery rules the checker explores exactly the three interleavings shown. A \texttt{2} reply exposes a violation of the assumed order of the two adds. Whether an implementation must realize all three traces or merely refine the permitted set is a separate specification question: an implementation can forbid one delivery order under refinement but not under trace equality. Use that distinction in reporting results. To check whether two operations can be swapped, include their future observations, not just their immediate updates; here the read leaves the state untouched and still does not commute with either addition.
+
+\paragraph{Memoize only equivalent search states.}
+An explorer can share future behavior between identical actor
+states with identical pending queues, but it must still retain which
+observable prefixes reached that state. The different replies in
+the table lead to the same final counter and no pending messages.
+Discarding every path after the first visit to that final state
+would therefore lose precisely what the test is meant to measure.
+When constructing a trace set, memoize the possible \emph{suffixes}
+and concatenate them to each observed prefix.

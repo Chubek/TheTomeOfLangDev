@@ -1,0 +1,59 @@
+% Source: linkers-loaders-ocr.txt
+% Source: intel-instr-vol2a.txt
+
+\section{Select a Form Before Filling Its Fields}
+
+Encoding an instruction means selecting a legal machine form and then writing the fields for that form. A mnemonic alone does not determine the size or meaning of a symbolic operand. In Chapter~2, John R. Levine contrasts 390 relative branches, whose signed displacement is scaled by two and added to the branch instruction's address, with SPARC branches, whose displacement is scaled by four and whose short format can split the field across the instruction word \cite[chapter~2]{levine2000linkers}. These are historical architectures described by Levine, not rules about all branch encodings. An encoder must know the architectural base, scale, signedness, and bit locations from the particular form. On a scaled form, alignment is tested before dividing; silently discarding low bits can branch somewhere else.
+
+Consider the Intel manual's long-mode \texttt{JRCXZ}. It branches when \texttt{RCX} is zero, without consulting the status flags. Its form is \texttt{E3} followed by one signed displacement byte, measured from the next instruction. There is no direct \texttt{JRCXZ} with a wider immediate. This makes it useful for studying a deferred field without conflating that problem with selection between a short and longer form. Given a label in the current input section, a forward reference still may not have a known offset when the assembler first sees the instruction.
+
+\section{The Deferred Operation Belongs to the Assembler}
+
+Call an internal instruction to fill such a field a \emph{fixup}. It can identify the containing fragment and offset within the fragment, the symbolic expression, and a field kind with the relevant encoding rules. A source location lets a later diagnostic point at the label operand, not the last line of the file. A fragment-relative location, instead of a provisional absolute offset, remains meaningful if earlier data or padding changes size. At final layout the assembler computes a particular field value or, where appropriate, asks the object writer to represent a dependency it cannot settle.
+
+An ELF relocation is not a copy of that in-memory record. It is a serialized ABI operation with a relocation kind, place, symbol index, and addend supplied as required by its format. It has neither the assembler's arbitrary expression tree nor its source-span semantics. An internal fixup can disappear into the resulting bytes, cause a diagnostic, or give rise to an output relocation if the remaining computation is both permitted and expressible. Levine's Chapter~1 example of a linker adjusting embedded x86 addresses illustrates the later operation. Do not infer from that example that every local branch needs a link-time patch.
+
+% Annotated walkthrough
+\section{Resolve a Fixed-Width Forward Branch}
+
+Save this fixture as \texttt{skip.s}. It is an encoding test, to be assembled and inspected rather than run.
+
+\begin{verbatim}
+.text
+    # E3 is fixed; the following byte depends on the label.
+    jrcxz .Lempty
+    # These five bytes lie between the branch base and target.
+    .fill 5, 1, 0x90
+.Lempty:
+    ret
+\end{verbatim}
+
+On x86-64, run \verb|as --64 -o skip.o skip.s|, then inspect with \verb|objdump -dr skip.o| and \verb|readelf -r skip.o|. The opcode at offset zero is \texttt{E3}, the field at offset one is \texttt{05}, and the return instruction \texttt{C3} is at offset seven. Use the next instruction as the base: $7-(0+2)=5$. The field offset is neither the instruction start nor that base. The bytes themselves give a round-trip test: interpret \texttt{05} as signed, add two, and recover seven. The object needs no relocation because the same section base would be added to both terms and cancels.
+
+\Cref{fig:visual-281} distinguishes the field the assembler writes from the base the processor uses.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram,x=1.3cm]
+  \foreach \i/\byte in {0/E3,1/05,2/90,3/90,4/90,5/90,6/90,7/C3} {
+    \draw (\i,0) rectangle ++(1,-0.75);
+    \node at (\i+0.5,-0.375) {\texttt{\byte}};
+    \node[anchor=north] at (\i,-0.82) {\i};
+  }
+  \draw[tome arrow] (1.5,1) node[above] {Patch this byte} -- (1.5,0);
+  \draw[tome arrow] (2,-1.35) -- (2,-1.9) --
+    node[below] {Next instruction \(+5\)} (7,-1.9) -- (7,-1.35);
+  \node[anchor=west] at (7,0.65) {\texttt{.Lempty}};
+\end{tikzpicture}
+\caption{The signed byte at offset 1 encodes \(7-2=5\), not \(7-1\) or \(7-0\). Decoding it and adding it to offset 2 recovers the target.}
+\label{fig:visual-281}
+\end{figure}
+
+One implementation of the field handler uses the final offsets to compute $d=\text{target}-(\text{start}+2)$ in widened integer arithmetic. It checks $-128\le d\le127$ before writing $d\bmod256$ into the reserved byte. The key invariant is that decoding the byte by the selected instruction's rule and adding the architectural base gives the target, not merely that a byte was written. This handler assumes both positions are fixed within the same section and that the reference to the local label cannot be redirected.
+
+A useful unit boundary is between computing the displacement and updating the fragment. The former can mark the result as known, still symbolic, or invalid for this form. The latter should change only the reserved field after its width and bounds agree with the selected encoding. In this case the \texttt{E3} opcode must remain untouched. A zero in the reserved field before resolution is not evidence that the target is the next instruction: only the fixup state says whether that byte is final.
+
+\section{Test Both the Sign and the Failure Path}
+
+Change the fill to 127 bytes and expect \texttt{E3 7F}. Change it to 128 and expect GNU \texttt{as} to diagnose a displacement out of range. Writing \texttt{80} would represent $-128$, not $128$. A backward check puts a local label at offset zero, three one-byte no-operations after it, and the branch at offset three. The base is five and the field is $-5\bmod256=251$, or \texttt{FB}. This verifies sign handling independently of the forward layout. Replacing the instruction with an ordinary conditional branch that examines flags is not a legal way to avoid an overflow diagnostic; it changes the condition being tested. When forms really are interchangeable, however, choosing between them can require revisiting layout, as in Chapter~\ref{ch:ext-283}.

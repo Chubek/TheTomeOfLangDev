@@ -1,0 +1,63 @@
+% Source: vienna-arch-desc-lang.txt
+
+\section{Generate State Transitions, Not Cycle Counts}
+
+A functional instruction-set simulator (ISS) must reproduce what instructions do to architectural state. It does not estimate how many cycles a cache access or a pipeline dependency costs. In the February 2024 VADL preprint, arXiv:2402.09087v1, Section~4.6 generates a functional interpreter from VIR, and Sections~3.1 and~4.8 distinguish it from the cycle-accurate path, which needs microarchitecture information \cite{himmelbauer2024vadl}. Two pipelines with the same architectural contract should agree on an instruction-level state trace under the same inputs even if their cycle traces do not agree.
+
+Listing~27 gives this VADL body, with normalized spacing. It assumes the surrounding format and resources:
+
+\begin{verbatim}
+instruction ADDI : Itype = {
+  X(rd) := ((X(rs1) as SInt) + immS) as Bits
+}
+\end{verbatim}
+
+The generated handler has to extract both register indices, recover the signed immediate, read the old source, perform a fixed-width addition, and update the destination and PC. Reads conceptually precede writes for the instruction: this matters whenever a destination can alias a source. The listing paired with it in Section~4.6 shows simplified generated C++ with a function returning \texttt{PC + 4}. That illustration is not a portable recipe for host-language casts. An implementation needs to preserve the guest's fixed-width behavior irrespective of host signed-overflow or shift rules. It must also respect hardwired register cells from the resource definition even when they do not appear specially in the instruction body.
+
+\section{Cache a Dispatch Target, Not the Result of an Instruction}
+
+Instead of JIT compilation, the paper uses an interpreter with direct-threaded dispatch. A sparse hash table associates guest instruction addresses with a dispatch target and the instruction word. Very large guest address spaces do not require a same-sized dense array of host code pointers. On a miss the interpreter decodes a word using the VIR decoder and creates an entry. For complex operands, the generator can predecode fields and retain the resulting data with the entry rather than repeating all extraction each time. The register value used by the instruction is still read on each execution.
+
+The paper describes comparing the cached word with the data-memory instruction when supporting self-modifying code. Another design it mentions is to invalidate entries at writes. The choice changes where the cost is paid. Whatever the mechanism, reuse is valid only while the instruction representation remains applicable. \Cref{fig:visual-330} diagrams the checked path; a production implementation also needs to obey the guest's rules for when a change to instruction memory becomes visible.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (pc) at (0,0) {Guest PC};
+  \node[tome box accent] (look) at (4,0) {Current word\\matches entry?};
+  \node[tome box] (run) at (8,0) {Run handler};
+  \node[tome box] (dec) at (4,-1.9) {Decode word\\and store entry};
+  \node[tome box] (next) at (8,-1.9) {Updated PC\\and resources};
+  \draw[tome arrow] (pc) -- (look);
+  \draw[tome arrow] (look) -- node[above] {yes} (run);
+  \draw[tome arrow] (look) -- node[left] {miss or changed} (dec);
+  \draw[tome arrow] (dec.east) -- (6.05,-1.9) -- (run.south west);
+  \draw[tome arrow] (run) -- (next);
+\end{tikzpicture}
+\caption{The cache can avoid repeated decoding, but the handler still applies the operation to the current architectural resources.}
+\label{fig:visual-330}
+\end{figure}
+
+% Annotated walkthrough
+\section{Replay the Same PC with a Different Word}
+
+In this teaching test, a harness resets the PC and source register before each step and makes any code modification visible before fetching. The dispatch table is deliberately not reset.
+
+\begin{verbatim}
+step A: PC=0x100; X(5)=41; word=0x00128293
+  miss -> install ADDI with rd=5, rs1=5, immS=1
+  read old X(5), write 42, return PC=0x104
+
+step B: PC=0x100; X(5)=41; word=0x00228293
+  entry exists but word changed -> refresh with immS=2
+  read old X(5), write 43, return PC=0x104
+\end{verbatim}
+
+A cache keyed only by PC that reuses the old word or predecoded operands could produce 42 again even though the operation class and destination have not changed. Compare results against a reference path with no cached operands. For a new signed operation test negative inputs and wraparound; for an altered PC rule check an explicit branch as well as fall-through. Section~4.6 describes tracing and co-simulation. A trace of the first divergent PC, changed register, or memory effect is more useful for diagnosing a fault than a suite's final return code alone.
+
+It is also worth replaying step B with unchanged bytes and a different source value. The cache should be reusable, but the answer must change. These two tests distinguish stale decoded data from an accidental cache of execution results: instruction identity and operand values obtained from state have different lifetimes. For instructions that can trap, the cached handler must also recreate the same architectural fault before publishing partial effects; caching a dispatch target must not turn an exceptional instruction into a cached result.
+
+\section{Distinguish the Measured Interpreter from Other Modes}
+
+The user-mode emulation described in Section~3.6 supplies explicit guest-to-host syscall mappings. It does not make the functional ISA model a full-system emulator. Section~5.6 measures the generated ISS on RV32IM and the AArch64 integer subset, with software floating point in the benchmark binaries. In the reported RV32IM Embench comparison it ran more than 21 times slower than QEMU's JIT configuration and about 75 percent slower than Spike, but faster than the other QEMU configurations tested. These are results for particular workloads and prototypes. Predecoding or better host C++ code can reduce execution cost without altering the guest state transition; neither the reported times nor those optimization opportunities indicate current tool support.

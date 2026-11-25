@@ -1,0 +1,64 @@
+% Source: linkers-loaders-ocr.txt
+% Source: psabi-x86-64.txt
+
+\section{Move an image without rewriting its instructions}
+
+Position-independent code (PIC) keeps instruction bytes usable at different addresses. It does not require every address in the image to be relative. A writable table can contain absolute addresses, provided the instructions reach its entries without embedding those addresses. Levine separates invariant code from process-specific data to explain why different processes can map the same code pages without each making a relocated copy \cite[chapter~8]{levine2000linkers}. The load bias can vary between processes, but it shifts all the loadable segments of one image by the same amount. The distance from a code location to a fixed data location in the image is therefore unchanged.
+
+Levine's historical examples solve the same problem in different ways. TSS/360 passed a routine's data address along with its code address. AIX can keep a table-of-contents address in a designated register across calls according to its own conventions. The i386 ELF example obtains a program counter with a call and pop, then forms the GOT base. None of these is the small-model AMD64 instruction sequence: AMD64 can address the Global Offset Table (GOT) directly relative to the instruction pointer, without reserving a GOT base register for each function. The AMD64 ABI supplement's \S3.5 explains how larger addressability requirements change the instruction sequences.
+
+\section{Distance and binding are separate questions}
+
+An assembler can encode an instruction aimed at a symbol whose distance is not yet known. It leaves a relocation for the static linker to complete once the output layout is known. When the target is an ordinary local or hidden symbol in the same image, a direct RIP-relative reference can work if the target is in range. A default-visible definition in a shared library can be preemptible: some references can bind to a different definition selected by the loader even when the link editor sees a definition in this library. In that case a direct reference to the local copy would implement the wrong binding. A reference through a GOT slot separates the fixed distance to the slot from the choice of what runtime address to store there.
+
+A related split applies to many calls across images: the local Procedure Linkage Table (PLT) entry is reachable at a fixed distance, but its underlying slot can point to a routine in a separately based image \cite[chapter~10]{levine2000linkers}. Some code uses indirect calls through GOT slots without an ordinary PLT call. For either data or functions, the table entry is indirection, not a way to make the ultimate target address itself invariant.
+
+% Annotated walkthrough
+\section{Choose a reachable representation}
+
+Consider a simplified code generator for small-model x86-64. Each displacement is measured from the end of the instruction that uses it. The emitter picks an addressing form; the link editor checks its actual displacement once it knows the final image layout.
+
+\begin{verbatim}
+if definition_is_fixed_within_image:
+    target = symbol_vaddr       # no runtime choice of definition
+else:
+    target = got_slot_vaddr     # only the slot's location is fixed
+disp = target - next_instruction_vaddr
+require -2^31 <= disp < 2^31    # avoid silent signed truncation
+encode disp; if using a slot, load its value before use
+\end{verbatim}
+
+At next-instruction address \texttt{0x1017}, direct access to local data at \texttt{0x3020} needs \texttt{0x2009}. Access to a GOT slot at \texttt{0x3fd0} from a different instruction ending at \texttt{0x1020} needs \texttt{0x2fb0}. With bias \texttt{0x50000000} the slot's runtime address is \texttt{0x50003fd0}; it may contain \texttt{0x60004000}, an address in a provider image. If only the consumer moves up by \texttt{0x10000}, repeat the calculation: \texttt{0x50013fd0} minus \texttt{0x50011020} still gives \texttt{0x2fb0}. The slot moves but its resolved value does not. The invariant is that the displacement depends only on the two positions within the consumer.
+
+Test exact positive and negative range endpoints: \texttt{0x7fffffff} and negative \texttt{0x80000000} fit, but positive \texttt{0x80000000} cannot be encoded as a signed 32-bit displacement. One must change the chosen representation or layout rather than write the truncated bits. Toolchains offer code models to express such placement assumptions; PIC by itself is not a guarantee of unlimited reach.
+
+An ELF relocation formula may express the same distance from a different origin. If the four-byte relocation field starts at $P$ and ends the instruction, then next RIP is $P+4$. The \texttt{PC32} calculation $S+A-P$ with addend $A=-4$ expresses exactly that distance when $S$ is the target.
+
+\Cref{fig:visual-294} follows the two stages of the indirect access as only the consumer moves.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node at (0,0.85) {Next RIP};
+  \node at (4.45,0.85) {GOT slot};
+  \node at (8.85,0.85) {Resolved object};
+  \node[tome box,minimum width=2.85cm] (ip) at (0,0) {\texttt{0x50001020}};
+  \node[tome box,minimum width=2.85cm] (slot) at (4.45,0) {\texttt{0x50003fd0}};
+  \node[tome box,minimum width=2.85cm] (target) at (8.85,-0.95) {\texttt{0x60004000}};
+  \node[tome box,minimum width=2.85cm] (ip2) at (0,-1.9) {\texttt{0x50011020}};
+  \node[tome box,minimum width=2.85cm] (slot2) at (4.45,-1.9) {\texttt{0x50013fd0}};
+  \draw[tome arrow] (ip) -- node[above] {\texttt{+2fb0}} (slot);
+  \draw[tome arrow] (ip2) -- node[above] {\texttt{+2fb0}} (slot2);
+  \draw[tome arrow] (slot.east) -- (target.west);
+  \draw[tome arrow] (slot2.east) -- (target.west);
+  \node at (0,-2.65) {After rebasing};
+  \node[align=center] at (8.85,-2.65) {Unchanged\\pointer value};
+\end{tikzpicture}
+\caption{The code displacement reaches the GOT slot, not the provider's data. Rebasing the consumer shifts both ends of that displacement equally, while the slot still points to the same provider address.}
+\label{fig:visual-294}
+\end{figure}
+
+\section{Inspect both stages of address formation}
+
+With an AMD64 GNU toolchain, put \texttt{static volatile int n = 7;} and \texttt{extern int remote;} in \texttt{access.c}. Define \texttt{int sum(void)\{return n + remote;\}} and compile with \texttt{cc -O2 -fPIC -c access.c}. In \texttt{objdump -dr access.o}, find a direct PC-relative access to local storage and a GOT-relative relocation for \texttt{remote}. In the object file the relocation refers to a not-yet-final displacement; it does not give the address of \texttt{remote}. Link with \texttt{cc -shared access.o -o libaccess.so} and inspect \texttt{readelf -rW libaccess.so}. Expect a dynamic relocation for the imported address, not for the resolved code displacement. This fixture is inspected rather than loaded, so it needs no provider for \texttt{remote}. When binding is known to be local and range permits, linkers can sometimes relax a GOT load to direct addressing. The key test remains whether executable bytes are independent of the runtime bias and whether the output still implements the promised binding.
