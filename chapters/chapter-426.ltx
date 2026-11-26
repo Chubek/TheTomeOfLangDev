@@ -1,0 +1,206 @@
+% Source: advanced-compiler-design-and-implementation-steven-s.-muchnick-.txt
+
+\section{Use Traversal Order for Numbering, Not for Proof of Dominance}
+
+In a graph with distinguished entry, \(a\) dominates \(b\) if
+every entry-to-\(b\) path contains \(a\). In this chapter all
+queries are on entry-reachable nodes. Unreachable nodes receive
+no interval, even when an edge from one enters the reachable
+region. Treating unreachable predecessors as already analyzed
+can give arbitrary results. Entry can be its own immediate
+dominator in the solver as a sentinel; it has no parent in the
+published dominator tree. The tree stores the closest proper
+dominator of every other reachable block. Muchnick presents
+dominators by iterating sets as well as by a faster algorithm
+\cite{muchnick1997advanced}. Here the iterative immediate-dominator
+scheme of Cooper, Harvey, and Kennedy avoids storing one full
+dominator set per block \cite{cooper2001simple}.
+
+Number nodes in reverse DFS postorder from the entry on the
+CFG. In \Cref{fig:visual-426}, DFS might temporarily discover
+\(J\) from \(L\), but \(L\) cannot dominate \(J\) because
+\(E,R,J\) is also a path. A CFG DFS timestamp answers a DFS
+tree question, not a dominance question. Only after constructing
+the dominator tree should we label its subtrees with intervals.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (e) at (1.35,1.5) {CFG \(E\)};
+  \node[tome box] (l) at (0,0) {\(L\)};
+  \node[tome box] (r) at (2.7,0) {\(R\)};
+  \node[tome box accent] (j) at (1.35,-1.5) {\(J\)};
+  \node[tome box dark] (de) at (6,1.5) {Dom \(E\)};
+  \node[tome box] (dl) at (4.1,-0.8) {\(L\)};
+  \node[tome box] (dr) at (6,-0.8) {\(R\)};
+  \node[tome box accent] (dj) at (7.9,-0.8) {\(J\)};
+  \draw[tome arrow] (e) -- (l);
+  \draw[tome arrow] (e) -- (r);
+  \draw[tome arrow] (l) -- (j);
+  \draw[tome arrow] (r) -- (j);
+  \draw[tome arrow] (de) -- (dl);
+  \draw[tome arrow] (de) -- (dr);
+  \draw[tome arrow] (de) -- (dj);
+\end{tikzpicture}
+\caption{The diamond's join is a direct child of the entry in the dominator tree, even though the CFG has no direct edge from entry to join.}
+\label{fig:visual-426}
+\end{figure}
+
+% Annotated walkthrough
+\section{Walk Immediate-Dominator Chains Toward Entry}
+
+\begin{verbatim}
+solve_idom(cfg, entry):
+    order := reverse(dfs_postorder(cfg, entry))
+    rank := index_by_block(order)        # entry is zero
+    idom := all_missing()
+    idom[entry] := entry
+    repeat:
+        changed := false
+        for b in order except entry:
+            known := [p for p in predecessors(b)
+                        if idom[p] is not Missing]
+            if known.empty(): continue
+            parent := known.first
+            for p in known.rest:
+                parent := intersect(parent, p, idom, rank)
+            if idom[b] != parent:
+                idom[b] := parent
+                changed := true
+    until not changed
+    return idom
+
+intersect(a, b, idom, rank):
+    while a != b:
+        if rank[a] > rank[b]: a := idom[a]
+        else: b := idom[b]
+    return a
+\end{verbatim}
+
+DFS in this algorithm explores only reachable CFG nodes and
+emits each on finish, not on discovery. Every nonentry node
+has at least its DFS tree predecessor earlier in reverse
+postorder, so it has one known predecessor by the time it is
+first visited. Backedge predecessors may become usable later
+and can require another sweep. Moving the larger rank upward
+is correct for this numbering because the provisional parent
+chains decrease toward the entry. If numbering instead grows
+in postorder, the comparison must be reversed; ranks, DFS
+times, and printed block numbers should have different names.
+Use an explicit stack with successor cursors to obtain finish
+order without overflowing the host call stack on a long chain.
+
+\section{Answer Dominance With Half-Open Tree Intervals}
+
+Gather child lists from the final immediate-dominator array,
+omitting the root self-link. Walk that tree and assign an
+increasing preorder number on entry. On leaving a node save
+the next unused number as its subtree end. A block \(a\)
+dominates \(b\) exactly when
+\(\mathrm{in}[a]\leq\mathrm{in}[b]<\mathrm{end}[a]\).
+Strict dominance excludes equality. The same numbering supports
+enumeration of all blocks dominated by \(a\) as a contiguous
+slice of the preorder array. These tree intervals are nested
+or disjoint; an arbitrary interval index for overlapping spans
+is not needed.
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+Block & Immediate dominator & Preorder slice & Dominated blocks \\
+\hline
+\(E\) & --- & \([0,4)\) & \(E,L,R,J\) \\
+\(L\) & \(E\) & \([1,2)\) & \(L\) \\
+\(R\) & \(E\) & \([2,3)\) & \(R\) \\
+\(J\) & \(E\) & \([3,4)\) & \(J\) \\
+\hline
+\end{tabular}
+\end{center}
+
+For SSA uses, block dominance is only part of the legality
+check. In the same block the defining instruction must be
+before the ordinary operand use. An incoming value for a join,
+on the other hand, is read at its predecessor's terminator.
+The definition of a value passed on \(L\)'s edge need not
+dominate \(J\). Do not compensate by weakening the dominance
+query; give the use the right program point.
+
+\section{Invalidate the Index on Graph Changes}
+
+Remove \(E\to R\) from the diamond. If \(R\) becomes
+unreachable, the only remaining path to \(J\) passes through
+\(L\). The program still has a block handle for \(J\), and
+perhaps for \(R\), but the old tree gives the wrong answer
+about \(L\) and \(J\). Version the tree against control-flow
+edits. Simple clients can rebuild it on demand; if using a
+dynamic algorithm, update both the immediate dominators and
+their labels or expose a different ancestry representation.
+Saving the old ranks just because the block allocator did not
+move any payload is not safe.
+
+Postdominance needs its own graph and policy. Reverse traversal
+from a chosen virtual exit handles multiple returns, but
+blocks from which no exit is reachable do not participate in
+the same tree. Exceptional edges, infinite loops, and synthetic
+exits affect which paths the answer quantifies over. Declare
+those choices before using postdominance for control dependence.
+
+To test small graphs, independently compute full dominator
+sets by initializing every nonentry reachable node to the
+reachable universe and intersecting its reachable predecessors'
+sets, adding the node itself. Compare every ordered pair to
+the interval answer. Include the edited diamond, a loop with
+a backedge, an unreachable predecessor pointing into a live
+join, and disconnected components. Separately compare CFG
+traversal output to the dominator-tree traversal on the diamond:
+their differing results are an intentional consequence of
+asking different graph questions.
+
+\section{Publish an Index That Supports Both Membership and Walking}
+
+\begin{verbatim}
+index_tree(children, entry):
+    preorder := []
+    events := [Enter(entry)]
+    while not events.empty():
+        kind, b := events.pop()
+        if kind == Enter:
+            start[b] := preorder.length
+            preorder.append(b)
+            events.push(Leave(b))
+            for c in reverse(children[b]):
+                events.push(Enter(c))
+        else:
+            end[b] := preorder.length
+    return (start, end, preorder)
+
+dominated_blocks(index, block):
+    require index.cfg_revision == current_cfg_revision
+    require index.has(block)
+    return index.preorder[index.start[block]:index.end[block]]
+\end{verbatim}
+
+The event stack makes pre- and post-actions explicit; it
+uses linear space in the worst case, for example when the
+entry immediately dominates thousands of blocks. A stack
+holding one child cursor per ancestor can bound traversal
+scratch by tree depth, although the published index still
+contains one row per reachable block. If consumers expect
+deterministic enumeration, build the child lists in a
+specified order, such as the stable published block order.
+That affects layout, not membership.
+
+Keep the dominance frontier separate from the subtree
+index. A join belongs to the frontier of \(L\) if \(L\)
+dominates a predecessor of the join but does not strictly
+dominate the join itself. In the original diamond, \(J\)
+is in the frontiers of both \(L\) and \(R\); it is not in
+either subtree. Frontiers are useful for finding potential
+SSA merge points, and computing them needs CFG edges in
+addition to the tree. The interval test can answer each
+dominance predicate but does not enumerate the frontier by
+slicing the preorder. On small graphs an additional oracle
+for dominance is to temporarily omit \(a\) from entry
+reachability and ask whether \(b\) becomes unreachable,
+handling the entry and same-node cases directly.

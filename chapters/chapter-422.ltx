@@ -1,0 +1,206 @@
+% Source: compilers-alfred-v.-aho-monica-s.-lam-ravi-sethi-etc.--1.txt
+% Source: dickman-thesis-editing-langs.txt
+
+\section{Keep the Abstract Tree and the Lossless Tree Distinct}
+
+An optimizer may want \texttt{Add(Name(x), Int(1))}, which says
+nothing about bytes separating the expressions or the parentheses
+around the addition. A refactoring tool needs the source order,
+comments, delimiters, and even unexpected tokens. Syntax trees as
+representations of operators and operands are standard compiler
+practice \cite{aho2007compilers}; the lowering from a lossless syntax
+tree to such an abstract syntax tree should be explicit. For
+example, an AST can erase parentheses while retaining a source
+occurrence on the result for a diagnostic. It should not treat
+the surviving inner expression as the exact range to replace
+when performing a source edit that must also remove parentheses.
+
+One useful lossless representation is a green tree of immutable
+nodes and tokens. A green node has a kind, ordered children,
+and total byte width. It has no parent and no absolute start.
+Token leaves own or refer to immutable bytes whose lifetime is at
+least that of the green node, and every real byte contributes its
+width exactly once, including trivia. The widths use the same
+byte unit as the snapshot spans in \Cref{ch:ext-421}.
+A synthetic missing token
+has width zero and a distinct kind or flag; discarded input is
+retained as error text instead of disappearing. A red view wraps
+a green node with the root revision and occurrence context,
+typically a parent and child index or an absolute start reached
+by accumulating the widths of preceding siblings.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Object & Suitable key & Information deliberately omitted \\
+\hline
+Green node & Arena ID or structural key & File, parent, absolute position \\
+Red occurrence & Root revision and child path & Independently copied children \\
+Lowered AST node & Lowering run and AST ID & Trivia and syntax-only grouping \\
+Semantic result & Occurrence and enclosing context & Physical green allocation site \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Share Shape Without Sharing Location}
+
+Suppose two distinct statement occurrences contain a child
+fragment \texttt{x+1}. They could both point to the same green
+node, as in \Cref{fig:visual-422}. Their red starts differ and
+they may bind \texttt{x} to different declarations. Even in
+one revision, using a green pointer as the key for a resolved
+name cache is not sound. Byte width and structural hash are
+properties of the shape and can be cached there; resolved type
+and absolute span are properties of an occurrence or its
+semantic context. The useful abstraction is a tree of
+occurrences implemented by a directed acyclic graph of immutable
+objects, not a graph of uniquely positioned children.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (one) at (0,1.3) {Red at byte 4};
+  \node[tome box] (two) at (5.8,1.3) {Red at byte 17};
+  \node[tome box accent] (green) at (2.9,-0.25) {Green \texttt{x+1}, width 3};
+  \node[tome box dark] (child) at (2.9,-1.7) {Token \texttt{x}, width 1};
+  \draw[tome arrow] (one) -- (green);
+  \draw[tome arrow] (two) -- (green);
+  \draw[tome arrow] (green) -- (child);
+\end{tikzpicture}
+\caption{Two red views point to one immutable expression shape. Each view computes a different absolute span for the name token.}
+\label{fig:visual-422}
+\end{figure}
+
+% Annotated walkthrough
+\section{Rebuild the Changed Path After Parsing}
+
+\begin{verbatim}
+red_child(view, index):
+    require 0 <= index < view.green.child_count
+    prefix := view.green.width_before_child(index)
+    return Red(view.revision, view, index,
+               view.start + prefix, view.green.child[index])
+
+splice(root, path, reparsed):
+    # Caller has certified a grammar-compatible boundary,
+    # including the effects of lexical and parse context.
+    if path.is_empty(): return reparsed
+    i := path.first
+    old := root.child[i]
+    new := splice(old, path.rest, reparsed)
+    if new is old: return root
+    children := root.children.copy()
+    children[i] := new
+    return make_green(root.kind, children)
+
+make_green(kind, children):
+    width := checked_sum(child.width for child in children)
+    return Green(kind, freeze(children), width)
+\end{verbatim}
+
+The replacement must come from the parser, not directly from
+substitution of an arbitrary text fragment. Replacing \texttt{x}
+in \texttt{x*y} by \texttt{a+b} without parentheses may
+require rebuilding the multiplication context because the
+expected tree is now an addition. Diekmann's incremental parsing
+account asks not just whether a subtree's text survived an edit
+but whether the parse state and context allow it to be reused.
+A simple compiler can reparse the entire file, then reuse
+exactly matching green objects. A faster parser may certify
+smaller boundaries; the green layout alone certifies none.
+
+When the edit lengthens one of the two fragments in the figure,
+untouched right siblings can keep their green objects. Their red
+views must be created from the new root and may report larger
+starts. Conversely, deleting and reinserting identical text can
+yield the same final green shape without preserving editor
+bookmarks that were attached to the deleted occurrence. A
+bookmark needs a document edit mapping, not an equality query
+on the new tree. If red views are memoized, store them by
+occurrence and revision, or use a bounded cache; retaining a red
+parent chain can keep an entire old revision reachable.
+
+\section{Bound the Cost of Wide Nodes and Canonicalization}
+
+Path copying has low cost for many fixed-arity expressions but
+\texttt{children.copy()} is linear in arity. Editing one
+declaration in a flat list of one hundred thousand declarations
+is not a logarithmic operation. Segment wide child lists into
+a persistent sequence, with aggregate widths and counts for
+subtrees, if traces show these edits dominate. For small nodes,
+a compact consecutive vector plus a linear prefix scan may
+be best. If profiling shows repeated random child lookup in
+moderately wide nodes, a separate prefix-width array makes
+individual lookups cheap while adding update and memory costs.
+Use a checked offset type common to the source buffer and green
+widths so that malformed or artificially huge input cannot
+wrap the prefix sum.
+
+Hash-consing, which looks up an immutable node by its structural
+key before allocating, is optional. Reusing existing subtrees
+from the previous tree does not require canonical identity for
+all equal fragments across the workspace. A structural hash
+must be verified against kind and child sequence on collision.
+If the table strongly owns all interned green nodes, it also
+prevents reclaiming history after editors discard their roots.
+Limit interning to selected immutable leaves or use weak
+entries with a reclamation policy when retaining nodes costs
+more than repeat construction.
+
+\section{Check the Tree at Both Consumer Boundaries}
+
+For the lossless consumer, concatenate original token bytes in
+occurrence order; the result must equal the source snapshot.
+Assert that each child's prefix and width fit inside its parent,
+including missing tokens sharing a location with real tokens.
+For the abstract consumer, compare the lowered tree after a
+scripted edit to a clean parse and lowering of the edited text.
+Do not compare allocation IDs; compare operators, ordered
+operands, and occurrence spans in the new revision. Keep a version
+of the old root live during these checks to detect accidental
+mutation through shared objects.
+
+One discriminating fixture contains two identical functions in
+different namespaces, with a comment in the first that becomes
+longer. Check that a reused fragment in the second function
+reports its shifted range and still names the second namespace's
+declaration. Run the fixture with green interning both enabled
+and disabled. A difference in name resolution is evidence that
+some semantic key is really encoding allocation or shape rather
+than a source occurrence.
+
+\section{Build Green Nodes From a Parser Event Stream}
+
+A top-down parser sometimes recognizes a prefix before it knows
+which node will enclose it. For \texttt{x + 1 * 2}, it can
+first recognize a name and then see the addition operator.
+Rather than allocating and mutating a node to add a parent,
+record an event stream and use a builder to create complete
+immutable nodes. The parser can open a marker before parsing
+the left operand and classify that marker once it sees the
+operator. An unused marker is ignored at build time. The
+builder makes tokens children of the innermost active marker,
+in source order. A lexer that feeds significant tokens to the
+parser should also tell the builder which trivia must be
+inserted around them.
+
+\begin{verbatim}
+Start(Add)
+    Start(Name); Token("x"); Finish
+    Token(" "); Token("+"); Token(" ")
+    Start(Multiply)
+        Token("1"); Token(" "); Token("*"); Token(" "); Token("2")
+    Finish
+Finish
+\end{verbatim}
+
+Omit the final \texttt{2} and a recovery event should produce
+a missing operand without inventing bytes. Materialize a
+zero-width missing node with the expected role; preserve
+the existing space and operator. If a later input supplies
+the operand, an unchanged prefix can be reused regardless of
+whether error nodes are interned. Test that a traversal that
+filters out missing nodes reports no extra text, while
+one that gathers completions still has a precise empty
+range at which to suggest an operand.

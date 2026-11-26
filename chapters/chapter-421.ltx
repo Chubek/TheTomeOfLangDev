@@ -1,0 +1,192 @@
+% Source: compilers-alfred-v.-aho-monica-s.-lam-ravi-sethi-etc.--1.txt
+% Source: dickman-thesis-editing-langs.txt
+
+\section{Make an Offset Mean One Thing}
+
+The lexer recognizes lexemes and supplies tokens to the parser; a
+token is not the string of characters it covers \cite{aho2007compilers}.
+Design the source interface so that byte coordinates, token indices,
+and display coordinates cannot be passed interchangeably. A
+lightweight span consists of a source snapshot identity and the
+half-open interval \([s,e)\) of byte offsets in that snapshot. It
+admits an empty interval at end of file and composes adjacent ranges
+without double counting their shared boundary. The same integer
+endpoints in a different file or revision need not designate the
+same text. Source IDs used by diagnostics should keep the snapshot
+available, or make its absence explicit if it has been evicted.
+
+Use the original bytes as the source of truth. For example, the
+three strings \texttt{a}, \texttt{é}, and \texttt{a} on a UTF-8
+line occupy respectively one, two, and one bytes. The last
+\texttt{a} starts at byte 3 and zero-based Unicode scalar column
+2. An editor protocol might demand UTF-16 units; a terminal printer
+has yet another question when there are combining marks or tabs.
+Neither column convention belongs in the stored token. Convert at
+the boundary, with a stated policy for invalid byte sequences and
+the treatment of CRLF. If spans may be snapped for display,
+do not feed the snapped positions back into the parser.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Query & Index & Necessary qualifier \\
+\hline
+Byte to source line & Sorted line starts & Same immutable snapshot \\
+Covering lexical token & Sorted token starts & Confirm half-open bounds \\
+Overlapping diagnostics & Augmented interval tree & Report all intersections \\
+Editor column to byte & Line text and conversion & Agree on coordinate encoding \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Match the Physical Buffer to the Edit Pattern}
+
+A flat immutable byte array offers cheap slicing and excellent
+sequential access. It is a sound default for a batch compiler. An
+editor might instead keep original text and append buffers, with
+pieces in a balanced tree whose internal nodes store subtree byte
+counts. Replacing a range splits pieces at its boundaries, splices
+new pieces, and changes only a search path and the affected part
+of the tree. With balanced structure and path copying, old
+revisions can remain readable. Account for the actual splice and
+rebalancing work; the fact that a single seek takes logarithmic
+time does not make deletion of arbitrarily many pieces free.
+Partition-aware cursors are essential: walking a token one byte at
+a time with a fresh seek for each byte squanders the index.
+
+In \Cref{fig:visual-421}, a token straddles a piece boundary.
+The token's spelling may be materialized or read through a streaming
+cursor, but the parser doesn't need two tokens. Conversely, two
+adjacent tokens may lie inside a single piece. Physical storage
+seams are not lexical facts. A piece tree can also cache line break
+counts; for a CRLF policy the count or its combining logic has
+to recognize a carriage return in one piece followed by a newline
+in the next.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (0,0) {Piece \texttt{hel}};
+  \node[tome box dark] (b) at (3,0) {Piece \texttt{lo+}};
+  \node[tome box accent] (id) at (1,1.45) {Name \([0,5)\)};
+  \node[tome box] (plus) at (5.4,1.45) {Plus \([5,6)\)};
+  \draw[tome arrow] (id) -- (a);
+  \draw[tome arrow] (id) -- (b);
+  \draw[tome arrow] (plus) -- (b);
+\end{tikzpicture}
+\caption{The logical token \texttt{hello} crosses a storage seam. Byte offsets in a snapshot do not depend on its piece layout.}
+\label{fig:visual-421}
+\end{figure}
+
+% Annotated walkthrough
+\section{Restart Lexing from a Justified Checkpoint}
+
+\begin{verbatim}
+relex(old, new, edit):
+    require new came from old by this one edit
+    # Checkpoint is valid only if its confirming reads
+    # could not have observed any byte changed by the edit.
+    start := safe_restart_at_or_before(old, edit)
+    lexer := resume(new.text, start.offset, start.state)
+    result := share_prefix_before(old.tokens, start)
+
+    while not lexer.at_end():
+        result.append(lexer.next_token())
+        p := lexer.offset
+        if p < edit.new_end: continue
+        q := p - edit.byte_delta
+        prior := old.token_boundary_at(q)
+        if prior exists and lexer.state == prior.state:
+            # From here the suffix bytes and state agree.
+            result.append_rebased_suffix(old.tokens, q, edit)
+            return finish(result, new.snapshot_id)
+
+    return finish(result, new.snapshot_id)
+\end{verbatim}
+
+Here a checkpoint saves all context relevant to future tokens, such
+as string mode, interpolation depth, or indentation state. The
+algorithm assumes a deterministic lexer that does not use absolute
+offsets for lexical decisions unless the needed context is accounted
+for in equality. \texttt{finish} owns the EOF marker in this
+sketch. Rebased positions must use the new snapshot ID even when
+their numerical offsets do not change. If the lexer can emit
+zero-width pending tokens, the boundary and state must include the
+pending outputs, or the implementation should restrict checkpoints
+to locations with none. If lexical recovery emits diagnostics,
+their ranges and replay rules are part of the reuse contract as well.
+
+Diekmann's incremental lexer accounts for the lookahead that may
+have influenced an earlier token. In a language with both
+\texttt{=} and \texttt{==}, inserting \texttt{=} immediately
+after the first one can invalidate a token that ended exactly at
+the insertion. Restarting at the nearest recorded token boundary
+is therefore not always safe. A simple implementation may restart
+at the beginning of the file if it cannot certify a nearer point.
+An edit that opens a block comment and leaves it open may force
+relexing to EOF even if the byte delta is small.
+
+\section{Use Two Indexes for Two Different Overlap Models}
+
+Nonempty tokens in a token stream are disjoint. A binary search
+for the last start at most the queried byte, followed by a check
+of the end, is sufficient for point lookup. If trivia is kept on
+a different channel the selected token may not cover the query;
+say whether to return no token or a neighbor. Empty tokens are
+anchors, not covering intervals; make the tie-break explicit for
+an insertion query at a shared boundary.
+
+Annotations and diagnostics can nest or cross. Suppose records
+cover \([0,40)\), \([16,19)\), and \([18,25)\). A search for byte
+23 that only tests the most recent start loses the outer record.
+Store interval records in a balanced tree keyed by start with a
+maximum end for each subtree. In a range overlap query, a subtree
+whose maximum end is no greater than the query's start is
+irrelevant, and nodes starting at or after the query's end need not
+contribute. Version or rebuild the index when its source coordinates
+change. If a text edit splits a diagnostic range, assigning it an
+offset delta alone does not repair what the message refers to.
+
+Compare incremental results to fresh lexing after each scripted edit.
+Include seam-spanning tokens, CRLF split over pieces, and an edit that
+changes comment state without changing byte count. Validate token
+kinds, canonical payloads, source slices, and diagnostics from the
+new revision. A benchmark should also count bytes relexed, bytes
+copied during splicing, and old snapshots retained by a diagnostic
+window; these measure different costs than the wall-clock time of a
+single favorable edit.
+
+\section{Translate Surviving Ranges, Not Every Old Range}
+
+Take an edit that replaces old bytes \([8,11)\) with five bytes.
+A token \([1,5)\) wholly before the change keeps its endpoints;
+one at \([12,14)\) moves to \([14,16)\). An old token
+\([7,12)\), however, overlaps the edit and must not be mapped by
+one delta. Even a token disjoint from the edited bytes can need
+rechecking if its lexical lookahead touches them. A cursor anchor
+at the old boundary needs a separate bias. At an insertion at byte
+8, an anchor biased left remains before the insertion and an anchor
+biased right follows the inserted bytes. Do not reuse that cursor
+policy for a token's end without first checking whether the token
+itself survived.
+
+When cached token payloads are relative to a group, suffix reuse
+can store a new group base rather than shifting each token. Prefix
+and suffix groups should carry their snapshot context through a
+wrapper, while absolute spans handed to clients always name the
+snapshot. If parents routinely derive one token's span from a
+relative base, assert that the sum still fits the snapshot length
+and offset type. This matters even on files shorter than the limit
+if implementation arithmetic mixes signed edit deltas with unsigned
+byte offsets. Exercise a negative delta at the end of a file and
+check that EOF remains an empty range at the new length.
+
+Line caches face the same problem. A single extra line near byte
+zero shifts every later line number, but not the text of those
+lines. A piece index that aggregates line breaks can translate from
+bytes to line number by summing counts along a search path. For a
+flat array of line starts, defer rebuilding until requested or use
+a persistent chunked sequence with relative offsets. Choose based
+on how many line lookups occur per edit, and compare the output of
+an indexed path to a simple count from the start on boundary cases.

@@ -1,0 +1,193 @@
+% Source: compilers-alfred-v.-aho-monica-s.-lam-ravi-sethi-etc.-.txt
+
+\section{Plan Relocation Before Reusing Addresses}
+
+Sliding mark-compact and semispace copying both move objects.
+The difference is that a sliding collector packs live objects
+within their original region, potentially overlapping old
+and new extents. It first determines liveness, then assigns
+destinations, and then rewrites references and moves bytes.
+The relocation table is keyed by old object starts throughout
+reference repair. Aho and colleagues describe this use of
+increasing source order to slide objects toward the lower end
+of the heap \cite{aho2007compilers}. The scheme saves a separate
+destination region, not all auxiliary storage: marking still
+needs work memory and relocation needs a representation.
+
+Consider one aligned region with fixed-size headers and several
+variable-size live objects. The placements below are offsets in
+the same region; \(C\) moves into a range that includes some
+of its own old bytes. The old address of \(C\) will eventually
+be inside the relocated \(C\) rather than at its start. An address
+inside a parseable heap is not necessarily a valid object reference.
+
+\begin{center}
+\begin{tabular}{lrrr}
+\hline
+Chunk & Old start & Bytes & New start \\
+\hline
+\(A\), live & 0 & 32 & 0 \\
+Gap & 32 & 16 & --- \\
+\(B\), live & 48 & 32 & 32 \\
+\(C\), live & 80 & 48 & 64 \\
+Gap & 128 & 32 & --- \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-414} depicts the slide. With uniform alignment,
+padding is already included in each extent, so the prefix sum
+of live extents produces another aligned start each time.
+For more varied alignment requirements, include any resulting
+gaps in the physical walk format rather than assuming the
+packed region has no intervening space.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a) at (0,1.1) {$A$: 0};
+  \node[tome box] (b) at (4,1.1) {$B$: 48};
+  \node[tome box] (c) at (8,1.1) {$C$: 80};
+  \node[tome box dark] (aa) at (0,-1.1) {$A$: 0};
+  \node[tome box accent] (bb) at (3,-1.1) {$B$: 32};
+  \node[tome box accent] (cc) at (6,-1.1) {$C$: 64};
+  \draw[tome arrow] (a) -- (aa);
+  \draw[tome arrow] (b) -- (bb);
+  \draw[tome arrow] (c) -- (cc);
+\end{tikzpicture}
+\caption{Live-object order stays the same, while removing the interior gap creates a larger free suffix.}
+\label{fig:visual-414}
+\end{figure}
+
+% Annotated walkthrough
+\section{Use an Immutable Old-Address Plan}
+
+\begin{verbatim}
+compact(region, roots):
+    mark_strong_closure(roots)
+    plan := empty_sequence()
+    dst := region.begin
+    for chunk in walk_old_chunks(region):
+        if chunk.allocated and marked(chunk.start):
+            plan.append(chunk.start, dst, chunk.extent)
+            dst += chunk.extent
+
+    mapping := index_old_starts(plan)
+    for root in roots: repair_slot_once(root, mapping)
+    for old, new, bytes in plan:
+        for slot in strong_slots(object_at(old)):
+            repair_slot_once(slot, mapping)
+
+    for old, new, bytes in plan:
+        move_overlapping_bytes(new, old, bytes)
+    rebuild_metadata(region, plan, dst)
+\end{verbatim}
+
+The first two loops that use the plan rewrite the root and
+payload slots while they still occupy old locations. For a
+nonnull slot into the compacted region, the old address must
+be in the mapping, because a strong edge cannot lead from a
+survivor to a dead object. Treat a missing key as a collector
+bug. A value pointing out of the region is unchanged, though
+outside objects that point into the region still need to
+contribute incoming slots. Weak and derived references need
+separate handling. The algorithm edits each physical slot
+once. If a slot has been repaired, its new address might also
+be a valid key in the mapping; a second application could
+move the reference a second time.
+
+In source order, the end of each destination extent is no
+greater than the end of its source extent. The source of any
+later object starts at or past that boundary, so the current
+move cannot overwrite an unread later object. It can overlap
+itself; use an overlap-safe byte move rather than a copy
+primitive that assumes disjoint ranges. The move uses the
+saved extent, not a fresh heap walker trying to recognize
+headers in a heap already half compacted. Allowing either a
+mutator or unrelated heap verifier to walk this intermediate
+state would break the interpretation of addresses.
+
+\section{Support Pins Without Moving Through Them}
+
+An object can be live and also forbidden to move, for example
+while an external API holds its raw address. One policy treats
+pinned objects as barriers: perform a slide independently in
+each interval between them and keep their addresses as
+identity entries in the relocation map. Reference repair still
+scans the fields of pinned objects; pinning their addresses
+does not pin their referents. This sacrifices the guarantee
+of one large free suffix. If a pinned word or derived address
+is the only evidence of liveness, register a proper root as
+well. A nonmoving pool is another design that exchanges more
+frequent edge bookkeeping for simpler layouts in movable
+regions.
+
+A side table can store a destination delta, an absolute
+address, or prefix information from which the destination is
+computed. Measure its lookup traffic during reference repair.
+Using the first word of every live object as temporary storage
+saves separate entries only if descriptor and extent information
+remain recoverable. The plan above values clarity over memory
+economy. Benchmark it with a dense live heap: calculating
+destinations and rewriting the graph may dominate even if
+most objects barely move and some remain at the same address.
+
+\section{Test the Difference Between an Address and Its Owner}
+
+Start with an object whose identity hash has already been
+published, put it in a hash table, and run a slide that moves
+it. The post-slide lookup must still work. If hashing is based
+on the address, either preserve an assigned hash in the object
+or design a table protocol that allows rehashing when the
+language permits it. Tests for raw reference equality alone do
+not catch a change in a previously visible hash.
+
+Construct a relocation mapping in which one new start equals
+another object's old start, deliberately list one root slot
+twice, and assert that the root visitor diagnoses or normalizes
+the duplicate. Then test a large object sliding only one
+alignment unit, a dead region, and pinning in the middle of a
+hole-filled region. Verify metadata after moving: starts, size
+records, mark state, and any address-indexed intergenerational
+tracking must describe the resulting heap, not the old
+configuration with patched payloads.
+
+\section{Reserve Side Metadata for Much or Little Motion}
+
+A plan entry per survivor is straightforward but can be
+expensive when the region contains a large number of tiny
+objects. For a region with several million 16-byte objects,
+three eight-byte fields per entry would require more space
+than the live objects themselves. A more compact design
+stores a destination prefix at fixed spatial boundaries and
+uses a bitmap or a short walk to sum aligned live extents
+inside the relevant interval. The tradeoff is more work per
+lookup, which is multiplied by the number of references,
+not just the number of moved objects. Measure alias-heavy
+graphs alongside graphs of the same size with fewer edges.
+
+Side metadata does not have to cover every old byte at the
+same granularity. If pages already carry object-start maps,
+the old offset can first identify a page and then a compact
+array indexed by the rank of that start on the page. An
+object may cross a page boundary; count its extent at its
+start, and do not add it again when processing the next page.
+Conversely, if the relocation policy forbids crossing a page
+boundary at the destination, that policy adds padding into
+the prefix calculation. Either decision needs to agree with
+the overlap proof and the new heap walker.
+
+Failure to reserve the plan must be dealt with before modifying
+root or object slots. In a collector with a mark-sweep
+fallback, it is possible to reuse the mark state and sweep
+without moving, provided the object layout is still intact
+and the root pass has not already overwritten addresses.
+Test this by injecting a reservation failure during planning.
+The failure cannot be handled by falling back to sweeping once
+references have been rewritten to destinations that do not
+yet contain the corresponding live objects.
+Run the same low-memory fixture on a heap with no garbage.
+Success at preserving that heap does not turn an impossible
+allocation into a possible one; the allocator still needs a
+distinct exhaustion path.

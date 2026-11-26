@@ -1,0 +1,191 @@
+% Source: psabi-x86-64.txt
+% Source: ffi-clisp.txt
+
+\section{Compute Layout for One Target, Not for C in General}
+
+An FFI field descriptor needs a byte offset, a native representation
+and an alignment constraint. To see why size alone is not enough,
+define a C record with members \texttt{uint8\_t kind},
+\texttt{uint32\_t count}, \texttt{double mean}, and
+\texttt{uint16\_t flags}, in that order. Under the ordinary LP64 System
+V AMD64 layout in the local supplement, an aggregate has alignment
+sufficient for its most strictly aligned member. Place each member at
+the first available appropriately aligned offset, and round the final
+extent to that aggregate alignment. The result is a record with the
+following arrangement.
+
+\begin{center}
+\begin{tabular}{lrrl}
+\hline
+Region & First byte & Bytes & Reason \\
+\hline
+\texttt{kind} & 0 & 1 & Byte member \\
+Padding & 1 & 3 & Align \texttt{count} to 4 \\
+\texttt{count} & 4 & 4 & Four-byte member \\
+\texttt{mean} & 8 & 8 & Eight-byte aligned member \\
+\texttt{flags} & 16 & 2 & Two-byte member \\
+Tail padding & 18 & 6 & Round stride to 24 \\
+\hline
+\end{tabular}
+\end{center}
+
+An array of two records puts the second \texttt{mean} at byte 32,
+not at byte 26. The size recorded in a binding must be usable as
+the stride; summing visible fields does not even account for the
+first record's internal gap. Some headers deliberately change
+alignment using compiler directives. Such attributes are part of
+the configured declaration, not conventions inferred from field
+names. The Common Lisp extract's discussions of foreign compound
+types and foreign storage distinguish modeling a layout from
+allocating and managing actual memory of that type.
+
+\section{Distinguish a Memory View from a Call Classification}
+
+Memory layout specifies where the bytes reside when an object exists
+in memory, not how an object passed by value travels. Under System V
+AMD64 a plain record containing one \texttt{double} followed by one
+\texttt{uint64\_t} can be split into an SSE eightbyte and an INTEGER
+eightbyte. Register exhaustion can force the entire argument to memory
+instead of allocating just the part for which a register was
+available. Passing a pointer to that record would be a single pointer
+argument. Passing the larger record from the table by value is yet
+another case: under the cited convention its ordinary fields do not
+satisfy the vector-class exception for larger objects.
+
+Other ABIs may use a different classification even when their memory
+layout matches. For an early implementation prefer a C shim taking
+a pointer to input and output records, compiled against the real
+header. The generated language view then needs layout only for the
+parts it accesses. If a C function returns a record via hidden
+caller-provided storage, that detail stays within the compiled shim.
+\Cref{fig:visual-388} shows why a successful offset test is not a
+successful call test.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (type) at (0,0) {Configured C type};
+  \node[tome box dark] (mem) at (5,1.25) {Memory layout};
+  \node[tome box accent] (call) at (5,-1.25) {Call classification};
+  \draw[tome arrow] (type) -- (mem);
+  \draw[tome arrow] (type) -- (call);
+  \draw[tome dashed] (mem) -- (call);
+\end{tikzpicture}
+\caption{Call classification can consult layout, but it also depends on the calling convention and the available argument locations.}
+\label{fig:visual-388}
+\end{figure}
+
+% Annotated walkthrough
+\section{Verify Addressable Fields and Delegate Bit-Fields}
+
+\begin{verbatim}
+verify_target(layout, c_probe):
+    require_equal(layout.size, c_probe.sizeof_record())
+    require_equal(layout.align, c_probe.alignof_record())
+    for field in layout.addressable_members:
+        require_equal(field.offset, c_probe.offsetof(field.name))
+    for field in layout.bit_fields:
+        require(field.supported_getter_symbol)
+        require(field.supported_setter_symbol)
+
+probe_get_mode(record):
+    return record.mode        # compiled against native header
+
+probe_set_mode(record, value):
+    if not 0 <= value <= 7: return RANGE
+    record.mode := value      # hypothetical unsigned three-bit field
+    return OK
+\end{verbatim}
+
+The bit-field helper is target C code expressed as pseudocode.
+Ordinary member addresses and \texttt{offsetof} will not give a
+bit-field offset. The ABI extract describes a concrete allocation
+policy, but byte order alone does not specify a portable one.
+Allocation unit, direction, rules for crossing or ending a unit and
+field signedness can matter. Test that setting mode to \(5\) after
+setting a neighboring field does not change the neighbor. Reject
+out-of-range setter values rather than trusting truncation to reflect
+the public operation. If clients need a portable serialized format,
+write an explicit bit encoding for that format, not for the
+compiler's C record.
+
+\section{Expose a Tagged View of a Union}
+
+A union overlays its alternatives at the same location and has room
+and alignment for the supported members. A union of a double and a
+32-bit integer in the example target is aligned for the double and
+occupies eight bytes. Neither an address nor the extent identifies
+which member the supplier intended. Suppose the record containing
+the union also holds a separate kind field: the wrapper should
+decode that kind first and read only the corresponding member, or
+report an unknown variant without examining the payload. Do not
+treat arbitrary inactive bytes as a second public value.
+
+Verify layout with a native fixture that writes distinct values,
+followed by one in which the language writes and C reads. Include
+arrays and records nested inside larger records so stride and
+alignment errors cannot hide at offset zero. Compare fields, not
+the padding bytes: padding has no promised semantic value and is
+not a stable basis for equality, hashing or interchange. Keep the
+fixture built with the library's packing switches and target defines;
+testing the default layout of a different translation unit can
+certify a perfectly consistent but irrelevant representation.
+
+\section{Work Through a Packed Extension Without Generalizing It}
+
+Suppose a target compiler is configured with a packing extension
+that caps every member's effective alignment at one for a
+specific record. Applied to the four members in the table,
+this configuration yields offsets \(0,1,5,13\), total size
+\(15\) and aggregate alignment \(1\). The second record's
+\texttt{mean} would begin at byte \(20\), not \(32\).
+An aligned base allocation would not make the first
+\texttt{mean} aligned: its byte offset is five. A runtime
+decoder can copy exactly eight bytes from that offset into
+an aligned native double and then decode that double under
+the target representation. Casting the original address to
+a native double pointer and dereferencing it is not an
+equivalent portable operation.
+
+This packing can change the machine classification too.
+The System V aggregate classification includes a MEMORY
+case for unaligned fields. Using the ordinary record's
+layout table with just an adjusted stride is therefore not
+enough. Neither does the example justify applying a unit
+alignment cap to every compiler feature with ``packed''
+in its name: explicit alignment attributes, nested records
+and individual member attributes may interact differently.
+Ask the configured compiler, or generate accessors so the
+binding does not need to represent the extension at all.
+
+\begin{verbatim}
+decode_packed_mean(view, record_index, layout):
+    require(layout.target == active_library_target())
+    require(0 <= record_index < view.record_count)
+    base := checked_multiply(record_index, layout.size)
+    address := checked_add(base, layout.offset_of_mean)
+    require(contains_bytes(view, address, native_sizeof_double))
+    tmp := allocate_aligned_native_double()
+    copy_bytes(tmp, view, address, native_sizeof_double)
+    return decode_target_double(tmp)
+\end{verbatim}
+
+This helper is for a live native memory view, not for loading
+records from a file. A file may specify an endian or floating
+format unrelated to the runtime target, and its length may
+represent no valid record sequence. Verify an unaligned field
+with a distinct pattern in adjacent fields: that exposes an
+implementation that rounds the field address down to the
+nearest aligned position before copying. Check count and
+extent separately; a stale metadata count must not authorize
+a read beyond the actual view.
+
+For a versioned record with a size field, consider whether
+the supplier guarantees a common readable prefix. If it
+does, an older library may supply that prefix and omit
+later fields. Do not use the size field as an array stride
+unless the API specifically defines it that way. A supplied
+record can be smaller than the allocation that contains it,
+and conversely the actual extent limits what may be read
+even when a version claims a larger type.

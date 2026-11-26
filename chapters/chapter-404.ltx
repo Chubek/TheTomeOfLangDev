@@ -1,0 +1,197 @@
+% Source: jvm-specs.txt
+% Source: concepts-and-semantics-of-proglang-2-ocaml.txt
+
+\section{Define Run-Time Selection Against a Resolved Request}
+
+Our diagram editor gives each drawable object a method
+\texttt{paint(Surface)}. A \texttt{Circle} and a
+\texttt{Label} override it. An instruction in a typed
+interpreter should not ask ``find anything named paint''.
+It asks for the virtual method resolved from a particular
+owner and descriptor; the receiver selects an implementation
+of that method. A \texttt{Label} can also declare
+\texttt{paint(Preview)} without changing the meaning of the
+original send. Return types, calling conventions, and
+argument representation are already fixed by the resolved
+request to the extent needed at the call boundary.
+
+The JVM specification illustrates this split. A virtual
+instruction refers to a symbolic constant-pool entry, which
+is resolved, and a subsequent selection step uses the
+receiver's class. Its specified behavior includes errors
+and frame setup; a particular physical table layout is not
+the semantic definition. \Cref{fig:visual-404} illustrates
+two receivers for one resolved method.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (k) at (0,0) {paint(Surface)};
+  \node[tome box] (a) at (3.2,.95) {Circle receiver};
+  \node[tome box] (b) at (3.2,-.95) {Label receiver};
+  \node[tome box accent] (c) at (6.5,.95) {Circle.paint};
+  \node[tome box accent] (d) at (6.5,-.95) {Label.paint};
+  \draw[tome arrow] (k) -- (a);
+  \draw[tome arrow] (k) -- (b);
+  \draw[tome arrow] (a) -- (c);
+  \draw[tome arrow] (b) -- (d);
+\end{tikzpicture}
+\caption{The receiver varies the implementation without changing the resolved method request.}
+\label{fig:visual-404}
+\end{figure}
+
+\section{Start With a Slow Path That Can Serve as an Oracle}
+
+In a miniature single-inheritance runtime, build an
+override map indexed by method-family identity, assigned
+during class verification. Each class map contains its
+locally declared overrides. A receiver without a local
+implementation searches its parent. An abstract override
+is an entry asserting that this class did not supply a
+callable body; it is not a miss that permits the interpreter
+to select a more distant implementation. A well typed
+language may prevent abstract receivers entirely but the
+metadata verifier should still establish the invariant.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Receiver & Local declaration & Result of base request \\
+\hline
+\texttt{Circle} & override & circle body \\
+\texttt{Label} & override and overload & label override only \\
+\texttt{BlankCircle} & none & inherited circle body \\
+\texttt{null} & none & null-receiver error \\
+\hline
+\end{tabular}
+\end{center}
+
+The descriptor still matters when the target has covariant
+returns or another adaptation at the ABI boundary. A
+runtime can install a bridge entry that returns the required
+representation. A direct call to the body is valid only if
+the caller performs the equivalent bridge or proves it
+unnecessary for that use. Match on the method family, not
+only the spelling and arity of the implementation.
+
+% Annotated walkthrough
+\section{Interpret the Send and Preserve the Calling Contract}
+
+\begin{verbatim}
+select(receiver_class, family):
+    cls := receiver_class
+    while cls != None:
+        entry := cls.local_overrides.get(family)
+        if entry is Abstract: raise no_concrete_method(family)
+        if entry exists: return entry
+        cls := cls.parent
+    raise no_concrete_method(family)
+
+send(frame, instruction):
+    method := resolve_once(frame.constants, instruction.index)
+    (receiver, args) := peek_operands(frame, method.descriptor)
+    if receiver is null: raise null_receiver()
+    entry := select(class_of(receiver), method.family)
+    callee := make_frame(entry, return_to(frame, instruction))
+    callee.locals[0] := receiver
+    place_arguments(callee, args, method.descriptor)
+    commit_call(frame, callee)
+\end{verbatim}
+
+This is a toy instruction, not a full JVM definition. In
+particular it does not implement interface-default selection,
+synchronized entry, or native methods. For this instruction,
+resolution precedes the null check; if the symbolic reference
+is invalid, the error should not be replaced by a null-receiver
+error. The receiver and evaluated arguments remain in the
+caller until the callee frame and its roots are installed.
+If lookup or frame construction raises, unwinding observes
+the language-defined state at the call.
+
+\section{Lower to an Indirect Call Without Changing the Request}
+
+A compiler can replace the superclass walk by loading a
+class descriptor, reading a slot assigned to the method
+family, and calling its address. A flattened table encodes
+the result of the same selection for each class. The native
+call still has the expected ABI, and it still checks null
+unless the receiver is proven non-null or the runtime has
+an equivalent trapping scheme. In a compiler IR, keep the
+receiver and arguments explicit instead of hiding them all
+inside descriptor manipulation.
+
+\begin{verbatim}
+ref := evaluate_receiver()
+val := evaluate_surface()       // may log or raise
+check_call_preconditions(ref)   // phase defined by language
+cls := load_class(ref)
+fn  := load_slot(cls, paint_family)
+call_indirect desc_paint(fn, ref, val)
+\end{verbatim}
+
+If argument evaluation raises before the call, neither the
+method lookup nor the callee's side effects may run ahead of
+that exception in this toy order. Replaying evaluation on a
+slow branch is also incorrect: an expression producing
+\texttt{Surface} can update a metric. Move a guard across
+effectful operations only with a proof that the observation
+or exception order will be unchanged.
+
+Test the interpreter and compiled path with identical event
+traces rather than just checking the returned pixels. Include
+a subclass inheriting an override, a same-spelled overload,
+a null receiver with an effectful argument, and a symbolic
+linkage failure. In a system permitting classes to load
+after compilation, new classes must get complete descriptors
+before publication. A compiled call with a layout-independent
+fallback can keep using its receiver's method family even
+when a new subclass appears; a call that guessed one target
+needs an additional guard or validity proof.
+
+\section{Compare Closed Class Dispatch With Open Message Lookup}
+
+An untyped prototype interpreter may instead define
+\texttt{receiver.paint} as a mutable property selection.
+There is no resolved method family to index. A local
+data property can shadow a function farther along the
+prototype chain, and the first occurrence can therefore
+produce a noncallable-property error. Do not keep walking
+after finding it just because an earlier call found a
+callable method. The cacheable fact is the result of this
+language's property lookup and invocation protocol, which
+is different from the typed slot selection above.
+
+\begin{verbatim}
+prototype_send(recv, name, args):
+    owner := recv
+    while owner exists:
+        if owns_property(owner, name):
+            value := read_property_as(owner, recv, name)
+            require_callable(value)
+            return invoke(value, recv, args)
+        owner := prototype_of(owner)
+    raise missing_property(name)
+\end{verbatim}
+
+The receiver passed to a method is still the original object,
+not the prototype that owns the method. The example assumes
+an acyclic chain, checked when prototype links are changed.
+It also leaves accessors to \texttt{read\_property\_as};
+if that operation invokes user code, a compiler cannot
+replace it with a cached function unless it preserves those
+effects or proves this particular property is a constant
+data method. The slow path should be the baseline for
+that proof. A test can install one routine on a prototype,
+send through a child, then add a noncallable shadow to the
+child and require the next send to fail. Also confirm
+that the original send observed a field on the child, not
+a same-spelled field on the prototype.
+
+An implementation may give this operation and static-family
+dispatch different IR opcodes. They have different effects
+and failure modes: a property accessor may execute arbitrary
+code before selection finishes, whereas a verified slot load
+need not invoke a user hook. A compiler that represents both
+as effect-free target selection cannot tell when motion across
+an intervening store would change what the program observes.

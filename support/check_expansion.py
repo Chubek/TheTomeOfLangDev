@@ -15,13 +15,14 @@ EXTENSIONS = (
     ("tome-native-toolchain.ltx", range(261, 303), (18, 24)),
     ("tome-description-languages.ltx", range(303, 352), (20, 15, 14)),
     ("tome-alternative-languages.ltx", range(352, 382), (10, 11, 11)),
+    ("tome-runtime-interfaces.ltx", range(385, 430), (12, 11, 11, 11)),
 )
 PLACEMENTS = (
     (382, "the-tome-of-langdev.ltx", 40, 41),
     (383, "tome-alternative-languages.ltx", 362, 363),
     (384, "tome-alternative-languages.ltx", 381, None),
 )
-CHAPTERS = (*range(EXTENSIONS[0][1].start, EXTENSIONS[-1][1].stop),
+CHAPTERS = (*(n for _, chapter_range, _ in EXTENSIONS for n in chapter_range),
             *(item[0] for item in PLACEMENTS))
 ALL_CHAPTERS = (*range(1, EXTENSIONS[0][1].start), *CHAPTERS)
 PRIMARY_SOURCES = (
@@ -49,6 +50,7 @@ PSEUDOCODE_BLOCK = re.compile(
     r".*?\\end\{\1\}",
     re.S,
 )
+TABLE = re.compile(r"\\begin\{(?:tabular\*?|tabularx|longtable)\}")
 VISUAL_MARKER = re.compile(r"^% Explanatory visual[ \t]*$", re.M)
 VISUAL_FLOAT = re.compile(
     r"^[ \t]*\\begin\{figure\}(?:\[[^\n]*\])?(.*?)\\end\{figure\}",
@@ -214,6 +216,8 @@ def check_tome(errors):
             errors.append(f"{path.name}: needs at least three sections")
         if re.search(r"(?m)^\s*\\(?:chapter|part)\b", body):
             errors.append(f"{path.name}: use the heading in the extension file")
+        if n in EXTENSIONS[-1][1] and not TABLE.search(body):
+            errors.append(f"{path.name}: needs a comparison or worked-trace table")
         notes = set(source_catalogue.SOURCE_NOTE.findall(text))
         if not notes:
             errors.append(f"{path.name}: no local source notes")
@@ -278,6 +282,7 @@ def main():
         "18 instruction-selection chapters, "
         "24 toolchain chapters, 20 HDL chapters, 15 architecture description chapters, "
         "14 logic-programming chapters, 30 core alternative-language chapters, "
+        "45 runtime-interface and compiler data-structure chapters, "
         f"{len(PLACEMENTS)} bridge and capstone placements, "
         "45 dossier chapter links, and local source catalogue checked."
     )

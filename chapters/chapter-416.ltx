@@ -1,0 +1,191 @@
+% Source: appel-book-ml-better-typeset.txt
+% Source: garbage-coll-in-large-lisp-system.txt
+
+\section{Define What the Tracer Is Allowed to Miss}
+
+Incremental tracing runs short collection slices separated by
+mutator execution. Concurrent tracing permits the tracer and
+mutator to execute at the same time. Both see a changing heap;
+the concurrent design must additionally handle interleavings
+within a scan or a store. In tricolor terminology, white
+objects are undiscovered, gray objects are queued or being
+scanned, and black objects have been scanned. These are
+logical states, not necessarily three header bits. Appel
+uses the colors to describe barrier obligations
+\cite{appel2004modern}; Moon describes incremental copying
+in a real Lisp system. Here keep the heap nonmoving, so the
+first problem is preserving reachability rather than making
+all loads tolerate evacuation.
+
+Imagine \(B\) is black and \(G\) is gray. The only path to
+white \(W\) currently goes through \(G\). The program copies
+the edge into \(B\), then deletes it from \(G\). If the tracer
+never inspects \(B\) again and later scans the cleared field
+in \(G\), it can miss the reachable \(W\). \Cref{fig:visual-416}
+shows what an insertion barrier must notice. Marking longer
+without a barrier does not make this race less fundamental.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (b) at (0,0.95) {Black $B$};
+  \node[tome box accent] (g) at (0,-0.95) {Gray $G$};
+  \node[tome box] (w) at (5.5,0) {White $W$};
+  \draw[tome arrow] (b) -- node[above,sloped]{inserted} (w);
+  \draw[tome dashed] (g) -- node[below,sloped]{deleted} (w);
+\end{tikzpicture}
+\caption{A store moves the only path to a white object from pending work into a portion of the graph already scanned.}
+\label{fig:visual-416}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Policy & Barrier keeps & Why the example survives \\
+\hline
+Insertion & New target & Discovers \(W\) during insertion \\
+Snapshot at start & Replaced target & Records \(W\) during deletion \\
+Remembered cards & Location of store & Covers a regional boundary only \\
+\hline
+\end{tabular}
+\end{center}
+
+The last row is not a substitute for either marking barrier.
+A store of an old reference into an old object can matter
+to a concurrent full mark even when it creates no young edge.
+A combined barrier can implement both purposes, but give each
+purpose an independent invariant and an independent test.
+
+% Annotated walkthrough
+\section{Start With Serialized Incremental Slices}
+
+\begin{verbatim}
+begin_mark():
+    stop_mutator()
+    enable_mark_epoch()
+    for root in roots: shade(root.load())
+    resume_mutator()
+
+store_pointer(slot, value):
+    if marking: shade(value)
+    slot.store(value)
+
+mark_slice(budget):
+    stop_mutator()
+    while budget > 0 and gray_queue not empty:
+        x := gray_queue.pop()
+        for slot in strong_slots(x): shade(slot.load())
+        blacken(x)
+        budget -= 1
+    if gray_queue empty:
+        for root in roots: shade(root.load())
+        if gray_queue empty: finish_mark_and_sweep()
+    resume_mutator()
+\end{verbatim}
+
+Here shading enqueues a white object once. The insertion
+barrier conservatively shades all new heap targets during
+marking, not only those written by black holders. New objects
+start black with empty slots; initialization writes obey the
+same barrier. Root slots are enumerated at start and checked
+again before ending the mark, allowing the ordinary mutator
+registers to change between slices. The example excludes
+weak-reference upgrades and other operations that can newly
+expose white objects; add appropriate barriers before
+introducing them. No mutator runs at the same time as a
+slice, so there is no race between field loads and shading.
+The budget counts objects for clarity, but scanning one large
+reference vector can exceed a useful pause budget. Chunk
+long scans and leave continuation work visible in the queue.
+
+\section{Move From Slices to Concurrent Publication}
+
+Concurrent tracing needs synchronized mark transitions and
+slot reads that respect the host memory model. One thread
+may change a mark bit while another is about to queue the
+same object. Duplicate queue entries are often cheaper to
+tolerate than lost work, but if only the winner of an atomic
+mark transition can enqueue, other threads must account
+for the interval between winning and publishing the work.
+Changing a mark bit does not publish the object's descriptor
+or make its fields safe to read; allocation needs its own
+initialization and publication protocol.
+
+An empty shared queue is not termination. A worker may be
+scanning an object, a mutator may hold a partially filled
+barrier buffer, or a winning marker may not yet have published
+its item. A simple finish protocol stops mutators, waits for
+in-flight barrier operations, flushes local logs, and brings
+workers to a known state. Then it drains all work and scans
+the necessary roots before reclaiming. More concurrent
+termination is possible, but the protocol must account for
+the same sources of work. Reclaiming concurrently with
+mutators after marking adds another set of synchronization
+requirements between sweeping, buffer retirement, and
+allocators; do not infer them from the marking protocol.
+
+\section{Compare Marking Semantics and Scheduling Costs}
+
+A snapshot-at-the-beginning barrier logs the previous
+referent of an overwritten reference so marking can
+preserve the initial reachable graph even after deletion.
+Its proof differs from the insertion policy: it retains
+some objects no longer reachable at the end. New allocations
+must be treated as live for that cycle, and initial roots
+need a well-defined snapshot. Use the actual replaced value,
+not an unrelated load raced by another writer. A collector
+can intentionally retain extra objects under either policy.
+That floating garbage is not a safety bug, but increases
+the memory headroom needed while a cycle is running.
+
+Measure mutator barrier cost, allocation rate, marking
+throughput, and final-pause work separately. If marking falls
+behind the allocation rate, it may need mutator assists or
+earlier starting thresholds. Parallel workers can still
+lose time to shared queue contention or cache-line traffic.
+To isolate correctness, force the store sequence in the
+figure between two mark slices, then test the concurrent
+version with a worker paused after claiming a mark and before
+publishing it. Force a finish request while a barrier buffer
+has exactly one entry. Tests with no precise control over
+scheduling may never exercise those boundary states.
+
+\section{Keep Compiler Ordering Part of the Contract}
+
+Once generated code emits a barrier inline, ordinary field
+stores and barrier operations cannot be moved independently.
+An optimizer might otherwise schedule an insertion barrier
+after a safepoint to improve register allocation, or remove
+an apparently redundant old-value load used by a deletion
+barrier. Represent the barrier's effects in the IR or lower
+its parts together after the relevant optimization passes.
+Audit atomic fields and bulk copies too: instructions that
+update several slots need coverage for each relevant edge.
+A kernel memory barrier alone does not discover an edge; a
+collector write barrier describes a semantic action and may
+in turn need memory ordering to carry it out safely.
+
+\section{State the Completion Argument at a Fixed Heap State}
+
+For the serialized insertion design, assume every black object
+has no white strong target when a pause starts. Scanning a
+gray object shades all its targets before turning it black,
+so that step preserves the property. Between pauses a store
+cannot create a black-to-white edge because its new target
+was shaded before installing the edge. At completion, the
+mutator is stopped, every root has a nonwhite target, and the
+gray queue is empty. If a root could reach a white object,
+take the first white object on that path. It would either
+be a root target or have a black predecessor, both excluded.
+This proof says why an empty queue has meaning only at the
+stated boundary. It does not say every black object is still
+reachable; black can include floating garbage.
+
+When adapting the argument to concurrency, deliberately pause a
+worker after it reads a reference from one vector slot but
+before it reads the next. Replace both slots from the mutator.
+Independently test a root change at the last handshake.
+The mark state and queued barrier work together must justify
+the final fixed heap argument; a collection cannot interpret
+the last queue read as proof that no more work will arrive.

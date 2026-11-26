@@ -1,0 +1,182 @@
+% Source: compilers-alfred-v.-aho-monica-s.-lam-ravi-sethi-etc.-.txt
+
+\section{Separate Discovering Survivors From Rebuilding Free Space}
+
+A stop-the-world mark-sweep collector does not move surviving
+objects. The mark pass identifies the closure of roots under
+strong reference fields; the sweep pass turns everything else
+into reusable storage. Keeping the phases separate makes it
+possible to debug the tracer without guessing whether a free-list
+operation destroyed evidence. Aho and colleagues describe a
+heap with embedded free lists as well as mark-sweep variants
+\cite{aho2007compilers}. In the simplest walkable representation,
+every chunk, used or free, has an extent. Store both allocation
+state and the current mark state; a free chunk is not a large
+object whose descriptor happens to describe no pointers.
+
+Mark when enqueuing, not when removing from the stack. For
+example, a vector may contain a thousand aliases for one child.
+The first edge marks it and enqueues it; the other edges do
+not enlarge the pending work. Marking must ignore integers and
+other non-reference words as directed by the descriptors. It
+also must not discover new roots by treating free-list links
+as object fields. The work stack belongs to the collector,
+which cannot casually allocate it from the heap that exhausted
+its allocation budget. Use reserve memory or a defined overflow
+strategy. Discarding a failed push and continuing to sweep can
+reclaim an unvisited child of a marked parent.
+
+\begin{center}
+\begin{tabular}{lrll}
+\hline
+Old start & Bytes & State at sweep & Outcome \\
+\hline
+0  & 32 & Marked object & Keep \\
+32 & 16 & Unmarked object & Merge into free run \\
+48 & 32 & Already free & Merge into free run \\
+80 & 16 & Unmarked object & Merge into free run \\
+96 & 32 & Marked object & Keep \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-412} shows the result of the sweep. A
+64-byte request can use the merged chunk. It could not be
+satisfied by any constituent chunk even after the collector
+had classified both dead objects. Conversely, two adjacent
+entries in a size bin are not necessarily adjacent in memory;
+merging needs physical order or boundary tags.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (0,0) {Live: 0--32};
+  \node[tome box accent] (b) at (4.1,0) {Free: 32--96};
+  \node[tome box dark] (c) at (8.2,0) {Live: 96--128};
+  \draw[tome arrow] (a) -- (b);
+  \draw[tome arrow] (b) -- (c);
+\end{tikzpicture}
+\caption{The sweep rebuilds one free extent between two live objects. End addresses are exclusive.}
+\label{fig:visual-412}
+\end{figure}
+
+% Annotated walkthrough
+\section{Accumulate Maximal Runs in Address Order}
+
+\begin{verbatim}
+discover(p):
+    if p is null: return
+    assert p names an allocated object start
+    if marked(p): return
+    mark(p)
+    push_reserved_work_stack(p)
+
+collect(region):
+    for root in roots: discover(root.load())
+    while work_stack not empty:
+        for slot in strong_slots(pop_work_stack()):
+            discover(slot.load())
+    clear_bins_for(region)
+    cursor := region.begin
+    run := empty
+    while cursor < region.end:
+        chunk := decode_chunk_at(cursor)
+        next := cursor + chunk.extent
+        if chunk.allocated and marked(cursor):
+            emit_free_run_into_bins(run)
+            run := empty
+            clear_mark(cursor)
+        else:
+            extend_contiguous_run(run, cursor, next)
+        cursor := next
+    emit_free_run_into_bins(run)
+\end{verbatim}
+
+This sketch assumes a single swept region; a multi-region
+runtime marks the entire graph before sweeping any region.
+Save the next address while the old chunk header is available.
+Emitting a free run can overwrite dead headers and install
+links. Keeping an iterator into a dead object's payload during
+that step is unsafe. Free-list insertion happens once per
+maximal run, so no stale nodes from the old bins need to be
+unlinked as they are merged. Reset surviving mark bits for
+the next collection; epoch bits can remove this particular
+write if their reuse policy avoids confusing old and new marks.
+
+\section{Choose Bin and Split Policies Together}
+
+A size-class bin gives quick access to common sizes, but a
+class can contain several actual extents. If the class covers
+48 through 63 bytes and a request is 56, a 48-byte item
+cannot be returned. Pick classes with exact sizes for small
+chunks, inspect candidate sizes, or search a class whose
+minimum is large enough. If removing a 96-byte chunk leaves
+16 bytes after serving a request, the split is legal only if
+16 bytes can encode the free chunk. Otherwise the object gets
+the whole chunk and the walker needs a way to learn the true
+extent rather than recomputing a smaller extent from its payload.
+Separate internal fragmentation from external fragmentation:
+the first is unused space in allocated chunks, while the second
+is free space split into chunks that cannot meet a request.
+
+A collector can report half the heap free while failing a
+moderate allocation. For example, alternating live 64-byte
+and free 64-byte chunks yield plenty of free bytes but no
+128-byte contiguous extent. Coalescing does nothing in this
+case; every free chunk already has a live neighbor. Possible
+responses include a distinct large-object region, expansion,
+or a moving collection such as \Cref{ch:ext-414}. Measure largest free extent alongside
+total free bytes. An adaptive collector that reacts only to
+free percentage may repeat the same expensive sweep and
+obtain the same insufficient result.
+
+\section{Turn the Heap Walk Into a Consistency Check}
+
+After a collection, walk the region without using the bins.
+Verify complete, nonoverlapping coverage, aligned starts,
+valid descriptors for survivors, and no mergeable adjacent
+free extents. Then traverse each bin and compare its nodes to
+the free extents discovered independently. A free chunk absent
+from the bins silently leaks capacity; the same chunk appearing
+twice can be returned to two different clients. Use a sequence
+that fills every size class, frees alternating objects, and later
+removes an intervening survivor. The first sweep must leave
+holes; the second must merge across the newly dead chunk.
+
+Finally, distinguish the collector's search cost from its sweep
+cost. Marking visits reachable objects and their fields. A
+linear sweep visits each physical chunk, live or dead; it need
+not touch every byte of each one. The choice of side bitmaps,
+header marks, or lazy per-page sweeping will affect memory
+traffic and latency even when the high-level algorithm is the
+same. Check pause distribution and the allocation slow path:
+delaying a sweep until a bin runs out simply transfers work to
+that particular allocation. The caller's observed latency remains
+part of the memory manager's behavior.
+
+\section{Give Large Objects Their Own Accounting}
+
+A contiguous page span can use a page descriptor to record
+extent and allocation state rather than adding a list node for
+every page. Coalesce only spans in the same address range and
+allocator domain. A free span that has been returned to the
+operating system is not immediately equivalent to mapped,
+committed storage; committing pages can be work on the next
+allocation. Count committed bytes and reserved address space
+separately, and record which component holds the metadata for a
+span after decommit. A heap checker must not fault merely to
+verify that an uncommitted span is listed once.
+
+Collecting while bins are empty is an important failure test.
+Cap the mark stack well below the maximum work for a wide live
+graph, then either reject the collection without sweeping or
+exercise the specified fallback. One fallback scans marked
+objects for unmarked children until no discovered edge adds
+a mark, discarding no live work. Its cost can be high on a
+deep graph with an unfavorable physical order; count repeated
+passes. Also try the opposite shape, a long singly linked
+chain, which often uses little explicit worklist space.
+The two fixtures distinguish graph depth from frontier size.
+Log the fallback separately so routine pause summaries cannot
+hide a repeated failure to reserve enough work memory.

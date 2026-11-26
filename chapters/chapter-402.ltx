@@ -1,0 +1,189 @@
+% Source: the-rust-proglang.txt
+
+\section{Resolve a Package Graph Before Resolving Its Names}
+
+A manifest is a set of requests: package names, version ranges,
+source choices, and perhaps features or target conditions. A
+lock graph is a particular solution. The Rust book's example
+contrasts a Cargo manifest's permitted versions with the exact
+selections in \texttt{Cargo.lock}. The important property for a
+compiler is not that two installations happen to have the same
+package names. Each importing package instance must see the same
+bindings from its local dependency aliases to particular package
+instances. Two lookup edges with the same label can attach to
+different provider nodes.
+
+Suppose an animation tool uses a scene reader and a thumbnail
+writer. The reader is written for version 1 of a color package;
+the writer is written for version 2. Our package manager allows
+multiple installed versions if their component ABIs can coexist.
+The package's module names alone are no longer adequate global
+keys. \texttt{Color.Pixel} from version 1 does not equal
+\texttt{Color.Pixel} from version 2 by spelling. A palette
+converter may translate between explicit types, but silently
+unifying the identities can mix layouts and assumptions.
+
+\section{Record What Each Edge Actually Selects}
+
+In \Cref{fig:visual-402}, both edge labels read \texttt{colors}
+but lead to different instances. If the language gives manifests
+the power to rename aliases, the reader can call the package
+\texttt{colors} while its source registry uses a longer name.
+The lock graph records the binding by importer, not just a
+deduplicated list of fetched packages.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (a) at (0,1.75) {Animation tool};
+  \node[tome box] (r) at (-2.1,.1) {Reader};
+  \node[tome box] (w) at (2.1,.1) {Writer};
+  \node[tome box accent] (c1) at (-2.1,-1.55) {Color 1.4};
+  \node[tome box accent] (c2) at (2.1,-1.55) {Color 2.1};
+  \draw[tome arrow] (a) -- (r);
+  \draw[tome arrow] (a) -- (w);
+  \draw[tome arrow] (r) -- node[left]{colors} (c1);
+  \draw[tome arrow] (w) -- node[right]{colors} (c2);
+\end{tikzpicture}
+\caption{The same dependency alias has a meaning relative to its importing package instance.}
+\label{fig:visual-402}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Fact & Example & Who consumes it? \\
+\hline
+Allowed version & reader requests 1.x & solver \\
+Selected version & reader gets 1.4 & lock replay \\
+Selected source & registry or git revision & fetcher \\
+Content digest & archive hash & verifier \\
+Active feature set & reader uses linear color & build planner \\
+Alias mapping & reader's colors edge & language resolver \\
+\hline
+\end{tabular}
+\end{center}
+
+Choose and state an identity policy. In this toy system an
+instance binds one immutable source coordinate and one resolved
+feature context. Targets that choose different module roots
+use different build variants. Some package managers unify
+features for a version within a resolution context, while others
+can build variants. Features may affect which declarations or
+dependencies exist, so the policy cannot be reconstructed from
+the version number after compilation.
+
+% Annotated walkthrough
+\section{Replay the Locked Graph Without Solving Again}
+
+\begin{verbatim}
+replay(manifest, lock, context):
+    require_lock_schema_supported(lock)
+    root := lock.root_for(context)
+    check_root_request_matches(root, manifest, context)
+    work := [root]
+    seen := {}
+    while work not empty:
+        id := work.pop()
+        if id in seen: continue
+        seen.add(id)
+        node := lock.nodes[id]
+        contents := fetch_exact(node.source, node.revision)
+        require_digest(contents, node.digest)
+        requests := active_requests(contents.manifest, node, context)
+        require_same_aliases(requests, node.edges)
+        for (alias, request) in requests:
+            destination := lock.nodes[node.edges[alias]]
+            require_matches(destination, request)
+            work.push(destination.id)
+        install_module_roots(id, contents, node.features, context)
+    return resolver_environment(root, reachable_edges(lock, seen))
+\end{verbatim}
+
+Validation must check feature constraints and source policy in
+addition to version ranges. The active-request function runs on
+the chosen feature configuration, including any applicable
+target conditions. If a locked request no longer matches, fail
+with the importing node and alias instead of silently running a
+new solve. A package archive with the correct name but an
+unexpected digest is also a failed replay, even if its visible
+interfaces happen to be identical. Sorting the lock encoding
+can make reviews easier without altering semantic order.
+
+\section{Distinguish a Dependency Upgrade from an Ambient Change}
+
+For an intentional upgrade, seed a solve from the lock graph
+and constrain unchanged edges where the policy allows. If a
+requested upgrade necessitates a transitive change, explain the
+chain of newly incompatible constraints. A fixture with one
+allowed range and two candidates tests update behavior; a locked
+build must ignore the later candidate and load the previously
+pinned one. A version solver that sometimes chooses the later
+version because a different registry mirror listed it first
+has turned an ambient condition into a dependency input.
+
+\begin{verbatim}
+input                         replay result
+same lock, newer release      retain locked node
+same lock, missing archive    fail unless cached exact bytes
+manifest excludes locked 1.4  reject; request new resolution
+alias points to new digest    a changed input, review the lock
+\end{verbatim}
+
+Mutable workspace paths require a different promise: either
+snapshot them, record a checked tree digest, or state that the
+workspace source is another uncontrolled input. Likewise an
+identical import graph alone does not guarantee bitwise identical
+executables. Compiler and linker versions, build options,
+generated files, and capabilities of build scripts can all
+affect output. To debug a reproducibility failure, first compare
+the resolved graph, then artifact inputs and build context.
+Keeping those records distinct tells the team whether a change
+came from a solver decision or from a later build stage.
+
+\section{Explain Failure at the Edge That Causes It}
+
+Change the example to a package with an exclusive native
+component: the package manager permits only one selected color
+version in this build. The reader allows versions 1.3 and 1.4;
+the writer requires 2.1. The conflict is not solved by
+selecting the newest version and letting the type checker
+complain. The empty intersection belongs to dependency
+resolution, before the front end can construct any valid root
+environments. Show the conflicting requests as paths from the
+root, together with the exclusive-component constraint. If the
+constraint is relaxed only for a different target, name that
+target difference instead of claiming every build fails.
+
+\begin{verbatim}
+tool -> reader -> colors: allowed {1.3, 1.4}
+tool -> writer -> colors: allowed {2.1}
+target native-backend: one provider for color-library ABI
+result: no valid simultaneous selection
+\end{verbatim}
+
+In the multiple-version case, by contrast, report item-level
+type errors with both concrete instances. An argument mismatch
+between two types simply printed as \texttt{Color.Pixel} is
+misleading. Add package source and selected version to the
+diagnostic; use dependency paths if the two labels still look
+identical. The goal is to let the programmer find the
+dependency edge to change, not to make the type checker behave
+as a second version solver.
+
+A resolver regression can compile a pair of fixtures using
+identical source text for both color providers. The fixture
+that imports the same node through two aliases sees one type;
+the fixture that imports the two distinct nodes sees two.
+Then rerun replay with exactly the same lock and reorder the
+registry results. The graph, import identity, and diagnostics
+must not change.
+
+Run the same graph fixture under a context that disables the
+writer. The writer-only package must not become an available
+source import merely because its archive remains in the cache.
+An offline cache is a way to satisfy exact fetches; it is not
+an additional search path. The compiler should receive only
+the active importer-relative environment so such a path fails
+in both clean and previously populated workspaces.

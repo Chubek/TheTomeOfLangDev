@@ -1,0 +1,198 @@
+% Source: intro-to-scheme-and-its-impl.txt
+% Source: appel-book-ml-better-typeset.txt
+
+\section{Make One Interface Own the Collector Boundary}
+
+The collector should not know how to dispatch an opcode, and
+the interpreter should not know how to decode forwarding
+headers. Start with a small contract: allocate an object
+using a descriptor and extent, enumerate and update all root
+slots, enumerate pointer fields in each object, and perform
+reference stores with the barriers the selected algorithm
+requires. The Scheme implementation notes illustrate the
+use of tagged value registers and an evaluation stack with
+recognizable roots. Appel describes the corresponding
+compiler contract using machine-level maps
+\cite{appel2004modern}. These two root providers can coexist
+in a runtime where a bytecode frame calls generated code,
+which calls a native helper and eventually returns to bytecode.
+
+For the interpreter, make the frame's published stack height
+match the slots that still hold live values. Popping two
+operands and decreasing the height before an allocating
+helper call may hide both operands. Keeping all capacity
+live forever instead retains old values and may read
+uninitialized entries. In a precise tagged stack, publish
+exactly the live interval and ensure a temporary root frame
+covers any live values outside it. For compiled code, a map
+and unwinder locate those slots; the same allocation primitive
+can be used once the compiler arranges its live values in the
+expected safe state.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Producer & Exposes & Pitfall \\
+\hline
+Interpreter & Live tagged stack slots & Popped operands across allocation \\
+Generated code & Final stack maps and unwind data & Stale spill or register location \\
+Native helper & Scoped handles & Raw pointer cached across reentry \\
+Object layout & Descriptor-guided fields & Numeric slots traced as addresses \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-418} shows the shared interface. A slot
+visitor implementing moving collection updates actual stack,
+frame, or handle storage. The same path can implement a
+nonmoving tracer whose visitor only reads. Keeping both
+collectors behind the slot interface is useful for tests:
+the nonmoving version can tolerate bugs in pointer repair,
+while agreement on ordinary reachability is still informative.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (i) at (0,1.2) {Interpreter stack};
+  \node[tome box] (j) at (4,1.2) {Compiled frames};
+  \node[tome box] (n) at (8,1.2) {Native handles};
+  \node[tome box dark] (s) at (4,-0.3) {Root slots};
+  \node[tome box accent] (g) at (4,-1.85) {Collector};
+  \draw[tome arrow] (i) -- (s);
+  \draw[tome arrow] (j) -- (s);
+  \draw[tome arrow] (n) -- (s);
+  \draw[tome arrow] (s) -- (g);
+\end{tikzpicture}
+\caption{Execution engines differ in how they find roots, not in the meaning of an updateable slot.}
+\label{fig:visual-418}
+\end{figure}
+
+% Annotated walkthrough
+\section{Walk an Allocating Bytecode Handler}
+
+\begin{verbatim}
+execute_make_pair(vm):
+    # Entering this scope and reading slots cannot collect.
+    with vm.temporary_roots(3) as tmp:
+        tmp[0] := vm.peek(1)
+        tmp[1] := vm.peek(0)
+        tmp[2] := null
+        vm.pop_n(2)
+        tmp[2] := vm.allocate_pair_with_null_fields()
+        # No collection between allocation return and root store.
+        vm.write_field_through_handles(&tmp[2], left, &tmp[0])
+        vm.write_field_through_handles(&tmp[2], right, &tmp[1])
+        vm.push_root_value_without_collection(tmp[2])
+\end{verbatim}
+
+Reserve operand stack capacity and temporary roots before this
+sequence, or expose a safe preparatory state while expanding
+them. The allocation may copy both operands, so the field
+initializers use the updated handle slots rather than saved
+pointer values. If a barrier slow path may itself collect,
+it needs a stable handle to the holder and must recompute
+the field location after moving it. The sketch assumes the
+allocation result is a parseable pair and that the final
+push does not collect. If the allocation can throw, define
+whether old operands are needed for exception transfer,
+and put the interpreter in the corresponding stack state.
+The temporary-root scope must unwind on either normal or
+exceptional exit.
+
+In generated code, specialize the analogous fast path only
+after establishing the same invariants. A reserve check can
+fall through to a noncollecting initialization block or branch
+to an allocating runtime call. In the slow branch, the
+compiler emits a map for the live operands; the call can
+then change their addresses, so later machine uses must be
+connected to the updated values. A map by itself is not a
+dataflow edge in the optimizer. Model relocation explicitly
+or use an ABI that makes the updated values available through
+known slots. A common mistake is to load a raw pointer
+before a call, map its original slot correctly, and continue
+using the redundant, stale register afterward.
+
+\section{Use an Independent Graph Oracle}
+
+Generate bounded sequences of allocations, field writes,
+root additions, and root removals. Use stable IDs in a
+separate abstract graph and compute strong reachability
+there, independently of the runtime's descriptor walker.
+For a full collection with no finalizers or weak edges,
+the graph reachable after the pause must be isomorphic to
+the model: same IDs, field values, sharing, and cycles.
+If testing generational behavior, compare reachable objects
+and incoming-edge coverage separately from reclaimed bytes.
+A young object retained by unreachable old storage may be
+legal until the next full cycle. Repeat with weak and
+conditional semantics only once the oracle models them.
+
+Add directed fixtures to complement random operations.
+Force collection in argument evaluation, at allocation
+refill, during an exception, and across a managed-to-native
+callback. Run at tiny heap sizes and trigger a move at every
+eligible allocation. Disable inline allocation in one run to
+exercise more slow paths, then enable it to verify the
+compiler's fast-path assumptions. Poison abandoned memory or
+protect an old range in debug builds so stale references
+fail at use, and ensure the graph oracle does not keep
+every expected object alive by storing managed references
+to them in the test harness.
+
+\section{Separate Allocation Failure From Graph Failure}
+
+Inject failures in heap growth, worklist reservation, and
+code metadata allocation. For each failure establish what
+state is still intact and which subsystem may retry. An
+evacuating collector cannot report an ordinary allocation
+failure halfway through overwriting old headers unless its
+fallback understands that transient state. By contrast,
+failure to allocate a descriptor table before publishing any
+objects can be handled without touching an existing heap.
+Check that an exception does not skip temporary root cleanup
+or leave a stopped mutator state permanently advertised.
+
+Publish useful counters before tuning: allocation volume
+and refill count, live bytes at collection, pause and
+handshake distributions, scanned slots, and remembered
+work if present. A regression with an increasing number
+of scanned roots but stable live bytes suggests a different
+investigation from one that copies an increasing live graph.
+Keep a minimal replay for every discovered bug and record
+the chosen collector and stress flags. Once the failure is
+reproducible with stable IDs, it can often be localized to
+one missing slot, missed barrier, or invalid layout rather
+than being labeled a generic memory-management crash.
+
+\section{Roll Out One New Invariant at a Time}
+
+Start with nonmoving precise tracing and verify object fields
+and root census before relying on relocation. Add copying
+with a small explicit root interface, then introduce compiled
+frames or a generational barrier separately. Keep a way to
+select the baseline in debug runs. If a native transition only
+fails after enabling the moving collector, inspect whether
+its handles are rewritten and reloaded; if it also fails
+under nonmoving tracing, inspect whether they are roots at
+all. This difference turns two implementations into a
+diagnostic tool rather than merely duplicate code.
+
+Test transitions under both code aging and reentry. Arrange
+for a generated frame to wait in a native callback that
+invalidates its compiled entry point, then allocate in
+the callback's interpreter frame. The census must include
+the old generated frame using its old maps, along with the
+native handles and the currently running bytecode frame.
+On return the renewed entry point is unrelated to the
+suspended invocation. Include a variant in which the native
+helper saves only a derived address. It should either be
+rejected by the interface or use a pin or a base handle with
+an offset, not happen to pass because the test did not move
+the object. These mixed-frame fixtures exercise a contract
+that no isolated collector or backend test establishes.
+
+Make the debug verifier check these fixtures immediately
+before and after resumption. A proof that the heap is
+parseable does not prove that the resumed function will reload
+the repaired register rather than a stale cached copy.

@@ -1,0 +1,173 @@
+% Source: ffi-clisp.txt
+% Source: ffi-for-gc-langs.txt
+
+\section{Represent a Closure as Code Plus an Environment}
+
+A host closure can refer to its lexical environment. A C
+function pointer names an entry that native code can call under a
+specified convention; it does not carry the lexical environment
+the VM uses internally. The Common Lisp extract describes
+declaring an entry callable from C, including its return type.
+Such a declaration solves the direction and representation of the
+machine call, not the question of which closure should receive it.
+Prefer a C API that accepts a function pointer and a context
+pointer together. Then many registrations can share one compiled
+entry point and each context identifies its own host closure.
+
+For example, a native file catalog receives a visitor as
+\texttt{int visit(const char *, size\_t, void *)}.
+The native code lends UTF-8 filename bytes for the duration
+of each visit and interprets the integer as continue or stop.
+The closure has a pattern and a limit in its environment.
+The context may contain a stable token to a strong root rather
+than an address into the managed heap. Crestani's discussion of
+reference objects distinguishes short-lived local references
+from explicitly released global references. A registration
+that escapes its creating call needs the latter kind of
+lifetime, even if the first invocation happens synchronously.
+
+\begin{center}
+\begin{tabular}{lp{0.61\linewidth}}
+\hline
+Thing & What keeps it valid \\
+\hline
+Machine entry & Compiled code remains loaded while registered. \\
+Context address & Native-owned or stably allocated until quiescence. \\
+Closure and captures & Root remains live through the last callback. \\
+Filename bytes & Borrow ends at callback return; copy for retention. \\
+Host error & Stored in a rooted or separately owned error slot. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Do Not Treat Unregistration as a Free}
+
+A catalog may have scheduled a callback just before the host closes
+its subscription. The subscription needs a closing state and a
+native operation that establishes quiescence: the supplier will
+not begin another callback and all outstanding invocations are
+finished. A counter in the context measures invocations that
+already found the context; it cannot account for native code
+holding its address but not yet inside the entry. The release
+decision therefore cannot rest on observing a zero counter alone.
+\Cref{fig:visual-390} separates closing admission from destroying
+the native context.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (open) at (0,0) {Registered};
+  \node[tome box dark] (closing) at (4,0) {Closing};
+  \node[tome box accent] (gone) at (8,0) {Released};
+  \draw[tome arrow] (open) -- node[above]{request stop} (closing);
+  \draw[tome arrow] (closing) -- node[above]{quiescence} (gone);
+\end{tikzpicture}
+\caption{The rooted closure and stable context survive closing, including callbacks already selected for delivery.}
+\label{fig:visual-390}
+\end{figure}
+
+% Annotated walkthrough
+\section{Install One Entry and Dispatch Through Context}
+
+\begin{verbatim}
+install(catalog, fn):
+    context := allocate_stable_context(root(fn))
+    # This API allows immediate visits during registration.
+    context.initialize_all_fields()
+    token := raw_install(catalog, visit_entry, context.address)
+    if token is failure:
+        # Failure promises no outstanding delivery.
+        destroy_context_and_root(context)
+        return RegistrationFailed
+    return Subscription(catalog, token, context)
+
+visit_entry(bytes, size, context):
+    if context.is_closing(): return STOP
+    with callback_scope_for_current_thread() as scope:
+        if scope is unavailable: return STOP
+        try:
+            fn := scope.resolve_root(context.closure)
+            name := decode_utf8_strict(copy_checked(bytes, size))
+            return CONTINUE if fn(name) else STOP
+        catch host_error:
+            context.record_first_error_no_throw(host_error)
+            return STOP
+
+close(subscription):
+    if subscription.mark_closing_once():
+        request_stop(subscription.token)
+        schedule_join_outside_callback(subscription)
+
+join_then_destroy(subscription):
+    raw_wait_quiescent(subscription.token)
+    destroy_context_and_root(subscription.context)
+\end{verbatim}
+
+The synchronous call during install is why fields are initialized
+before handing over the entry. The callback must not depend on a
+token that install has not returned yet. Native glue handles a
+failure to enter the runtime by returning the stop value with a
+native-safe diagnostic; the error recording helper must not itself
+let a host exception escape. This example records a host reference
+within the attached scope before releasing local roots; an independent
+diagnostic object is another option. Multiple visitor threads need a
+well-defined arbitration rule for the first reported failure.
+
+Closing from within a callback must not wait synchronously for
+that callback to return. A native function documented to wait
+for all its callbacks will otherwise be waiting on the frame
+that invoked it. In this example even the stop request must be
+specified as nonblocking and legal in the callback. If the
+supplier lacks such an operation, queue both stop and wait to a
+safe coordinator and ensure the subscription stays retained by
+the queue.
+
+\section{When the Signature Has No Context Pointer}
+
+Some legacy interfaces accept only a function pointer. A single
+global closure is correct only if the public API enforces the
+same singleton scope and non-reentrancy that the dispatcher
+assumes. A thread-local closure works for a synchronous nested
+call only if the callee invokes it on that same thread; save
+and restore the previous slot around the nested call. Delayed
+or cross-thread delivery invalidates that technique.
+
+Alternatives are an explicitly bounded pool of compiled entries,
+each with its own stable slot, or a target-supported trampoline
+mechanism that constructs a distinct callable entry with a
+context. If choosing the pool, refuse a registration when the
+pool is full and do not reuse a slot before quiescence; a stale
+delivery should never invoke a newer closure. If choosing the
+trampoline, let the platform-supported mechanism handle code
+generation, ABI and executable-memory policy. Where neither is
+available, redesign the shim to supply context or reject that
+mode. Test immediate visits, nested synchronous visits, stop
+requested inside a callback and delayed completion after close.
+These are distinct paths even if the closure's body always
+returns the same Boolean.
+
+\section{Define What a Stop Result Means to the Owning Operation}
+
+Two visitor registrations can be active for the same catalog.
+One may stop because it reached a result limit; another may stop
+because decoding a filename failed. A single global error slot
+cannot distinguish those outcomes. Put a first-error slot on each
+subscription or enclosing invocation, choose one producer under
+its lock or an atomic commit, and tie the slot lifetime to the
+root that stores the error. A stop requested by a closure with
+no raised error leaves the slot empty. The native return code
+means stop in both cases; the host can distinguish them only
+after consulting the correct slot.
+
+Suppose a catalog function calls the very same entry twice
+before it checks its stop result. The second invocation should
+not enter a closure whose failure is already committed. Define
+whether running visits may finish, and gate new entries on the
+operation's failure or stop state. For an asynchronous design,
+the listener for errors reads the slot only after an ordering
+event such as completion or an acquire of a published error
+record. If the operation is synchronous, retrieval still has
+to happen after the external call returns to its own frame.
+An error raised while that call is on the stack cannot use
+the ordinary interpreter unwinder to skip it.

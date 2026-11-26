@@ -1,0 +1,186 @@
+% Source: appel-book-ml-better-typeset.txt
+
+\section{Count Ownership Edges, Not Variables in the Source}
+
+For an immediate reference counter, an object's count is the
+number of strong incoming edges, including owning root slots.
+A register borrowed while a strong owner remains live is not an
+additional edge. For example, reading a child from a list node
+can yield a borrowed reference, but if calling an unknown helper
+might overwrite the field or destroy the node, the reference
+must be retained across that call. Appel describes the extra
+operations on ordinary stores and the possibility of eliminating
+some of them with dataflow analysis \cite{appel2004modern}.
+The optimization requires a lifetime argument, not just algebra
+showing that an increment and decrement would add to zero.
+
+For a strong replacement store, retain the new value before
+releasing the old one. In the self-assignment case the slot could
+be the last owner; a decrement first might reclaim the object
+before the increment. Publish the new slot value before invoking
+any zero-count cleanup, so code observing the holder sees the
+replacement. In a simple collector, process zero-count objects
+through a queue: outgoing edges stay strong until removed by
+that queue. A million-element chain then does not require a
+million host stack frames. Budgeting the drain bounds the cost
+of an individual drain slice, not the memory waiting in the
+queue. The allocation path may still have to do substantial
+work if the queue lags behind the mutator.
+
+\section{Find Out Where Nonzero Counts Come From}
+
+In \Cref{fig:visual-410}, the two nodes keep each other's count
+positive even after the root is removed. If \(B\) has two
+separate fields pointing to \(A\), subtract two edges in a
+cycle test, not one. The graph used for classification is a
+multigraph. If there is a root to \(B\), classification must
+instead preserve both objects, including \(A\), whose own
+count has no external contribution.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (r) at (0,0) {Root removed};
+  \node[tome box dark] (a) at (4,0) {$A$};
+  \node[tome box accent] (b) at (8,0) {$B$};
+  \draw[tome dashed] (r) -- (a);
+  \draw[tome arrow] (a) to[bend left=24] (b);
+  \draw[tome arrow] (b) to[bend left=24] (a);
+\end{tikzpicture}
+\caption{Neither object reaches zero while the mutual edges remain, even though no root reaches the pair.}
+\label{fig:visual-410}
+\end{figure}
+
+Let the candidate set contain \(A\) and \(B\), with a single
+edge in each direction. The trial count of a node is its true
+count minus the number of incoming edges whose source is in
+the candidate set. The computation does not change the counts
+that ordinary releases observe.
+
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+Situation & Counts \(A,B\) & Trial \(A,B\) & Keep \\
+\hline
+Root to \(A\) & \(2,1\) & \(1,0\) & both \\
+No root & \(1,1\) & \(0,0\) & neither \\
+Root to \(B\) & \(1,2\) & \(0,1\) & both \\
+\hline
+\end{tabular}
+\end{center}
+
+% Annotated walkthrough
+\section{Classify Candidates With Trial Deletion}
+
+\begin{verbatim}
+replace_strong(slot, value):
+    retain(value)
+    previous := slot.load()
+    slot.store(value)
+    release(previous)
+
+classify(candidates):
+    # Stop the mutator; actual counts and edges are stable.
+    for x in candidates:
+        trial[x] := count[x]
+    for x in candidates:
+        for y in strong_targets(x):
+            if y in candidates: trial[y] -= 1
+    seeds := {x in candidates where trial[x] > 0}
+    kept := reach_inside_candidates(seeds)
+    return candidates minus kept
+\end{verbatim}
+
+The positive trial counts represent incoming edges from outside
+the set, so seeds and their descendants inside the set must
+survive \cite{jones2011garbage}. Every path from a root into the set starts with an
+outside incoming edge, unless the root was omitted from the
+true counts; that omission invalidates the premise. A candidate
+set can be incomplete and still safe, but it may leave garbage
+alive. If \(B\) is excluded, its edge to \(A\) looks external
+and can preserve \(A\) even in the absence of any real root.
+Building a candidate set by following strong edges from an
+object whose count dropped but remained positive is one way to
+reduce such missed opportunities. It does not guarantee a cheap
+pass: the suspect can lead into much of the live heap.
+
+The result must be reclaimed as a group. First mark its members
+as doomed, while the graph remains stable. Remove their outgoing
+edges to survivors exactly once, enqueueing ordinary zero-count
+work as needed. Internal edges between doomed nodes need not
+invoke ordinary release; both endpoints are about to disappear.
+An implementation must not publish half of a freed cycle to
+the allocator and then consult its old headers while freeing the
+other half. Temporarily defer recursive destruction during the
+group operation. This example assumes no resurrection or
+user-defined finalizers; adding either requires a distinct
+semantic phase rather than reusing ordinary zero-count code
+blindly. Alternatively, take a full tracing pass occasionally
+and reclaim unmarked objects as one unreachable set.
+
+\section{Choose an Update Model and Test It}
+
+Atomic increments and decrements alone do not let a thread
+safely acquire a strong reference from a location another thread
+can clear. Reading a raw address and then incrementing can race
+with the last release. A shared slot must instead use a lock
+or another acquisition protocol that keeps the object alive
+until the retain has succeeded. Weak acquisition has the same
+issue. In a count-plus-control-block design, weak owners keep
+the control block, not the payload, alive. Upgrading attempts an
+atomic transition from a nonzero strong count, without allowing
+the zero state to become live again. Counter overflow also needs
+a policy. Wrapping to zero is not one; checked overflow or a
+deliberate immortal state preserves safety at different costs.
+
+To test local optimizations, instrument owning stores and compute
+the incoming degree independently at quiescent points, including
+queued objects that still own fields. Compare the result to
+stored counts. Use a diamond graph to exercise sharing, a
+self-replacement with exactly one owner to exercise ordering, and
+a dead cycle with a live outgoing tail to exercise boundary
+decrements. In the last fixture an independent root holds the
+tail. Its count should fall, not reach zero. Drop that root and
+verify ordinary release reclaims it. Record zero-queue backlog
+and candidate traversal size separately: a collector can have
+cheap decrement instructions yet spend too long processing
+their delayed consequences.
+
+\section{Model Transfers and Reentrancy Explicitly}
+
+Some calling conventions transfer an owned reference rather
+than borrow it. In intermediate code, giving an owned value
+to one successor is not the same as copying to both. Consider
+a branch that sends a freshly returned value to one of two
+blocks. Each block can take the original ownership token:
+the executions are exclusive. Within one block, splitting the
+value into two owning fields must create a second token. At a
+control-flow join, the compiler must reconcile ownership on
+every incoming edge, including unwind edges. A release hoisted
+out of a branch is valid only when every execution reaching it
+owns the reference it releases. This matters even if a test
+never drives the count below zero: prematurely releasing while
+a borrowed use remains is enough to make execution incorrect.
+
+For an ordinary cache with a strong field and a notifier, plan
+for callbacks that can reenter the cache. A replacement might
+install \(Y\), release the last count of \(X\), and enter a
+cleanup callback that replaces \(Y\) with \(Z\). The original
+replacement must not assume its field still contains \(Y\)
+when the callback returns; it also must not invoke the callback
+under a nonreentrant cache lock. A common approach performs
+the owning exchange under that lock and releases the old
+owning reference after unlocking. If the API returns the new
+value, it can return a separately held strong reference, not
+a borrowed reread of the slot. Test notifications on two
+nested replacements and check both release counts.
+
+Deferred counting changes the model. An implementation may
+keep no counts on certain temporary stack references and scan
+those roots before reclaiming an object with zero heap count.
+The zero value then denotes a candidate, not a verdict. Trial
+deletion must include that independent root information or
+operate only on a reconciled counting state. Mixing deferred
+updates from one design with a reclamation condition from the
+immediate design invalidates both proofs.

@@ -1,0 +1,189 @@
+% Source: concepts-and-semantics-of-proglang-2-ocaml.txt
+% Source: linkers-loaders-ocr.txt
+
+\section{Draw Three Boundaries Around a Module}
+
+Suppose a renderer lets its clients reserve image tiles. Its module
+\texttt{Tiles} exports an opaque \texttt{Pool}, a constructor, and
+\texttt{reserve(Pool, Size)}. A caller must know the signature of
+\texttt{reserve}, and the ABI must tell it how to pass a pool handle.
+Neither obligation implies that the caller should know the allocator's
+free-list layout. Likewise the implementation might call a helper
+with external linkage from another object file, without admitting
+that helper into the source-language public interface.
+
+Distinguish three audiences. The author of a module sees private
+definitions; the importer sees the language-level interface; the
+object linker sees the symbols and relocations it must process
+\cite{levine2000linkers}. All three may use different names for the
+same function. A source-private item can have a linker symbol because
+two implementation objects share it. A public type can have no linker
+symbol at all. Putting language visibility in an object symbol flag
+alone cannot express these distinctions.
+The distinction also applies when a language imports a native
+function: finding the address does not check the type or the
+ownership and calling protocol that the wrapper promises
+(\Cref{ch:ext-396}).
+
+\section{Decide What an Importer Must Know}
+
+An interface file is a compact, typed description of the external
+contract, not an edited copy of the source. A useful starting point
+is a stable definition identity per declaration, together with the
+kind of declaration, type, constraints, visibility, and any facts a
+consumer may embed in its own object. Ada illustrates the separation
+by allowing specification and body to be compiled as distinct units.
+An implementation is checked against its specification; a client is
+checked against the specification instead of the implementation.
+\Cref{fig:visual-397} distinguishes this type-checking boundary from
+the later link.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (i) at (0,1.45) {Tiles interface};
+  \node[tome box] (c) at (-2.0,0) {Client object};
+  \node[tome box] (b) at (2.0,0) {Tiles object};
+  \node[tome box accent] (e) at (0,-1.45) {Executable};
+  \draw[tome arrow] (i) -- (c);
+  \draw[tome arrow] (i) -- (b);
+  \draw[tome arrow] (c) -- (e);
+  \draw[tome arrow] (b) -- (e);
+\end{tikzpicture}
+\caption{Both compilations check against the interface; the linker connects the resulting object files.}
+\label{fig:visual-397}
+\end{figure}
+
+The toy compiler promises that a pool is passed as one opaque
+handle. Changing the body from a list to a bitmap is compatible
+with this promise. Changing the constructor from one argument to
+two is not. A less obvious example is \texttt{TileSize}, defined as
+a compile-time constant: a switch or an array bound in a client may
+already contain its numerical value. Its value belongs to the
+interface even if no relocation ever refers to it.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Declaration & Importer records & Object consequence \\
+\hline
+Opaque \texttt{Pool} & identity, handle ABI & no exposed field offsets \\
+\texttt{reserve} & type, calling convention & external call relocation \\
+\texttt{TileSize} & type and value & immediate or array extent \\
+Private free list & nothing & local data or hidden symbol \\
+\hline
+\end{tabular}
+\end{center}
+
+An opaque type passed by value is a different design. Even if field
+names are hidden, size, alignment, copy rules, and destruction can
+affect the caller. Either publish the necessary layout facts or choose
+an ABI that keeps the storage behind an indirection. Hiding the
+names while silently exposing the layout defeats implementation
+independence, although it still prevents source-level field access.
+
+% Annotated walkthrough
+\section{Build and Validate an Interface Artifact}
+
+\begin{verbatim}
+compile_unit(spec, body, resolved_imports, target):
+    imported := load_interfaces(resolved_imports, target)
+    promised := check_declarations(spec, imported)
+    public := normalize_external_contract(promised, target)
+    require_no_unnameable_public_types(public)
+    checked := check_body(body, imported, promised)
+    require_all_promises_implemented(promised, checked)
+    fingerprint := hash(format_revision, target.abi, public)
+    object := emit_object(checked, imported)
+    object.provides := (public.module_id, fingerprint)
+    object.requires := fingerprints_consumed_during_emission()
+    publish_together(public, fingerprint, object)
+
+check_link_inputs(objects):
+    providers := index_unique_providers(objects)
+    for obj in objects:
+        for (module_id, expected) in obj.requires:
+            actual := providers[module_id].interface_fingerprint
+            if actual != expected:
+                error("rebuild consumer", obj, module_id)
+    resolve_relocations(objects)
+\end{verbatim}
+
+Here fingerprint matching is part of the build driver, not a claim
+about what a conventional linker understands. The driver must reject
+a missing provider distinctly from a fingerprint mismatch. The
+interface serializer should be stable across irrelevant source
+edits: fresh type variables need canonical numbering, unordered
+maps need a canonical encoding, and private source locations need
+not affect the external fingerprint. On the other hand, the
+serializer must preserve semantically meaningful order, such as the
+order of public fields if it controls offsets.
+
+\section{Track Extra Promises Introduced by Optimization}
+
+Imagine the renderer inlines \texttt{reserve} into a client when the
+implementation is available. A change to the free list may then
+leave the source contract untouched while invalidating the inlined
+instructions in that client. Record a separate body dependency for
+cross-module inlining. A compiler that emits specialization templates
+must handle those similarly. Do not include every private routine in
+every client's fingerprint, and do not pretend a hash of signatures
+validates code that has copied implementation details. A conservative
+build system can rebuild more than required; an unsound one can keep
+an old instruction sequence in a new executable.
+
+Test independence by building a consumer once and relinking it
+against a body-only change, with intermodule optimization disabled.
+Then test the reverse: arrange for a constant or calling convention
+to change under the same symbol spelling and verify that the driver
+rejects the old consumer. Repeat with an inlining build and require
+the extra dependency to invalidate it. Finally compile an unrelated
+consumer that tries to name the private helper and insist on a
+front-end diagnostic even if a matching symbol appears in an object
+dump. These are separate checks of separate boundaries.
+
+\section{Handle a Change That Crosses Only One Boundary}
+
+Suppose version A lets clients construct an alignment of 32 bytes
+by reading the public constant \texttt{TileSize}. Version B raises
+it to 64, but retains the same handle and routine signatures.
+The module can still process a request from any object that obeys
+the binary calling convention. That alone does not make the
+mixture correct: the contract no longer says that a caller's
+32-byte scratch area is sufficient. Linking the two objects
+without checking their interface fingerprints hides the mismatch
+until some rendering branch uses the old scratch area.
+
+To keep binary clients, redesign this promise intentionally.
+Provide a query whose result is passed to the allocation routine,
+accept both alignments for a documented compatibility period,
+or version the entry point. A query is not equivalent to a constant
+in a language that permits it in type-level array extents. In
+that case, retaining the old constant as a supported compatibility
+surface or deliberately requiring recompilation may be a better
+choice than replacing it with a runtime operation.
+
+\begin{verbatim}
+event       interface hash    symbol reserve     old consumer
+edit list   unchanged         unchanged          usable
+change 32   changed           unchanged          reject at build
+rename ABI  changed           changed            reject at build
+new helper  unchanged         unchanged          usable
+\end{verbatim}
+
+This trace assumes the normalized interface also encodes all
+ABI-relevant names or version tags; renaming a linker name alone
+must either change the recorded ABI contract or be covered by an
+alias recognized by the linker. During a parallel build, a client
+must not see a new interface published alongside an old object,
+even if both files are individually well formed. One implementation
+publishes a generation directory and atomically switches a manifest
+pointer. Consumers pin that generation while they read. Besides
+resolving symbols, the build then guarantees that the interfaces
+describing the call and the objects providing its implementation
+came from compatible compilations.
+Add a fixture that attempts to mix artifacts from two generations
+of an otherwise unchanged module. If both fingerprints match,
+the mix is intentionally legal under the interface policy; if an
+embedded layout changes, repeat and require rejection.

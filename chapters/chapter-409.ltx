@@ -1,0 +1,190 @@
+% Source: region-gc-for-dynmlang.txt
+% Source: the-rust-proglang.txt
+
+\section{Separate Ownership from Placement}
+
+An owner has authority to arrange destruction; an arena determines
+where allocations are placed and when their storage is reclaimed.
+The two concepts need not coincide. A unique vector owner can drop
+its buffer individually, while a parse-job owner can drop thousands
+of nodes at once by releasing an arena. A borrowed view grants
+access without granting either authority. Rust's ownership rules
+illustrate this distinction: borrowing a vector is not moving its
+owner and does not make the borrower responsible for dropping it.
+A language with region
+inference goes further: it can choose placements and insert region
+entry and exit using information about where values are stored and
+which regions a computation accesses. Nagata, Kobayashi, and
+Yonezawa investigate combining such inference with soft typing
+for a dynamically typed language.
+
+Consider a compiler server with three lifetimes. The process
+owns an identifier interner. A compilation unit owns the retained
+syntax tree. A single parse attempt owns a scratch arena holding
+tokens and speculative nodes. A scratch node can refer to a unit
+node and to an interned identifier. A unit node must not retain a
+reference to scratch once the attempt ends. The boundary condition
+is about accesses, not about whether the bytes have been cleared.
+Reusing the very same scratch pages on a retry makes an invalid
+reference particularly hard to diagnose because its address may
+still point to an apparently valid node.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Holder & Target & Safe policy \\
+\hline
+Scratch node & Unit node & Borrow until scratch closes \\
+Retained unit node & Scratch node & Copy or reject escape \\
+Unit node & Interned name & Use process-stable ID \\
+Interner & Unit-owned text & Copy bytes into process storage \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-409} depicts permitted stored references under a
+simple outlives rule. A restricted language can enforce the rule on
+field types; an inference pass can instead generate constraints on
+placements. The order goes from a shorter-lived holder toward a
+longer-lived target. A temporary read by outer code while the inner
+scope is open is another matter: it can be valid even though saving
+that temporary in an outer object would be invalid.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (s) at (0,0) {Attempt};
+  \node[tome box accent] (u) at (4,0) {Unit};
+  \node[tome box dark] (p) at (8,0) {Process};
+  \draw[tome arrow] (s) -- node[above]{borrows} (u);
+  \draw[tome arrow] (u) -- node[above]{borrows} (p);
+\end{tikzpicture}
+\caption{When regions are nested in time, an object may point into its own region or one that outlives it.}
+\label{fig:visual-409}
+\end{figure}
+
+% Annotated walkthrough
+\section{Promote a Graph Before Closing the Attempt}
+
+\begin{verbatim}
+retain(node, scratch, unit, copied):
+    if node is null: return null
+    if owner(node) is not scratch:
+        assert owner(node) outlives unit
+        return node
+    if copied contains node: return copied[node]
+    result := unit.allocate_node(node.kind)
+    copied[node] := result
+    result.name := stable_name_id(node.name)
+    for field in node.reference_fields:
+        result[field] := retain(node[field], scratch, unit, copied)
+    return result
+
+parse_unit(tokens, unit):
+    with scratch_attempt() as scratch:
+        temporary := parse(tokens, scratch)
+        validate(temporary)
+        root := retain(temporary, scratch, unit, empty_map())
+        return root
+\end{verbatim}
+
+Insert the mapping before visiting children so that shared nodes
+remain shared and cycles terminate. Store only process-stable IDs
+in the name field; a slice into token text would require its own
+copy. The example assumes these are parse nodes without external
+identity observers. If observers already hold references into
+scratch, copying does not transfer those references. It creates
+new objects. Promotion by copying is therefore much easier before
+publishing the parse result. For a deeply nested tree, replace
+recursive calls with a worklist; the lifetime proof does not rely
+on the host call stack.
+
+Now consider an error halfway through promotion. Scratch is still
+closed by scope cleanup, but a monotonic unit arena may retain the
+partly copied nodes. If a server retries often, build the retained
+graph in a provisional arena owned by the unit and adopt that arena
+only on success. A rewind marker in the unit arena can work
+instead when no other allocation can intervene and no observers
+have seen any object past the marker. In either implementation,
+publication and successful transfer of ownership must be ordered:
+the unit should never advertise a pointer to an arena the failure
+path still intends to discard.
+
+\section{Analyze Outlives Constraints at Closures and Loops}
+
+If a function returns a closure capturing a temporary pair, the
+pair must live as long as the closure, not just until the function
+returns. One solution allocates the pair in a result region supplied
+by the caller. Another extracts just the captured fields and places
+them in the closure. The first preserves sharing with another
+escaping reference to the pair; the second requires proof that
+changing its representation preserves observable behavior. A
+region-polymorphic helper can construct the same representation
+in different destinations without baking a particular allocation
+policy into the helper. Calls through unknown functions may require
+conservative placement unless their interfaces state their effects.
+
+Even correct placement can waste memory. Suppose each iteration
+creates 4 KiB of temporary data and leaves only a 32-byte summary.
+Putting both in a loop-wide arena retains roughly 4 GiB of temporary
+data after a million iterations, even if no iteration keeps a
+reference to its predecessors. Use an iteration arena for descent
+and allocate the summary into a longer-lived destination before
+reset. If an update to a retained summary starts storing a pointer
+to the temporary, the transformation is no longer safe. Verify
+effects of mutation as well as allocation sites.
+
+\section{Make Storage Release and Cleanup Distinct}
+
+Releasing an arena need not run a destructor for every object.
+That is a feature for compiler nodes containing only bytes and
+references, but wrong for objects owning files, locks, or foreign
+resources. Restrict arena contents to trivially droppable objects,
+manage resource owners outside the arena, or keep an explicit
+cleanup log executed before releasing arena storage. Cleanup order
+must fit the dependencies of those callbacks. If callbacks inspect
+other arena objects, running them after returning the pages is not
+an option; if callbacks can allocate, define whether the closing
+arena rejects reentry.
+
+For integration tests, run both the successful and failed parse
+through the same small scratch pages so a retry immediately
+overwrites freed data. Verify retained sharing, inspect the
+live-byte curve over many retries, and separately test cleanup
+on exceptions. If process-lifetime interned names keep growing
+under rejected input, that is not a violation of the outlives
+rule. It is a policy problem. A lifetime discipline proves that
+a reference remains valid; it does not prove that the selected
+owner releases storage at a useful time.
+
+\section{Partition Parallel Work by Ownership}
+
+The parser can also send subtrees to parallel diagnostic workers.
+Giving each worker its own scratch arena avoids allocator locking,
+but it does not allow the worker to retain a pointer into the
+parent's scratch arena after the parent returns. A join inside
+the attempt is one valid boundary: the attempt cannot close
+until every child returns. A detached job instead needs a
+snapshot in storage that the job owns, or a shared owner whose
+lifetime extends through the job. Moving an arena handle can be
+cheaper than copying the nodes when the whole arena transfers
+and no outstanding borrows remain. It is not enough to copy the
+handle if closing either copy would release the same storage.
+
+For example, a job might return a diagnostic consisting of a
+message, a file identifier, and two byte offsets. If its line
+snippet is represented as a view into a temporary decoding
+buffer, recycling that buffer invalidates the diagnostic even
+though the byte offsets and message are safe. Either store an
+owned snippet or reload it from an immutable source snapshot
+whose version is part of the diagnostic. This is a useful review
+question for every arena-backed API: among its returned fields,
+which are owning values, which are identifiers, and which are
+views with an expiration point? Grouping them into a single
+record should not erase the answer.
+
+Inspect memory after closing the last owner as well as after
+each attempt. A steady process heap during compilation does
+not distinguish successful reuse from storage mistakenly
+retained across all units.

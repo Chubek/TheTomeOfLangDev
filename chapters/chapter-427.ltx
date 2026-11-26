@@ -1,0 +1,196 @@
+% Source: a-compact-and-xtnsible-scheme-vm.txt
+
+\section{Separate the Current Frame from the Current Top}
+
+A stack interpreter needs to find the current code, instruction
+pointer, and locals even as evaluating expressions pushes and
+pops temporary values. Use a frame descriptor with a code or
+closure reference, the next instruction, the base of its local
+slots, and the segment boundary to restore on return. In this
+design a separate frame vector indexes descriptors and a value
+vector holds locals and operands; some VMs instead put metadata
+on the same stack. O'Leary and Feeley's Ribbit is a compact
+stack-machine contrast, using linked three-field cells for
+stack, bytecode, and objects rather than the vectors used here.
+The layout is an implementation choice, not a change to
+call-by-value execution.
+
+Assume a call has already computed its callee and arguments.
+The caller's continuation, including its next instruction,
+is saved before transferring control. Reserve enough space for
+callee locals and operands, consistently marking uninitialized
+slots so the collector does not read uninitialized memory as a
+value. On normal return restore the caller's previous operand
+depth, consuming the call inputs and pushing one result. Locals
+are addressed relative to the frame base; an absolute stack
+index identifies a particular live activation, even when two
+recursive calls have the same source declaration and local
+number.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Record & Typical lookup & Lifetime \\
+\hline
+Frame descriptor & Current activation & Until return or unwind \\
+Local slot & Frame base plus slot number & At most the region owning the slot \\
+Operand slot & Top relative to frame boundary & Until consumed or discarded \\
+Upvalue cell & Closure's capture index & While the cell is reachable \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Capture a Mutable Variable Once Per Activation}
+
+Consider a factory returning two closures, \texttt{read} and
+\texttt{bump}, over one local initialized to 40. If each
+closure captures the value by copying 40 into a private field,
+calling \texttt{bump} does not affect \texttt{read}. For
+capture by reference, both closures must keep the same
+indirect cell. The cell can refer to the local slot while it
+is live and contain its own value after the slot dies. As
+shown in \Cref{fig:visual-427}, the transition changes the
+cell's storage target but not the identities in the closure
+records. Call the closed representation a heap slot, not a
+pointer into the dead frame.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (read) at (0,0.95) {\texttt{read}};
+  \node[tome box] (bump) at (0,-0.95) {\texttt{bump}};
+  \node[tome box dark] (cell) at (3.4,0) {Upvalue cell};
+  \node[tome box] (local) at (7,0.95) {Stack slot};
+  \node[tome box accent] (heap) at (7,-0.95) {Closed value};
+  \draw[tome arrow] (read) -- (cell);
+  \draw[tome arrow] (bump) -- (cell);
+  \draw[tome arrow] (cell) -- node[above,sloped]{open} (local);
+  \draw[tome dashed] (cell) -- node[below,sloped]{after close} (heap);
+\end{tikzpicture}
+\caption{Both closures share one mutable cell. Closing it preserves their aliasing while allowing the frame's slot to be reused.}
+\label{fig:visual-427}
+\end{figure}
+
+% Annotated walkthrough
+\section{Close Cells Before Reusing Slots}
+
+\begin{verbatim}
+capture(activation, local):
+    i := activation.base + local
+    require i names a live local in this activation
+    if open_index.contains(i): return open_index[i]
+    cell := new_upvalue(Open(stack_id, i))
+    open_index[i] := cell
+    return cell
+
+close_suffix(first_invalid):
+    # open_index is ordered by slot, for a single stack.
+    while not open_index.empty():
+        i, cell := open_index.max_pair()
+        if i < first_invalid: break
+        value := stack[i]           # still live here
+        publish_closed(cell, value) # includes heap barrier if needed
+        open_index.remove(i)
+
+return_from_call():
+    frame := frames.last()
+    result := root_temporarily(pop_result())
+    close_suffix(frame.restore_depth)
+    stack.truncate(frame.restore_depth)
+    frames.pop()
+    push(result)
+\end{verbatim}
+
+Closing the cell copies the current value, not the initial
+value at capture. During a call, assignments to a captured
+local can go through its slot because an open upvalue's reads
+and writes use that same slot. After close, both closure
+operations use the closed value field. To capture a variable
+already captured by a parent closure, forward the parent's
+cell rather than interning a new stack index. Use a stack ID
+or a per-stack index if different coroutines can have live
+slots at the same numeric offset. A raw pointer into a vector
+is not safe for open cells if the vector may relocate on push.
+
+Slot reuse is the actual boundary. A block-local slot reused
+before frame return must close at block exit, before writing
+any other variable there. A block that invalidates a non-suffix
+set of slots needs \texttt{close\_slot} calls or an allocator
+policy that releases blocks in stack order. Normal return is
+not the only release path: exception unwinding and a tail call
+that reuses its activation must close the affected cells at the
+same boundary. Captured bindings read after suspension require
+that the coroutine's saved stack remain reachable, or that the
+slots be moved through a protocol preserving open cell access.
+
+\section{Make Stack Scans and Recovery Agree With the Layout}
+
+A tagged value stack can expose all initialized live slots
+to a precise collector; an unboxed stack may require a
+per-instruction map. Descriptors holding closure or code
+references and a pending return value also need tracing as
+appropriate. For the compiler/native boundary and stack
+maps, see \Cref{ch:ext-411}. An open upvalue can cause a
+suspended stack to be kept alive, and a closed cell can point
+to a heap object. Defining the tracing policy for each variant
+prevents either from becoming an invisible source of live
+references. If a write barrier or allocation may collect,
+keep the return value and close operation's inputs rooted
+until publication. The pop-and-root step must not expose a
+safepoint between removing the result from its old root slot
+and registering its temporary root.
+
+Exercise the factory with frame growth between capture and
+return, call both closures, then create a second factory
+activation with the same slot numbers. The first pair must
+agree on its updated value without affecting the second
+pair. Add nested captures forwarded through a closure that
+never reads the variable itself. Finally force an early
+unwind through a frame after its closure has escaped; test
+that the escaped closure still uses the right value.
+
+\section{Choose Capture Storage From Workloads}
+
+Eagerly allocating heap boxes for the compiler's marked
+captured locals simplifies frame teardown, but pays even
+on paths that never actually create a closure. An open-cell
+scheme pays when capture occurs and on closing, with an index
+to preserve aliasing. A sorted linked list can make closing
+a suffix cheap in a VM with very few live open cells; finding
+an arbitrary capture can take a linear scan. An ordered tree
+makes both locating a capture and updating the index
+logarithmic but produces more allocation and pointer traffic.
+Compare actual numbers of simultaneously open captures,
+closures sharing cells, and cells closed per unwind before
+choosing. Test equality of effects, not only closure count:
+one extra box allocated per closure can be a semantic bug
+as well as a memory regression.
+
+\section{Check the Stack Shape at Instruction Boundaries}
+
+Suppose a caller has a saved temporary in slot 4, a callee in
+slot 5, and an integer argument in slot 6. One calling
+convention sets restore depth to 5 and reuses slot 6 as the
+callee's first local, leaving slot 5 occupied by the call's
+closure until return. If a capture refers to slot 6 and the
+callee updates it from 40 to 41, a return closes that cell
+with 41, truncates to depth 5, and writes the result at slot
+5. The caller's temporary in slot 4 is untouched. Moving
+frame metadata outside the value vector does not eliminate
+the need to track the two separate boundaries: local base 6
+and restore depth 5.
+
+An interpreter can check a bytecode function before execution
+by walking its control-flow graph with the operand depth at
+each instruction entry. For a binary integer operation,
+require at least two operands above the operand base and
+propagate one fewer to the successor. A conditional jump
+that pops its predicate takes the same reduced depth to both
+targets. At a join, reject conflicting incoming depths unless
+the instruction set explicitly permits them. Check each local
+and capture operand against its own descriptor, not against the
+current global stack length. A deep caller stack must not
+make an invalid operand in a shallow callee acceptable. Add
+an independent check that return paths root the pending
+result before any operation which can collect.

@@ -1,0 +1,193 @@
+% Source: concepts-and-semantics-of-proglang-2-ocaml.txt
+
+\section{Specify What Clients Can Prove About Types}
+
+A priority queue provides an \texttt{empty} value, an operation
+that inserts a key, and a removal operation. If clients know the
+queue is an array of keys, they can treat any array as a queue,
+including arrays that violate the heap invariant. An abstract
+type declaration lets the implementation use the array internally
+without making that equation available to importers. The meaning
+of an abstract type is not ``no representation exists'', but
+``the client cannot derive a representation equality from this
+signature''. The module treatment of abstraction and functors
+in \cite{harper2016practical} gives a language-level account.
+
+Signature matching checks more than the presence of member
+names. Each abstract type specification is matched by a
+declaration of the right kind and arity. Later member types use
+those chosen declarations consistently. Manifest declarations
+such as \texttt{type key = Bytes.t} impose an equality rather
+than merely requiring a fresh name. An implementation with
+\texttt{insert : Int.t -> queue -> queue} cannot match that
+signature merely because both keys fit one machine word. Type
+equality is not an ABI equivalence.
+
+\section{Pass Ordering as a Module Parameter}
+
+The example in the local OCaml text parameterizes ordered lists
+by a module providing an element type and a comparison. We use
+the same idea for priority queues. A functor takes an ordering
+module and returns a queue module. The result publishes
+\texttt{key = Order.key}, so a client can call \texttt{insert}
+with its existing keys, but leaves \texttt{queue} abstract. The
+comparator's ordering laws are a separate contract: a comparator
+returning inconsistent results can break queue invariants without
+producing any type error.
+\Cref{fig:visual-401} shows the two distinct output type facts.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (o) at (0,0) {Order};
+  \node[tome box dark] (f) at (2.7,0) {MakeQueue};
+  \node[tome box accent] (k) at (5.7,.85) {key = Order.key};
+  \node[tome box accent] (q) at (5.7,-.85) {abstract queue};
+  \draw[tome arrow] (o) -- (f);
+  \draw[tome arrow] (f) -- (k);
+  \draw[tome arrow] (f) -- (q);
+\end{tikzpicture}
+\caption{The result shares the argument's key type but hides the queue representation.}
+\label{fig:visual-401}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Specification & Visible equation & Example consequence \\
+\hline
+\texttt{type queue} & none to a representation & cannot pass an array \\
+\texttt{type key = Order.key} & key equality & can pass an existing key \\
+\texttt{val empty : queue} & not a type equation & can obtain a valid queue \\
+\texttt{val insert : key -> ...} & not a type equation & mismatched keys fail \\
+\hline
+\end{tabular}
+\end{center}
+
+Do not substitute the textual spelling \texttt{Order.key}
+throughout the compiler. Elaborate it into a projection from
+the formal module binder. Application substitutes a resolved
+module path or identity for that binder; projections discovered
+later must use the same substitution. Shadowing the spelling
+\texttt{Order} in a nested module must not alter the type of
+an already elaborated declaration.
+
+% Annotated walkthrough
+\section{Seal the Result With an Explicit Identity Rule}
+
+\begin{verbatim}
+signature ORDER:
+    type key
+    val compare : (key, key) -> Ordering
+
+signature QUEUE(key_type):
+    type key = key_type
+    type queue
+    val empty : queue
+    val insert : (key, queue) -> queue
+    val pop : queue -> Option<(key, queue)>
+
+elaborate_apply(functor, arg, application_binder, mode):
+    match_signature(arg, functor.parameter_signature)
+    spec := substitute_module(functor.result_spec, arg.identity)
+    if mode == Generative:
+        result_id := fresh_static_stamp(application_binder)
+    else:
+        require_stable_path(functor, arg)
+        result_id := intern_path_application(functor.id, arg.id)
+    return seal_public_view(spec, result_id)
+
+seal_public_view(spec, result_id):
+    for component in spec.in_dependency_order:
+        if component is abstract_type:
+            publish_type_id(result_id, component.id)
+        else:
+            publish(component.with_public_type_projections())
+\end{verbatim}
+
+The functor definition is checked once against the parameter and
+result signatures before these applications are elaborated.
+Interning an applicative path creates a stable type identity, not
+a cache of the functor's executed initialization or its values.
+A generative rule makes fresh static identities at distinct
+application binders in this toy elaborator. Repeated references
+to one result binder reuse its identity. Do not mint a new
+identity each time a type checker resolves a name.
+
+\section{Decide Which Queues May Cross an Application Boundary}
+
+Let \texttt{Forward} and \texttt{Reverse} share the same
+integer key type but implement opposite orderings. A queue
+from \texttt{MakeQueue(Forward)} must not be popped using the
+reverse module: the first implementation arranged its storage
+according to a different comparator. An applicative design keys
+the abstract result type by the argument module identity, not
+by the type of its keys or the shape of its signature. Conversely,
+two stable aliases of \texttt{Forward} should not split result
+types if the rule says aliases preserve identity.
+
+\begin{verbatim}
+A = MakeQueue(Forward)
+B = MakeQueue(Forward)
+C = MakeQueue(Reverse)
+
+k  = 3                      // key shared across A, B, C
+qa = A.insert(k, A.empty)    // accepted
+C.pop(qa)                   // rejected under either rule
+B.pop(qa)                   // applicative yes, generative no
+\end{verbatim}
+
+A language with first-class modules may represent hidden types
+as existential packages. Unpacking exposes an abstract witness
+locally; returning that witness as a naked type can be illegal
+when its binder would escape. The check is about identifiers
+occurring in types, not about whether memory is reachable at
+run time. A private type projected from a named, exported
+module can ordinarily escape by its public abstract name.
+
+Keep a regression fixture that swaps the queue representation
+while retaining its signature. Client code should still typecheck,
+including code that passes keys from a separate package. Then
+deliberately expose a representation equality and check that
+tests using it distinguish the old and new versions. That
+second fixture demonstrates the cost of publishing an equation:
+discarding it later can break clients even though every value
+function still has the same spelling and arity.
+
+\section{Publish a Sharing Constraint Rather Than a Representation}
+
+Suppose two modules are passed to a new functor, one that
+prints keys and one that provides the ordering. Testing the
+signatures independently establishes that both define a key
+type. It does not establish that the key removed from the
+queue can be printed. The new functor must either demand a
+sharing equation or accept a conversion as a value argument.
+The equation can connect two abstract types without making
+either one equal to any client-visible representation.
+
+\begin{verbatim}
+functor Describe(Order : ORDER,
+                 Print : PRINTER where Print.key = Order.key):
+    module Q = MakeQueue(Order)
+    val describe_top(q : Q.queue):
+        match Q.pop(q):
+            None -> "empty"
+            Some(k, rest) -> Print.format(k)
+\end{verbatim}
+
+At application the checker resolves both actual projections,
+then tests them in the public type-equality environment. If
+the printer and ordering each hide their own integer type,
+the checker cannot use their private equations to conclude
+that they agree. To expose the right fact, define the abstract
+key in a shared module and refine both signatures to refer to
+that same abstract key. The resulting diagnostic can point to
+two distinct abstract declarations instead of naming two
+unavailable representations.
+
+Then change just the comparator without changing the shared
+key type. Printing still works, but each queue remains tied to
+its own ordered representation. These two fixtures exercise
+different equalities: one for values contained in a queue, the
+other for the abstract queue itself.

@@ -1,0 +1,180 @@
+% Source: psabi-x86-64.txt
+% Source: ffi-typesafety.txt
+
+\section{Preserve the C Declaration Until Target Selection}
+
+A foreign declaration describes how to find a function and which
+native declaration is authoritative. It should not just rename an
+ordinary source type. Consider a statistics library that exports
+\texttt{int stats\_add(long sample, size\_t weight)}.
+If the host has arbitrary-precision integers, both parameters can be
+ordinary integers at the public surface, but they have distinct C
+types and conversion rules. A negative sample is legitimate. A
+negative weight is not made legitimate by reduction modulo a power of
+two. A too-large sample must be rejected before the call unless this
+particular wrapper deliberately specifies a different operation.
+
+The scalar table in the local System V AMD64 supplement gives
+eight-byte sizes and alignment for \texttt{long} and pointers in the
+model it describes. This is LP64: C \texttt{int} remains 32 bits.
+A common Windows x64 configuration instead uses LLP64: pointers are
+wide but C \texttt{long} remains 32 bits. This distinction is
+independent of the register-passing rules. A declaration mapping
+keyed only by the word ``x64'' cannot handle even these two models,
+let alone a target with 32-bit pointers on the same instruction set.
+
+\begin{center}
+\begin{tabular}{lrrp{0.35\linewidth}}
+\hline
+C type & LP64 bits & LLP64 bits & Meaning in the binding \\
+\hline
+\texttt{int} & 32 & 32 & Signed C integer \\
+\texttt{long} & 64 & 32 & Signed C integer \\
+\texttt{size\_t} & 64 & 64 & Unsigned size in these targets \\
+\texttt{void *} & 64 & 64 & Object pointer, not a size \\
+\hline
+\end{tabular}
+\end{center}
+
+The table describes the two data models used in this example, not a
+portable recipe for deducing the layout of every typedef from the name
+of a data model. Obtain the target's facts from the same toolchain and
+configuration that see the library header. Where the source identifier
+is a macro or is only defined as a static inline helper, there may be
+no exported symbol to load; generate a C shim compiled with the header
+instead of trying to resolve the spelling of the helper at runtime.
+
+\section{Keep Representation and Permission Separate}
+
+Represent a resolved foreign parameter as three pieces:
+source-language type, target ABI type and a conversion or access rule.
+A function result that is a nullable opaque pointer and an argument
+that is a writable buffer may use the same pointer representation and
+be passed by the same register class. A caller cannot substitute one
+for the other. Preserve pointee kind, nullability, lifetime and extent
+in the language-facing descriptor even when machine lowering discards
+those distinctions. Furr and Foster's representational types for
+OCaml and Java make a related point: knowing the low-level C type
+does not by itself say which high-level operations are valid on a
+value represented that way.
+
+The source declaration may expose distinct wrappers for signed and
+unsigned native parameters that have the same width. Read an unsigned
+64-bit return into a host integer without treating the top bit as a
+sign bit. For a C enumeration, retain named constants and determine
+the native representation under the actual compiler flags; decide
+what to do with unknown values before declaring the language enum
+exhaustive. For plain \texttt{char}, retain the distinction from
+\texttt{signed char} and \texttt{unsigned char}. A character code
+unit and a Unicode scalar are distinct even when both appear on the
+language side as integers.
+
+\Cref{fig:visual-386} splits two consumers of the same declaration.
+The stub emitter receives a machine signature; the wrapper emitter
+receives mapping rules whose details should survive all the way to
+diagnostics. Conflating them makes it difficult to explain why a
+particular language value is ill-formed for a valid native signature.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (decl) at (0,0) {C declaration};
+  \node[tome box dark] (facts) at (4,0) {Target mapping};
+  \node[tome box accent] (stub) at (8,1.3) {Machine signature};
+  \node[tome box] (checks) at (8,-1.3) {Conversion rules};
+  \draw[tome arrow] (decl) -- (facts);
+  \draw[tome arrow] (facts) -- (stub);
+  \draw[tome arrow] (facts) -- (checks);
+\end{tikzpicture}
+\caption{A single target mapping feeds both native lowering and checks; neither output substitutes for the other.}
+\label{fig:visual-386}
+\end{figure}
+
+% Annotated walkthrough
+\section{Elaborate a Declaration and Apply Its Checks}
+
+\begin{verbatim}
+elaborate(decl, target):
+    require(supported_convention(decl.convention, target))
+    signature := []
+    conversions := []
+    for parameter in decl.parameters:
+        c_type := resolve_typedefs(parameter.c_type, target)
+        signature.append(abi_representation(c_type, target))
+        conversions.append(converter(parameter.policy, c_type))
+    result := resolve_typedefs(decl.result.c_type, target)
+    return BoundDecl(decl.symbol, decl.convention, signature,
+                     abi_representation(result, target),
+                     conversions, decoder(decl.result.policy, result))
+
+checked_integer(value, c_type):
+    require(is_host_integer(value))
+    bits := c_type.value_bits_including_sign
+    if c_type.is_signed:
+        lo := -(2 ** (bits - 1))
+        hi :=  (2 ** (bits - 1)) - 1
+    else:
+        lo := 0
+        hi := (2 ** bits) - 1
+    require(lo <= value <= hi)
+    return encode_native_integer(value, c_type)
+\end{verbatim}
+
+The integer helper describes an ordinary two's-complement target and
+uses an arithmetic domain that can represent both bounds. Do not
+compute \(2^{64}\) with a machine operation that cannot represent it.
+Boolean parameters are mapped by a different rule: convert the
+language truth value to the native representation explicitly, not
+through a test based on unspecified upper register bits. Likewise
+support for native floating point must specify both rounding and
+exceptional values; a host real that cannot be converted to a finite
+\texttt{float} should not silently become an infinity if the API
+requires finite inputs.
+
+\section{Use a Small Value Matrix to Expose Width Drift}
+
+For the example, generate cases at both ends of the 32-bit signed
+range and just outside it. On the LLP64 target the wrapper rejects
+the outside samples; on LP64 it can pass them. Pass \(2^{63}\) as an
+unsigned weight to both, if the library's semantic range permits it,
+and check a native fixture receives that exact value. Also pass
+\(-1\) as a weight and ensure the native function was never entered.
+A test suite using only \(0\), \(1\), and \(-1\) as signed samples
+cannot detect the mapping error. Keep tests of conversion validity
+separate from tests of argument delivery: the correct language range
+paired with an incorrectly generated machine signature is still wrong.
+
+\section{Elaborate Aliases Without Erasing Their Boundary Meaning}
+
+Imagine a header introduces two aliases using the same unsigned
+integer storage: one for a byte count, another for a sample
+number. A front end can share the native type node for both,
+but should preserve their names in source locations and allow
+their binding policies to differ. For instance, an arbitrary
+sample number can fit the native width and still refer to no
+sample; a byte count of that width can exceed the extent of
+the allocation paired with it. Validate the latter relation
+at the call after argument conversion, rather than defining
+all values of the native type as an acceptable buffer length.
+
+For an example spanning preprocessing, suppose a library
+publishes a count alias that is 32 bits unless an extended
+mode is enabled. Both variants have the same function names,
+so export lookup cannot tell which was compiled. Generate the
+raw declaration from the exact compiler configuration and
+compare a supported library version or configuration query
+before using the interface. Keep the alias spelling in the
+error report: an announcement that ``unsigned integer size
+disagrees'' is less actionable than identifying which count
+typedef changed and under which define. If no metadata or
+deployment rule can establish that the library matches the
+header, choose a provider-supplied shim or refuse to guess.
+
+Incomplete types offer a different example of intentional
+information loss. The generator can accept a pointer to an
+incomplete type as an opaque argument without knowing the
+object size. It should refuse a request to allocate the
+pointee or embed it by value. The same principle is useful
+for unmodeled types: representation knowledge should be
+required only for the operations the binding actually offers.

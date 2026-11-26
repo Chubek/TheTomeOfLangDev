@@ -1,0 +1,172 @@
+% Source: clr-lang-integration.txt
+% Source: ffi-typesafety.txt
+
+\section{Localize Failure Before Translating It}
+
+An exception does more than choose a return value: it initiates
+control transfer, searches for handlers, and may unwind state
+owned by intervening frames. Hamilton's CLR extract describes a
+shared two-pass model with exception clause tables and cleanup.
+Languages targeting that runtime can participate in a common
+mechanism. That is not a property of an arbitrary C boundary.
+Unless the participants deliberately specify compatible unwinding,
+keep C++ exceptions and host exceptions on their originating sides.
+An expected failure across the boundary travels as a value.
+
+Suppose a host requests an encoded thumbnail from a C facade to a
+C++ library. The C facade writes a pointer and length only on
+success, and optionally initializes a caller-allocated diagnostic
+record on failure. Internal exceptions are translated by the
+facade, after C++ scope cleanup. The host sees the stable status
+and chooses whether to return an error value or raise its own
+exception. Native error numbers are often insufficient to
+distinguish domain failures, missing features and recoverable
+resource problems for language callers. Preserve the native
+category and raw code in an internal diagnostic even when
+several statuses share a common public variant.
+
+\begin{center}
+\begin{tabular}{lp{0.61\linewidth}}
+\hline
+Condition & Across-boundary representation \\
+\hline
+Malformed image & Domain status; output pointer remains null. \\
+Unsupported encoding & Capability status; retry only with other input. \\
+Allocation failure & Resource status; fixed diagnostic if possible. \\
+Host visitor raises & Native stop sentinel plus saved host error. \\
+Unknown failure code & Generic error with original code retained. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Write Down the Status-Output Relation}
+
+For every status, say which outputs have defined values. Suppose
+\texttt{SIZE} means the output is absent but a separate required
+length is valid; ordinary failure promises neither output. A
+wrapper cannot call its generic result decoder on every branch
+and then replace the result with an error. The read itself can
+be invalid. Likewise, nonlocal transfers that skip a frame's
+cleanup invalidate the reasoning about what has been released.
+Replace a library's documented nonlocal exit protocol with a
+shim that contains it within a compatible, carefully scoped region,
+or reject the interface. Do not route such a transfer across a
+host entry frame and expect its cleanup to run.
+
+There may be secondary error state, such as a thread-local error
+number. Read it only when the documented return sentinel indicates
+failure, and capture it immediately at the native boundary, before
+logging, deallocation or VM transitions. An unrelated value in that
+slot on success is not an error. \Cref{fig:visual-392} shows
+the two independent cleanup regions and the status transmitted
+between them.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (throw) at (0,1.25) {Native exception};
+  \node[tome box dark] (catch) at (0,-1.25) {C facade catches};
+  \node[tome box accent] (status) at (5.4,-1.25) {Stable status};
+  \node[tome box] (host) at (5.4,1.25) {Host error};
+  \draw[tome arrow] (throw) -- node[left]{native unwind} (catch);
+  \draw[tome arrow] (catch) -- node[below]{ordinary C return} (status);
+  \draw[tome arrow] (status) -- node[right]{after cleanup} (host);
+\end{tikzpicture}
+\caption{The native exception ends at the facade. The wrapper can raise a new error after discharging its own cleanup obligations.}
+\label{fig:visual-392}
+\end{figure}
+
+% Annotated walkthrough
+\section{Translate Under Transactional Output Rules}
+
+\begin{verbatim}
+facade_encode(input, out, diagnostic):
+    out.ptr := null
+    out.len := 0
+    clear(diagnostic)
+    try:
+        with native_owned_buffer(encode_cpp(input)) as buf:
+            length := checked_c_size_t(buf.length)
+            # Everything after release must be nonthrowing.
+            ptr := buf.release_to_caller()
+            out.ptr := ptr
+            out.len := length
+            return OK
+    catch BadImage:
+        write_fixed_diagnostic(diagnostic, "bad image")
+        return BAD_INPUT
+    catch OutOfMemory:
+        write_fixed_diagnostic(diagnostic, "out of memory")
+        return RESOURCE
+    catch supported_unexpected_exception:
+        write_fixed_diagnostic(diagnostic, "encoder failure")
+        return INTERNAL
+
+host_encode(image):
+    with native_view(image) as input:
+        status, out, diag := call_facade(input)
+        if status == OK:
+            with owned_native_result(out) as buffer:
+                return copy_buffer_to_host(buffer)
+    raise translate(status, diag)
+\end{verbatim}
+
+The diagnostic writer must not allocate or throw while handling
+allocation failure. This example assumes callers obey the facade
+contract for output pointers, and that creating the host owner
+is nonthrowing until it has assumed cleanup responsibility. Put
+allocator identity in the buffer owner, not the diagnostic.
+A generic catch does not catch native faults such as invalid
+memory accesses, and must not swallow runtime conditions that
+have their own required propagation protocol. Scope the guarantee
+to exceptions the implementation can handle correctly.
+
+\section{Make the Reverse Path Obey the Same Rule}
+
+If the encoder calls a host progress visitor, its entry stub
+catches a recoverable host exception, saves it in a rooted slot,
+and returns the library's stop code. The outer wrapper raises the
+saved error after the native caller has actually stopped and its
+foreign frame has been restored. A JNI-inspired API may instead
+represent an outstanding exception as explicit runtime state;
+Furr and Foster's study of JNI glue illustrates why using runtime
+APIs through C requires modeling more than ordinary argument
+types. For a pending-error interface, check the documented pending
+state and use only the cleanup and error APIs permitted in that
+state. Clearing it silently and trusting a placeholder result
+changes the language semantics.
+
+Arrange a fixture where the progress visitor raises and native
+cleanup encounters its own recoverable diagnostic. Record a
+precedence rule: here the first host error is primary, and later
+cleanup details are secondary. Test a normal native cancellation
+with no saved exception as a separate path. Finally inject an
+error after a native allocation but before publication, checking
+that the intermediate allocation is freed and that the host
+never sees a half-filled successful result.
+
+\section{Describe Partial Work Without Inventing Rollback}
+
+Sometimes a native writer has already sent several records
+when a failure occurs. The raw contract can expose a committed
+prefix count on a separate failure status. Translate that as
+an interruption with an explicit prefix, not as a generic
+exception suggesting that nothing was written. The count is
+valid only on success and that specific partial status, and
+must not exceed the number supplied. An interface promising
+an all-or-nothing write cannot implement that promise merely
+by hiding the partial count. It needs a separate facility,
+such as writing to a staging object that can then be published.
+
+For a resumable writer, suppose five records were submitted
+and the supplied count is two. The binding can return the
+starting index of the next unwritten record, with clear units
+and indexing. A retry of the full original array would write
+the first two records twice. If a failure leaves the exact
+commit point unknown, report that uncertainty rather than
+assuming a committable prefix of zero. Use a fixture to fail
+before the first record, between two records, and after all
+records are written but before acknowledgement. Those cases
+exercise different host policies even when a library uses the
+same low-level error number for all of them.

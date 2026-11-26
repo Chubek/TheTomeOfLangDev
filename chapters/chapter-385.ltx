@@ -1,0 +1,171 @@
+% Source: c-apis-in-ext-lang-ffi.txt
+% Source: ffi-typesafety.txt
+
+\section{Write Three Contracts for One Operation}
+
+A foreign function interface (FFI) does not make two languages agree.
+It defines a place where their implementations must agree on selected
+facts. Take a native image library whose entry point borrows a row of
+pixels, applies a transform, and writes the number of pixels processed.
+The machine contract specifies symbol, calling convention, widths,
+alignment and argument placement. The value contract specifies what a
+pixel is, whether a null pointer denotes an empty row and whether the
+count is pixels or bytes. The protocol contract specifies who may call
+the function, how long it may keep the pointer and what it has done
+when it reports failure. A wrapper that gets just the first contract
+right may run to completion and still return an incorrect image.
+
+The survey extract on C APIs in extension languages describes the same
+conversion and invocation tasks realized by different API designs:
+Lua uses a virtual stack to mediate values, while other APIs in the
+survey expose handles or descriptors through C variables. A native
+wrapper should use the host's abstraction for accessing values, not
+infer a heap layout from what a debugger happens to display. Furr and
+Foster study this distinction directly: their analyses model how native
+code accesses high-level values and track facts such as tags and offsets.
+Ordinary C type checking does not prove that a particular host descriptor
+contains the tag needed by an extraction operation.
+
+\begin{center}
+\begin{tabular}{lp{0.64\linewidth}}
+\hline
+Contract & Example obligation for a row transform \\
+\hline
+Machine & Count and output count use the library target's \texttt{size\_t}. \\
+Value & Four bytes form one pixel in specified channel order. \\
+Lifetime & The input read lease ends before the native call returns. \\
+Effect & A failed operation does not publish a new interpreter image. \\
+Thread & Only calls on the session owner thread may touch the transform state. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Make Failure and Aliasing Part of the Interface}
+
+Suppose the API accepts a read-only input view and a mutable destination
+view. It declares overlapping ranges invalid, says that the destination
+may be partially modified on failure, and reports a processed count only
+on success. The language wants a functional operation: its original
+image remains unchanged and it yields either a complete new image or
+an error. Use a fresh private destination and publish it only after
+validating the returned count. This decision comes from the desired
+language effect, not from the shape of the C signature. Using the input
+as the destination to save one allocation would violate both layers.
+
+With a moving collector, the input owner must be live and the exposed
+address must not change during the borrow. A root is not automatically
+a pin. The wrapper can copy the input into native storage if no
+appropriate address-stability mechanism exists. It can also share a
+stable allocation if the language guarantees the view will not be
+mutated concurrently. This is why \Cref{fig:visual-385} separates the
+raw entry point from the checks that make the public operation safe
+for ordinary clients. The model assumes a conforming library; a thin
+in-process binding cannot enforce arbitrary native memory accesses.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (host) at (0,1.25) {Public operation};
+  \node[tome box dark] (wrap) at (0,-1.25) {Checked wrapper};
+  \node[tome box accent] (native) at (5.4,-1.25) {Raw entry point};
+  \node[tome box] (result) at (5.4,1.25) {Published image};
+  \draw[tome arrow] (host) -- node[left]{values} (wrap);
+  \draw[tome arrow] (wrap) -- node[below]{stable native views} (native);
+  \draw[tome arrow] (native) -- node[right]{validated success only} (result);
+\end{tikzpicture}
+\caption{The native call receives leased views; it does not decide whether a host image becomes observable. The wrapper controls publication.}
+\label{fig:visual-385}
+\end{figure}
+
+% Annotated walkthrough
+\section{Turn the Obligations into a Call Plan}
+
+\begin{verbatim}
+transform_row(session, image, row):
+    require_owner_thread(session)
+    require(open(session))
+    require(0 <= row < image.height)
+    require(image.format == RGBA8)
+    pixels := checked_c_size_t(image.width)
+    bytes := checked_multiply(pixels, 4)
+    view := image.checked_row(row, bytes)
+    if pixels == 0:
+        return empty_rgba_row()
+
+    with read_lease_or_copy(view) as src:
+        with allocate_native(bytes) as dst:
+            written := native_size_t_cell()
+            status := raw_transform(session.handle, src, dst,
+                                    pixels, address(written))
+            if status != OK:
+                return translate(status)
+            if read(written) != pixels:
+                return ContractViolation
+            return copy_to_new_row(dst, bytes)
+\end{verbatim}
+
+Range validation is not just a sign test. Converting a large width to
+the native count type and then multiplying can truncate or overflow.
+Validate the width before narrowing and compute the byte size with
+checked arithmetic in the domain used for addressing. The row lookup
+also checks the offset and extent against the actual allocation; a
+correct row size does not prove a particular row lies within bounds.
+The early return works only because the public operation defines empty
+rows to have no native side effects. For a stateful transform that
+advances a line counter even on empty input, that shortcut is wrong.
+
+The output cell is read only on success because failure does not promise
+to initialize it. The fresh destination may still be destroyed after
+failure because deallocation is independent of initialization. Copying
+assigns the new image its own storage; adopting the destination instead
+would require transferring responsibility to an object that carries
+the matching deallocator. The nested leases release in reverse order
+on every normal or translated exit, including allocation failure after
+the input is prepared.
+
+\section{Test Conditions That Identical Values Hide}
+
+Use a four-pixel row with distinct byte values in each channel and a
+stride larger than its visible width. The distinct channels reveal a
+channel-order mismatch; a stride with slack distinguishes a row lookup
+from a naive multiplication by width alone. A test implementation can
+write half the destination, return failure, and leave the output cell
+untouched. Verify that it produces no host image, leaks no allocation,
+and never reads that cell. Test empty rows separately from a width so
+large that computing its byte size fails. The former can be a legitimate
+no-op; the latter is always rejected before entry.
+
+Record which obligations the language enforces and which are assumptions
+on the supplier. Generated stubs can encode convention and sizes.
+The wrapper can check values and arrange leases. Only the native
+implementation, specification or a stronger isolation mechanism can
+establish compliance with no retention and bounded writes. Test the
+public postcondition, not just the status: returning the correct error
+after exposing a partially transformed array is still an observable
+violation. A useful review question is whether replacing the native
+function with another implementation of the same published contract
+could reveal any undocumented assumption in the wrapper.
+
+\section{Distinguish a Retryable Call from a Retryable Result}
+
+Suppose the transform additionally updates an internal exposure
+estimate for the next row. A resource failure before entry permits
+a retry without changing the estimate. A failure while copying the
+native destination back into the host, after the native function
+reported success, has a different meaning: the next row will see
+the new estimate even though the caller never received an image.
+The published-image guarantee does not imply rollback of the
+session. To promise atomicity over both image and session, reserve
+host result storage before entry and use an infallible commit,
+or negotiate a native prepare and commit protocol. If neither is
+available, expose a result that distinguishes not-applied from
+applied-but-unavailable. Treating both cases as retryable silently
+applies the same row twice.
+
+Exercise these two paths with a fixture that increments a native
+counter only at its commit point. Before-entry allocation failure
+must leave the counter unchanged. Failure after native success
+must either be impossible by construction or observable as a
+different effect. This is an interface test even though neither
+branch exercises a novel machine representation.

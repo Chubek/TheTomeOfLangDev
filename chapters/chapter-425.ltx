@@ -1,0 +1,207 @@
+% Source: advanced-compiler-design-and-implementation-steven-s.-muchnick-.txt
+
+\section{Give a Dataflow Run Its Own Numbering}
+
+Solve backward liveness on the reachable blocks of a fixed
+function. To avoid ambiguities about joins, assume in this
+chapter that the IR has ordinary local variables and no SSA
+edge arguments. Within a block, \(\mathrm{use}\) contains variables
+read before their first definition and \(\mathrm{def}\) contains all
+variables defined. At function exit there is no implicit live
+variable in this example: return operands are ordinary uses
+inside the return block. Then \(\mathrm{out}(b)\) is the union of
+\(\mathrm{in}\) over successors and
+\(\mathrm{in}(b)=\mathrm{use}(b)\cup
+(\mathrm{out}(b)\setminus\mathrm{def}(b))\). Muchnick separates
+these transfer operations from the worklist management used to
+find a fixed point \cite{muchnick1997advanced}.
+
+Build a dense numbering of active variables and another of
+blocks. Their indices are not generational IR handles or
+interner IDs. A bit array sized by the largest symbol index
+in a whole workspace is wasteful when a function names only
+twenty variables. Associate saved results with the numbered
+domain and graph revision. Two equal vectors from different
+numberings need not denote the same set of variables, and a
+new edge may invalidate facts even if the numbering still fits.
+
+\section{Choose a Container for Each Kind of Set}
+
+A dense bitset for \(n\) elements on \(w\)-bit words stores
+\(\lceil n/w\rceil\) words. Whole-set union, difference, and
+change detection use word operations, with unused tail bits
+kept zero; complement must mask them. A classic sparse set
+instead maintains \texttt{dense[0:size]} for enumeration and
+\texttt{sparse[id]} for candidate positions into that prefix.
+Membership tests both the bounds and \texttt{dense[pos] == id}.
+Ignoring the equality check lets an old position claim
+membership for an element that was cleared or swapped out.
+Initialize any storage that may be read, even if the sparse
+positions are not semantically meaningful until checked.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Container & Attractive operation & Cost or caveat \\
+\hline
+Dense bitset & Wordwise union and subtraction & Touches words even when empty \\
+Sparse set & Constant-time insert, erase, clear & Index array scales with domain \\
+Sorted sparse vector & Merge two small sorted sets & Random insertion can shift entries \\
+Queue and queued flags & Ordered pop and deduplication & Maintain two representations \\
+\hline
+\end{tabular}
+\end{center}
+
+Sparse-set erase normally swaps the last dense element into
+the hole and repairs its sparse position. Clear may just set
+size to zero when entries are plain indices, not owners of
+resources. This is useful for temporary sets that see only a
+few of a fixed universe in each use. It is not automatically
+a memory win to store a sparse set per block: if each one
+has an \(n\)-entry sparse index, storage can dwarf bitsets.
+Keep the sparse index for scratch sets or membership in the
+pending worklist, and choose the stored liveness representation
+by cardinality and union workload.
+
+\section{Send Changes Against the Direction of Control}
+
+In \Cref{fig:visual-425}, entry \(E\) defines \(x\), header
+\(H\) uses \(x\), loop body \(B\) uses \(y\), and exit \(R\)
+returns \(x\). Assume \(y\) is an incoming function parameter,
+not defined by an instruction in \(E\). Once \(B\)'s live-in
+gains \(y\), \(H\) must reconsider its live-out, and so must
+\(E\) if \(H\)'s live-in changes. A solver that only wakes
+successors cannot guarantee either update. The fixed points
+for \(H\) and \(B\) both contain \(x,y\) on entry; \(E\)
+has \(y\), not \(x\), live on entry, since it defines \(x\).
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (e) at (0,0) {\(E\): define \(x\)};
+  \node[tome box accent] (h) at (3.6,0) {\(H\): use \(x\)};
+  \node[tome box dark] (b) at (3.6,-2) {\(B\): use \(y\)};
+  \node[tome box] (r) at (7.2,0) {\(R\): return \(x\)};
+  \draw[tome arrow] (e) -- (h);
+  \draw[tome arrow] (h) -- (r);
+  \draw[tome arrow] (h) to[bend left=24] (b);
+  \draw[tome arrow] (b) to[bend left=24] (h);
+\end{tikzpicture}
+\caption{Control follows the arrows. A change to a block's live-in wakes the blocks with edges into that block.}
+\label{fig:visual-425}
+\end{figure}
+
+% Annotated walkthrough
+\section{Deduplicate the Worklist Without Losing a Self Update}
+
+\begin{verbatim}
+schedule(b):
+    if queued[b]: return
+    queued[b] := true
+    queue.push(b)
+
+solve_liveness(blocks):
+    for b in blocks:
+        in[b] := empty_bits()
+        out[b] := empty_bits()
+        queued[b] := false
+    for b in initial_order(blocks):
+        schedule(b)
+    while not queue.empty():
+        b := queue.pop()
+        queued[b] := false
+        next_out := empty_bits()
+        for s in successors[b]:
+            next_out.or_into(in[s])
+        next_in := use[b] | (next_out & ~def[b])
+        out[b] := next_out
+        if next_in != in[b]:
+            in[b] := next_in
+            for p in predecessors[b]:
+                schedule(p)
+    return (in, out)
+\end{verbatim}
+
+The flag is cleared before transfer so that a self-edge can
+schedule the current block if needed. Both tables are stored,
+but only changed live-in influences another block's equation.
+Bitset ownership matters: assigning \texttt{out[b]} must not
+publish a scratch array that the next iteration wipes. Seed
+every block in the domain, including a reachable nonterminating
+loop with no path from it to an exit. Starting only at return
+blocks would miss the loop's local reads. Initialize from the
+empty sets for this may-analysis: with monotone transfers and
+a finite domain bits only grow at successive iterations, and
+each strict increase can wake finitely many predecessors.
+
+\section{Benchmark Iterations, Footprint, and Invalidation}
+
+Queue or stack order shouldn't change the least fixed point
+in this setup, but it changes the number of transfers. A
+postorder over the forward CFG often gives successor results
+to predecessors sooner; if scheduling by a traversal of the
+reverse graph, remember components that cannot reach a return.
+Compare results against a full-sweep solver on the same graph.
+In the loop fixture, assert \(y\) reaches \(E\) and \(x\)
+does not. Include a self-loop whose live-out changes after
+its first pop, a domain one greater than the word width, and
+a test that clears and then repopulates the same sparse set.
+
+Count word operations, pushes suppressed by membership,
+revisits, and reserved bytes per block. With 256 dense
+variables, one row costs 32 bytes for the bits; a sparse set
+with a dedicated 32-bit index per variable costs 1024 bytes
+before its dense array. At much larger domains where nearly
+all sets remain tiny, a sorted vector may avoid touching long
+zero spans. Neither choice excuses stale facts after edits.
+Deleting a use can shrink the desired fixed point; merely
+seeding work with old nonempty rows is not guaranteed to
+recover the least solution of cyclic equations. The simple
+safe baseline is to clear and solve again on the changed graph.
+
+\section{Validate the Sparse Set Without Clearing Its Index Array}
+
+\begin{verbatim}
+contains(set, id):
+    if id outside set.domain: return false
+    p := set.sparse[id]
+    return 0 <= p < set.size and set.dense[p] == id
+
+insert(set, id):
+    require id belongs to set.domain
+    if contains(set, id): return false
+    set.dense[set.size] := id
+    set.sparse[id] := set.size
+    set.size += 1
+    return true
+
+erase(set, id):
+    if not contains(set, id): return false
+    hole := set.sparse[id]
+    last := set.dense[set.size - 1]
+    set.dense[hole] := last
+    set.sparse[last] := hole
+    set.size -= 1
+    return true
+\end{verbatim}
+
+For a trace, insert 20 and 31, clear by setting size to
+zero, and then insert 7. The stale index for 20 points to
+position zero, which is now in bounds again. Only the
+equality check rejects membership. Separately erase 20
+from the original two-element set. Repairing the moved
+31's index is necessary even though both dense elements
+still exist as initialized memory. This representation
+can schedule work in arbitrary order by popping the last
+dense member, but it cannot stand in for a FIFO queue if
+the algorithm measures or relies on a particular order.
+
+A liveness diagnostic might enumerate variables set in a
+row. Wordwise iteration can skip zero words and remove the
+least-significant set bit from a local word copy per emitted
+index. On 64-bit words, test index 63, 64, and an empty
+last word; this catches shifts carried out in a narrower
+host type or indices produced from padding. Compare the
+enumeration against the solver's reference set and verify
+that formatting the diagnostic did not mutate the row.

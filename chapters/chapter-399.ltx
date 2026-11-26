@@ -1,0 +1,187 @@
+% Source: the-rust-proglang.txt
+% Source: linkers-loaders-ocr.txt
+
+\section{Expose a Public Route Without Moving the Definition}
+
+A chart library has separate implementation modules for rings,
+axes, and grids. Its author wants consumers to write
+\texttt{Charts.Grid}, not \texttt{Charts.Layout.Grid}. The first
+name can be a re-export of the type defined in \texttt{Layout}.
+An instance created through either route (where both routes are
+visible) belongs to the same type. By contrast, a wrapper around
+the type can impose a new invariant and a forwarding function can
+provide a new calling contract. Neither is the same as re-exporting
+the original definition. Rust's distinction between local
+\texttt{use} and \texttt{pub use} is a concrete example of turning
+a name binding into part of the downstream surface.
+
+An export table for the language can map a pair of namespace and
+public spelling to a canonical definition, an effective visibility,
+and provenance. A linker export table \cite{levine2000linkers}
+answers another question: which binary name can be bound from
+outside this file or image? Re-exporting a source type need not add
+a binary symbol; re-exporting a function does not by itself
+require an extra binary entry point. A language may choose to
+preserve a binary name as a separate ABI promise.
+
+\section{Compute the Surface from Legal Routes}
+
+Allow the owner of an item to authorize publication from a private
+module without opening that module's entire contents. In our toy
+language, \texttt{Layout.Grid} is marked re-exportable by its owner
+but the \texttt{Layout} route is internal. The library publishes
+the item under \texttt{Charts.Grid}; \texttt{Layout.pack} is not
+marked re-exportable. A valid private import is therefore not
+automatically a valid re-export. The builder checks the declaration
+and each proposed route under its own access policy. In this
+example \texttt{Grid} is public in the table of \texttt{Layout},
+but the \texttt{Layout} module itself is not exported by
+\texttt{Charts}. Local table membership alone does not make a
+path from the package root public.
+\Cref{fig:visual-399} distinguishes the public spelling from
+the implementation path.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box accent] (p) at (-2,1.2) {Charts.Grid};
+  \node[tome box] (i) at (2,1.2) {Layout.Grid};
+  \node[tome box dark] (d) at (0,-1.1) {Grid definition};
+  \draw[tome arrow] (p) -- node[left]{public route} (d);
+  \draw[tome arrow] (i) -- node[right]{internal route} (d);
+\end{tikzpicture}
+\caption{A facade changes the path clients use, not the declaration that establishes type identity.}
+\label{fig:visual-399}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Facade action & Definition identity & Client sees \\
+\hline
+Local alias of \texttt{Grid} & same & nothing new \\
+Public alias as \texttt{Grid} & same & new route \\
+Public wrapper type & distinct & new nominal type \\
+Forwarding function & distinct & new callable declaration \\
+Remove old public route & unaffected & missing name \\
+\hline
+\end{tabular}
+\end{center}
+
+Public signatures can leak private names even if the table is
+correct. If \texttt{Charts.Grid} has a public constructor that
+returns an internal-only error type, either export an appropriate
+public route for the error, hide its identity behind an abstraction,
+or reject the signature under the language's accessibility rules.
+Do not silently insert the error into the public table: that would
+turn an incidental implementation choice into a compatibility
+commitment.
+
+% Annotated walkthrough
+\section{Propagate Candidates Before Reporting Conflicts}
+
+\begin{verbatim}
+build_export_tables(modules):
+    for m in modules:
+        explicit_keys[m] := declared_explicit_public_names(m)
+        candidates[m] := checked_public_local_declarations(m)
+
+    repeat until no candidate set grows:
+        for (src, in_key, dst, out_key) in named_reexports:
+            for item in candidates[src][in_key]:
+                require_named_route_allowed(src, dst, item)
+                add_candidate(dst, out_key, item.definition)
+
+        for (src, dst) in wildcard_reexports:
+            for (key, item) in candidates[src]:
+                if key in explicit_keys[dst]: continue
+                if not wildcard_route_allowed(src, dst, item): continue
+                add_candidate(dst, key, item.definition)
+
+    require_each_named_source_resolved_unambiguously()
+    for (m, key) in occupied_keys(candidates):
+        ids := candidates[m][key]
+        if size(ids) != 1: error_with_routes(m, key, ids)
+        exports[m][key] := only(ids)
+    return exports
+\end{verbatim}
+
+This deliberately simple policy rejects ambiguity even at a
+wildcard-generated export. A more permissive language may omit an
+ambiguous name until an importer tries to use it. The keys for
+explicit exports are reserved before propagation, so an explicit
+export shadows wildcard results from the outset, even when it
+cannot yet resolve. The set of valid identities per key is finite
+and only grows. Propagating entire chains would not terminate on a
+cycle; store provenance edges separately and reconstruct one or
+two acyclic paths for diagnostics. A strongly connected component
+containing only aliases and no defining origin cannot invent a
+definition. Report an ungrounded named re-export rather than
+treating the cycle as an item.
+
+\section{Test the Facade as an External Consumer}
+
+Exercise the public paths by compiling a fixture outside the
+library, where private access is unavailable. Check that the
+facade publishes the two expected routes if it is keeping a
+deprecated spelling, and that both denote the same item. Move
+the implementation and repeat, preserving canonical identity
+where the language and ABI promise it. A wildcard may unintentionally
+expand the facade when an implementation module adds a declaration.
+Diff a normalized manifest of public names, signatures, and aliases
+to catch unreviewed additions and removals. Include namespace in
+the comparison: keeping a type but losing a same-spelled
+constructor is still a breaking surface change.
+
+A final fixture should import a diamond: two submodules publish
+the same \texttt{Grid}, then the facade imports both. It should
+succeed without a duplicate-type error. Change one arm to a
+distinct \texttt{Grid}, require a conflict, and resolve it with an
+explicit export. These tests distinguish duplicate reachability
+from duplicate definition and make results insensitive to
+the order in which modules happened to be visited.
+
+\section{Distinguish a Facade Change from a Replacement Definition}
+
+Suppose \texttt{Charts.Grid} was published before the package's
+internal layout was split. In the next release, a new constructor
+algorithm belongs in \texttt{Geometry}, but the old \texttt{Grid}
+is embedded in values passed between libraries. Reassigning
+\texttt{Charts.Grid} to a newly declared but otherwise identical
+record changes its nominal identity. This matters if a provider
+still returns the original type through a different public path:
+equal field lists are not proof that the two values belong to the
+same declaration. A correct alias preserves the existing identity;
+an explicit adapter can convert if the package intentionally
+replaces the type.
+
+\begin{verbatim}
+release 1: Charts.Grid -> id 17
+           Layout.Grid -> id 17
+release 2: Charts.Grid -> id 17
+         Geometry.Grid -> id 17
+replacement:
+           Charts.Grid -> id 49
+         Geometry.Grid -> id 17
+\end{verbatim}
+
+Treat these numbers as stable IDs scoped to a compatible package
+line, not as IDs shared by arbitrary installed versions. A package
+that derives every identity from its original module path needs
+an explicit migration rule or a retained declaration to achieve the
+second row. It must also decide what happens to the old public
+\texttt{Layout.Grid} path. Removing it is a source break even
+though every surviving route still points to the original item.
+Keeping a deprecated alias lets a compiler diagnose the old path
+while presenting a single canonical name in documentation.
+
+Changes to a facade can carry behavior beyond the spelling.
+Re-exporting an existing function normally does not change its
+effects; a new forwarding function might log, translate errors,
+or run at a different point in initialization. If the facade
+needs to adapt behavior, use a wrapper and document that contract.
+If its role is to keep names stable while internal code moves,
+prefer the identity-preserving route. Test both public source
+compatibility and binary compatibility if the package promises
+both; a generated name manifest checks only the former.

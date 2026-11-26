@@ -1,0 +1,195 @@
+% Source: appel-book-ml-better-typeset.txt
+
+\section{Give a Spelling an Identity, Not a Meaning}
+
+Consider two occurrences of \texttt{count} in an outer function and a
+third occurrence in a nested function that declares its own
+\texttt{count}. The lexer can assign all three the same symbol.
+The resolver must not assign all three the same binding. One identity
+answers ``what name did the user write?''; the other answers ``which
+declaration does this use select?'' Appel's Tiger implementation makes
+string equality cheap by mapping each spelling to a symbol and then
+uses symbols as keys in separate environments \cite{appel2004modern}.
+The indirection is useful precisely because the same alphabet of names
+can serve different scopes and namespaces. \Cref{ch:ext-420}
+uses those IDs as keys for lookup, shadowing, and restoration.
+
+Use an opaque \texttt{SymbolId}, minted by a pool, rather than exposing
+an integer conversion as a public constructor. A token contains this
+ID as well as a source span. The span lets the diagnostic printer show
+the exact input even if the language admits multiple spellings for a
+name. For example, if canonical Unicode normalization is part of the
+language, apply it before interning and preserve the source bytes in
+the source snapshot. If the language instead compares identifier bytes
+literally, normalization changes the meaning of a program and must not
+be applied. Homograph warnings, if supported, are a separate analysis;
+similar-looking names need not compare equal.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Identity & Example & Validity domain \\
+\hline
+Spelling ID & \texttt{count} in the name pool & Owning pool lifetime \\
+Binding ID & Inner declaration of \texttt{count} & Resolver's declaration store \\
+Source span & Bytes of one use of \texttt{count} & One file revision \\
+Artifact ID & Name at index 6 in an object file & Artifact's own name table \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Keep the Reverse Lookup Independent of Buckets}
+
+A useful layout has three pieces: a byte store containing canonical
+spellings, a dense vector of byte descriptors, and a hash index from
+candidate hash to symbol IDs. A descriptor records offset and length,
+so the byte store can move on growth without changing the ID. Reverse
+lookup indexes the vector directly. Forward lookup computes a hash and
+then tests the bytes of candidates. Neither the hash nor the index
+bucket is a symbol ID. Two different spellings can have the same hash,
+and rebuilding the index at a new capacity can move every bucket.
+
+In \Cref{fig:visual-419}, two spellings deliberately collide in bucket
+\(h\). Growing the pool rebuilds the arrows on the left but leaves the
+arrows on the right alone. A conventional open-addressed table can
+encode these candidates as a probe sequence instead of a chain; it
+still needs a full equality test before returning an existing ID.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (h) at (0,0) {Bucket \(h\)};
+  \node[tome box dark] (a) at (3,0.85) {ID 12};
+  \node[tome box dark] (b) at (3,-0.85) {ID 13};
+  \node[tome box accent] (x) at (6,0.85) {\texttt{count}};
+  \node[tome box accent] (y) at (6,-0.85) {\texttt{total}};
+  \draw[tome arrow] (h) -- (a);
+  \draw[tome arrow] (h) -- (b);
+  \draw[tome arrow] (a) -- (x);
+  \draw[tome arrow] (b) -- (y);
+\end{tikzpicture}
+\caption{The collision index locates candidates; the ID vector locates bytes. Rebuilding the index does not rename symbols.}
+\label{fig:visual-419}
+\end{figure}
+
+% Annotated walkthrough
+\section{Make Insertion the Only Way to Mint an ID}
+
+\begin{verbatim}
+intern(pool, source_bytes):
+    key := canonical_name(source_bytes)
+    h := hash(key, pool.seed)
+    with pool.write_lock:
+        for id in pool.index.candidates(h):
+            if bytes_at(pool, id) == key:
+                return id
+
+        id := checked_next_id(pool.descriptors.length)
+        reserve_descriptor_and_index_capacity(pool, h)
+        reserve_bytes(pool, key.length)
+        offset := pool.bytes.length
+        pool.bytes.append(key)
+        pool.descriptors.append((offset, key.length))
+        pool.index.add(h, id)
+        return id
+
+spelling(pool, id):
+    require id belongs to pool
+    with pool.read_lock:
+        return copy(bytes_at(pool, id))
+\end{verbatim}
+
+The candidate search must occur under the write lock, or be repeated
+there if an optimistic lookup missed. If two worker threads both miss
+and append without rechecking, equality on IDs is no longer a valid
+test for equality on names. The reserve steps arrange for the published
+update to require no further allocation in this sketch. An implementation
+with fallible operations later in the sequence needs to roll back
+partial insertion or build the entry privately before publishing it.
+The reverse lookup copies while the lock protects the backing array;
+a borrowed slice into a relocatable byte store cannot outlive the lock.
+Immutable separately allocated chunks are an alternative if slice
+borrowing is important.
+
+Hashing an input of length \(k\) still costs \(O(k)\). The gain comes
+after interning, when resolution, occurrence searches, and IR attribute
+lookups compare or hash small IDs. With suitably distributed hashes and
+a controlled load factor, the candidate count is small on average; a
+forced-collision test is still worth keeping. To assess memory, count
+distinct canonical bytes, descriptors, and index capacity separately.
+An input with a fresh name at every occurrence may pay more for
+interning than it would for spans alone. Avoid interning literal
+bodies just because identifier names already use a pool.
+
+\section{Define What Stable Means at the Export Boundary}
+
+A pool with append-only descriptors guarantees stability across
+capacity changes within one lifetime. It does not guarantee that
+the name \texttt{count} gets the same integer after a clean build.
+Discovery order changes under parallel parsing, and restoring a saved
+artifact might start with a different subset of the names. For a
+deterministic export, collect the names that the artifact actually
+uses, sort their canonical bytes with a specified comparison, give
+them artifact-local indices, and rewrite every emitted reference
+through the translation map. On import, intern the serialized bytes in
+the receiving pool before interpreting any reference. Sorting only
+the printed name table while leaving raw pool IDs in bytecode is
+not a valid translation.
+
+Separate pools also require a bridge. If worker \(A\)'s number 12
+means \texttt{count} while worker \(B\)'s number 12 means \texttt{size},
+their elements must not be compared by integer alone. Use a branded ID
+type when the language supports it, or store/check a pool tag at
+boundaries. When merging, construct a worker-to-owner ID map once and
+apply it to the whole transferred representation, including any side
+tables of symbol-keyed metadata. Rehashing the worker's local table
+does nothing to make its IDs valid elsewhere.
+
+\section{Plan for Retention Before Adding Eviction}
+
+A one-shot compiler can usually free the whole pool after emitting
+the artifact. An editor service that interns across thousands of edits
+can accumulate long-abandoned misspellings. Start with an explicit
+pool lifetime such as a workspace session or document epoch. Before
+introducing eviction, identify caches, snapshots, and diagnostics
+that can retain the ID. If an evicted index is immediately reused,
+an old token could silently name a different spelling. Epoch changes
+with explicit remapping, or generational handles with checked lookup,
+trade that silent error for a visible invalidation boundary. If the
+contract instead claims identity across all simultaneously live
+snapshots, reclamation must preserve that contract.
+
+Test the contract by forcing a resize, forcing unequal keys to hash
+identically, and parsing the same inputs in different worker orders.
+Check that in-memory equality agrees with canonical byte equality
+inside each pool and that final artifacts agree byte for byte across
+worker orders. Add a separate fixture with two same-spelled
+declarations. Their spelling IDs must match and their binding IDs
+must differ even after both sets of IDs have been exported and read
+back. These assertions detect different failures and should not use
+one another as their test oracle.
+
+\section{Budget the Width of the Descriptor Fields}
+
+Suppose a workspace keeps an average of twelve canonical bytes
+for each of five million distinct names. The raw spellings then
+take about sixty million bytes, not counting allocation slack.
+An eight-byte descriptor takes forty million bytes more, before
+any space for probing or chaining. This estimate suggests a useful
+layout change: keep the descriptor unpadded if possible and avoid a
+separate heap allocation for each tiny spelling. It does not
+justify truncating the byte offset to fit into a thirty-two-bit
+field. A workspace with fewer but longer names can exhaust the byte
+offset before it exhausts the ID. Check both limits independently,
+including any reserved sentinel used for missing names.
+
+A sharded pool can reduce contention, but the shard assignment
+must be a function of the canonical name: all equal keys must
+consult the same shard before choosing an ID. Encoding shard and
+local index together preserves opaque equality, at the cost of
+dividing the available bits and complicating vectors indexed by
+symbol. Measure the time spent hashing and copying separately from
+time blocked on the lock before adding sharding. If most work
+occurs outside this lock, a more elaborate ID layout can impose a
+lasting cost on downstream tables for very little throughput gain.

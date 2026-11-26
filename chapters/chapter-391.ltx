@@ -1,0 +1,170 @@
+% Source: ffi-for-gc-langs.txt
+% Source: c-apis-in-ext-lang-ffi.txt
+
+\section{Attachment Is Not the Same as Permission to Execute}
+
+A library can call a bridge from a worker that the VM did not
+create. Native thread-local storage on that worker does not by
+itself contain a runtime thread record, valid stack bounds or an
+appropriate local-root frame. Runtime attachment is the protocol
+for creating or associating that record. A runtime may also
+require the thread to enter a managed execution region under a
+lock, or may require all interpreter operations to run on an owner
+thread regardless of attachment. Those are separate restrictions.
+Attaching a worker does not make an owner-only object callable from
+the worker.
+
+Crestani's survey \cite{crestaniFFI} identifies cooperation between the FFI and the
+collector on multithreaded heaps: another thread can collect while
+external code runs, and uncoordinated descriptor access can become
+invalid. The extension-language C API survey notes that
+multithreading complicates access to JNI strings and arrays even
+when primitive type mappings are straightforward. A bridge cannot
+use a thread's apparent success with a scalar callback as evidence
+that passing managed references the same way is valid.
+
+\begin{center}
+\begin{tabular}{lp{0.59\linewidth}}
+\hline
+Arrival state & Required transition \\
+\hline
+Worker not attached & Register if allowed, otherwise use a mailbox. \\
+Attached, outside VM & Enter managed region with the runtime's protocol. \\
+Managed thread in outbound call & Reenter under the saved foreign frame. \\
+Attached to a different VM & Do not reuse the existing thread context. \\
+VM shutting down & Reject or drain under a shutdown admission protocol. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Choose Direct Entry or a Mailbox Explicitly}
+
+Consider a meter library that reports pairs of native integers from
+a worker. If delivery is asynchronous and cannot return a decision,
+the callback can copy the two integers to a native mailbox. The VM
+owner drains the mailbox. Define coalescing, queue limits and what
+to do on shutdown as part of the operation. For example, it is
+reasonable to substitute newer samples for previously queued
+samples in a live display, but incorrect to substitute them in a
+recording operation promising every sample. Do not enqueue a raw
+pointer to managed data or a native view that expires on callback
+return.
+
+When the C API demands a decision immediately, a mailbox with a
+synchronous reply can deadlock. Suppose the VM owner has called
+\texttt{meter\_flush} and waits for its worker. If the worker
+cannot finish until the owner consumes a decision request, neither
+thread can progress. Direct attachment only helps if the VM and
+application permit the worker to run the closure, and if the owner
+does not retain a lock it needs. \Cref{fig:visual-391} distinguishes
+the two legitimate designs; a blocking relay is not automatically
+equivalent to either.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (work) at (0,0) {Native worker};
+  \node[tome box dark] (direct) at (4.4,1.25) {Attach and enter};
+  \node[tome box dark] (queue) at (4.4,-1.25) {Copy to mailbox};
+  \node[tome box accent] (vm) at (8.8,0) {Managed handler};
+  \draw[tome arrow] (work) -- (direct);
+  \draw[tome arrow] (work) -- (queue);
+  \draw[tome arrow] (direct) -- (vm);
+  \draw[tome arrow] (queue) -- (vm);
+\end{tikzpicture}
+\caption{Direct entry runs on the arriving worker; a mailbox moves execution to the VM owner and changes the timing contract.}
+\label{fig:visual-391}
+\end{figure}
+
+% Annotated walkthrough
+\section{Make Each Entry Scope Own Exactly Its Transitions}
+
+\begin{verbatim}
+decide_entry(ctx, sample):
+    admission := ctx.vm.try_admit_callback()
+    if admission is None: return STOP
+    with admission:
+        attachment := attach_this_thread_if_needed(ctx.vm)
+        if attachment is failure: return STOP
+        try:
+            with enter_or_reenter_managed(attachment):
+                with local_root_frame() as roots:
+                    try:
+                        handler := roots.load_global(ctx.handler)
+                        arg := roots.box_sample(sample)
+                        return CONTINUE if handler(arg) else STOP
+                    catch recoverable_host_error:
+                        ctx.record_first_error_without_throw()
+                        return STOP
+        finally:
+            if attachment.was_created_here:
+                detach_this_thread(attachment)
+\end{verbatim}
+
+Assume the native registrar keeps \texttt{ctx} live until callback
+quiescence, and entry and exit helpers expose failures without
+unwinding into C. The local root frame is closed before detachment.
+A callback entered on a thread already registered may reuse the
+attachment but has no right to detach that thread. Parent and
+nested entries each get distinct local frames. A thread-local
+context handle cannot simply be captured at registration on the
+owner and replayed later on a foreign worker; store the VM
+identity and resolve the context of the actual arriving thread.
+
+For frequent invocations on a persistent worker, amortize
+attachment only when a guaranteed thread-exit hook can detach and
+the VM can coordinate termination with that worker. Attachment
+and entry can have different costs: an idle attached worker may
+leave managed execution so that it is not considered to be executing
+managed instructions while waiting in a native library. A collector
+may require a foreign-state transition to know which roots are
+stable and whether the thread should participate in a safepoint.
+Do not implement the transition by just setting a user-level flag.
+
+\section{Prove Shutdown Against an Entry in Progress}
+
+Define closing to prevent new admissions and let admitted callbacks
+leave before destroying runtime state. A VM pointer must remain
+valid long enough for a rejected late entry to observe closing, so
+the supplier must also acknowledge that native delivery has
+stopped. Use a two-phase stop: close admission, request native
+stop, then wait for quiescence in a context that does not hold
+the runtime lock needed by admitted workers. Only afterward can
+the registrar release its roots and its reference to the VM.
+
+Drive the test with barriers, not arbitrary sleep durations.
+Pause a worker immediately before admission, trigger closing, then
+release the barrier and observe a native stop result with no heap
+access. Repeat with a barrier just after admission; destruction must
+wait while that worker unwinds its entry stack. Finally drive a
+callback on an already attached thread while that thread is in an
+outbound call and verify that the VM's managed-to-foreign state is
+restored, and that returning to the original host caller still uses
+its own root frame.
+
+\section{Keep the Reentry Stack and Runtime Lock in Agreement}
+
+A same-thread nested callback creates an alternating stack:
+host call, foreign entry, managed callback, another foreign entry,
+and possibly another managed callback. Track the transition
+state as nested scopes rather than a thread-wide Boolean. At the
+deepest return, restore the foreign state of the inner call.
+After that call returns to its managed caller, restore the
+callback's managed state. Clearing a global in-callback flag at
+the first return would leave the outer callback outside the
+state the VM expects. The root-map discussion in
+\Cref{ch:ext-411} explains the underlying constraint: the
+collector needs locations that remain valid during each
+transition, including suspended outer frames.
+
+Consider a library that holds its own meter mutex while asking
+the callback for a decision. The callback can attach correctly
+and still deadlock if it calls an operation that tries to
+acquire that mutex. This failure is not a collector bug.
+Either the library drops its lock before invoking callbacks,
+or the binding explicitly excludes those reentrant operations.
+Test the restriction with a callback that invokes the disallowed
+method and confirm it receives a host error without entering
+the native operation. The same test on an unrelated meter can
+establish whether the restriction is per object or per library.

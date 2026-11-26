@@ -1,0 +1,176 @@
+% Source: appel-book-ml-better-typeset.txt
+
+\section{Make Allocation and Heap Walking Agree}
+
+A heap object needs more than an address. The component that allocates
+it and the component that later walks past it must agree on its
+extent, alignment, and reference fields. This is an internal ABI:
+the frontend can change the meaning of a vector without touching it,
+but changing the location of the vector length affects both generated
+code and the collector. A useful first design gives each object a
+header with a descriptor and uses descriptors to enumerate reference
+slots, as in Appel's account of the compiler interface
+\cite{appel2004modern}. A slot is a location the collector can read
+and, for moving collection, rewrite. It is not merely the pointer
+value previously read from that location.
+
+Assume eight-byte words and sixteen-byte object alignment. Use a
+descriptor ID in the first word and a type-specific auxiliary word
+next. For a reference vector, that word is the element count. For a
+pair, it can hold flags without changing the fixed size. A record
+with an unboxed counter cannot use a scan policy of ``follow every
+nonzero word.'' The integer may coincide with an aligned heap address.
+Conversely, forgetting one real reference need not crash during
+tracing; it may only become visible after the reclaimed storage
+is reused. The following small layout deliberately distinguishes
+slot type from the bytes currently stored in it.
+
+\begin{center}
+\begin{tabular}{lrrl}
+\hline
+Kind & Header & Extent & Slots after header \\
+\hline
+Counter & 16 & 32 & none \\
+Pair & 16 & 32 & 0, 1 \\
+Ref vector, length 3 & 16 & 48 & 0, 1, 2 \\
+Byte vector, length 17 & 16 & 48 & none \\
+\hline
+\end{tabular}
+\end{center}
+
+In \Cref{fig:visual-408}, the last word of the reference vector is
+padding. It is not a fourth element. Its address matters to the next
+allocation, but its bit pattern must have no effect on reachability.
+A heap checker can deliberately fill padding with a pattern that
+resembles an address and verify that the slot visitor ignores it.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (h) at (0,0) {Header: 16 B};
+  \node[tome box accent] (p) at (3.9,0) {Three slots: 24 B};
+  \node[tome box] (a) at (7.9,0) {Pad: 8 B};
+  \draw[tome arrow] (h) -- (p);
+  \draw[tome arrow] (p) -- (a);
+\end{tikzpicture}
+\caption{The physical extent includes padding, but the scanner visits only the three payload slots.}
+\label{fig:visual-408}
+\end{figure}
+
+% Annotated walkthrough
+\section{Reserve, Initialize, and Publish}
+
+\begin{verbatim}
+extent(kind, count):
+    check count is valid for kind
+    bytes := checked_add(16, checked_payload(kind, count))
+    return checked_align_up(bytes, 16)
+
+reserve_in_buffer(thread, bytes):
+    assert thread.top <= thread.limit
+    if bytes > thread.limit - thread.top: return Miss
+    start := thread.top
+    thread.top := start + bytes
+    return start
+
+new_ref_vector(thread, count):
+    bytes := extent(RefVector, count)
+    p := reserve_in_buffer(thread, bytes)
+    if p is Miss:
+        refill_or_collect(thread, bytes)
+        p := reserve_in_buffer(thread, bytes)
+        if p is Miss: signal allocation failure
+    # No safepoint until header and slots are initialized.
+    p.descriptor := RefVector
+    p.aux := count
+    for i in 0 .. count-1:
+        p.slot[i] := null
+    return p
+\end{verbatim}
+
+This is a fast path for a cooperative stop-the-world runtime. No
+collector walks the reserved interval between allocation and
+initialization. The subtraction check avoids forming an overflowing
+end address; the size calculation independently checks multiplication,
+addition, and rounding. Use the same logical extent calculation in
+the debug walker, but check the result against the containing block
+before trusting a header read from a damaged heap. When collection
+can happen in the refill routine, arguments needed after that call
+belong in updateable roots. Here the count is an integer. A variant
+that fills the vector with an existing object must root that object
+before the refill and reload it afterward.
+
+Publication to another mutator is a separate event from making
+the object parseable by the collector. An object containing only
+null references may be safely scanned before its intended contents
+have been installed; application code must not receive it until
+its logical initialization is complete. A concurrent heap walker
+cannot use the private-buffer argument above as written: it needs a
+way to distinguish a reserved range from a committed range, and a
+publication protocol for descriptors and fields. Either arrange
+such a protocol explicitly or keep that walker out of private
+allocation buffers until the owning thread has retired them.
+
+\section{Account for Fast-Path Waste and Slow-Path Work}
+
+Suppose a buffer has 32 bytes left and a vector needs 48. The
+allocator cannot leave the old tail looking like an object if the
+heap walker enumerates every address up to the region limit.
+The runtime could walk only committed prefixes, or install a
+recognized filler covering the remainder. The latter representation
+must accommodate the smallest possible tail: with sixteen-byte
+alignment and a sixteen-byte filler header it can. Neither design
+implies that objects of size larger than a standard buffer should
+receive oversized private buffers. Allocate large objects via a
+separate path, and still charge their full bytes to collection
+triggers. An allocation counter that records only buffer refills
+can miss an entire class of heap pressure.
+
+Measure requested payload, rounded allocation, abandoned buffer
+tails, and slow-path invocations separately. With a million pairs
+the layout above allocates 32 MB for 16 MB of payload. Enlarging
+alignment to 32 bytes does not change that case, but a vector
+of length three then grows from 48 to 64 bytes. A workload report
+that counts objects without sorting by layout will hide the effect.
+Likewise, a large buffer may save synchronization without reducing
+overall collection cost if it raises the amount of memory retained
+in private tails across many mostly idle threads.
+
+\section{Keep Representation Choices Local}
+
+A dynamically typed implementation can put immediate values and
+references in the same slot using tags. This changes the visitor:
+a descriptor identifies the slot as containing a tagged value,
+and the visitor tests and decodes before tracing. It restores
+the tag when rewriting a moved pointer. With compressed references
+the visitor instead needs a heap-base and encoding convention.
+Do not spread either convention through marking and sweeping code.
+Use a scanner that produces abstract slots and a representation
+layer that implements reading and writing them. A fixed descriptor
+bitmap still has a role in such a system: it tells the collector
+where a word is a tagged value rather than arbitrary bytes.
+
+Build one regression fixture for each allocation entry point.
+Allocate a reference vector across a buffer boundary, place a
+sole live reference in its last slot, and force collection. In
+the next fixture put the same bit pattern in a byte vector and
+test that it does not retain the referent. Round-trip changes
+through the moving visitor and finally walk to the next object.
+Together those checks exercise size, initialization, and pointer
+enumeration; a test that merely checks the returned address is
+aligned covers none of the agreements on which tracing depends.
+
+The layout contract also applies during transitions. A class
+whose fields can change shape at run time cannot first publish a
+descriptor for a reference slot and then fill that slot with an
+immediate integer using a representation the descriptor does not
+permit. For a first implementation keep the scanning descriptor
+immutable for the life of an object and allocate fresh storage
+for a representation change. Property lookup may still use a
+mutable logical shape if the physical slots all have the same
+tagged representation. When later optimizing away tags, test a
+collection exactly where the optimized path changes shape, not
+only after the mutation has completed. The scanner sees the
+object at a machine instruction boundary, not at a source-level
+property assignment considered as a single operation.

@@ -1,0 +1,191 @@
+% Source: types-and-programming-languages-benjamin-c.-pierce-.txt
+
+\section{Give Each Kind of Edge Its Own Reachability Rule}
+
+A strong field preserves its target whenever the holder is
+live. A weak field does not. A surviving holder's weak slot
+must be cleared if its referent dies, or updated if the
+referent survives and moves. Pierce notes that weak pointers
+and finalizers go beyond the simple reachability model of a
+store \cite{pierce2002types}. A collector that supports them
+has to decide exactly when an operation can still observe an
+object, not simply when its bytes become available. In a
+moving heap a weak getter must not return a stale address from
+before collection. In a concurrent heap, testing that a value
+is nonnull and then converting it to a strong reference must
+follow a protocol that excludes concurrent reclamation. It must
+also account for any marking obligation created by the new strong
+root during a concurrent cycle, as discussed in \Cref{ch:ext-416}.
+
+For a cache indexed by object identity, an ordinary strong
+value paired with a weak key can accidentally keep the key
+alive. A cache entry may describe a method derived from a
+type, while the method representation points back to that type.
+If the table traces the value unconditionally, the path from
+table to method to type defeats the weak key. An ephemeron
+gives the pair a conditional rule: if the entry is reachable
+and its key has been marked live by other evidence, trace its
+value. The entry's conditional edge is not itself evidence
+that its key is live. After its value has been marked, that
+value's outgoing strong edges are ordinary strong edges.
+
+\Cref{fig:visual-417} shows the cache when no independent
+root reaches its key. The solid arrow from the value back to
+the key makes no difference unless the value is reached.
+If another root reaches the value itself, it can legitimately
+keep the key alive and thereby activate the entry.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (e) at (0,0) {Live entry};
+  \node[tome box] (k) at (5,1.2) {Key};
+  \node[tome box accent] (v) at (5,-1.2) {Value};
+  \draw[tome dashed] (e) -- node[above,sloped]{test only} (k);
+  \draw[tome dashed] (e) -- node[below,sloped]{if key live} (v);
+  \draw[tome arrow] (v) -- node[right]{strong} (k);
+\end{tikzpicture}
+\caption{The value's back-reference does not activate the entry unless the value or key is already reachable by another path.}
+\label{fig:visual-417}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Edge kind & Marks the target? & When a target dies \\
+\hline
+Strong & Yes, from a live holder & No live strong slot can point to it \\
+Weak & No & Clear or report according to the API \\
+Ephemeron value & Only when its key is live & Drop an inactive entry \\
+\hline
+\end{tabular}
+\end{center}
+
+% Annotated walkthrough
+\section{Derive Ephemeron Liveness to a Fixed Point}
+
+\begin{verbatim}
+trace_conditional_edges():
+    shade_all_roots()
+    repeat:
+        drain_strong_worklist()
+        # Scans discover weak slots and ephemerons separately.
+        progress := false
+        for e in discovered_ephemerons:
+            if marked(e.key) and not e.activated:
+                e.activated := true
+                progress := true
+                shade(e.value)
+    until not progress
+
+process_observers():
+    trace_conditional_edges()
+    clear_plain_weak_slots_to_unmarked_targets()
+    drop_inactive_ephemeron_entries()
+    enqueue_and_mark_finalizable_closure()
+    retrace_newly_retained_objects_under_finalization_policy()
+\end{verbatim}
+
+For example, root \(K_1\) activates an entry whose value
+contains a strong pointer to \(K_2\). That, in turn,
+activates the entry with key \(K_2\). If the second entry
+appears first in a pass, a single scan misses its value.
+The loop drains pending strong work and reexamines entries
+until no new rule fires. It includes newly discovered
+entries, not just those found by the initial root scan.
+An entry activated once cannot become inactive during this
+nonconcurrent mark. Two entries pointing at one another's
+keys with no independent seed stay inactive; following all
+their values before checking keys would compute the wrong
+fixed point.
+
+Repeated full passes can be quadratic on a long dependency
+chain. Index pending entries by key and schedule activation
+when a key first becomes marked. An entry found after its
+key was marked must still test that condition during
+registration. In a moving implementation these decisions can
+use a stable mark identity or forwarding metadata for the
+duration of the collection. Do not forward a referent merely
+to ask whether it is live: a normal forwarding function
+creates a copy when none exists, making the query have the
+wrong effect.
+
+\section{Specify Finalization Before Exposing It}
+
+Choose observable ordering explicitly. The sketch uses one
+possible policy: clear plain weak slots and drop inactive
+ephemerons before retaining objects for finalizers. A later
+resurrection does not refill a cleared slot or recreate a
+removed cache entry. Then take a snapshot of eligible
+unmarked finalizable objects, queue those objects as roots,
+and trace the closure the callbacks may access. Define how
+weak fields and ephemerons newly discovered in that closure
+are processed; for example, retain new conditional values
+only for keys live after retention, while never rebuilding
+previously dropped entries. Other languages choose different
+ordering. The test oracle needs the language's policy, not
+a universal expectation about which reference clears first.
+
+Callbacks run after collector metadata is consistent. A
+callback might allocate, raise an exception, or store its
+receiver in a global. Marking the object only for the callback
+body but reclaiming its children first makes the body unsafe.
+Record finalization state so that a resurrected object is not
+automatically queued a second time, and hold queue roots while
+callbacks wait or run. Specify what happens if a callback never
+returns and whether exceptions are reported. Provide explicit
+close or scoped resource management for prompt release; a
+tracing collection might never run before process exit.
+
+\section{Test Decisions Rather Than Callback Timing}
+
+Run the ephemeron chain in both entry orders, and check a
+cycle of keys with no seed and the same cycle with one root.
+After moving survivors, read through both plain weak and
+activated conditional slots. In a concurrent API, repeatedly
+race a weak upgrade against the last strong release and verify
+that success returns an actual strong owner; failure must not
+produce a half-installed handle. Use a deterministic hook to
+drain the finalizer queue in tests instead of sleeping for
+a wall-clock interval. Include a finalizer that allocates and
+resurrects, then drop the resurrecting root and verify the
+contract for at-most-once invocation. Distinguish an observable
+cleared slot from when its old referent's bytes are reused.
+
+An observer registry also raises a reachability question of its
+own. If every registered wrapper is rooted by the registry,
+wrappers that users have discarded may accumulate without
+bound. Decide whether registration holds the wrapper strongly,
+tracks only still-live wrappers, or publishes independent
+notifications containing no referent. A dead wrapper must
+not keep a notification payload alive unless the notification
+is itself an intended root. Test dropping wrappers while
+their referents remain live, and dropping the referents while
+the wrappers remain live. Those cases stress different sides
+of the observer contract.
+
+\section{Distinguish Reclamation From Cache Eviction}
+
+An ephemeron can keep a large value alive whenever a small
+key remains reachable. This is correct, but it is not an
+eviction policy. A runtime that interns classes for the
+entire process might retain the values of an ephemeron cache
+for the entire process, even if nobody has queried the cache
+recently. Use an explicit size or recency policy when memory
+depends on bounding the cache. Tests should be able to
+distinguish an explicit eviction from a collector removing
+an inactive entry, especially if both paths publish a
+notification about that entry.
+
+For partial collection, specify what it means for a key in an
+uncollected generation to be live. A nursery pass can treat
+that key as provisionally live for an entry it encounters.
+This preserves a young value that may still be needed by
+an old key, but can retain extra data until the next full
+cycle. Remember the relevant conditional slots or entries
+so the young collector can reach them without treating every
+old value as a strong root. Test a cached value that remains
+young for several passes and whose old key becomes unreachable
+before the next full pass. The full pass, not the minor pass,
+must eventually settle the key's actual reachability.

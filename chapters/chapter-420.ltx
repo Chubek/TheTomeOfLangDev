@@ -1,0 +1,191 @@
+% Source: appel-book-ml-better-typeset.txt
+
+\section{Separate Binding Policy from Its Index}
+
+Assume a language with distinct value and type namespaces, lexical
+scope, and sequential value declarations. In a declaration
+\texttt{let x = x + 1}, the initializer sees the old environment;
+only after the initializer is resolved does the newly declared
+\texttt{x} become visible. Meanwhile a type called \texttt{x} may
+coexist with either value. None of these rules is an automatic
+consequence of using a hash table. A compiler must encode the key
+as a namespace and symbol pair and define the points at which
+declarations enter the environment. It is helpful to store each
+declaration's source site and stable-for-the-resolution identity
+in a separate declaration store. A scoped map then contains only
+the identities of visible declarations.
+
+Appel contrasts imperative installations followed by stacklike
+restoration with functional environments that keep old mappings
+available \cite{appel2004modern}. Both can implement the sequential
+example. The choice is about time travel: do we only move forward
+and temporarily descend into a child scope, or must several tasks
+query different historical environments at once? In
+\Cref{fig:visual-420}, two sibling bodies begin from the same
+published environment. The `x' declarations made by them are distinct
+even when both maps eventually contain the same key set.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (outer) at (3,1.4) {Outer: \(\mathtt{x}\mapsto D_0\)};
+  \node[tome box] (left) at (0,0) {Left: \(\mathtt{x}\mapsto D_1\)};
+  \node[tome box] (right) at (6,0) {Right: \(\mathtt{x}\mapsto D_2\)};
+  \node[tome box accent] (shared) at (3,-1.4) {Shared map subtree};
+  \draw[tome arrow] (outer) -- (left);
+  \draw[tome arrow] (outer) -- (right);
+  \draw[tome dashed] (left) -- (shared);
+  \draw[tome dashed] (right) -- (shared);
+\end{tikzpicture}
+\caption{Two extensions start from the same visible bindings. Path copying can retain the untouched parts of both maps without sharing their new declarations.}
+\label{fig:visual-420}
+\end{figure}
+
+\section{Pay for the Shape of Lookup You Actually Need}
+
+With one map per scope and a parent link, lookup can stop at the first
+scope with a matching key. That makes duplicate detection simple:
+inspect only the current map. The worst-case number of maps inspected
+is the depth of the scope chain, notably for missing names. Small
+sorted vectors may beat a hash table for scopes consisting of two
+parameters and one local; they avoid a capacity-sized allocation and
+keep keys next to each other. A hybrid can promote a scope once its
+entries exceed a measured threshold. Ensure the change of
+representation doesn't change lookup order for constructs such as
+overload groups.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Representation & Lookup path & Scope exit \\
+\hline
+Parent-linked maps & Test current, then ancestor maps & Restore parent pointer \\
+Current map with undo log & Test one visible map & Undo local declarations \\
+Persistent balanced map & Descend one tree & Drop current root \\
+\hline
+\end{tabular}
+\end{center}
+
+An undo log keeps a single map of the visible winners. It is an
+especially good fit for a nonparallel depth-first resolver, since an
+unknown name takes one ordinary map lookup and the log needs one
+record per installed declaration. Snapshots of this implementation
+are not cheap: saving the log length does not preserve an independent
+map that a concurrent task can read. The log length is a cursor for
+restoration, not a shareable map version.
+
+% Annotated walkthrough
+\section{Restore Shadowed Values in Exact Reverse Order}
+
+\begin{verbatim}
+begin_scope():
+    return (fresh_scope_id(), undo.length)
+
+declare(scope, space, symbol, decl):
+    key := (space, symbol)
+    previous := visible.get(key)    // Some(binding) or None
+    if previous exists and previous.scope == scope.id:
+        report_duplicate(decl, previous.declaration)
+        return
+    undo.push((key, previous))
+    visible[key] := Binding(scope.id, decl)
+
+resolve_sequential_let(scope, name, init):
+    resolved_init := resolve_expression(init, visible)
+    decl := new_declaration(name, resolved_init, scope.id)
+    declare(scope, ValueSpace, name.symbol, decl)
+    return decl
+
+end_scope(scope):
+    require this is the innermost open scope
+    while undo.length > scope.undo_position:
+        key, previous := undo.pop()
+        if previous exists: visible[key] := previous
+        else: visible.remove(key)
+\end{verbatim}
+
+Beginning a scope need not change visibility at all. A name's
+previous value is saved immediately before updating the current map;
+the record contains absence explicitly so restoration does not leave
+a tombstone that shadows an ancestor. A duplicate in this example is
+diagnosed without replacing the first declaration. That policy lets
+later uses resolve consistently during recovery. A language with
+mutually recursive functions needs a different installation sequence:
+enter all headers, then check all bodies under the shared extended
+environment. Moving a single-binding operation across the body
+boundary would change which recursion patterns the language supports.
+
+Run a trace with an outer value \texttt{x} and nested blocks declaring
+\texttt{x}, then \texttt{y}, then \texttt{x} again in a deeper
+block. Read \texttt{x} after each close and read \texttt{y} after
+its declaring block closes. Include a type named \texttt{x}; the
+value undo operation must not touch its entry. If an error return from
+one block bypasses restoration, the next sibling inherits a
+declaration that does not lexically enclose it. A scope guard or a
+structured traversal that executes scope exit even on early returns
+makes this failure harder to introduce.
+
+\section{Publish Roots When Readers Need Snapshots}
+
+A persistent balanced search tree path-copies nodes along an
+insertion, including nodes changed by rebalancing. With \(n\)
+keys this costs \(O(\log n)\) time and new nodes per insertion,
+while an old root continues to name the old map. A hash-array mapped
+trie trades ordering for branching by successive groups of hash
+bits; it needs a specific representation for collisions. In either
+case, a persistent flattened map can carry the declaring scope in
+its values, so a lookup still distinguishes a duplicate from legal
+shadowing. Persisting the map is not enough if its values are mutable
+and their meaning changes after publication. Use immutable entries or
+separately version any semantic facts intentionally updated later.
+
+Do not equate environment root identity with language equivalence.
+Two independently built roots may contain the same bindings; returning
+to exactly the old root after a scope closes is a cheap sufficient
+test for reuse, not a necessary one. Conversely a cached lookup for
+\texttt{x} depends on what shadows it and what namespace was searched,
+not just on the declaration it returned. Adding an inner declaration
+can change a lookup even when none of the old declarations changes.
+For a cache that tracks individual lookups, record the relevant
+negative searches as dependencies. Otherwise keep environment root
+identity in the cache key and accept coarser invalidation.
+
+\section{Measure Lifetime, Not Just Lookup Latency}
+
+Use three benchmark shapes: a single large module, deeply nested
+small blocks with many misses, and many simultaneous environment
+snapshots. Record successful and failed probes separately as well
+as peak live nodes, not only allocations. A persistent environment
+can free most copied paths promptly when readers drop their roots;
+retaining every root in a diagnostic history makes the same algorithm
+look much worse. Check identical resolver outputs across
+representations using source sites of declarations, not allocation
+order of declaration IDs. The exercise reveals which performance
+differences are actually attributable to the map and which come
+from keeping unnecessary history alive.
+
+\section{Do Not Model Imports as Arbitrary Parent Links}
+
+Consider a module that imports public value \texttt{paint} from
+both \texttt{Colors} and \texttt{Canvas}, then declares no local
+\texttt{paint}. A single lexical parent chain gives one of those
+modules priority even if the language reports ambiguity. Use a
+module export index and a separate import tier, with ordering and
+visibility rules specified independently of the local map. For a
+simple language, search for the key in the current lexical
+chain first, then collect public imports
+only if the lexical search returned no value binding; report
+ambiguity if more than one distinct declaration remains. If two
+imports reexport the same underlying declaration, deduplicating
+by declaration identity rather than textual name makes the policy
+explicit. A lexical namespace cannot implement linker resolution
+by itself; compare the three boundaries in \Cref{ch:ext-397}.
+
+Store candidate provenance with ambiguous results. A deterministic
+diagnostic can sort by qualified module name and declaration site
+independently of the map's probe order. That is useful even if
+batch and editor resolvers use entirely different maps. Test a
+module that adds a local value to resolve the ambiguity, and a
+module that adds only a local type of the same name. In the latter
+case the value lookup must still report the two imported candidates.

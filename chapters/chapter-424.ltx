@@ -1,0 +1,196 @@
+% Source: simple-graph-ir-il-sea-of-nodes.txt
+% Source: irdl-ir-def-lang-for-ssa-cc-compiler-opt-ir-il.txt
+
+\section{Distinguish the Two Graphs in Block-Based SSA}
+
+A block-based intermediate representation has a control-flow
+graph of blocks and a graph of relations between value definitions
+and operand uses. An optimization that replaces an arithmetic
+operand may not change any control edge. A branch rewrite can
+change both graphs, for example by dropping an argument on a
+deleted edge. Click and Paleczny's graph IR puts control and
+value dependencies in a common object graph instead; it is an
+alternative representation, not a reason to elide either relation.
+The examples here use block arguments for SSA joins, as in the
+MLIR model \cite{lattner2021mlir}, rather than explicit phi
+instructions \cite{cytron1991ssa}.
+
+Store a terminator's outgoing edge occurrences in semantic order.
+For a conditional branch the true and false positions are not
+interchangeable. A block with two destinations that happen to be
+the same block still has two edge occurrences. If the two edges
+pass different values to that block, a map keyed only by source
+and target cannot represent the program. Give the edge occurrence
+an identity of its own or key by owning terminator and successor
+position under a contract forbidding position changes without
+remapping. Maintain the target's predecessor index as the inverse
+of those occurrences, not as a set of predecessor blocks.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Stored relation & Canonical location & Reverse lookup \\
+\hline
+Control transition & Terminator's ordered edge & Target's incoming edge IDs \\
+Ordinary value use & Instruction operand slot & Definition's use list \\
+Edge argument use & Outgoing edge argument slot & Definition's use list \\
+Block membership & Block's ordered instructions & Instruction's owner link \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Represent Uses Per Operand Occurrence}
+
+The instruction \texttt{add(v,v)} has two uses of \texttt{v},
+not one. Store a use record for each operand occurrence, with an
+owner, an operand position within that owner, a definition, and
+the position of the record in the definition's reverse list.
+For a thin implementation the record can be embedded in the
+operand slot; if changing the operand array moves it, the use
+identifier must still resolve correctly or be rewritten as well.
+A growable dense reverse list with swap-removal is efficient
+when the order of uses has no semantics. Debug output and
+deterministic passes should obtain stable ordering separately
+if the revision history otherwise determines enumeration order.
+
+In \Cref{fig:visual-424}, branch slots \(E_0\) and \(E_1\)
+target the same block \(J\). The predecessor index lists two
+edges. Each edge owns its argument use and \(J\)'s block
+parameter gets the value from the edge by which control arrives.
+Dropping \(E_1\) means unlinking its argument uses, even when a
+test of the set of successor blocks sees no change.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (p) at (0,0) {Block \(P\)};
+  \node[tome box] (t) at (3.2,0.95) {\(E_0\): pass \(a\)};
+  \node[tome box] (f) at (3.2,-0.95) {\(E_1\): pass \(b\)};
+  \node[tome box accent] (j) at (6.6,0) {Block \(J(x)\)};
+  \draw[tome arrow] (p) -- (t);
+  \draw[tome arrow] (p) -- (f);
+  \draw[tome arrow] (t) -- (j);
+  \draw[tome arrow] (f) -- (j);
+\end{tikzpicture}
+\caption{One pair of blocks can be connected by separate edge occurrences. A block argument is selected by the edge, not just the predecessor block.}
+\label{fig:visual-424}
+\end{figure}
+
+% Annotated walkthrough
+\section{Change Operands Through Their Reverse Index}
+
+\begin{verbatim}
+set_use(u, new):
+    old := use[u].definition
+    if old == new: return
+    require type_of(new) == expected_type(u)
+    require new is available at u
+    i := use[u].reverse_index
+    list := uses_of[old]
+    assert list[i] == u
+    last := list.pop()
+    if last != u:
+        list[i] := last
+        use[last].reverse_index := i
+    use[u].definition := new
+    use[u].reverse_index := uses_of[new].length
+    uses_of[new].append(u)
+
+replace_all_uses(old, new):
+    if old == new: return
+    preflight_types_and_availability(uses_of[old], new)
+    reserve_uses_capacity(new, uses_of[old].length)
+    while not uses_of[old].empty():
+        set_use(uses_of[old].last(), new)
+\end{verbatim}
+
+The loop removes a use from the list it is draining; it doesn't
+walk a cursor over a vector whose iteration order changes under
+it. The preflight ensures that a type or dominance error cannot
+leave only half of the uses replaced. For an ordinary operand,
+availability includes definition-before-use order inside a block;
+for an edge argument it is tested at the source terminator.
+A replacement with no type conflict can still create a use
+before its definition. This might be obvious when both are
+instructions in one block and much harder to see at a merge.
+
+Store and update both directions in one mutation API. Rewrites
+that create a partially built graph should keep it private until
+all endpoints, reverse links, and block argument arities are
+reconciled. Split a critical edge, for instance, by creating a
+new intermediary block, retargeting that exact terminator edge,
+and attaching a forward edge passing the old values to the old
+destination. Those values must still be available at the new
+forwarding terminator; receiving and relaying intermediary block
+arguments is one way to ensure this. Repointing every edge with
+the same target would also change paths the rewrite did not select.
+
+\section{Validate Authority With a Slow Reconstruction}
+
+In a debug verifier, reconstruct incoming edge lists by visiting
+terminators and reconstruct use lists by visiting every ordinary
+operand and edge argument. Compare multisets of edge identities
+or use identities, plus slot positions, to the maintained indexes.
+Finding equal degrees is not enough: two missing occurrences
+can be masked by two duplicates. If the IR also stores block
+owner links, compare each against the actual block list. Run the
+verification immediately after graph mutation transactions, not
+only at the end of the compiler when the responsible pass is
+hard to identify.
+
+For a pass that edits infrequently, don't maintain a duplicate
+index just because you can. A linear reconstruction may be
+cheaper than keeping reverse links for every rare query.
+Record graph versions for derived analyses: changing an
+operand need not invalidate dominance, but retargeting an edge
+potentially does. A handle's successful generation check says
+the object is live, not that an old analysis about it remains
+valid. \Cref{ch:ext-426} shows how a single removed edge can
+change dominance while leaving both block handles unchanged.
+
+\section{Exercise Multiplicity and Graph Churn Together}
+
+Construct a terminator that passes \texttt{v} on one edge and
+\texttt{w} on the other to the same join. Make a following
+ordinary instruction use \texttt{v} twice, choosing a case where
+the definition of \texttt{v} dominates all three uses. The reverse
+index must have three distinct entries. Replace the uses of
+\texttt{v} by another dominating value, take the false branch
+only, and erase the now-unused definition. After the edit the
+remaining edge argument must still be \texttt{w}. This fixture
+checks both index directions and would fail on an endpoint-only
+control map or a user-only value map.
+
+For memory and latency measurements, distinguish definitions
+with no users, the common short reverse lists, and a few hot
+definitions used by hundreds of operands. An inline small-vector
+reverse list saves allocations for common arities but fattens
+every record, even when empty. Measuring only a high-fanout
+synthetic program favors a different representation than editor
+incremental lowering or mostly scalar optimization.
+
+\section{Detach Cycles in Bulk Before Reclaiming Their Records}
+
+Dead code removal can encounter an unreachable loop whose
+instructions use one another through block arguments. Erasing
+individual definitions only when their reverse lists are
+empty will not reclaim the loop. First determine the full
+deletion set. Prove that no use of a value defined in that
+set survives, or rewrite those external uses. An unreachable
+block can have an outgoing edge into a reachable join:
+cutting the edge and unlinking its argument uses may remove
+some of the alleged external uses without making the join
+unreachable. Rebuild the surviving join's incoming list and
+check it against the remaining terminators.
+
+Once the cut is accounted for, unlink uses owned by deleted
+instructions and edges, then free operands, edges, and
+definitions in an order that leaves no index pointing into
+the retired storage. Cycle handling is then a graph operation,
+not a special case in the allocator. To test this path build
+two unreachable blocks with a loop-carried parameter, one
+of which also branches to a live join. After removal, scan
+the join's predecessor list and the reverse uses of every
+live definition. Verify both are free of handles to the
+deleted set even if those numeric slots are allocated again.

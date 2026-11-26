@@ -1,0 +1,191 @@
+% Source: appel-book-ml-better-typeset.txt
+% Source: garbage-coll-in-large-lisp-system.txt
+
+\section{Treat Address Change as an Object-Identity Operation}
+
+A two-semispace collector allocates into one range while
+reserving a second for the next collection. At the pause,
+the occupied range becomes from-space and the empty range
+becomes to-space. Copy reachable objects to to-space, repair
+their incoming references, and discard from-space as a unit.
+This exchanges memory headroom for a compact destination and
+a pause that does not need to inspect individual garbage
+objects. Each old object has at most one destination.
+Preserving that property matters for mutable objects and for
+reference equality: two references to one object must not
+start pointing at different copies.
+
+Forwarding is the operation that preserves sharing. If an old
+header has a forwarding tag, return the recorded destination.
+Otherwise read the old descriptor and size, copy the object
+with its ordinary header intact, and replace the source header
+with a forwarding record. A minimum object extent must be
+large enough for that record, or the implementation can use
+side metadata. Appel's exposition uses Cheney's traversal
+and interprets the destination itself as a work queue
+\cite{appel2004modern}. The Symbolics 3600 copying design
+described by Moon shares the notion of forwarding but uses
+different spaces and scheduling; two fixed halves are a
+design choice, not a requirement of forwarding.
+
+\section{Read the Destination as a Queue}
+
+In \Cref{fig:visual-413}, objects before the scan cursor have
+no remaining from-space references. Objects between the scan
+and free cursors are parseable destination objects, but their
+fields may still refer to old addresses. The unallocated
+suffix after the free cursor is not scanned. This is why the
+destination header must preserve the original descriptor and
+extent. At every loop iteration the cursor starts at exactly
+one object, not at the first pointer field.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (r) at (0,0) {Scanned};
+  \node[tome box accent] (q) at (4,0) {Waiting};
+  \node[tome box] (f) at (8,0) {Unallocated};
+  \draw[tome arrow] (r) -- node[above]{scan} (q);
+  \draw[tome arrow] (q) -- node[above]{free} (f);
+\end{tikzpicture}
+\caption{The copied but unscanned interval is Cheney's queue. Forwarding appends to the interval, while visiting consumes its first object.}
+\label{fig:visual-413}
+\end{figure}
+
+Let \(R\) point twice to pair \(A\), with \(A\) pointing to
+\(B\) and \(B\) back to \(A\). Assume \(A\) needs 32 bytes
+and \(B\) needs 48, and count offsets in to-space. The two
+root slots do not require two copies.
+
+\begin{center}
+\begin{tabular}{lrrl}
+\hline
+Action & Scan & Free & Newly recorded \\
+\hline
+Forward both root slots & 0 & 32 & \(A \mapsto 0\) \\
+Scan \(A'\) & 32 & 80 & \(B \mapsto 32\) \\
+Scan \(B'\) & 80 & 80 & nothing \\
+\hline
+\end{tabular}
+\end{center}
+
+% Annotated walkthrough
+\section{Evacuate Each Object Exactly Once}
+
+\begin{verbatim}
+forward(p):
+    if p is null or outside_from_space(p): return p
+    assert p is an object start
+    if forwarded(p): return forwarding_address(p)
+    bytes := extent(p)
+    assert bytes <= to_limit - free
+    dst := free
+    copy_bytes(dst, p, bytes)
+    free := free + bytes
+    install_forwarding(p, dst)
+    return dst
+
+flip(roots):
+    scan := to_begin
+    free := to_begin
+    for slot in roots: slot.store(forward(slot.load()))
+    while scan < free:
+        obj := object_at(scan)
+        for slot in strong_slots(obj):
+            slot.store(forward(slot.load()))
+        scan := scan + extent(obj)
+    assert scan = free
+    exchange_space_roles_and_resume_allocation_at(free)
+\end{verbatim}
+
+The mutator is stopped and no allocation runs while
+\texttt{forward} is active. If immutable or nonmoving objects
+exist outside from-space, ignoring their addresses does not
+eliminate their outgoing edges. Any slots in those objects
+that can refer to from-space must be seeded as roots or
+enumerated by a separate policy. For a generational instance see
+\Cref{ch:ext-415}. Likewise, weak slots must not
+call this routine indiscriminately: evacuating their referents
+would convert weak reachability into strong reachability. Handle
+roots or recomputation must restore derived addresses that
+cannot themselves be interpreted as object starts.
+
+\section{Check Headroom Before Entering Forwarding}
+
+In equal-size spaces with the same alignment and no promotion
+or collection-time allocation, the total extent copied is at
+most the old occupied extent. Destination exhaustion then
+indicates a bug or a violated assumption. But if the application
+filled a 16 MiB space and 15 MiB survives, a requested 2 MiB
+object still does not fit after the flip. Collection completed
+correctly; capacity did not suffice. Grow or fail according
+to the allocation policy rather than flipping repeatedly and
+recopying the same survivors. If a variable-size planner
+chooses a smaller destination, an evacuation failure after
+source headers have been overwritten is not a routine retry.
+It needs a planned fallback or prior reserved capacity.
+
+Physical locality is a separate decision. Breadth-first order
+puts objects discovered around the same time together, but
+need not put the nodes along one hot path close to each other.
+For a wide tree whose common operation follows one child per
+level, a depth-first layout can pack that route more tightly
+on some workloads. Conversely, a scan processing all items
+on one level may benefit from breadth-first layout. Do not
+attribute gains from rebuilding a contiguous heap entirely to
+one traversal order. Measure bytes copied, objects copied,
+post-collection allocation runway, and application access
+patterns separately.
+
+\section{Exercise the Space Boundary Twice}
+
+Run fixtures with one self-loop, two paths to one child, and a
+mixed-size cycle. Compare object identity before and after
+the move using test IDs not derived from addresses. Then force
+a second flip so both ranges have occupied both roles.
+A stale address could coincidentally point inside the active
+space on the second flip, so verify the graph before every
+reuse. On debug builds invalidate or poison from-space when
+the proof says no live slots go there. A parser that depends
+on a stale header will then fail near the bad collection.
+
+Finally, test exact fit in the destination and an allocation
+that requires one alignment unit more. Keep a pinned or
+foreign object out of this semispace unless the design has a
+special place for it. Merely skipping its copy would cause
+the old range to be reclaimed around it. A nonmoving region
+with recorded outgoing slots accounts for both its lifetime
+and any references it holds to evacuated objects.
+
+\section{Audit the Order of Header Operations}
+
+A forwarding tag is only recognized in the occupied portion
+of from-space. The object at an arbitrary address within that
+range is not necessarily valid, so a debug visitor can check
+an object-start bitmap before trusting the header. Once an
+object is forwarded, reading its ordinary size from that old
+header is no longer meaningful; a debug heap iterator for
+old space needs precomputed starts or some separate way to
+decode forwarded extents. In production the basic algorithm
+does not walk old space linearly, so it does not need that
+additional metadata merely to advance its queue.
+
+An implementation might optimize a byte vector by omitting
+its padding from the physical copy. Its destination extent
+must still include the padding, and its object header must
+still be initialized. If another subsystem exposes stable
+object bytes, such as hashing an explicitly specified byte
+payload, it cannot read unspecified padding as part of the
+logical value. Use a vector of length one together with an
+object of a different alignment-sensitive extent to test the
+scanner's advance. Looking only at the first relocated object
+does not catch a bad queue stride.
+
+For a heap with multiple roots, also change enumeration order
+in the test harness. The new addresses and hence the order
+of scanning may vary, but the graph modulo addresses must be
+the same. This gives a direct way to detect hidden assumptions
+that a particular root is the one to copy a shared object.
+Repeat with repeated root values in different slots, rather
+than registering one physical root slot several times.

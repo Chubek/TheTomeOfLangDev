@@ -14,7 +14,7 @@
 ##   make count      — Count words/pages
 ##   make chapter-lengths — Measure chapters with Pandoc
 ##   make lint       — Check for common LaTeX issues
-##   make check-expansion — Check chapter walkthroughs, visuals, dossier links and source catalogue
+##   make check-expansion — Check chapter content, placement, sources, and new chapter lengths
 ##   make help       — Show this help
 ##
 
@@ -23,7 +23,7 @@
 MAIN    := the-tome-of-langdev
 CLASS   := $(MAIN).cls
 LTX     := $(MAIN).ltx
-EXTENSIONS := tome-extensions.ltx tome-native-toolchain.ltx tome-description-languages.ltx tome-alternative-languages.ltx
+EXTENSIONS := tome-extensions.ltx tome-native-toolchain.ltx tome-description-languages.ltx tome-alternative-languages.ltx tome-runtime-interfaces.ltx
 PDF     := $(MAIN).pdf
 BIB     := references.bib
 SUPPORT := $(wildcard support/*.sty)
@@ -96,6 +96,7 @@ chapter-lengths:
 
 check-expansion:
 	python3 -B support/check_expansion.py
+	@python3 -B support/chapter_lengths.py --minimum 120 $$(seq 385 429) > /dev/null
 
 help:
 	@echo "The Tome of Programming Language Development — Build System"
@@ -113,5 +114,5 @@ help:
 	@echo "  make count      Count words and chapters"
 	@echo "  make chapter-lengths   Measure chapter plaintext lengths with Pandoc"
 	@echo "  make lint       Check for common LaTeX issues"
-	@echo "  make check-expansion  Check chapter walkthroughs, visuals, dossier links and source catalogue"
+	@echo "  make check-expansion  Check chapter content, placement, sources, and new chapter lengths"
 	@echo "  make help       Show this help"

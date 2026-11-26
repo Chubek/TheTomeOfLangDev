@@ -1,0 +1,189 @@
+% Source: jvm-specs.txt
+% Source: dlang-specs.txt
+
+\section{Separate Finding a Binding from Computing Its Value}
+
+An import may request a declaration, an allocated storage cell,
+or a fully initialized value. Those requests need not have the
+same dependencies. Consider a small drawing application: the
+\texttt{Brushes} module registers a standard brush in its initializer,
+and \texttt{Canvas} constructs a default view from that brush.
+\texttt{Brushes} also imports the type \texttt{Canvas.Bounds}.
+The type dependency is harmless at run time; the eager request
+for a brush is a real initialization edge. Giving all import
+edges the same meaning can either reject this program or allow
+it for the wrong reason.
+
+Assume a language in which function declarations can be bound
+before executing any initializer, but invoking one can still
+read module storage. Allocating the storage for both modules
+does not make either module ready. That distinction matters when
+an initializer calls a function from another module which in turn
+reads a variable in the first. The variable must either have an
+explicit language-defined pre-initialization value or the read
+must fail; whatever bits happened to be in storage are not a
+language policy.
+
+\section{Classify Cycles by the Demands They Contain}
+
+\Cref{fig:visual-400} shows why a compile-time cycle can coexist
+with an acyclic run-time order. Signatures can be collected for
+the entire component; for initialization, \texttt{Canvas} waits
+on \texttt{Brushes} but not the reverse. If \texttt{Brushes} now
+asks for the constructed view during registration, add the
+reverse value edge. Topologically sorting the original import
+graph misses this semantic distinction.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (c) at (-2.4,0) {Canvas};
+  \node[tome box dark] (b) at (2.4,0) {Brushes};
+  \draw[tome arrow] (c) to[bend left=24] node[above]{eager value} (b);
+  \draw[tome dashed] (b) to[bend left=24] node[below]{type only} (c);
+\end{tikzpicture}
+\caption{Canvas must wait for a registered brush; the type-only import does not make Brushes wait for Canvas.}
+\label{fig:visual-400}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Dependency & Needed by & Runnable before initialization? \\
+\hline
+Exported type & type checker & no run-time action \\
+Function address & loader & yes, in the toy design \\
+Calling that function & initializer & depends on what it reads \\
+Default brush value & view construction & only after publication \\
+\hline
+\end{tabular}
+\end{center}
+
+If dependencies are explicit, diagnose a strongly connected
+component of eager demands and produce a short cycle path with
+the value requests labeled. If user code can make arbitrary
+calls in initializers, a static graph may be incomplete; a
+runtime guard can reject a demand when it occurs. Alternatively,
+force authors to declare the eager dependencies and restrict
+initializers so their dynamic accesses cannot escape the graph.
+The implementation below chooses dynamic failure in a serialized
+initialization phase, not a fixed point over side effects.
+
+% Annotated walkthrough
+\section{Execute at Most Once and Publish Only on Success}
+
+\begin{verbatim}
+prepare(module):
+    module.cells := allocate_unpublished_cells()
+    module.declarations := bind_function_addresses()
+    module.state := Prepared
+
+ensure_ready(m, stack):
+    match m.state:
+        Ready: return
+        Failed(cause): raise prior_failure(m, cause)
+        Running: raise initialization_cycle(stack, m)
+        Prepared: pass
+    m.state := Running
+    stack.push(m)
+    try:
+        pending := run_initializer(m, stack)
+        verify_all_required_values(pending)
+        m.cells := pending
+        m.state := Ready
+    catch exc:
+        m.state := Failed(exc)
+        raise exc
+    finally:
+        stack.pop()
+
+read_export(m, name, stack):
+    ensure_ready(m, stack)
+    return m.cells[name]
+\end{verbatim}
+
+Here exported value reads are subject to readiness; an initializer
+uses its own staged cells directly under the language's local
+definite-assignment rules. Running into itself via an exported
+value read fails. A language need not choose this exact behavior.
+The JVM specifies four initialization states for classes and
+interfaces and treats a same-thread recursive request differently:
+it allows that request to complete normally, potentially exposing
+the effects of preparation and whatever initialization has run so
+far. That behavior should not be confused with reexecuting the
+initializer or with a transaction that publishes every write at once.
+
+\section{Make Failure and Ordering Observable on Purpose}
+
+Staging the module's exports does not undo actions on other
+objects. If an initializer changes a shared registry and then
+raises, a failed state prevents a second attempt but does not
+erase the first attempt's registry changes. A production API can
+prepare candidate registrations privately, commit once at the
+end, and use an explicit compensating operation only where it
+can prove the operation is safe. Avoid automatic retry for effects
+whose execution count is externally observable.
+
+For independent modules, specify whether initializer order is
+observable and whether a deterministic tie-break is part of the
+contract. Concurrent initialization needs more than running the
+same code on two threads: readiness must publish writes with
+appropriate synchronization, failures must wake waiters, and
+waiting on another owner introduces cross-thread cycles. A single
+initialization executor precludes those particular wait cycles if
+initializers cannot create their own blocking waits. Test a
+diamond (the common prerequisite runs once), a failing action
+(the failure is replayed without rerunning), and a reentrant value
+read (the cycle path includes both requests). Log effect events as
+well as outputs so a duplicate registration cannot go unnoticed.
+
+\section{Decide Where to Put Delayed Work}
+
+Languages can also put a module's startup order directly into
+their specification. D, for example, defines lexical order for
+static constructors inside a module and reverse order for static
+destruction. This concerns execution of effects, not the order
+in which the compiler collects the module's declarations.
+
+One way to fix the brush cycle is to have the registry store a
+factory instead of a constructed view. The factory captures enough
+information to fetch the default view when invoked. It must not
+fetch the view when registered; that would reintroduce the demand
+at the old point. This changes the public contract: reading a
+registry entry now yields a factory, and forcing it can fail or
+produce effects later. The compiler cannot make this rewrite
+merely because it found a cycle unless the language treats that
+change in timing as unobservable.
+
+\begin{verbatim}
+eager startup:
+    Canvas asks for Brushes.default
+    Brushes asks for Canvas.default_view
+    Canvas is Running: cycle
+
+factory startup:
+    Canvas asks for Brushes.default
+    Brushes publishes the brush and a view factory
+    Canvas publishes its default_view
+    client calls the factory: Canvas is Ready
+\end{verbatim}
+
+If a registry routine immediately invokes a factory to validate it,
+the factory version still fails. Document which calls merely store
+a callback and which calls execute it. The same issue appears
+when a nominally lazy value computes its key eagerly or demands
+a dependency to log a description. The initialization trace must
+include these reads, not just the textual imports. Unstructured
+callbacks in startup code can make the value graph harder to
+reason about than the module graph.
+
+An alternative is to extract the common state into a third module
+with no initialization dependencies and pass prepared values into
+an explicit startup routine. This eliminates the cycle by moving
+control to the application rather than delaying it into the
+first read. Compare the two options with a fixture that observes
+when factory work starts. In an eager setup the failure is part
+of startup; in the delayed setup it may happen after drawing has
+begun. That choice belongs in the library's initialization contract,
+not in an incidental traversal order chosen by the loader.

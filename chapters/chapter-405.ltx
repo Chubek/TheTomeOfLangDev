@@ -1,0 +1,207 @@
+% Source: cc-compiler-desgin-handbook-codegen-2nd-end.txt
+% Source: dlang-specs.txt
+
+\section{Treat a Slot as an ABI Contract}
+
+In the toy ABI used here, a class in a single inheritance
+chain begins with a pointer to its table. A subclass
+inherits the parent's field offsets and table slots. A
+new virtual declaration reserves a new slot; an override
+replaces the target of an existing slot. The entry has
+the signature promised to callers of the original method.
+These choices make a call compiled through a base type
+work on an object allocated by a subclass, including when
+the caller was compiled before the subclass existed.
+
+The compiler design handbook's chapter on object-oriented
+optimization illustrates this layout for single inheritance
+and uses embedded base objects to explain why a more
+complex layout is needed for multiple inheritance. Those
+ideas are not a specification of all C++ targets. The
+toy offsets below are chosen for exposition; real targets
+also specify alignment, metadata, and construction rules.
+
+\section{Keep Both the Object Address and the View Address in Mind}
+
+A \texttt{Dial} contains a \texttt{Widget} view at byte
+0 and a \texttt{Colored} view at byte 24. A routine
+accepting \texttt{Colored} receives a pointer into the
+\texttt{Dial}; it does not need to know that \texttt{Dial}
+exists. That pointer names the beginning of the
+\texttt{Colored} subobject, where its table pointer lives.
+Now \texttt{Dial} overrides \texttt{tint} and implements it
+with access to fields in the full object. The selected
+entry expects the view address but the overriding body
+expects the complete address. An entry thunk adapts one
+to the other. \Cref{fig:visual-405} shows this with
+addresses relative to the complete object.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (w) at (0,1.0) {Widget at +0};
+  \node[tome box] (c) at (0,-1.0) {Colored at +24};
+  \node[tome box dark] (t) at (3.35,-1.0) {tint entry thunk};
+  \node[tome box accent] (d) at (6.6,1.0) {Dial.tint(+0)};
+  \draw[tome arrow] (c) -- node[below]{select} (t);
+  \draw[tome arrow] (t) -- node[right]{subtract 24} (d);
+\end{tikzpicture}
+\caption{The caller passes the Colored view. The entry thunk restores the complete Dial address before entering the body.}
+\label{fig:visual-405}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+View & Slot & Entry target & Body expects \\
+\hline
+Widget & 0 & inherited \texttt{Widget.paint} & Widget pointer \\
+Widget & 1 & \texttt{Dial.resize} & Dial pointer \\
+Colored & 0 & adjustor for \texttt{Dial.tint} & Dial pointer \\
+Colored & 1 & inherited \texttt{Colored.mix} & Colored pointer \\
+\hline
+\end{tabular}
+\end{center}
+
+Slot 0 in one view is unrelated to slot 0 in the other.
+An inherited body such as \texttt{Colored.mix} must not
+be adjusted to the complete object simply because the
+complete object has type \texttt{Dial}. The adjustment
+depends on the entry's incoming view and the selected
+body's expected view. The D specification describes a
+related mechanism for interface views and adjustor
+thunks; its concrete representation is its own ABI.
+
+% Annotated walkthrough
+\section{Lay Out Entries With the Correct Incoming Receiver}
+
+\begin{verbatim}
+build_table(complete, view):
+    entries := []
+    for family in view.slot_order:
+        body := select_override(complete, view, family)
+        require_compatible_override(body, family.contract)
+        from_offset := offset_of_view(complete, view)
+        to_offset := offset_of_view(complete, body.expects_view)
+        delta := to_offset - from_offset
+        entries.append(make_entry(body, delta, family.contract))
+    return entries
+
+make_entry(body, delta, contract):
+    if delta == 0 and same_abi(body, contract): return body
+    return thunk(view_receiver, args):
+        receiver := byte_offset(view_receiver, delta)
+        result := call_body(body, receiver, adapt_args(contract, args))
+        return adapt_result(body, contract, result)
+
+upcast_to_colored(dial):
+    if dial is null: return null
+    return byte_offset(dial, 24)
+\end{verbatim}
+
+This toy code assumes statically determined offsets in the
+table construction, concrete targets, and unambiguous
+subobject paths. A real layout supporting virtual bases
+may have to load an offset determined by the complete
+class, and two occurrences of a repeated base may require
+distinct paths even though the base name is identical.
+An abstract slot needs a noncallable marker or a trap,
+not accidental fallthrough to another slot. In any variant,
+constructor code must set the appropriate table pointers
+before making the views observable under the language's
+construction semantics.
+
+\section{Test Overrides, Results, and Layout Evolution}
+
+For a concrete address trace, allocate a \texttt{Dial} at
+1000. Upcasting to \texttt{Colored} yields 1024, whose
+first slot points to the adjustor. The thunk computes
+1000 and enters \texttt{Dial.tint}. Dispatching slot 1
+instead passes 1024 unchanged. Use distinct sentinel values
+in both subobjects so the test catches reading the wrong
+field even when the call reaches the expected function.
+Also test a null upcast; it must not manufacture an
+interior address.
+
+A covariant result can require adjustment in the other
+direction. Suppose the slot promises to return a
+\texttt{Colored} pointer and an override produces a
+\texttt{Dial} pointer. The adapter must apply the required
+upcast to that result, preserving null. A pure
+receiver-adjusting entry might be a tail jump; an adapter
+that has to transform the normal return generally needs
+control after the body returns. Its unwind metadata must
+describe that choice correctly.
+
+For layout evolution, compile a caller against one version
+and then link a class whose previous slots have been
+reordered. The ABI checker must reject this mixture rather
+than assuming a shared method spelling can save it.
+Adding a base field can similarly shift a separately
+compiled view. Version the ABI, force consumers to
+recompile, or reserve a representation whose offset and
+slot promises do not move. If an implementation has
+moving collection, interior views also need a way to
+identify their owning allocation or be represented as
+base-plus-offset roots. A machine pointer to byte 24 is
+not automatically a pointer to a separately allocated
+object.
+
+\begin{verbatim}
+baseline: Colored.tint(1024) -> Dial.tint(1000)
+baseline: Colored.mix(1024)  -> Colored.mix(1024)
+new nonvirtual method: existing entries unchanged
+reordered slot: old caller must not link under the same ABI
+\end{verbatim}
+
+Finally compare a direct call that takes a complete
+\texttt{Dial} receiver with a virtual call through
+\texttt{Colored}. The renderer should see the same
+mutation in both cases. This is not a claim that the
+addresses passed at the source call boundary match; it
+demonstrates that the entry adapter makes the difference
+irrelevant to the body.
+
+\section{Keep Construction and Destruction Consistent With the View}
+
+Assume this toy language suppresses derived virtual behavior
+during a base initializer. Calling \texttt{tint} against the
+\texttt{Colored} portion of a half-built \texttt{Dial} must
+therefore select the base initializer's target, not a
+\texttt{Dial} implementation that reads still-uninitialized
+fields. One implementation installs construction-phase
+tables when entering each base and installs the final tables
+after the fields they require are ready. Another can restrict
+which virtual calls are allowed during construction. Neither
+policy follows from the byte offsets alone.
+
+\begin{verbatim}
+allocate Dial storage
+install Colored construction table on view +24
+initialize Colored fields
+initialize Dial's own fields
+install final tables for both views
+publish Dial
+\end{verbatim}
+
+If construction fails after the base initializer, cleanup
+must know which portions were actually constructed. Do not
+route through a final-class destructor that assumes all
+fields are live. If the language mirrors base-only behavior
+on destruction, restore the corresponding phase view before
+entering a base destructor. Test by letting a base initializer
+and destructor each log a virtual call with a visible
+implementation name, and then compare a call on a fully
+constructed object. The trace should match the phase
+specified by the language; memory layout inspection alone
+cannot verify that rule.
+
+For a moving collector, the table entry's transient interior
+address and the object view stored in language variables may
+have different liveness requirements. \Cref{ch:ext-408,ch:ext-411}
+separates layout from the roots that must survive a
+collection point.
+In particular, a safepoint inside an adjustor that performs
+a non-tail call has to describe any live managed receiver
+under the representation used at that machine instruction.

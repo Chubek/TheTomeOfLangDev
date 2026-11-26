@@ -1,0 +1,195 @@
+% Source: concepts-and-semantics-of-proglang-2-ocaml.txt
+% Source: the-rust-proglang.txt
+
+\section{Select a Declaration Before Selecting Its Machine Body}
+
+The call \texttt{measure(x)} can involve several distinct
+decisions. Name resolution locates an overload set, overload
+resolution chooses a declaration, and generic instantiation
+supplies arguments to that declaration. If the chosen
+declaration is a virtual method, a fourth decision is made
+when the receiver is known. Static determination of an
+overload is not evidence that the final method body is fixed.
+That later selection is the subject of \Cref{ch:ext-404}.
+The local OCaml concepts text contrasts Java overloading with
+overriding; the Rust book illustrates substitution of concrete
+types during monomorphization.
+
+In our toy language a shape printer provides \texttt{encode(Int)},
+\texttt{encode(Real)}, and \texttt{encode[T:Scalar](Vector[T])}.
+Implicit widening from integer to real is allowed. Exact
+matches outrank widening, but comparisons across parameters
+use dominance, not a sum: a candidate must be no worse on all
+arguments and better on at least one. Use language-defined
+tie-breakers only after this comparison. Treat candidates that
+cannot infer their required type arguments as inapplicable.
+
+\section{Keep Conversions and Substitutions in the Typed Call}
+
+\Cref{fig:visual-403} splits the information a front end
+derives from the callable instance that the back end emits.
+An inserted conversion belongs to the selected candidate,
+not to the source argument independent of the candidate.
+Record it rather than looking at the arguments again after
+optimization; a value proven constant later does not entitle
+the compiler to choose a different overload.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (s) at (0,0) {Overload set};
+  \node[tome box dark] (t) at (3.25,0) {Typed call};
+  \node[tome box accent] (i) at (6.5,0) {Concrete instance};
+  \draw[tome arrow] (s) -- node[above]{rank} (t);
+  \draw[tome arrow] (t) -- node[above]{substitute} (i);
+\end{tikzpicture}
+\caption{The typed call fixes the declaration and any argument conversions before instantiation.}
+\label{fig:visual-403}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Input type & Selected declaration & Later instance \\
+\hline
+\texttt{Int} & exact integer overload & existing body \\
+\texttt{Real} & exact real overload & existing body \\
+\texttt{Vector[Int]} & vector overload & vector body for integer \\
+\texttt{Vector[Real]} & vector overload & vector body for real \\
+\texttt{Vector[Image]} & no viable overload & none \\
+\hline
+\end{tabular}
+\end{center}
+
+When candidate resolution tries inference, its tentative
+unifications belong to that attempt. Roll them back before
+trying another candidate. Distinguish a failed constraint
+from an ambiguous successful pair so that diagnostics can
+show exactly where each candidate falls out. Resolve a
+selected generic's obligations to the concrete conformance
+identities that lowering will need.
+
+% Annotated walkthrough
+\section{Collect Concrete Instances With a Worklist}
+
+\begin{verbatim}
+make_typed_call(candidates, operands):
+    trials := []
+    for c in candidates:
+        trial := infer_in_private_context(c, operands)
+        if trial.applicable: trials.push(trial)
+    best := require_unique_best(trials)
+    return Call(best.decl, best.substitution, best.conformances,
+                apply_conversions(best.plan, operands))
+
+request(decl, substitution, conformances):
+    key := instance_key(decl, substitution, conformances, target)
+    if key not in symbols:
+        symbols[key] := reserve_symbol(key)
+        work.push(key)
+    return symbols[key]
+
+while work not empty:
+    key := work.pop()
+    ir := substitute_checked_body(key)
+    for edge in ir.direct_generic_edges:
+        edge.symbol := request(edge.decl, edge.args, edge.evidence)
+    emit(symbols[key], ir)
+\end{verbatim}
+
+Reserving a symbol before visiting its dependencies handles a
+recursive call at the same instantiation: \texttt{scan[Int]}
+can refer to itself before the body has been emitted. Roots
+must include reachable address-taken functions and concrete
+instances named as exports, not just ordinary call
+instructions. If conformance arguments can vary at one type,
+the instance key must distinguish them; even the same data
+layout does not imply identical implementations of an operation.
+
+\section{Bound Expansion That Does Not Repeat a Key}
+
+The worklist alone does not terminate an expansion in which a
+generic calls itself at strictly growing types. For example,
+instantiating \texttt{nest[Int]} may require
+\texttt{nest[Vector[Int]]}, which needs another vector layer.
+A runtime base case does not necessarily remove the emission
+dependency: the compiler may not know which path will run.
+Specify a rule that detects unsupported growth or issue a
+diagnostic at a bounded compiler resource limit, with a few
+links from the instantiation chain. If the language requires
+such programs to compile, provide a representation-sharing or
+dictionary-passing implementation for the problematic code.
+
+\begin{verbatim}
+fn scan[T](xs):
+    if xs.empty: return 0
+    return 1 + scan[T](xs.tail)       // repeats the same key
+
+fn nest[T](x, n):
+    if n == 0: return
+    nest[Vector[T]](singleton(x), n - 1)
+    // the concrete type keeps growing even if n decreases
+\end{verbatim}
+
+Separate compilation gives a further choice: export checked
+generic IR and allow consumers to instantiate, or provide
+shared generic code with a documented representation contract.
+For the former, duplicate concrete bodies can use a linker
+deduplication mechanism when available; the build must still
+guarantee that all providers of a given key agree, including
+which generic body revision was used. Equal symbol spellings do
+not repair inconsistent instantiation inputs. Distinguish the
+interface dependencies of a client calling a nongeneric routine
+from those of a client emitting a library generic's body.
+
+Measure size and runtime separately. Direct calls often enable
+inlining and scalar optimizations, but many nearly identical
+instances can occupy instruction-cache space and increase build
+time. Test both overload choice and emission: a pair
+\texttt{(Int,Real)} versus \texttt{(Real,Int)} for two integer
+arguments must be ambiguous under the dominance rule; two
+calls to one successful vector specialization should request
+one emission key. Also add a fresh override without adding an
+overload: a virtual caller's descriptor should stay unchanged
+even when its observed target changes.
+
+\section{Share Only Code That Has the Same Representation Contract}
+
+Suppose \texttt{Count} and \texttt{Index} are distinct nominal
+types represented by the same integer word. A compiler could
+emit one machine function for \texttt{length[Count]} and
+\texttt{length[Index]} if their representation, generated
+operations, and calling conventions agree. It cannot apply the
+same rule to \texttt{encode} if the two types supply different
+formatters. They can share a body that calls an explicitly
+passed formatter, but not a body that baked in either
+formatter's address. The compiler is then choosing a different
+lowering strategy, not changing the generic's source meaning.
+
+\begin{verbatim}
+length[Count] -> length_word
+length[Index] -> length_word
+encode[Count] -> encode_word(count_format, argument)
+encode[Index] -> encode_word(index_format, argument)
+\end{verbatim}
+
+To share code, prove compatibility for returns and indirect
+arguments as well as scalar parameters. A function copying
+values might use different move, copy, or tracing behavior
+even when size and alignment match. A language exposing
+function identity may also constrain aliasing of public entry
+points; small wrappers can preserve distinct source-visible
+function identities while delegating to a shared body.
+
+Compare both code generation strategies on two nominal word
+types whose formatters produce deliberately different strings.
+Then feed the same two types into a generic that just counts
+elements and compare emitted body count. Neither test alone
+justifies the optimization: the first verifies that sharing
+preserves behavior, the second detects whether the compiler
+actually eliminated redundancy in a case where it could.
+
+Also compare builds with and without link-time optimization.
+A merge performed at link time must preserve the same evidence
+and public entry-point distinctions as a merge in the front end.

@@ -1,0 +1,186 @@
+% Source: psabi-x86-64.txt
+% Source: ffi-clisp.txt
+
+\section{Separate Resolution from Invocation}
+
+A dynamic loader can tell the runtime where an export lives without
+telling it how to call the export. Symbol lookup and relocation
+belong to the link/load layer \cite{levine2000linkers}; the runtime
+still needs a target calling convention and a prototype to construct
+the call. In the Common Lisp extract, foreign function definitions
+include argument and result types and distinguish the Lisp binding
+name from the foreign name. Keep that distinction in the runtime:
+two public methods may wrap the same symbol with different policies,
+but neither can invent a different machine signature for it.
+
+For a running example use \texttt{double affine(double x, int n,
+double y)}, defined to return \(x \cdot n+y\). On System V AMD64,
+the integer and SSE argument classes draw from distinct register
+sequences. Thus the logical second argument does not use the second
+integer register, nor does the logical third argument use the third
+floating-point register. This allocation follows the passing rules
+in the local supplement, not a rule such as ``parameter \(k\) always
+uses register \(k\).'' The same instruction set with a different
+calling convention can assign this signature differently.
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+Value & ABI class & System V location & Fixture value \\
+\hline
+\texttt{x} & SSE & \texttt{xmm0} & \(2.5\) \\
+\texttt{n} & INTEGER & \texttt{edi} (low 32 bits) & \(4\) \\
+\texttt{y} & SSE & \texttt{xmm1} & \(-0.75\) \\
+Return & SSE & \texttt{xmm0} & \(9.25\) \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Give Each Stub a Machine Job and a Runtime Job}
+
+There are three common ways to realize the machine job: emit a typed
+C shim in advance, build a call with a target-aware invocation
+library, or emit code from the runtime. A shim lets the C compiler
+perform ABI classification, including obscure aggregate cases. A
+dynamic call engine is convenient when signatures are discovered
+at runtime. A code emitter can optimize repeated calls, but must
+also handle stack alignment, register preservation, spill placement,
+prologue and epilogue rules, and unwind metadata where applicable.
+The first implementation should not hand-assemble calls just because
+it can generate code for its own language. That code generator may
+use a different convention for its internal calls.
+
+The runtime job is to convert values, arrange roots and leases,
+transition to a foreign state when appropriate, and restore the host
+calling context. In a dynamic engine, the array of argument pointers
+often points at aligned native argument cells. A pointer parameter
+then has a cell containing the pointer, and its entry in the array
+points at that cell, not at the pointee. The cells must be kept until
+the invocation has finished. \Cref{fig:visual-387} marks this
+distinction between preparing bytes and placing them into ABI
+locations. The return cell is another machine value until the wrapper
+converts it back.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (args) at (0,1.2) {Host arguments};
+  \node[tome box dark] (cells) at (4.1,1.2) {Native cells};
+  \node[tome box accent] (abi) at (4.1,-1.2) {ABI locations};
+  \node[tome box] (callee) at (8.2,-1.2) {C function};
+  \draw[tome arrow] (args) -- node[above]{convert} (cells);
+  \draw[tome arrow] (cells) -- node[right]{classify and place} (abi);
+  \draw[tome arrow] (abi) -- (callee);
+\end{tikzpicture}
+\caption{A dynamic outgoing call uses native cells as staging storage, not as a substitute for registers and the outgoing stack area.}
+\label{fig:visual-387}
+\end{figure}
+
+% Annotated walkthrough
+\section{Prepare a Reusable Stub Without Retaining Call Locals}
+
+\begin{verbatim}
+bind(module, spec):
+    lease := retain_module(module)
+    try:
+        entry := resolve_export(lease, spec.export_name)
+        shape := (spec.target, spec.abi, spec.native_signature)
+        machine_plan := get_or_compile_call_plan(shape)
+        return ForeignFunction(lease, entry, machine_plan, spec)
+    on_error:
+        release_module(lease)
+        raise
+
+invoke(bound, args):
+    require_arity(bound.spec, args)
+    with bound.borrow_module_for_call():
+        with new_marshalling_frame() as frame:
+            for i in argument_order(args):
+                frame.stage(i, bound.spec.convert(i, args[i]))
+            frame.seal()
+            with foreign_execution(frame.roots):
+                bound.plan.call(bound.entry, frame.argument_cells,
+                                frame.return_cell)
+            return bound.spec.decode(frame.return_cell)
+\end{verbatim}
+
+The shape key is sufficient only for a plan that takes the entry
+point as data, and only if the signature encodes all lowering-relevant
+facts. Include fixed versus variadic mode and the fixed count when
+supporting both. A specialized stub that embeds an entry address
+must also carry the module lifetime; caching it by symbol name would
+permit an unload and reload to leave a stale address in executable
+code. The call lease must be acquired atomically with checking that
+the binding is still open. A concurrent close may prevent new
+invocations but cannot unmap a module whose native frame is running.
+
+The call frame is per invocation and owns conversion temporaries,
+including any allocated before a later argument fails validation.
+Keep it installed while decoding the result if that step can allocate
+or throw. When an API reports errors through thread-local state,
+that state must be captured immediately after native return, before
+a runtime transition or other helper can overwrite it. Arrange
+capture in the shim or machine plan, not in the eventual decoder.
+Provide a dedicated policy when an API does not allow callbacks
+during a region otherwise marked foreign.
+
+\section{Compare Against Calls Emitted by the Target C Compiler}
+
+Use a reference caller compiled against the real prototype and a
+test library compiled separately. Try the mixed scalar example,
+then signatures that exhaust integer registers before SSE registers
+and the converse. For stack arguments choose distinct sentinels in
+nonadjacent slots, not a run of equal zeros. Verify both the values
+that arrived and the result consumed by the runtime. A simple test
+returning the first argument may pass even if every following
+argument is misplaced. Finally, force collection during result
+boxing, and close the binding while a conforming fixture waits
+inside native code. The first checks the runtime frame; the second
+checks module ownership, which a successful register test does not
+exercise.
+
+\section{Account for a Hidden Result Parameter and Its Storage}
+
+Extend the example to a native routine that returns a record
+containing three plain doubles. On System V AMD64 this ordinary
+24-byte aggregate classifies as MEMORY. The caller allocates
+result storage and passes its address in the first integer
+argument register. The called function writes there and
+returns the same address in \texttt{rax}. For a signature
+with a leading visible pointer, that visible pointer is no
+longer in \texttt{rdi}; it moves to \texttt{rsi}. Visible
+floating-point parameters still start their own SSE sequence.
+In a C shim the compiler implements the convention; if
+implementing the machine plan directly, compute the hidden
+arguments before assigning visible locations.
+
+Reserve return storage with the aggregate alignment and keep
+it distinct from locations the callee can access through
+other names. Moving the record into its host representation
+can require allocations; the return storage remains valid
+until conversion is over. An invocation engine with a
+separate return-buffer parameter may already insert the hidden
+pointer. Do not also append it to the public argument vector.
+That would not produce two valid copies of one address: it
+would shift the rest of the effective signature.
+
+Build a fixture that produces three unrelated doubles based
+on both its leading pointer argument and a separate numeric
+argument. Initialize the return storage with distinguishable
+defaults and make the pointed input a different allocation
+whose contents must remain unchanged. Compare each result
+field and the untouched input after the call. This fixture
+tests caller allocation, hidden position and full-width
+return consumption, in contrast to the earlier scalar
+fixture which verifies only register assignment among
+explicit parameters.
+
+Exercise the error path with a failure during conversion of
+the second argument. That failure must not call the callee,
+and it must reclaim any first-argument native allocation
+without reading or decoding the return storage. Counters
+on native entry and allocator release make these two
+expectations independent. A prepared machine plan has no
+per-call cleanup to perform on this path because none of
+the machine invocation has begun.

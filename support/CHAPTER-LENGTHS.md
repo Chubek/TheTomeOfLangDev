@@ -15,8 +15,8 @@ was the 32 chapters under 65 lines, ranging from 43 to 64. The working
 floor for that cluster and for the new chapters was 90 nonblank lines,
 close to the longer supplements' median.
 
-After the pass, the revised and new chapters run from **90 to 102**
-nonblank lines. Across all 384 chapters, the median is still 98.
+After that pass, the revised and new chapters ran from **90 to 102**
+nonblank lines. Across the then-current 384 chapters, the median was 98.
 The 82 chapters between 66 and 89 lines are outside this pass.
 
 | File IDs | Baseline | Expanded material |
@@ -37,4 +37,25 @@ Recheck the revised set using the same floor:
 ```sh
 python3 -B support/chapter_lengths.py --minimum 90 308 310 $(seq 352 384)
 make check-expansion
+```
+
+## Runtime interfaces and data structures
+
+Parts XXXVI–XXXIX add 45 chapters in `tome-runtime-interfaces.ltx`.
+Each includes a worked example, a table, editable TikZ artwork, annotated
+pseudocode, and at least **120 nonblank Pandoc lines**.
+
+| File IDs | Chapters | Coverage |
+| --- | ---: | --- |
+| 385–396 | 12 | Foreign declarations, external calls and stubs, ABI layouts, ownership, callbacks, and binding verification |
+| 397–407 | 11 | Module interfaces, imports and exports, initialization, packages, static and dynamic dispatch, vtables, and witness tables |
+| 408–418 | 11 | Allocation and ownership, precise roots, reference counting, tracing, copying, compaction, and collector integration |
+| 419–429 | 11 | Compiler and interpreter data structures, from symbols and syntax trees through graph indexes, VM frames, and incremental queries |
+
+`make check-expansion` checks this placement, source and citation links,
+figures, walkthroughs, tables, and the 120-line floor. To see the counts
+for just these chapters:
+
+```sh
+python3 -B support/chapter_lengths.py --minimum 120 $(seq 385 429)
 ```

@@ -1,0 +1,197 @@
+% Source: psabi-x86-64.txt
+% Source: windows-x86-64.txt
+
+\section{Recover the Types That the Ellipsis Does Not State}
+
+A declaration such as \texttt{int emit(const char *format, ...)}
+supplies a type for the fixed prefix but not for its tail. An
+invocation bridge needs both: the ABI cannot place an argument
+whose native type it does not know. In addition, the values passed
+in the variadic tail undergo C's default argument promotions.
+An input \texttt{float} becomes \texttt{double}; smaller-rank
+integers undergo integer promotions, which commonly produce
+\texttt{int} but can produce \texttt{unsigned int} if
+\texttt{int} cannot represent every value of the original type.
+These are conversions, not instructions to copy a narrow
+object into one end of a larger argument slot.
+
+The callee also needs a way to know what to fetch. It may read
+a format, consume a fixed sequence of types determined by a
+command, or use a count or typed sentinel. A count alone cannot
+describe a heterogeneous sequence. An arbitrary-precision host
+integer has no unique native width chosen by the C ellipsis.
+Infer native types only from a validated operation-specific
+schema. Where an API uses a null pointer sentinel, stage an
+actual null of the prescribed pointer type, not an integer
+zero with whatever size and passing class the host prefers.
+
+\section{Compare Two x64 Call Plans for One Tail}
+
+For the example, declare that the known schema consumes a promoted
+double followed by an int. The fixed format is a native pointer.
+Use \(1.25\) and \(7\) as the tail values. The System V AMD64
+supplement \cite{amd64abi2014} uses independent integer and vector argument registers
+and specifies a hidden value in \texttt{al} for variadic calls:
+an upper bound on the number of vector registers used, between
+zero and eight. The bridge can use the exact count. On the
+Microsoft x64 convention \cite{microsoftx64calling}, the first four positions use register
+slots by position, with floating-point values duplicated in the
+corresponding general-purpose registers for variadic calls. The
+local Windows assembly extract describes the register slots,
+alignment and caller-reserved home area.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Value or obligation & System V AMD64 & Microsoft x64 \\
+\hline
+Format pointer & \texttt{rdi} & \texttt{rcx} \\
+Promoted double & \texttt{xmm0} & \texttt{xmm1} and \texttt{rdx} \\
+Promoted integer & \texttt{esi} & \texttt{r8d} \\
+Variadic setup & \texttt{al} may be 1 & FP duplication as above \\
+Home area for this call & None required & 32 bytes reserved by caller \\
+\hline
+\end{tabular}
+\end{center}
+
+Duplication is a bit copy of the double's representation for
+placing the argument; it is not a numeric conversion to an
+integer. The home area is separate from any padding needed for
+stack alignment and from arguments passed on the stack. On
+System V, a variadic fixed prefix containing a vector-register
+argument contributes to the register count too. The tail types
+alone are not enough to compute that count.
+
+\Cref{fig:visual-393} uses a fork to show which information is
+shared and which is target-specific. C promotion precedes both
+placement decisions. Conversely, a callee's \texttt{va\_list}
+is not a portable array of word-sized arguments: the callee
+may have to consult register-save areas and overflow storage.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (args) at (0,0) {Typed arguments};
+  \node[tome box dark] (prom) at (4,0) {Promoted tail};
+  \node[tome box accent] (sv) at (8,1.2) {System V placement};
+  \node[tome box accent] (ms) at (8,-1.2) {Microsoft placement};
+  \draw[tome arrow] (args) -- (prom);
+  \draw[tome arrow] (prom) -- (sv);
+  \draw[tome arrow] (prom) -- (ms);
+\end{tikzpicture}
+\caption{Both call plans start with the promoted types; the convention controls their eventual locations.}
+\label{fig:visual-393}
+\end{figure}
+
+% Annotated walkthrough
+\section{Validate a Closed Family of Variadic Shapes}
+
+\begin{verbatim}
+emit_checked(operation, values, target):
+    schema := supported_operations.lookup(operation)
+    require(schema is not None)
+    require(length(values) == length(schema.tail))
+    fixed := [stable_native_format(schema.format_literal)]
+    tail := []
+    for expected, supplied in zip(schema.tail, values):
+        narrow := checked_convert(supplied, expected.source_c_type)
+        promoted := default_argument_promotion(narrow, target)
+        require(promoted.c_type == expected.fetched_c_type)
+        tail.append(promoted)
+    shape := signature(int_result, types(fixed), types(tail))
+    plan := prepare_variadic(target, fixed_count=1, shape=shape)
+    return plan.call(emit_entry, concatenate(fixed, tail))
+\end{verbatim}
+
+Validate under the semantic types first. If the operation wants
+a finite measurement representable as native \texttt{float},
+validate and round to that type before its promotion to
+\texttt{double}; using the unrounded host real would give
+different semantics. If the operation instead accepts a C
+double directly, do not round to float just because the
+ellipsis will ultimately use the same ABI class. The format
+string here is selected by the wrapper, not parsed from an
+arbitrary caller-supplied format with hidden width and precision
+arguments. A fixed-signature C shim for each allowed schema is
+often simpler than dynamic variadic preparation. The compiled
+shim must call the prototype including its ellipsis.
+
+\section{Test Both Register and Overflow Paths}
+
+Build a native receiver that reads the tail in the promised
+order and stores a typed trace. Compare it with a direct C
+caller. Exercise an empty tail, a tail starting with a
+promoted integer followed by a promoted float, a tail with
+more than four total arguments on Microsoft x64, and one that
+uses all the System V vector slots before spilling. Use an
+exactly representable noninteger in each floating position
+and distinct integer patterns in the intervening positions.
+Tests that fetch only the first word cannot distinguish several
+incorrect placement algorithms.
+
+On the callee side, build a second fixture that delegates to
+a supported \texttt{v} variant using a \texttt{va\_list}
+initialized by the target C compiler. A function taking a
+\texttt{va\_list} is not interchangeable with the original
+variadic function; its explicit last parameter has its own
+target-dependent type. Forward through C when forwarding itself
+is needed. Do not construct a \texttt{va\_list} by converting
+an array of prepared cells into a pointer.
+
+\section{Exercise a Tail Whose Values Have Different Origins}
+
+Suppose an operation expects a count of small bins, a small
+real-valued offset, and a marker pointer. On a target with
+32-bit \texttt{int}, its tail specification can start with
+an unsigned 8-bit count and a \texttt{float} offset, but the
+receiver must fetch \texttt{int}, \texttt{double}, and the
+specified pointer type. The source count 255 is valid and
+becomes a positive \texttt{int}; 256 is rejected before
+promoting even though a native int could hold it. The
+offset is rounded to the source float representation and
+then widened. A zero host integer cannot be accepted as
+the marker without an explicit conversion to the pointer
+sentinel the schema documents. These choices distinguish
+the domain of accepted values from the fetching types.
+
+\begin{verbatim}
+receive_bin_trace(tag, ...):
+    cursor := target_va_start(tag)
+    try:
+        count := target_va_arg(cursor, C_INT)
+        offset := target_va_arg(cursor, C_DOUBLE)
+        marker := target_va_arg(cursor, C_VOID_POINTER)
+        return encode_trace(tag, count, offset, marker == native_null)
+    finally:
+        target_va_end(cursor)
+\end{verbatim}
+
+Compile the receiver in C rather than simulating native
+\texttt{va\_arg} with this pseudocode. For this example the
+C shim declares the fixed \texttt{tag} parameter with a
+type suitable for its environment's \texttt{va\_start}
+interface. If two consumers need independent traversals of
+the tail, use the target's \texttt{va\_copy} and give each
+cursor its own \texttt{va\_end}; a plain assignment is not
+portable across representations. The wrapper should not
+export the cursor beyond the receiver's lifetime. A safer
+public result is the copied trace of already fetched values,
+which has no dependency on incoming argument storage.
+
+For the Microsoft fixture, place a floating-point argument
+past the fourth position and check it as well as the
+duplicated register cases. For the System V fixture, put a
+fixed double before the tail doubles and check that the
+call plan counts it along with the tail's vector arguments.
+These tests detect a bridge that implemented the tail
+promotion rules but forgot that the fixed prefix participates
+in call classification and can exhaust register capacity.
+
+If the binding caches these plans, key the cache by target,
+convention, return type, fixed count and the complete sequence
+of effective argument types. Two calls with the same total
+arity may have different fixed counts and need different
+preparation. An unsupported schema should fail before lookup
+or invocation rather than reuse a plan for a superficially
+similar sequence of register classes.

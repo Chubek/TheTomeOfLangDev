@@ -1,0 +1,187 @@
+% Source: ffi-typesafety.txt
+% Source: psabi-x86-64.txt
+
+\section{Treat Generation as a Join of Two Inputs}
+
+A native header can tell a binding generator about names,
+declarator structure, attributes, typedefs and certain
+compile-time constants under the chosen preprocessor
+configuration. It cannot reliably tell it how long a
+buffer is kept, whether a factory returns an owned handle,
+or whether a callback can run on a thread with no VM
+attachment. Generate raw declarations from a target C
+front end; join those declarations against a reviewed
+policy manifest before generating an ordinary host API.
+Missing policy for a pointer-bearing operation need not
+prevent a raw binding from being generated, but it must
+prevent a supposedly safe wrapper from being generated.
+
+Take a signal library exporting an operation named
+\texttt{series\_read} with a handle, mutable point buffer,
+capacity, and written count. The header establishes that
+the count uses \texttt{size\_t}. The policy says capacity
+and count are points, not bytes, only successful status
+initializes the count, and the point array is not retained.
+A change from points to bytes could preserve the entire
+binary signature and still require a binding change. In the
+other direction, an ABI change such as a new record member
+may preserve the conceptual operation but invalidate compiled
+raw code. Version and review the two inputs separately.
+
+\begin{center}
+\begin{tabular}{lp{0.62\linewidth}}
+\hline
+Artifact & What it supplies or checks \\
+\hline
+Parsed target header & Type graph, symbol spellings, attributes, constants. \\
+Policy manifest & Ownership and borrow rules, units, status refinements. \\
+Native compile checks & Record offsets, alignment and compatible prototypes. \\
+Cross-language fixtures & Observable call placement and runtime policies. \\
+Release metadata & Header configuration and supported native revisions. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Verify With an Independent Authority}
+
+Regenerating the raw declarations and comparing them with
+an earlier generated file identifies drift; it does not
+show which result is correct. Emit a C probe that includes
+the real header rather than rebuilding the header from the
+binding. For records whose layout the host consumes, have
+the target compiler check \texttt{sizeof}, alignment and
+offsets against numeric literals taken from the host view.
+For functions, compare the compiler's concrete declaration
+with a generated expected function-pointer type, using a
+compile-time type check or an assignment with warnings made
+fatal as appropriate to the toolchain. Do not introduce a
+cast to silence a mismatch. For macros, compile a facade
+that invokes the macro as the header intends. None of these
+checks requires executing host-built probes while
+cross-compiling.
+
+Compile and run a separate native fixture on the actual
+target as well. The System V supplement illustrates why:
+a by-value record can have correct offsets but be passed
+using a classification the raw binding did not implement.
+The fixture should write and read distinct payloads under
+separate compilation so accidental agreement between two
+passes of the generator cannot hide a mismatch. The two
+arms in \Cref{fig:visual-395} answer different questions:
+what the wrapper claims, and which claims the target compiler
+and running fixture corroborate.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (hdr) at (0,0) {Configured header};
+  \node[tome box dark] (gen) at (4,1.2) {Generator with policy};
+  \node[tome box dark] (cc) at (4,-1.2) {Native compiler};
+  \node[tome box accent] (cmp) at (8,0) {Verification};
+  \draw[tome arrow] (hdr) -- (gen);
+  \draw[tome arrow] (hdr) -- (cc);
+  \draw[tome arrow] (gen) -- (cmp);
+  \draw[tome arrow] (cc) -- (cmp);
+\end{tikzpicture}
+\caption{Probe declarations are interpreted by the native compiler independently of the generator's layout and signature decisions.}
+\label{fig:visual-395}
+\end{figure}
+
+% Annotated walkthrough
+\section{Fail Generation at Unsupported or Stale Policy}
+
+\begin{verbatim}
+generate(target, header, manifest):
+    index := parse_c(header, target.triple, target.flags)
+    seen_policy := empty_set()
+    for item in sorted(index.public_declarations):
+        shape := normalize_native_type(item, target)
+        if unsupported(shape):
+            emit_rejection(item, reason(shape))
+            continue
+        emit_raw_declaration(item.symbol, shape)
+        emit_independent_compile_checks(item, shape, header)
+        if has_policy(manifest, item.stable_name):
+            policy := get_policy(manifest, item.stable_name)
+            require(policy.expected_shape == fingerprint(shape))
+            require(policy_mentions_valid_parameters(policy, item))
+            verify_cleanup_on_every_exit(policy)
+            emit_checked_wrapper(item, shape, policy)
+            seen_policy.insert(item.stable_name)
+    require(seen_policy == manifest.requested_wrappers)
+\end{verbatim}
+
+The shape fingerprint covers calling convention, type identity
+where relevant, and all layout and signature details used by
+the output. It is not an ownership fingerprint. The manifest
+must still be reviewed when a library release changes semantics
+without changing the ABI. Deterministic sort order and a recorded
+target configuration make a generated diff usable by reviewers.
+A native library with a separately versioned ABI can expose a
+small version query; resolve that trusted entry and check
+compatibility before opening the rest of the surface.
+
+\section{Track the Proof Boundary of Static Checking}
+
+Furr and Foster \cite{furr2008ffi} demonstrate how multilingual analysis can
+model C access to Java and OCaml values; for instance, a tag
+check can refine which representation operations are permitted
+on a subsequent branch. A binding generator can use analogous
+local checks when compiling wrappers: a borrowed reference
+cannot outlive its root frame, and an output field may be read
+only on the branch that initializes it. Proving these properties
+of generated glue is not a proof that an external library
+obeys its documented retention or status rules.
+
+For the signal library, force the supplier to report a short
+successful read, write partial storage and fail, and report an
+out-of-range successful count. The wrapper publishes the short
+record sequence only for the first case. Run these alongside
+tests that deliberately fail compilation when configured
+packing or a typedef changes. Examine which check failed:
+that makes it possible to identify a declaration mismatch,
+a policy mismatch or an implementation violation instead
+of treating all three as an opaque broken binding.
+
+\section{Version Layout Facts Separately from Semantic Reviews}
+
+Imagine two versions of the signal library. One adds a
+timestamp to the point record at the end; the other leaves
+the record unchanged but starts clearing output on a documented
+short-read status. The first changes array stride and likely
+the shape fingerprint. A native build of the old fixture
+including the new header should fail its size or stride
+assertion even though the leading point coordinates still
+occupy the same offsets. The second version compiles under
+the old declaration but needs a reviewed policy and updated
+expectations about when to read or publish the result.
+
+Keep separate verdicts in CI, for instance a target type
+probe, a linked integration fixture and a release policy
+review. Record the library identity used by each integration
+run; a successful compile can exercise one header while
+the loader finds a different binary of the same name. If
+platform metadata and runtime version queries do not establish
+compatibility, tie the installed library and binding together
+as one tested distribution artifact. A version string does
+not override explicit layout or calling-convention evidence.
+
+Generation should be deterministic across machines configured
+for the same target. Avoid ambient include paths and producer
+timestamps in generated declarations. Normalize source locations
+in the provenance record without changing the actual compiler
+arguments. Preserve the original declaration location for
+diagnostics so a rejected declaration is actionable. If
+a policy entry becomes unused because a symbol disappeared
+behind a preprocessor condition, make the generator fail
+or mark that policy explicitly inapplicable to the target;
+silently dropping it can remove a public operation unnoticed.
+
+As a final negative check, change one manifest assertion to
+say that the returned count is initialized on all statuses.
+Use a fixture whose failure path leaves the count untouched,
+and instrument the wrapper so that a read of the output
+cell is detected. Compilation and native layout should still
+pass. Only the policy test should fail, demonstrating why a
+header-only pipeline cannot stand in for runtime verification.

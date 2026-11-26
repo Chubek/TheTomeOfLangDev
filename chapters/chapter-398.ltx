@@ -1,0 +1,185 @@
+% Source: the-rust-proglang.txt
+% Source: concepts-and-semantics-of-proglang-2-ocaml.txt
+
+\section{Resolve Names to Identities, Not File Paths}
+
+Consider two libraries that both export a type named \texttt{Frame}.
+One is a video library and the other is a layout library. A source
+file can import the former as \texttt{Video} and the latter as
+\texttt{Layout}; \texttt{Video.Frame} and \texttt{Layout.Frame} denote
+different types despite the same final segment. An alias makes a new
+binding in an environment. It does not create a second definition
+or change which package instance owns the item. Moving a definition
+between source files is also distinct from renaming its module:
+source discovery and name resolution are different compiler jobs.
+
+Rust's book illustrates paths anchored at a crate root and paths
+relative to the current module. OCaml's \texttt{open} illustrates a
+different issue: importing members into an unqualified environment
+can mask an existing binding. Neither choice requires a resolver to
+guess which file happens to be present. In the resolver below, each
+package has already provided its root and a table of direct
+dependency aliases. The import syntax names an anchor explicitly
+when a particular root is intended.
+
+\section{Keep the Namespace and Lookup Tier Explicit}
+
+Our miniature language separates module, type, and value names.
+Each intermediate segment of a dotted path is looked up in the
+module namespace; its final segment is looked up in the namespace
+required by the syntax. It is legal for the type \texttt{Frame} and
+its constructor function \texttt{Frame} to coexist. That does not
+allow a variable named \texttt{Video} to hijack the module path
+\texttt{Video.Frame}. A language with first-class module values
+may make another choice, but it still needs a rule for those
+intermediate segments.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Use & Starting lookup & Final namespace \\
+\hline
+\texttt{Frame} in a type & lexical scope tiers & type \\
+\texttt{Video.Frame(...)} & local module alias & value \\
+\texttt{root.ui.Frame} & current package root & context dependent \\
+\texttt{dep.layout.Frame} & declared dependency alias & context dependent \\
+\texttt{super.Frame} & enclosing module & context dependent \\
+\hline
+\end{tabular}
+\end{center}
+
+Within one scope, our policy gives declarations and explicit imports
+precedence over wildcard imports. Two explicit imports that bind
+the same name to distinct identities in one namespace are errors at
+the declaration sites. Two wildcard matches from that namespace
+are an error at the use instead, unless both denote the same
+identity. An inner scope shadows an outer scope as a whole: we
+test both tiers of the inner scope before checking the outer scope.
+This is a particular policy, not a property of importing.
+\Cref{fig:visual-398} shows why the alias is not the definition.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (a) at (0,1.1) {Video.Frame};
+  \node[tome box] (b) at (0,-1.1) {Clip.Frame};
+  \node[tome box dark] (m) at (3.0,0) {Module identity};
+  \node[tome box accent] (d) at (6.0,0) {Type definition};
+  \draw[tome arrow] (a) -- (m);
+  \draw[tome arrow] (b) -- (m);
+  \draw[tome arrow] (m) -- (d);
+\end{tikzpicture}
+\caption{Two local names for the same module resolve to the same type; both occurrences retain their original spelling for diagnostics.}
+\label{fig:visual-398}
+\end{figure}
+
+% Annotated walkthrough
+\section{Walk a Qualified Path Without Falling Back}
+
+\begin{verbatim}
+resolve(path, expected_kind, scope, requester):
+    (head, tail) := split_anchor(path)
+    if head.is_anchor:
+        start := resolve_anchor(head, requester)
+    else if tail.is_empty:
+        return lexical(head, expected_kind, scope)
+    else:
+        start := lexical(head, Module, scope).definition
+    require_access(start, requester)
+    require_nonempty(tail)
+    cur := start
+    for (segment, is_last) in mark_last(tail):
+        kind := expected_kind if is_last else Module
+        entry := members_visible_to(cur, requester)[kind, segment]
+        if entry is missing:
+            fail_at(segment, "not a visible member of", cur)
+        cur := entry.definition
+    return cur
+
+lexical(name, kind, scope):
+    for frame in enclosing_scopes(scope):
+        direct := frame.direct[kind, name]
+        if direct exists: return direct
+        matches := canonicalize(frame.wildcard_matches(kind, name))
+        if size(matches) > 1: report_ambiguity(matches)
+        if size(matches) == 1: return only(matches)
+    report_unbound(name, kind)
+\end{verbatim}
+
+In this notation the dependency name is part of the anchor:
+\texttt{dep.layout.Frame} uses the package bound to \texttt{layout}
+and then walks \texttt{Frame}. Member lookup asks what the
+requester may see, including valid public aliases. It does not run
+another lexical search at each dot. If an inner \texttt{Video}
+shadows an outer one but has no \texttt{Frame}, report the failed
+member lookup in the inner one. Falling back to the outer
+\texttt{Video} would mean the first segment can change its identity
+depending on the remainder of the path.
+
+\section{Preserve Enough Context for Diagnostics and Incrementality}
+
+After resolution, attach a definition identity to each use but
+retain the span and import chain. If wildcard imports from distinct
+modules produce two candidates, a good diagnostic points to the
+use, both imports, and both declarations. It can suggest qualified
+alternatives without selecting a candidate arbitrarily. If a user
+references a module by a package alias that is not declared, suggest
+checking the manifest instead of speculatively searching adjacent
+directories for a matching name.
+
+A resolution cache cannot depend only on the declaration it chose.
+Today a wildcard scope may contain exactly one \texttt{Frame};
+tomorrow a different wildcard source may export another. The
+original definition has not changed but the lookup is ambiguous.
+Record the searched namespace entries, including misses and the
+wildcard export surfaces consulted. As a regression test, insert
+the new export and verify that only affected users become
+ambiguous. Then make it a re-export of the original and verify the
+ambiguity clears while provenance still shows both routes. Repeat
+the test with a value namespace addition to ensure it does not
+invalidate a type lookup unnecessarily.
+
+\section{Order Resolution Queries Without Consulting the Filesystem}
+
+Import declarations themselves can refer to other aliases. To
+keep the example deterministic, suppose such references are
+allowed only for explicit imports in the same module. Enter
+local declarations and explicit import names into the scope first,
+with unresolved import targets marked as pending. Import right
+hand sides can query declarations and those pending names but not
+the wildcard environment being built. Once explicit imports are
+bound, process wildcard sources, then resolve ordinary type and
+value expressions. This rule makes the right hand sides independent
+of the order in which wildcard candidates happen to arrive.
+
+\begin{verbatim}
+import View as Front     // module alias, forward reference
+import dep.layout as View
+import dep.video as Film
+import Front.*           // opens the layout package
+import Film.*            // opens the video package
+
+type Output = Frame     // ambiguous between distinct type IDs
+type Safe = Front.Frame
+\end{verbatim}
+
+The first import triggers the pending lookup of the second; its
+resolved answer is installed under both \texttt{Front} and
+\texttt{View}. If the second right hand side were \texttt{Front}
+instead, the search would revisit an in-progress query. Report the
+two alias declarations as a cycle. Do not mistake such a cycle
+for two modules that refer to each other's already-declared types.
+A resolver can memoize state and outcomes of explicit import
+queries and share the referenced definition once; textually
+substituting paths multiplies work and makes source spans harder
+to preserve.
+
+Now build the example twice with opposite source enumeration
+orders. Both runs must choose the same root for \texttt{Front},
+reject the same use of \texttt{Frame}, and report candidates in
+a stable order. In an editor, inserting a typo in the dependency
+alias should strand only lookups affected by that alias, not turn
+every error into an unqualified-name fallback. These properties
+follow from the resolution environment and the phase boundary,
+not from a fortunate ordering of filesystem entries.

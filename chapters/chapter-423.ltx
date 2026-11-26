@@ -1,0 +1,195 @@
+% Source: irdl-ir-def-lang-for-ssa-cc-compiler-opt-ir-il.txt
+
+\section{Define the Owner Before Choosing the Allocator}
+
+The IRDL account of MLIR describes operations with SSA operands
+and results, blocks of operations, and regions of connected
+blocks. A nested operation can own a region; an operand's
+reference to a value is not ownership. The distinction is
+useful well beyond MLIR \cite{lattner2021mlir}. Assume here
+that a function owns its mutable IR, an instruction can have
+several results, and deleting a block is responsible for
+detaching its instructions and edges. A value identifier can
+be an instruction handle paired with a small result index,
+provided rewriting the instruction cannot silently reinterpret
+that index. Block parameters require their own value variant
+in this design. A simple implementation gives all values their
+own handles to avoid identity changes on result-list edits.
+
+An arena is first a lifetime decision: all objects owned by it
+ultimately expire together. A bump allocator serves immutable
+or append-only objects particularly well: it can allocate by
+advancing a cursor and reclaim storage in bulk. In a long-lived
+mutable IR full of edits, that alone leaves every removed
+payload occupying space. A slot arena can reclaim during
+individual erasure while retaining arrays and free lists sized
+for the peak live count. Decide separately whether destruction
+of payloads is required; releasing bump pages does not execute
+destructors for objects with owned memory or other resources.
+The compiler's arenas are distinct from language-level heap
+management at runtime; see \Cref{ch:ext-418} for the latter
+integration boundary.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Allocation strategy & Strength & Important limit \\
+\hline
+Bump arena & Cheap allocation and bulk retirement & No slot reuse by erasure \\
+Slot arena & Cheap handle validation and reuse & Holes can hurt iteration \\
+Slots plus dense payloads & Fast iteration with deletion & Back-pointer needs repair \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Make Reuse Observable to a Stale Reference}
+
+Consider work queued for instruction at slot 7. A rewrite
+erases that instruction and creates an unrelated one. If the
+queued item contains only slot 7, it will now modify the wrong
+instruction. A generational handle contains arena provenance,
+slot index, and generation. Valid lookup requires that the
+right arena owns a live slot of the expected generation. In
+\Cref{fig:visual-423}, the handle for the new instruction can
+be dereferenced; the handle copied by the old worklist cannot.
+Use distinct handle types for blocks, values, and instructions
+so accidentally putting one in an operand becomes a type error
+instead of a surprising successful lookup.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (old) at (0,1) {Handle \((7,4)\)};
+  \node[tome box] (new) at (0,-1) {Handle \((7,5)\)};
+  \node[tome box dark] (slot) at (4.5,0) {Slot 7: generation 5};
+  \node[tome box accent] (p) at (8,0) {Payload B};
+  \draw[tome dashed] (old) -- node[above,sloped]{reject} (slot);
+  \draw[tome arrow] (new) -- node[below,sloped]{accept} (slot);
+  \draw[tome arrow] (slot) -- (p);
+\end{tikzpicture}
+\caption{The reused slot has the same index and a different generation. The allocator detects work aimed at the old occupant.}
+\label{fig:visual-423}
+\end{figure}
+
+% Annotated walkthrough
+\section{Move Payloads Without Renaming the Survivors}
+
+\begin{verbatim}
+find_slot(arena, h):
+    if h.owner != arena.owner: return Missing
+    if h.slot >= arena.slots.length: return Missing
+    s := arena.slots[h.slot]
+    if not s.live or s.generation != h.generation:
+        return Missing
+    return s
+
+erase(arena, h):
+    s := require_live_slot(arena, h)
+    require detached_from_graph(arena, h)
+    row := s.dense_row
+    last := arena.dense.length - 1
+    removed := arena.dense[row]
+    if row != last:
+        moved := arena.dense[last]
+        arena.dense[row] := moved
+        arena.slots[moved.slot].dense_row := row
+    arena.dense.truncate_after_move(last)
+    s.live := false
+    if s.generation == MAX_GENERATION:
+        s.retired := true
+    else:
+        s.generation += 1
+        arena.free.push(h.slot)
+    destroy(removed)
+\end{verbatim}
+
+This is move pseudocode: the removed payload is extracted,
+and only the removed payload is destroyed. In a real
+implementation use the container's swap-remove operation or a
+carefully implemented equivalent, so that a noncopyable payload
+is not destroyed twice. Allocation takes a free slot or appends a
+fresh slot, appends a dense row storing the slot number, and
+publishes the row index before marking the slot live. Erasure
+repairs the relocated occupant's slot link. It is essential to
+verify both directions: each live slot finds the row that
+claims it, and each dense row has exactly one live slot.
+
+The generation does not validate cached pointers to a row.
+A growth of the dense array or a swap-removal can move a
+payload while leaving its handle valid. Expose short-lived
+borrows only while the arena is not mutating; retain handles
+instead of those borrows across calls to rewriting passes.
+This sketch uses exclusive access during mutation. A checked
+lookup followed by unsynchronized use is not a concurrency
+protocol: another thread can erase or move the payload
+between the check and the load.
+
+\section{Choose Lifetimes for Scratch Storage and Side Tables}
+
+Stable handles let many passes share a common IR; they do not
+imply that all analysis uses a slot-indexed array. If a function
+loses eighty percent of its instructions after inlining and
+simplification, a table sized by the largest allocated slot
+is mostly holes. Build dense numbers for analyses that visit
+all live nodes of one graph revision. Record the mapping in
+both directions for diagnostics and invalidate it when nodes
+are added or erased. A generation-stamped scratch side table
+is a useful alternative for sparse updates; reset the entry
+whenever the recorded handle generation differs. Both options
+need a separate check for semantic freshness after an operand
+change that leaves the node alive.
+
+Do not wrap a generation silently. With an eight-bit generation,
+repeatedly rewriting the same slot can recreate the original
+bit pattern quickly. Retire exhausted slots as in the
+pseudocode, or impose an owner epoch that invalidates every
+externally held handle before rebuilding. Arena provenance must
+also not be reused while a prior arena's handles can survive.
+Persisting slot bits in an object file is not a strategy for
+stable exported IDs; assign an artifact-local namespace during
+serialization instead.
+
+\section{Test the Contract Independently of Optimization}
+
+Keep two handles alive, erase the first, and assert the
+second still reaches its original payload after the slot's
+row was moved. Allocate again and check that the new handle
+can point to the freed slot while the stale handle fails. Use
+a tiny generation width in a test build to exercise retirement,
+and try the same slot and generation in a distinct arena.
+At the pass boundary, scan every operand and edge for invalid
+handles; stale optional worklist entries can be skipped, but
+a stale authoritative graph reference is an invariant violation.
+
+Finally measure peak slots, dense rows, and wasted payload
+capacity separately. A bump arena can be faster for a short
+phase even if it leaves all obsolete records allocated until
+phase exit. The decision should follow edit frequency and
+lifetime rather than a desire to make every allocation in
+the compiler use one policy.
+
+\section{Do Not Use the Allocator as a Graph Commit Protocol}
+
+Suppose cloning a loop reserves two new blocks before cloning
+their instructions. An instruction in the first block may
+already need the ID of a target in the second. Reserving valid
+handles early is useful, but a lookup succeeding must not
+imply that a verifier can traverse the half-built function.
+One strategy stages the clone in an edit transaction under
+exclusive access: allocate skeletons, construct a mapping from
+original to clone, then install the mapped edges and operands.
+Validate shape and types before attaching the cloned blocks
+to their final owners. If the clone is abandoned, erase the
+private staging records rather than restoring a previously
+retired generation.
+
+Mutating the same arena in a transaction avoids remapping
+the newly minted handles at commit. A separately owned
+staging arena gives stronger isolation, but its handles cannot
+cross unchanged into the function arena. Either way, avoid
+storing a generation-stamped handle for an unfinished object
+in a long-lived worklist before commit. Otherwise a stale
+queued item can represent either a failed construction or a
+deleted valid instruction, making it hard to distinguish a
+broken mutation policy from a stale but harmless hint.

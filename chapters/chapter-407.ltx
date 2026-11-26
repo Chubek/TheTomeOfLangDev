@@ -1,0 +1,206 @@
+% Source: optimizing-dynlang-with-polymorphic-inline-caches-jit.txt
+% Source: osr-survey-deopt-jit.txt
+
+\section{Cache a Result for One Call Site, Not One Method Name}
+
+A drawing loop sends \texttt{paint} to a sequence of
+objects. If the loop usually sees circles, the runtime
+can remember the result of looking up \texttt{paint}
+on a circle at that call site and test whether it still
+applies. The same method name at another call site may
+mostly see labels and benefit from a different entry.
+H\"olzle, Chambers, and Ungar's SELF work \cite{holzle1991pic} describes the
+extension from one cached result to several: a polymorphic
+inline cache. The collected receiver types also provided
+feedback for recompilation. Profiles characterize
+observed calls, not all legal calls.
+
+Consider a small interpreter with single inheritance,
+mutable method definitions, and immutable class identity
+per receiver. A cache entry records the class, target,
+and a dispatch world number. The number changes whenever
+any method lookup result can change: replacing an
+inherited method must invalidate results on subclasses,
+even when their identity and own declarations stay the
+same. A coarse counter is easy to explain; a production
+runtime may track more precise dependencies for the
+method family and classes traversed by lookup.
+
+\section{Specify What Happens as Types Accumulate}
+
+\Cref{fig:visual-407} shows a two-case fast path. A miss
+goes to baseline lookup, which may extend the cache or
+mark the site megamorphic. Varying receivers must not
+change whether an invalid send raises, what target a
+valid send selects, or which receiver is passed. The
+cache stores an entry only when the baseline returns a
+plain callable target under facts represented by its guard.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (s) at (0,0) {Send site guards};
+  \node[tome box] (c) at (4,1.3) {Circle.paint};
+  \node[tome box] (l) at (4,0) {Label.paint};
+  \node[tome box accent] (m) at (4,-1.3) {Baseline lookup};
+  \draw[tome arrow] (s) -- node[above]{circle} (c);
+  \draw[tome arrow] (s) -- node[above]{label} (l);
+  \draw[tome arrow] (s) -- node[below]{miss} (m);
+\end{tikzpicture}
+\caption{Fast paths depend on both the receiver and the validity of the cached lookup. A miss executes the normal selection algorithm.}
+\label{fig:visual-407}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Input sequence & Small cache result & Selection check \\
+\hline
+circle, circle & miss, hit & same class and world \\
+circle, label, circle & miss, miss, hit & two valid entries \\
+circle, label, arc & abandon after third class & baseline dispatch \\
+circle, method edit, circle & miss, invalidate, miss & world changed \\
+\hline
+\end{tabular}
+\end{center}
+
+The table assumes a cold capacity-two site per row.
+The megamorphic state can use a shared lookup cache,
+but shared entries still need all relevant keys and
+validity checks. A long sequence of per-site guards can
+cost more than the lookup it was supposed to avoid.
+Gather counts before tuning thresholds; a cache that
+turns megamorphic after several rare receiver classes
+may miss the dominant phase of a workload.
+
+% Annotated walkthrough
+\section{Preserve the Operands on All Paths}
+
+\begin{verbatim}
+send(site, recv, args):
+    require_receiver(recv)
+    world := dispatch_world
+    if site.world != world: site.reset(world)
+    cls := class_of(recv)
+    if site.mode != Mega:
+        for entry in site.entries:
+            if entry.cls == cls:
+                return invoke(entry.target, recv, args)
+
+    target := baseline_select(cls, site.method)
+    if site.mode != Mega and target.cacheable:
+        if length(site.entries) == capacity:
+            site.become_mega()
+        else:
+            site.append(cls, target)
+    return invoke(target, recv, args)
+
+replace_method(owner, method, new_body):
+    require_dispatch_mutation_boundary()
+    owner.methods[method] := new_body
+    dispatch_world := fresh_world_number()
+\end{verbatim}
+
+This single-executor model permits mutations at dispatch
+boundaries, not between lookup or a successful guard and
+entry into the selected body. The body itself can perform an
+edit that affects subsequent selections. The receiver and
+argument expressions have already run. The miss path
+receives their values; it must not replay those
+expressions. With other threads, reading the counter once
+is not a complete protocol. The VM needs coherent
+publication, a definition of when a concurrent edit
+affects selection, and a way to keep old code alive
+while calls can still enter or execute it.
+
+\section{Devirtualize Under a Proof or a Guard}
+
+A known final method can be called directly if the
+language and linkage rules prevent replacement. A
+closed-world class analysis might also show that every
+possible receiver selects the same target. In an open
+world, that reasoning must be backed by a dependency
+on the absence of relevant new subclasses or methods.
+One alternative is an explicit exact-class guard plus
+method-validity guard and a normal fallback. Direct
+selection can enable inlining, but does not itself
+require inlining or deoptimization.
+
+\begin{verbatim}
+optimized_send(recv, args):
+    if class_of(recv) != Circle or not assumption.valid:
+        resume_baseline_at_send(recv, args)
+    else:
+        inline_circle_paint(recv, args)
+\end{verbatim}
+
+If all that happened before the guard was evaluation of
+the operands, resuming at the send is legitimate. A guard
+inserted inside the inlined body needs a different resume
+point, especially after drawing effects. Recovery data
+may reconstruct locals, materialize virtual objects,
+and recreate missing inlined frames
+\cite{fluckiger2022deoptless}. Such reconstruction
+describes interpreter state; it does not replace the
+machine root maps used to find live references at
+collection points (\Cref{ch:ext-411}). If a collection
+occurs during the miss, reload moved operands through
+updated root locations before invoking.
+
+\section{Exercise Edits With and Without Active Optimized Code}
+
+Invalidating future entries and revoking assumptions in
+already executing code are separate tasks. At a
+safepoint, a runtime can mark dependent optimized entries
+unusable for new calls and arrange to leave affected
+active frames before they execute code relying on
+invalid facts. Define what happens to a method invocation
+that has already selected an old body. For example,
+the language may let that invocation finish while
+requiring its next send to use current methods. A cache
+reset alone cannot recover an inlined send that no longer
+consults the cache.
+
+Test a loop that logs argument evaluation once per send.
+Warm up on circles, add a label to exercise the new
+receiver path, then edit an inherited circle implementation
+without changing the circle's identity. Compare returned
+values and emitted events to baseline. Trigger a guard
+failure after an observable drawing command in an inlined
+frame and ensure the resume point neither draws it twice
+nor skips later work. Finally let an unrelated site
+remain hot during the edit: with precise dependencies it
+should stay optimized, whereas the coarse-world model
+can legitimately discard its cache. Both policies must
+agree on results, even when they disagree on cost.
+
+\section{Record Why the Cached Lookup Reached That Body}
+
+Imagine \texttt{Circle} inherits \texttt{paint} from
+\texttt{Shape}. A precise dependency is not simply
+``the body on Shape is unchanged''. It includes the
+absence of a more specific definition on every step up
+to that owner. Installing \texttt{Circle.paint} changes
+the first match without touching \texttt{Shape}. Moving
+a prototype link in a prototype-based interpreter can
+have a similar effect. Cache dependencies have to match
+the premises of the actual lookup rule.
+
+\begin{verbatim}
+select Circle.paint:
+    Circle.paint absent      record absence at Circle
+    Shape.paint present     record target at Shape
+edit Circle.paint:
+    invalidate absence at Circle, keep other Shape users
+\end{verbatim}
+
+A dependency index can store cached and compiled artifacts
+against both kinds of fact. Under a stop-the-world editing
+protocol, install the new methods and invalidate affected
+artifacts before resuming threads; a background compiler
+must also revalidate assumptions before publishing code
+compiled from an older snapshot. Finally, test that an
+invalidated entry is still retained as long as some paused
+frame needs its code or reconstruction metadata. Selection
+validity and storage lifetime are independent.

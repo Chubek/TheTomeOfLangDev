@@ -1,0 +1,189 @@
+% Source: lang-emb-and-ffi.txt
+% Source: c-apis-in-ext-lang-ffi.txt
+% Source: ffi-for-gc-langs.txt
+
+\section{Choose the Smallest Useful Native Surface}
+
+Build one interpreter extension for a rolling numerical
+summary. The native library accumulates an unsigned sample
+count and a real-valued sum. The public interpreter methods
+are \texttt{open\_meter()}, \texttt{feed(m, bytes)},
+\texttt{mean(m)}, and \texttt{close(m)}. Each sample is a
+little-endian unsigned 16-bit integer. The public buffer is
+binary, not a UTF-8 string; a zero byte is a perfectly
+ordinary byte. The native library takes an opaque meter
+pointer, a byte pointer and a byte count. It rejects an odd
+byte count and count overflow without changing the meter.
+It never retains the byte pointer and all calls are on the
+VM owner thread. The outer wrapper does not need a general
+foreign declaration language to implement this interface.
+
+Use compiled C stubs for the raw calls. Including the real
+meter header lets the target compiler pass a \texttt{size\_t}
+in its native representation while the interpreter-facing
+entry checks a host buffer. The native query writes the mean
+through a \texttt{double *} on success and returns
+\texttt{EMPTY} without initializing it otherwise. Avoid
+passing library records by value and avoid making either
+side depend on the layout of the other side's objects.
+Expose the meter as VM userdata or a dedicated foreign object,
+not as an integer address a script can change.
+
+\begin{center}
+\begin{tabular}{lp{0.62\linewidth}}
+\hline
+Public operation & Successful effect or defined alternate result \\
+\hline
+\texttt{open\_meter} & Own a new meter initialized to count zero. \\
+\texttt{feed} & Append the complete sequence or leave state unchanged. \\
+\texttt{mean} & Return a real, or an empty option for count zero. \\
+\texttt{close} & Remove the pointer and destroy once; repeat is harmless. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Define a Stack Shape at Each Exit}
+
+Use an interpreter with a C API resembling the Lua virtual
+stack in the local embedding extract. The extract shows
+arguments and results moved through stack operations, and
+userdata used to associate native storage with host values.
+The survey of C APIs in extension languages contrasts this
+arrangement with exposing handles in C variables. Here the
+call frame has the meter and byte objects in argument slots
+one and two. On success \texttt{feed} pushes the number of
+samples accepted. On recoverable failure it pushes a
+distinguished absence plus an error object. This is an
+invented wrapper convention: the count returned to the
+interpreter is the number of result slots, not a native
+function's status or the number of samples. A stack
+discipline error can return a wrong value while the native
+state is otherwise perfectly consistent.
+
+\Cref{fig:visual-396} shows the path from argument slots to
+native state. The callback and thread cases from
+\Cref{ch:ext-390,ch:ext-391} are excluded here by contract.
+The meter object owns the native meter; the byte object
+does not. Leases follow the bounded copy-or-pin model of
+\Cref{ch:ext-389}, reflecting the distinction between
+copies and reference objects in Crestani's survey.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (slots) at (0,1.25) {VM arguments};
+  \node[tome box dark] (stub) at (4.3,1.25) {Checked C stub};
+  \node[tome box accent] (meter) at (4.3,-1.25) {Opaque meter};
+  \node[tome box] (result) at (0,-1.25) {VM results};
+  \draw[tome arrow] (slots) -- node[above]{validate} (stub);
+  \draw[tome arrow] (stub) -- node[right]{leased bytes} (meter);
+  \draw[tome arrow] (meter) -- node[below]{via stub} (result);
+\end{tikzpicture}
+\caption{The meter update consumes a temporary byte view; the checked stub encodes its result in interpreter slots.}
+\label{fig:visual-396}
+\end{figure}
+
+% Annotated walkthrough
+\section{Implement Feed and Keep the Commit Point Visible}
+
+\begin{verbatim}
+vm_feed(vm):
+    require_owner_thread(vm)
+    meter := check_open_userdata(vm, 1, MeterKind)
+    bytes := check_byte_object(vm, 2)
+    size := checked_c_size_t(byte_length(bytes))
+    if size % 2 != 0: return vm_push_error(vm, OddLength)
+    samples := size / 2
+    # Reserve result resources before native mutation.
+    success := prepare_pushable_integer(vm, samples)
+    with stable_read_only_bytes(bytes) as view:
+        status := raw_meter_feed(meter.ptr, view.data, size)
+    if status != OK: return vm_push_error(vm, translate(status))
+    push_prepared_no_fail(vm, success)
+    return 1
+
+raw_meter_feed(m, data, size):
+    if size % 2 != 0: return ODD_LENGTH
+    n := size / 2
+    if n > MAX_COUNT - m.count: return LIMIT
+    extra := 0.0
+    for i in 0 .. n - 1:
+        extra += data[2*i] + 256 * data[2*i + 1]
+    m.sum += extra
+    m.count += n
+    return OK
+\end{verbatim}
+
+The native loop reads two bytes independently; casting the
+buffer to a native 16-bit integer pointer would introduce
+endianness and alignment assumptions. The zero-length
+case runs no iterations; the native API explicitly
+permits null for that case. The example uses floating
+accumulation and does not promise exact large sums.
+Preparation of the interpreter result must also reserve
+enough VM stack space and root any boxed value across the
+call. If the implementation leaves result boxing until
+after commit, a host allocation failure can cause a caller
+to retry a batch the library already counted. Either
+avoid that failure window or document a weaker contract.
+
+\section{Finish the Other Entry Points and Test the Composition}
+
+For open, construct and initialize empty userdata with
+its finalizer before acquiring a native meter. Store the
+returned pointer before doing anything that can fail. An
+explicit close takes that pointer out and destroys it;
+the finalizer follows the same path and sees an empty
+object after explicit close. There is no reentrant native
+execution in this design. If the library later starts
+calling user handlers, this simple owner-thread argument
+does not establish lease or teardown safety. For mean,
+read the out cell only on success, and map \texttt{EMPTY}
+to the empty option without ever inspecting the cell.
+
+Start the end-to-end test by querying a fresh meter. Then
+feed the byte pairs \((0,1)\) and \((2,0)\), which encode
+256 and 2 and therefore yield mean 129. An unaligned
+view of those four bytes must yield the same result. Pass
+an odd-length slice next and verify that the mean is still
+129; next use a native fixture seeded near the count limit
+and ensure the overflow status does not change the meter.
+Test allocation failure before mutation and inspect the
+interpreter stack shape on every path. Finally close
+twice and trigger finalization, verifying that the native
+destroy routine ran exactly once and that further queries
+reject the closed object without reaching C.
+
+\section{Extend the Trace to Cover Identity and Ownership}
+
+Open a second meter before closing the first one. Feed it
+the pair \((4,0)\) and query it between the first meter's
+feed and close. Its mean must be 4; the earlier mean of 129
+belongs only to the first owner. Force the native allocator
+to reuse the first meter's address on a subsequent open.
+Keeping the old userdata in a script variable must not allow
+it to read the new meter. Ownership is attached to the
+userdata instance, and close already removed its pointer;
+pointer equality is not an object-identity test.
+
+Use an instrumented VM adapter to track the result slots
+as well as the native allocator. Before feed, the adapter
+records two argument slots and a rooted prepared result.
+On success it observes one result slot with integer 2.
+On odd input it observes absence and a descriptive error,
+not a return count of zero masquerading as a stack count.
+While injecting preparation failure, verify both that no
+native feed ran and that the prepared slot was not exposed.
+The stack trace and native state trace establish different
+halves of the interface; neither replaces the other.
+
+Treat the binding as a module with a native lifetime:
+do not unregister or unload the meter implementation while
+any userdata may invoke its finalizer. If the interpreter
+supports unloading, keep the library alive through all
+open meters, or reject unloading until the host has closed
+and invalidated those objects. In a statically linked
+interpreter this obligation is trivial, but the identical
+public interface in a dynamically loaded interpreter may
+require an explicit module lease as in \Cref{ch:ext-387}.

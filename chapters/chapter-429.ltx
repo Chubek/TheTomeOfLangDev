@@ -1,0 +1,211 @@
+% Source: appel-book-ml-better-typeset.txt
+% Source: irdl-ir-def-lang-for-ssa-cc-compiler-opt-ir-il.txt
+% Source: a-compact-and-xtnsible-scheme-vm.txt
+
+\section{Pick a Program That Crosses Every Ownership Boundary}
+
+Audit a toy language with lexical scopes, capture by reference,
+fixed-width integer addition, and mutable local variables. The
+following program makes a closure over two locals. Evaluate
+\texttt{a = maker(false)}, \texttt{b = maker(true)}, then
+\texttt{a()}, \texttt{b()}, and \texttt{a()} in that order.
+The calls return 1, 2, and 2. The two final results happen to
+agree, but there is no aliasing between the two counters.
+
+\begin{verbatim}
+fn maker(flag) {
+    let step = if flag then 2 else 1;
+    var total = 0;
+    return fn() {
+        total = total + step;
+        return total;
+    };
+}
+\end{verbatim}
+
+The audit follows name resolution in the sense of Appel's
+distinction between symbols and bindings \cite{appel2004modern},
+block arguments as found in MLIR \cite{lattner2021mlir}, and a
+toy stack machine with a different layout from Ribbit's linked
+cell stack. No production compiler or VM is assumed to have this
+entire combination. At each boundary, identify the lookup key,
+the entity that owns it, and the ways that a once-valid fact
+stops being valid. This is more informative than asking whether
+the implementation uses arrays or hash tables in the abstract.
+
+\section{Trace One Spelling Through Three Forms of Identity}
+
+The declaration and three uses of \texttt{total} share one
+spelling ID. Each occurrence has its own source span. The
+resolver records all uses against one declaration ID in the
+source, but two calls of \texttt{maker} require two separate
+runtime locations. Store this distinction in the interfaces:
+a use resolves to a binding; closure analysis assigns that
+binding a capture slot in the nested function's layout; closure
+construction fills that slot with the enclosing activation's
+cell. If one procedure looks up the capture by spelling ID
+while another looks it up by capture slot, shadowing can
+pass tests with distinct names and still fail in real programs.
+
+\Cref{fig:visual-429} shows the point where one lexical binding
+becomes multiple cells. Neither a cell nor a source span is
+an appropriate input to the linker as a name. Conversely an
+artifact-local name index cannot resurrect the original
+activation. Reaching an entity via a chain of translations is
+not evidence that the identifiers in the chain are equivalent.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (sym) at (3.5,2.9) {Symbol \texttt{total}};
+  \node[tome box dark] (bind) at (3.5,1.45) {Declaration \(D\)};
+  \node[tome box accent] (a) at (0,0) {Cell for activation \(A\)};
+  \node[tome box accent] (b) at (7,0) {Cell for activation \(B\)};
+  \draw[tome arrow] (sym) -- (bind);
+  \draw[tome arrow] (bind) -- (a);
+  \draw[tome arrow] (bind) -- (b);
+\end{tikzpicture}
+\caption{Resolution chooses the source declaration \(D\). Execution instantiates a separate captured location for each call of the factory.}
+\label{fig:visual-429}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Boundary & Data to inspect & Invalidated by \\
+\hline
+Syntax occurrence & Revision and path or span & Text edit \\
+Name resolution & Use-to-declaration map & Added visible shadowing name \\
+IR analysis & Value handles and graph revision & CFG or operand rewrite \\
+Bytecode layout & Local and capture descriptors & Replacing a code object \\
+Activation & Open stack index or closed cell & Slot reuse if not closed \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Inspect the Join Before and After Simplification}
+
+The generic \texttt{maker} can lower its initializer to a branch
+in entry \(E\), with paths \(T\) and \(F\) passing 2 and 1
+respectively to a join \(J(s)\). The definition of \(s\) is a
+block parameter. To remove the path blocks, allow a conditional
+branch with two edge occurrences \(E\to J\), passing the two
+constants directly; this is legal if the constants are now
+available at \(E\) and no eliminated block has effects. The
+new predecessor index for \(J\) still has two entries.
+Assert that the edge-argument uses now occur at \(E\), the
+old handles for the deleted blocks fail validation, and the
+dominance tree is recomputed for the new graph. All these
+checks address separate obligations even though the edge
+count into \(J\) remains two.
+
+At closure lowering, use \(s\) to initialize a local slot
+for \texttt{step}. The pure SSA value representing its
+initial content is not the storage for mutable \texttt{total}.
+Introduce the latter as a local with a location that can be
+captured, rather than making mutation of the cell look like
+an SSA definition of the same value. Installing a capture
+makes initialization visible through the cell. Since
+\texttt{step} never changes in this example, a later compiler
+could specialize its capture mode to by-value; the baseline
+keeps both by-reference, which makes the teardown contract
+uniform.
+
+% Annotated walkthrough
+\section{Run One Harness Against Clean and Incremental Builds}
+
+\begin{verbatim}
+audit(snapshot, editor):
+    clean := compile_from_scratch(snapshot)
+    reused := editor.compile(snapshot)
+    for build in [clean, reused]:
+        assert reconstruct_bytes(build.syntax) == snapshot.bytes
+        assert checked_resolution_matches_source(build)
+        verify_control_edges_and_uses(build.ir)
+        verify_dominance_against_slow_solver(build.ir)
+        verify_stack_and_capture_layout(build.code)
+        assert run_factory_script(build.code) == expected(snapshot)
+    assert compare_normalized_outputs(clean, reused)
+
+run_factory_script(code):
+    vm := fresh_vm(code)
+    a := vm.call("maker", false)
+    b := vm.call("maker", true)
+    vm.force_stack_growth()
+    return [vm.call(a), vm.call(b), vm.call(a)]
+\end{verbatim}
+
+The test harness compares named source occurrences and
+normalized structural results rather than allocation numbers.
+For this fixture \texttt{expected} is an independent table
+maintained with the test edits, not a number obtained from
+the compiler being audited. In the runtime trace, after
+\texttt{maker} returns the cells are closed. Growing or reusing
+the stack must not change the values read through them.
+Independently exercise stack growth before return to check that
+an open upvalue uses an index, not a stale interior pointer.
+Add a frame that returns two closures over one activation and
+assert they do alias; testing only nonaliasing would accept a
+VM that accidentally copies a cell for each closure.
+
+\section{Separate an Edit's Semantic Impact From Its Coordinate Impact}
+
+First insert a comment before the nested function. The
+diagnostic projection and byte coordinates change, but
+bytecode without source maps need not. A reused green subtree
+does not prove the old source span remains valid, and a query
+returning locations cannot simply compare the old and new
+result by green shape. Next replace \texttt{else 1} with
+\texttt{else 3}. The new factory-call sequence gives 3, 2,
+and 6. That edit can leave name resolution untouched but
+changes the false branch value, the join's inputs, and
+compiled code. If the runtime supports publishing new code
+while existing closures remain live, make that a separate
+test: a closure over an old code object and activation is
+not automatically migrated by a new compile. Here each audit
+runs a fresh VM and promises no migration.
+
+Finish by collecting retained source snapshots, arena slots
+versus live IR nodes, dataflow scratch size, dirty queries
+versus executed queries, and open versus closed upvalue
+counts. A phase is ready to optimize when its input/output
+equivalence is measurable and a slow reference model can
+reject stale indexes. Profile the whole pipeline after
+changing a container: saving allocations in the parser is
+not progress if a new cache root keeps every previous file
+revision live. The point of the audit is to identify which
+contracts changed and which did not, not to mandate one
+data structure across the compiler and runtime.
+
+\section{Inject a Representation Fault Where the Audit Can Localize It}
+
+Use fault-injection fixtures in a debug build, one at a time.
+The relevant check should fail before downstream outputs
+are compared; a plain output mismatch does not distinguish
+a graph rewrite error from a bytecode capture error.
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Injected defect & First check expected to fail \\
+\hline
+Use raw green ID as source position & Occurrence span after comment insertion \\
+Merge parallel CFG edges by endpoint & Join argument and edge multiplicity check \\
+Leave old reverse operand index & Reconstructed use-list comparison \\
+Reuse a slot before closing its capture & Factory growth and activation reuse trace \\
+Skip invalidation of the false literal & Incremental build after \texttt{else 3} \\
+\hline
+\end{tabular}
+\end{center}
+
+Also run a variant with a same-spelled local \texttt{total}
+inside a new nested block. First read the outer \texttt{total},
+then declare the inner one, then read it. The two reads
+must have different binding IDs despite one spelling ID.
+This variant distinguishes an occurrence mapping bug from
+the earlier duplicate-activation fixture, where the source
+binding must remain the same. Record which contract each
+fixture exercises before optimizing the data structure that
+implements it; otherwise a later refactor can remove the
+test case that was the only one to distinguish the two.

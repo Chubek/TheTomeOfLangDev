@@ -1,0 +1,184 @@
+% Source: c-apis-in-ext-lang-ffi.txt
+% Source: lang-emb-and-ffi.txt
+% Source: ffi-for-gc-langs.txt
+
+\section{Hide Representation, Not Responsibility}
+
+A C API can forward declare an incomplete type and return a
+pointer to it. The caller can hold that pointer and pass it
+to declared operations, but need not know the object's size
+or fields. This is a native opaque handle, distinct from a
+runtime handle referring to a managed object. The C API survey
+uses opaque JNI reference types for the second direction; the
+Lua embedding extract illustrates userdata as a place a host
+can associate native data with a VM value. Neither technique
+answers who owes destruction of a particular native object.
+An opaque pointer is not automatically an owned pointer.
+
+Consider a native music catalog with an owned session and
+read-only track views borrowed from that session. A session
+can close explicitly. A view can be used only while its
+session exists, and becomes invalid on a documented refresh.
+The wrapper should not expose the view solely as a pointer
+with a destructor; it acquires no right to free an individual
+track. A public view may carry a strong reference to the
+session plus a refresh generation. A query borrows the
+session for the duration of native use and validates the
+generation under the same synchronization that excludes
+refresh. A strong reference alone does not prevent explicit
+close or structural mutation.
+
+\begin{center}
+\begin{tabular}{lp{0.60\linewidth}}
+\hline
+Returned handle & Wrapper obligation \\
+\hline
+Fresh owner & Invoke matching destroy exactly once. \\
+Retained shared handle & Balance each successful retain with release. \\
+Borrowed view & Hold a parent lease; check the view generation. \\
+Static borrowed handle & Do not free; honor module and library lifetime. \\
+Ownership transferred out & Mark wrapper moved only when transfer commits. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Use a State Machine Rather Than a Null Check}
+
+The address of an allocation may be recycled. Its numeric
+identity cannot distinguish a new session from an old one.
+An internal handle table can pair slot indexes with generations,
+refuse stale tokens, and avoid claiming that tokens are stable
+across process invocations. Do not silently recycle a
+generation on wraparound while an old token may survive.
+Native addresses, if used at all, remain private to the raw
+wrapper and must be presented only to operations of the right
+handle family and library instance.
+
+\Cref{fig:visual-394} illustrates an owner with nonblocking
+close. Close rejects future uses but need not destroy the
+resource immediately. Active leases can finish, then the
+last one schedules destruction on the owner thread. Explicit
+close and finalization share the same state transition, so
+they cannot each destroy the pointer. A finalizer should not
+be relied on for timely release; files, device slots and
+registrations can be exhausted long before a collector
+notices memory pressure \cite{jones2011garbage}.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (open) at (0,0) {Open};
+  \node[tome box dark] (closing) at (4.1,0) {Closing};
+  \node[tome box accent] (dead) at (8.2,0) {Destroyed};
+  \draw[tome arrow] (open) -- node[above]{close admission} (closing);
+  \draw[tome arrow] (closing) -- node[above]{drain and destroy} (dead);
+\end{tikzpicture}
+\caption{No new lease starts in Closing. Existing leases and the destruction task continue to retain the native module.}
+\label{fig:visual-394}
+\end{figure}
+
+% Annotated walkthrough
+\section{Make Lease Acquisition Atomic With Admission}
+
+\begin{verbatim}
+acquire(owner):
+    with owner.lock:
+        if owner.state != Open: return Closed
+        owner.active += 1
+        return Lease(owner, owner.ptr)
+
+close(owner):
+    with owner.lock:
+        if owner.state == Open: owner.state := Closing
+        task := take_destroy_task_if_ready_locked(owner)
+    if task: queue_to_owner_thread(task)
+
+release(lease):
+    owner := lease.owner
+    with owner.lock:
+        owner.active -= 1
+        task := take_destroy_task_if_ready_locked(owner)
+    if task: queue_to_owner_thread(task)
+
+take_destroy_task_if_ready_locked(owner):
+    if owner.state != Closing or owner.active != 0: return None
+    owner.state := DestroyQueued
+    return retained_destroy_task(owner, move(owner.ptr))
+\end{verbatim}
+
+Assume leases are single-use and that installing a lease is
+infallible once the count is incremented. Reserve any required
+storage before acquiring the lock. The queue accepts the task
+without throwing or uses a specified safe fallback.
+The job calls the native destroy once, outside the lock and
+on the correct thread, then records \texttt{Destroyed}.
+Use a destroy API whose lifetime effect is defined even if
+it also reports a diagnostic; a failure with ownership
+retained needs a separate recovery state. Merely clearing
+the pointer could lose the only remaining owner. Never hold
+the state mutex across a C operation that can invoke host
+callbacks, including a destroy operation with that behavior.
+
+Crestani's local and global reference lifetimes concern
+managed referents visible to C, but the distinction helps
+here too: a temporary reference that proves reachability
+for one call is not a permanent ownership claim. If the
+catalog retains a managed callback, hold that callback
+root independently of the individual catalog operations
+until native quiescence, then release it. Closing a catalog
+does not imply callback release unless the native contract
+guarantees the appropriate join.
+
+\section{Find the Transfer Point on Each Status Branch}
+
+Suppose registering a native filter in the catalog consumes
+it only on success. Keep a private owner before the call,
+prevent simultaneous loans or transfers, and move its
+pointer to the catalog only on the success branch. On
+failure it remains an owned filter, still eligible for a
+retry or for destruction. State the opposite explicitly
+for a native API that consumes its argument on all returns.
+Without the status-specific rule the wrapper either frees
+a pointer it no longer owns or leaks a filter still owed.
+
+Test an allocator that reuses a released address, a view
+whose generation invalidates on refresh without moving
+the underlying allocation, close racing a blocked lease,
+and a destroy operation observed on the owner thread.
+For transfer, run separate success and failure fixtures
+that count frees at the supplier and at the wrapper.
+Check that the sum is one after all objects are closed.
+
+\section{Avoid a Strong Reference Cycle Through a Callback}
+
+Suppose each catalog holds a native subscription whose
+context roots a managed closure which captures the owning
+catalog. The collector considers the root strong, so
+dropping the last application reference to the catalog will
+not run its finalizer. Destroying the subscription only
+from that finalizer cannot break the cycle. Introduce an
+explicit subscription lifetime, or root a dispatcher with
+a weak reference to the catalog when loss of the owner
+means delivery should stop. A weak lookup must be upgraded
+to a temporary strong lease before invoking application
+code. If it fails, the invocation returns the native stop
+result and initiates teardown via the designated owner.
+
+Design the library unloading rule together with this
+teardown path. A queued destruction job keeps the module
+lease independently of whether there is still a reachable
+catalog object. When running the job, first ensure native
+subscriptions cannot invoke any longer, then call destroy
+and release the lease. If the runtime stops processing
+that queue before draining it, assigning destruction to
+the correct thread on paper accomplishes nothing. Verify
+shutdown while an application intentionally forgets to close
+one subscription and a destruction task is already queued.
+The runtime may provide explicit leak reporting rather
+than pretend that forgotten close is timely or harmless.
+
+A useful debug assertion is that \texttt{DestroyQueued} owns
+the only destroy task and has zero active leases. Assert it
+when dequeuing, not merely when closing, so tests can catch
+a misguided path that reopened admission after scheduling.

@@ -1,0 +1,173 @@
+% Source: ffi-for-gc-langs.txt
+% Source: lang-emb-and-ffi.txt
+
+\section{Choose Which Kind of Sequence Crosses}
+
+A managed string is not a pointer to the first element of a C
+string. It may have several internal encodings, come from a
+substring, or contain a zero byte when encoded in UTF-8. A C
+function expecting a NUL-terminated string has no length with
+which to distinguish an internal zero from the terminator. A
+function accepting a byte span can distinguish those cases, but
+does not automatically know whether the bytes are text. Give
+these two conversions different names and types. If the public
+wrapper accepts text for a terminator-based API, encode in the
+promised encoding and reject embedded zeros; appending a zero is
+necessary but not sufficient.
+
+Contrast a display name with the contents of a configuration file.
+The name uses UTF-8 with no embedded NUL and may pass as a
+terminated string. The file contents may include arbitrary bytes and
+need a span. In either case lengths in the native prototype might be
+measured in bytes rather than Unicode scalars, UTF-16 code units,
+or visible characters. For instance, the string consisting of one
+e with an acute accent in its precomposed form takes two bytes in
+UTF-8. A wrapper that allocates for one byte plus a terminator
+will not have allocated enough for both encoded bytes and the
+terminator.
+
+\begin{center}
+\begin{tabular}{lp{0.62\linewidth}}
+\hline
+Native parameter & Binding policy \\
+\hline
+Terminated name & Encode, reject internal zero, append one terminator. \\
+Input span & Keep owner alive and address stable for the borrow. \\
+Output span & Pass capacity, then check returned length before reading. \\
+Owned result & Record release function; free even if conversion fails. \\
+Retained input & Transfer native storage or lease through completion. \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Match the Lifetime to the Last Native Use}
+
+Crestani describes both copying and indirection through reference
+objects in garbage-collected FFIs. Copying bytes to independent
+storage avoids exposing movable heap addresses. A reference object
+can preserve liveness and let runtime APIs find the current object
+location; it does not authorize dereferencing a cached interior
+pointer. This is a general property of precise moving collectors
+\cite{jones2011garbage}. Pinning arranges address stability when the
+runtime supports it but may constrain collection, and it does not
+prevent ordinary mutation by another thread. The binding must
+separately provide a read lease, a synchronization rule or a copy.
+
+Choose between a synchronous borrow and retention before optimizing
+for copy cost. When a library consumes bytes before returning, a
+pin may last only for that call. When it enqueues work, returning
+from the enqueue call merely changes who is responsible for the
+next use. \Cref{fig:visual-389} shows a completion protocol in
+which cancellation is a request; only the completion event certifies
+that no worker will subsequently read the allocation. A compiler
+cannot generally derive that protocol from a \texttt{const char *}
+parameter. The const qualification says nothing about how long the
+callee may use the pointer.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (copy) at (0,0) {Native copy};
+  \node[tome box dark] (queue) at (4,0) {Job owns lease};
+  \node[tome box accent] (done) at (8,0) {Release at completion};
+  \node[tome box] (cancel) at (4,-1.5) {Cancellation request};
+  \draw[tome arrow] (copy) -- (queue);
+  \draw[tome arrow] (queue) -- (done);
+  \draw[tome dashed] (cancel) -- (queue);
+\end{tikzpicture}
+\caption{Acceptance transfers the copy's lease. A cancellation request alone does not return it.}
+\label{fig:visual-389}
+\end{figure}
+
+% Annotated walkthrough
+\section{Read an Owned Result Without Leaking It on Decode Failure}
+
+\begin{verbatim}
+get_label(native_object):
+    data := initialized_null_pointer_cell()
+    size := initialized_zero_size_cell()
+    with lease(native_object) as handle:
+        status := raw_read_label(handle, address(data), address(size))
+        if status != OK:
+            # This API leaves data and size unowned on failure.
+            return translate(status)
+        ptr, n := read(data), read(size)
+        try:
+            require(ptr != null or n == 0)
+            length := checked_host_length(n)
+            if length == 0: return ""
+            bytes := copy_exactly(ptr, length)
+            return decode_utf8_strict(bytes)
+        finally:
+            if ptr != null: raw_free_label(handle, ptr)
+\end{verbatim}
+
+The invented API supplies its result length in bytes, excludes any
+trailing terminator, and guarantees a readable extent of at least
+that length on success. It may produce a non-null pointer for a
+zero-length allocation, so the empty result must still follow the
+deallocation rule. The caller does not use \texttt{strlen}, which
+would both erase valid internal zeros and read past the extent when
+there is no terminator. Incorrect UTF-8 is a domain error after the
+native operation has succeeded; the native allocation remains owed
+even then. This release function takes the object handle, so the
+object lease covers release as well as read and copy.
+
+When using a VM value stack, an index is not by itself a durable
+reference. The embedding extract illustrates Lua's index-oriented
+stack interface. If the wrapper obtains a byte pointer from a
+VM API, follow that API's lifetime rules while keeping the owner
+reachable. Do not equate the lifetime of a temporary index with
+that of a separately retained object; stack restoration, pushes
+or return to the caller can change which value an index denotes.
+
+\section{Make ``Query Then Fill'' a Bounded Protocol}
+
+Another library writes into caller-provided storage and allows a
+query for required capacity. Between calls the required size may
+change, for example because the label is mutable. Do not allocate
+once and assume a successful fit. On a documented insufficient
+capacity status, discard the partial data, validate the new size
+and retry up to a fixed limit or under a snapshot lease; then
+report a changing value rather than using an unbounded allocation
+loop. Count the terminating byte if the API requires room for one.
+For an implementation that returns the actual readable size, reject
+success with a claimed length larger than the capacity. This check
+does not undo writes by a nonconforming library; it prevents the
+wrapper from performing an additional out-of-bounds read.
+
+Ask the fixture for invalid UTF-8, an empty allocated buffer, an
+empty null buffer and a label whose size grows between calls.
+Track frees with the fixture allocator. For the retained-input
+variant, arrange for the native worker to read after enqueue
+returns and after one collection. The data must still be valid,
+even when the managed source is already unreachable. Also mutate
+the original managed array immediately after enqueue; if the
+public operation offers snapshot semantics, the worker's reading
+must see the pre-enqueue bytes. That test distinguishes a stable
+address from a stable value.
+
+\section{Handle Completion Before the Submission Call Returns}
+
+Consider an async compressor that calls completion exactly once
+on acceptance, possibly during submission, and never on rejection.
+The submitting thread owns a reference to a native job object.
+Create a second, provisional reference for completion before calling
+the compressor. Completion records the outcome and releases its
+reference; it cannot destroy the job while the submitter still
+owns the other reference. On rejection, the submitter releases the
+provisional reference itself. On acceptance, the submitter never
+releases the provisional reference, even if it observes a completed
+job. This convention has an owner for each reference on every
+path and does not need to infer ownership from a callback's timing.
+
+Store the copied buffer in the job and destroy it when the last
+reference ends, assuming completion is the last legal native read.
+If a public future can refer to the job, give it its own reference
+or move the submitter's reference into it. Do not give cancellation
+authority to free the copy. To test the early-completion path,
+run a library fixture that calls the callback before it returns
+acceptance and then checks the submitting wrapper can still read
+the completion record. Also reject submission without dispatch:
+precisely the same native bytes must be reclaimed, by a different path.

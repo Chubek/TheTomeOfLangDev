@@ -1,0 +1,194 @@
+% Source: garbage-coll-in-large-lisp-system.txt
+% Source: appel-book-ml-better-typeset.txt
+
+\section{Define the Boundary of a Minor Collection}
+
+Many programs create short-lived objects while retaining
+a smaller stable core. A generational collector exploits
+this tendency by collecting a young region more frequently
+than an old region. It is a workload hypothesis, not a rule
+of the language. Moon's account of ephemeral objects in the
+Symbolics 3600 discusses both lifetime classification and
+tracking locations containing pointers into the area of
+interest. Appel describes software techniques for maintaining
+such information \cite{appel2004modern}. The collector does
+not need to prove every old object live at each minor
+collection. It does need every incoming strong edge from the
+uncollected heap into the collected region.
+
+Consider an old queue \(Q\) storing the only reference to a
+new request \(R\), which holds new payload \(P\). The root
+points to \(Q\). A minor collector that does not walk old
+objects will find neither \(R\) nor \(P\) unless it treats
+the slot in \(Q\) as an additional root. Record that slot,
+the holder object, or a small address range containing it.
+The resulting remembered information must cover all actual
+old-to-young edges, though it may cover locations that have
+since been overwritten and are no longer edges.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Remembered unit & Work at store & Work at minor pause \\
+\hline
+Exact slot & Record slot address & Inspect that slot \\
+Holder object & Record holder & Scan its reference fields \\
+Card of bytes & Mark small range & Locate and inspect slots in range \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-415} separates the edge across the
+collection boundary from the edge that will be discovered
+by ordinary young-object traversal. The root to \(Q\) can
+be ignored by the forwarding routine because its value is
+not in the nursery. Ignoring both that value and \(Q\)'s
+recorded slot would lose an entire reachable subgraph.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box] (root) at (0,0) {Root};
+  \node[tome box dark] (q) at (2.7,0) {Old $Q$};
+  \node[tome box accent] (r) at (5.6,0) {Young $R$};
+  \node[tome box accent] (p) at (8.5,0) {Young $P$};
+  \draw[tome arrow] (root) -- (q);
+  \draw[tome arrow] (q) -- node[above]{remember} (r);
+  \draw[tome arrow] (r) -- (p);
+\end{tikzpicture}
+\caption{A single remembered slot lets the minor collector find both young survivors without tracing the old graph.}
+\label{fig:visual-415}
+\end{figure}
+
+% Annotated walkthrough
+\section{Carry Remembered Edges Across Evacuation}
+
+\begin{verbatim}
+write_reference(holder, slot, value):
+    slot.store(value)
+    if in_old(holder) and in_current_young(value):
+        dirty(card_containing(slot))
+
+collect_young():
+    stop_mutators_with_completed_barriers()
+    old_cards := snapshot_dirty_cards()
+    next_cards := empty_card_set()
+    for slot in roots:
+        slot.store(evacuate_if_young(slot.load()))
+    for slot in unique_pointer_slots_on(old_cards):
+        slot.store(evacuate_if_young(slot.load()))
+        if in_survivor_young(slot.load()):
+            next_cards.add(card_containing(slot))
+    while evacuation_queue not empty:
+        holder := evacuation_queue.pop()
+        for slot in strong_slots(holder):
+            slot.store(evacuate_if_young(slot.load()))
+            if in_old(holder) and in_survivor_young(slot.load()):
+                next_cards.add(card_containing(slot))
+    finish_flip_and_install(next_cards)
+\end{verbatim}
+
+This example uses a stop-the-world copying nursery with an
+old region that is not moved by the minor cycle.
+\texttt{evacuate\_if\_young} tests the old nursery range; it
+copies once and queues objects whether they land in young
+survivor space or are promoted. The pseudocode maintains a
+fresh set rather than clearing every dirty card after it
+is read. If a surviving old-to-young edge stays in place
+and no mutator rewrites it, clearing its card would lose it
+at the next minor collection. Likewise, a freshly promoted
+object can acquire old-to-young edges even without any
+mutator store. The evacuation scan must account for them.
+
+\section{Scan Precisely Inside Coarse Cards}
+
+A card is an address range, not a sequence of tagged values.
+The first bytes may be the tail of an object that starts on
+an earlier card. Find that object using an object-start or
+block-offset structure, then consult its descriptor for
+reference slots in the dirty card. If instead the implementation
+marks a holder's starting card, its scanner must enumerate
+all fields of the holder, not just those physically on that
+card. A large reference array crossing a boundary with its
+only young value in the final slot distinguishes these two
+interpretations. Store and scanner must use the same one.
+
+An unchecked store in an initialization helper is not
+automatically safe. It may initialize an old object allocated
+directly into the old region. Likewise, a vector copy, a
+native setter, and generated code specialized for a known
+shape may bypass a generic setter. Check every operation
+that can write a reference, and give bulk stores a documented
+way to mark the affected ranges before reaching a safepoint.
+In the simple cooperative protocol, no pause can occur
+between the store and its post-barrier; concurrent collection
+requires a stricter protocol for publication and cleaning.
+
+\section{Tune Using Survival and Scan Cost}
+
+An age threshold counts completed young survivals, not wall
+time. Promoting quickly reduces repeated copying but puts
+more data beyond the reach of minor reclamation. If a workload
+keeps objects alive for three minor pauses and discards them
+before the fourth, a threshold of two tends to promote
+objects that die soon thereafter. Increasing the nursery can
+reduce the number of times these objects are seen, but also
+raises the maximum live volume and changes pause distribution.
+Track copied bytes by age, promotion bytes, and occupancy
+of the destination before changing thresholds.
+
+Repeated updates to a wide old table can spread dirty cards
+over much of old space. Then a nominally minor cycle spends
+more time scanning old memory than its name suggests. Measure
+dirty card count, bytes of old storage examined, and actual
+old-to-young slots found. Sparse referents over densely dirty
+cards might justify refinement or a different card size;
+a single highly reused card may be cheaper than an exact
+set with many duplicate insertion attempts.
+
+\section{Test What the Young Collector Deliberately Ignores}
+
+Force two minor collections with no intervening store to
+the old queue, inspect the request through that queue after
+both, then clear the slot and check that the request can
+die. Test a promotion whose child remains young. In debug
+builds, compare the remembered coverage against a walk of
+all old reference slots before invoking a minor cycle.
+Presence of additional dirty cards is acceptable; absence of
+one actual incoming slot is not. Finally include garbage
+old objects whose fields retain young ones. The minor policy
+may keep those young objects alive until an old or full
+cycle proves their holders dead. That conservative retention
+is a cost of collecting only part of the heap, not a reason
+to ignore such fields at the next minor cycle.
+
+\section{Reserve Space for a Promotion Spike}
+
+Suppose the nursery has 8 MiB occupied, only 3 MiB of young
+survivor space is free, and old space can accept another 1 MiB.
+If 5 MiB turns out to survive, neither the age threshold nor
+the three-region layout guarantees a destination. A runtime
+can reserve enough destination space before the pause, grow
+the allowed destination, or implement a promotion-failure
+fallback with explicit metadata. A naive fallback restarts
+marking at the old roots and walks the old nursery exactly as
+before. That is not valid after forwarding has destroyed some
+headers and roots and fields point into both destinations.
+Fault-inject at every allocation used by evacuation to ensure
+the chosen policy cannot silently enter that state.
+
+A full cycle that moves old objects also affects remembered
+state. With an exact remembered set, the address of a slot may
+change even though the referent remains young. In a card
+table, moving a holder to a new card invalidates the old card
+as a description of that edge. Rebuild the remembered set
+during full tracing or demonstrate that the full cycle leaves
+no young survivors. For a test, move a holder while keeping a
+young referent, run a minor cycle without rewriting the holder,
+and verify that the relocated holder still names the referent.
+Testing only the full collection would miss this failure.
+Verify the same boundary when a full cycle reclassifies a
+young region as old without changing any addresses. Generation
+membership, not address stability, determines which stores
+must be represented in the remembered set.

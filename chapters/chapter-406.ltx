@@ -1,0 +1,208 @@
+% Source: the-rust-proglang.txt
+% Source: jvm-specs.txt
+
+\section{Identify the Interface as Well as the Slot}
+
+A \texttt{Thermometer} can implement both
+\texttt{Readable} and \texttt{Calibrated}. If slot zero
+of the first interface is \texttt{read} and slot zero
+of the second is \texttt{calibrate}, the number zero
+alone does not identify the requested operation. The
+interface identity determines the namespace for the slot.
+The receiver determines which implementation of that
+interface to use. Implementations can represent that
+second mapping as a lookup from a class, or arrange for
+it to be carried with the receiver.
+
+The JVM's \texttt{invokeinterface} refers to a resolved
+interface method and selects a target relative to the
+receiver class. Its rules do not require one physical
+layout. Rust's book explains the contrasting source
+choice between use of a generic bound and a trait object.
+The following example shows one possible representation of
+the latter idea rather than claiming a stable Rust ABI.
+
+\section{Package the Data Pointer With Evidence of Conformance}
+
+A borrowed erased value in our language is a pair
+\((p,w)\): \(p\) denotes a concrete receiver, and \(w\)
+denotes the witness table for that receiver's conformance
+to a particular interface. The table contains call
+entries compiled for an erased receiver ABI. Each entry
+knows how to pass its receiver to the concrete body.
+The introduction rule, which constructs the pair, must
+verify the correspondence between data and witness.
+\Cref{fig:visual-406} shows how the two halves of the
+pair are used.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (v) at (0,0) {Erased reference};
+  \node[tome box] (p) at (3.25,1.05) {Receiver data};
+  \node[tome box] (w) at (3.25,-1.05) {Witness table};
+  \node[tome box accent] (f) at (6.45,0) {read adapter};
+  \draw[tome arrow] (v) -- (p);
+  \draw[tome arrow] (v) -- (w);
+  \draw[tome arrow] (p) -- node[above]{argument} (f);
+  \draw[tome arrow] (w) -- node[below]{slot} (f);
+\end{tikzpicture}
+\caption{One half of the erased reference supplies the receiver; the other supplies the callable entry.}
+\label{fig:visual-406}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Representation & Where evidence lives & Dispatch step \\
+\hline
+Class pointer & class/interface map & find interface then slot \\
+Borrowed erased pair & witness pointer in pair & load slot from witness \\
+Generic dictionary & hidden function argument & load operation from dictionary \\
+Concrete specialized call & compiler knowledge & call selected body \\
+\hline
+\end{tabular}
+\end{center}
+
+A borrowed pair does not by itself own the data. An
+owned package needs destruction and deallocation rules,
+and may include size, alignment, or tracing metadata.
+Some designs separate ownership support from dispatch
+slots. Decide whether a witness has process lifetime or
+can become stale when a defining library unloads. A
+valid pointer to receiver bytes is not proof the
+associated code remains callable.
+
+% Annotated walkthrough
+\section{Check Conformance at Erasure and Adapt at the Call}
+
+\begin{verbatim}
+erase_borrow(receiver : borrow T, contract):
+    checked := resolve_conformance(T, contract)
+    table := materialize_witness(checked, erased_abi(contract))
+    return BorrowedPair(address(receiver), table, lifetime(receiver))
+
+call_read(value : Readable<Output = Int>, meter):
+    slot := slot_of(Readable<Output = Int>, "read")
+    entry := value.witness.methods[slot]
+    return entry(value.data, meter)
+
+thermometer_read_adapter(data, meter):
+    receiver := as_borrowed_thermometer(data)
+    return thermometer_read(receiver, meter)
+
+upcast(pair, super_contract):
+    conversion := pair.witness.super_views[super_contract]
+    return BorrowedPair(conversion.adjust(pair.data),
+                        conversion.witness, pair.lifetime)
+\end{verbatim}
+
+In the example, the associated output type is fixed by
+the erased contract: every allowed witness returns an
+integer using the same calling convention. If one witness
+returned a byte array instead, the caller could not
+choose how to receive or drop it. Other solutions include
+returning a boxed value with its own metadata or making
+the associated type unavailable in callable erased
+requirements. A method quantified over a fresh type at
+each call cannot be implemented by an ordinary fixed
+slot for every concrete instantiation unless the ABI
+defines an additional universal calling protocol.
+
+\section{Do Not Reuse a Witness Across an Unproved Conversion}
+
+Upcasting to a superinterface does not generally mean
+copying the pair unchanged. If the target's slots are
+not a prefix of the original view, the witness pointer
+must change. Some implementations reuse an appropriate
+prefix; others store a superinterface witness explicitly.
+Adapt the data pointer too if the target witness expects
+another view. The witness and pointer form an invariant
+together. Do not update one before writing it to a
+shared container if a reader could observe the mismatch.
+
+\begin{verbatim}
+thermometer as Readable<Int>:
+    witness R0: slot 0 = read_thermometer
+thermometer as Calibrated:
+    witness C0: slot 0 = calibrate_thermometer
+call Calibrated slot 0 with R0:
+    not a representable well-typed operation
+\end{verbatim}
+
+Construct a heterogeneous sequence containing a simulated
+sensor and a thermometer. Compare the output from erased
+reads with direct calls and verify their adapters receive
+the intended concrete addresses. Add a type with the
+same-sized representation and deliberately different
+read behavior. A deduplicator cannot collapse the two
+witnesses merely because the allocations are equal in
+size. A default interface implementation may itself
+need the witness to call another requirement; passing
+evidence onward ensures that a concrete override is used.
+
+In a dictionary-passing generic, the same conformance
+information can arrive in a hidden argument while the
+value retains a non-erased static type. A witness table
+and a trait object are not synonyms: one is evidence,
+while the other packages evidence with data and a
+lifetime or ownership contract. Test an owned form by
+destroying it after the last call and observing the
+concrete destructor exactly once. Test the borrowed form
+by transferring the pair between functions but rejecting
+its use after the borrow ends.
+
+\section{Pass the Witness Into Shared Default Code}
+
+Now extend \texttt{Readable} with a default \texttt{readTwice}.
+It calls \texttt{read} twice and combines the results.
+Suppose the thermometer produces a reading from stored
+state, while a simulated sensor advances a deterministic
+sequence on each read. The default body can be generated
+once using erased operands and a self-witness, or it can be
+specialized for each conformance. It cannot call
+\texttt{thermometer\_read} in shared code merely because
+that was the first conformance loaded. The fixed output
+type lets the same body combine the results regardless
+of where the readings came from.
+
+\begin{verbatim}
+shared_read_twice(data, self_witness, meter):
+    read := self_witness.methods[READ_SLOT]
+    first := read(data, meter)
+    second := read(data, meter)
+    return (first, second)
+
+thermometer_default(data, meter):
+    return shared_read_twice(data, Thermometer_Readable, meter)
+
+simulator_default(data, meter):
+    return shared_read_twice(data, Simulator_Readable, meter)
+\end{verbatim}
+
+Those two default adapters have the same entry ABI as an
+override. If only the simulator supplies an explicit override
+of \texttt{readTwice}, replace its default adapter with its
+own callable entry, without touching its \texttt{read}
+slot. The operation ID lives in the interface contract; the
+choice of default or concrete code lives in the conformance.
+Calling shared default code can itself perform another
+dispatch, so an optimizer that folds the outer call must
+separately establish the target of each inner operation.
+
+As a test, install a \texttt{read} that logs its invocation and
+returns increasing integers. Invoking the shared default
+must log twice, in order, and return two different values.
+Erasing the sensor as a superinterface should still reach
+its concrete read adapter through the new witness view.
+If an erased value crosses a library boundary, verify that
+both parties agree on the witness version and slot
+signature; matching a prefix of method names says nothing
+about associated types or ownership conventions.
+
+A good negative fixture asks to erase two readers whose
+associated outputs differ into the same \texttt{Readable<Int>}
+sequence. Reject the incompatible conversion when the
+witness would be formed, not at the eventual indirect
+call. The caller's return convention must already be known.

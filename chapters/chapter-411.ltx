@@ -1,0 +1,186 @@
+% Source: appel-book-ml-better-typeset.txt
+% Source: intro-to-scheme-and-its-impl.txt
+
+\section{Make a Root a Machine Location}
+
+A precise collector knows exactly which machine locations
+contain references at a point where the program can stop. A
+root census includes interpreter frames, compiled frames,
+globals, and registered native handles. A slot containing a
+reference has two roles in a moving collector: it preserves
+reachability and it receives a replacement address. A census
+that collects pointer values in an ordinary array can preserve
+the first role while failing the second. Walk the original
+locations or define how each collected value is copied back
+before execution resumes.
+
+The map for a compiled function is generally not a bitmap of
+source variables. Register allocation may assign the same stack
+word to a pointer in one part of the function and an integer
+later. A precise map identifies final machine locations, so it
+must reflect register allocation, spill insertion, frame layout,
+and the convention for identifying a stopped frame's program
+counter. For a caller suspended in a callee, the saved return
+address is a useful map key \cite{appel2004modern}. For the
+youngest frame stopped at a poll, the runtime and compiler need
+an equally explicit convention, such as a poll-specific resume
+PC paired with a saved register context.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+At a call & Meaning & Collector action \\
+\hline
+Frame slot 24 & Live base reference & Visit and update \\
+Saved register \(r_4\) & Derived address & Rebuild from updated base \\
+Frame slot 40 & Dead old reference & Do not visit \\
+Saved register \(r_7\) & Integer subtotal & Do not visit \\
+\hline
+\end{tabular}
+\end{center}
+
+\Cref{fig:visual-411} distinguishes selecting the caller's map
+from finding its physical register storage. A callee's spill
+location can hold a caller's callee-saved root. The caller's
+map describes its logical register; unwind information tells
+the walker where the value now resides. The collector must
+update the storage from which the caller will actually resume.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (f) at (0,0) {Callee frame};
+  \node[tome box] (m) at (4.1,1.2) {Caller map};
+  \node[tome box accent] (s) at (4.1,-1.2) {Saved register};
+  \draw[tome arrow] (f) -- node[above,sloped]{return PC} (m);
+  \draw[tome arrow] (f) -- node[below,sloped]{unwind} (s);
+  \draw[tome dashed] (m) -- (s);
+\end{tikzpicture}
+\caption{The return address identifies what is live; unwinding identifies where the live value is stored.}
+\label{fig:visual-411}
+\end{figure}
+
+% Annotated walkthrough
+\section{Repair Derived Addresses After Visiting Bases}
+
+\begin{verbatim}
+enumerate_thread(thread):
+    for frame in unwind(thread.saved_context):
+        map := lookup_map(frame.code, frame.stop_key)
+        for entry in map.base_roots:
+            record_root(resolve(frame, entry))
+        for spec in map.derived_roots:
+            base := resolve(frame, spec.base)
+            derived := resolve(frame, spec.derived)
+            delta := known_or_computed_delta(spec, base, derived)
+            record_derived(base, derived, delta)
+
+repair_roots():
+    for slot in recorded_base_roots:
+        slot.store(relocate_or_keep(slot.load()))
+    for record in recorded_derived_roots:
+        record.derived.store(record.base.load() + record.delta)
+\end{verbatim}
+
+The example assumes a non-null base and valid offset arithmetic,
+and a root list with duplicate storage locations normalized.
+Capture derived offsets before any update. If a vector base
+moves from address 1000 to 4000 and a cursor was 1032, the
+cursor must become 4032. Looking up 1032 as if it were an object
+start is incorrect. Retain the base in machine-level liveness
+even if the cursor is its only future use. An alternative is to
+forbid derived pointers across safepoints and recompute them
+after each pause. That may reduce metadata and simplify the
+collector, but increases recomputation and register pressure.
+Decide before optimizing address calculations across calls.
+
+The maps and unwind data have lifetimes too. Invalidating a JIT
+entry point prevents new calls; it does not eliminate suspended
+frames in the old code. Keep its metadata until all such frames,
+and any suspended continuations referencing that code, have
+drained. A code cache that recycles the same virtual addresses
+needs a version or equivalent synchronization, so a stale PC
+cannot accidentally select the replacement function's map.
+
+\section{Define Where a Thread Can Stop}
+
+In a cooperative design, allocation slow paths, calls that may
+allocate, and loop-backedge polls provide known stop states.
+Without polls a long nonallocating loop can indefinitely delay
+a collection requested by another thread. A poll must not
+advertise a stable context until compiler and runtime agree on
+which registers and frame state are visible. Arbitrarily
+suspending a thread in the middle of an untracked object store
+does not establish that contract. Measure time to reach the
+safepoint separately from time spent performing collection; a
+large handshake delay is not fixed by speeding up marking.
+
+Native transitions need their own rule. A blocking native call
+can be treated as outside managed execution only after publishing
+its handles and relinquishing access to raw movable storage. A
+pin is an alternative when the collector supports pinning, but
+the pin must have both a lifetime and a rooting policy. A
+registered handle that survives one callback is not automatically
+valid after the owning scope closes. If the native code reenters
+managed execution, it participates as a mutator again and
+reloads any movable references through their handles.
+This is the collector-side contract behind the bounded
+pinning scopes and callback contexts in
+\Cref{ch:ext-389,ch:ext-390,ch:ext-391}.
+
+\section{Test Locations After the Backend Changes Them}
+
+Construct a compiled function with a live pointer across one
+call and a scalar across a second call using the same spill
+slot. Force relocation inside both callees. The first must
+rewrite the slot, and the second must leave its integer intact.
+Run another variant in which the only visible use after the
+call is a derived address. Compare slot and register locations
+against a compiler debug dump at each native stop key, and
+exercise a callee-save register spilled more than one frame
+deep. Also force collection during interpreter-to-JIT transitions
+and after JIT invalidation. A missing metadata entry should be
+an explicit diagnostic at the boundary, not a request to fall
+back to guessing which machine words are pointers.
+
+\section{Keep Safepoints Separate From Reconstruction State}
+
+An optimizing compiler can maintain two records at the same
+machine address. A deoptimization record says how to reconstruct
+an interpreter state, perhaps materializing a scalar-replaced
+pair. A stack map says which locations already contain references
+and need updating for collection. Suppose the pair does not
+exist in the heap but its two pointer fields live in registers.
+The stack map lists those registers, not a fictional root for
+the pair. If later deoptimization constructs the pair, it uses
+the updated values. A compact shared format may encode both
+records, but a consumer must still know which parts it needs.
+
+Control flow can make a single return address ambiguous if the
+compiler merges a slow path from two source points. Callers
+can share one machine map only if they present compatible
+root locations to the shared call, for example by performing
+edge moves into canonical spill slots. Filling a union of the
+locations with whatever bytes happen to be there is not a
+precise map. A tagged-value interpreter can test a slot tag,
+but an untagged compiled slot might contain an ordinary integer
+in one predecessor and a pointer in the other.
+
+Exception transfer changes the applicable state. During
+unwinding the runtime should use a known safe state or prevent
+collection during any interval without one. After landing at a
+handler, it cannot keep using the map of the abandoned call.
+A saved exception object may itself be a runtime root before
+the handler has established a managed frame. Test an exception
+raised through compiled and native frames with a collection
+at the permitted transition, not just on normal return.
+
+You can validate maps with an independent interpreter of the
+compiler's location assignments. At each stop key, compare the
+emitted entries against reconstructible live reference values
+and inspect packed tables for signed-offset or register-number
+encoding mistakes. Such comparisons catch structural errors;
+run with simultaneous aliases and move the referenced objects
+to check that the unwinder and entry stubs interpret the
+metadata in the same way as the backend that wrote it.

@@ -1,0 +1,191 @@
+% Source: compilers-alfred-v.-aho-monica-s.-lam-ravi-sethi-etc.--1.txt
+% Source: dickman-thesis-editing-langs.txt
+
+\section{Make a Query Key Name a Computation}
+
+An incremental compiler needs more than a cache of previous
+answers. It needs to know which inputs were observed when
+constructing each answer. Aho and colleagues explain dependency
+graphs over attributes of parse-tree occurrences, with edges
+specifying which attributes supply others \cite{aho2007compilers}.
+Here the graph extends across separately requested compiler
+computations, and an execution discovers its own outgoing
+dependencies. Diekmann's account of context-sensitive subtree
+reuse illustrates why a syntax fragment is not, by itself,
+an adequate key for all its semantic computations.
+
+One possible key is \texttt{TypeOf(module,item,target)}, where
+the item has stable logical identity within the project and
+the target selects target-sensitive rules. Do not put the
+workspace revision in every logical key if the intention is
+to reuse entries across revisions. Keep a revision stamp
+in the entry, or run an invalidation transaction before
+serving a new revision. Inputs such as compiler options,
+source bytes, package configuration, and generated declarations
+must all be explicit fields of keys or observed input queries.
+Ordinary file reads through the host environment bypass the
+dependency graph and let stale results escape.
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Record & Example & Contract \\
+\hline
+Input key & Value export lookup for \texttt{draw} & Version presence or absence \\
+Query key & Type of a particular call & Stable logical computation \\
+Memo payload & Type and diagnostics & Immutable result of a successful run \\
+Forward edge & Type computation reads lookup & Replace after successful evaluation \\
+Reverse edge & Lookup wakes type computation & Mirrors the forward read \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Track Negative and Conditional Reads}
+
+In a toy module system a name lookup first checks a local
+declaration index and then tries imports. Initially the local
+\texttt{draw} entry is absent and the call resolves to an
+import. If an edit adds a local declaration, the previous
+imported declaration has not changed, yet the name now
+resolves differently. Record the absent local entry or an
+explicit version of the index where the lookup occurred.
+Likewise, if a language distinguishes value and type
+namespaces, querying a value should not unnecessarily depend
+on type-only additions. The precision of invalidation is
+bounded by these input keys. A whole-module key can be correct
+but repeatedly wake queries that do not read the changed names.
+
+\Cref{fig:visual-428} shows both observed reads in the
+initial revision. After a local value appears, the query uses
+that value and no longer reads the import. The retired edge
+is almost as important as the installed one: without removing
+it, edits to the import keep causing unrelated recomputations.
+
+% Explanatory visual
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[tome diagram]
+  \node[tome box dark] (ty) at (3.5,2.65) {Type call};
+  \node[tome box accent] (lookup) at (3.5,1.3) {Find \texttt{draw}};
+  \node[tome box] (local) at (0,0) {Local: absent};
+  \node[tome box] (import) at (7,0) {Imported: present};
+  \draw[tome arrow] (ty) -- (lookup);
+  \draw[tome arrow] (lookup) -- (local);
+  \draw[tome arrow] (lookup) -- (import);
+\end{tikzpicture}
+\caption{Arrows mean ``reads from.'' Invalidation travels in the opposite direction, including from a previously absent local entry.}
+\label{fig:visual-428}
+\end{figure}
+
+% Annotated walkthrough
+\section{Start With Dirty Propagation and Demand-Driven Repair}
+
+\begin{verbatim}
+commit_inputs(edits):
+    # No queries run during this transaction.
+    changed := install_input_values(edits)
+    todo := queue_of(changed)
+    seen := set_of(changed)
+    while not todo.empty():
+        key := todo.pop()
+        for user in reverse_reads[key]:
+            memo[user].dirty := true
+            if seen.insert_if_absent(user): todo.push(user)
+
+get(key):
+    if is_input(key): return input_value(key)
+    if key in active: report_query_cycle(active, key)
+    if memo[key] exists and not memo[key].dirty:
+        return memo[key].value
+    reads := empty_set()
+    with active.push_until_exit(key):
+        result := evaluate(key, read = function(dep):
+            value := get(dep)
+            reads.insert(dep)
+            return value)
+    publish_result_and_replace_edges(key, result, reads)
+    return result
+\end{verbatim}
+
+The sketch is single-threaded, uses a stable snapshot for
+the whole evaluation, and treats a cycle as failure rather
+than an ordinary cacheable result. A diagnostic result that
+the query deliberately computes as a normal value can be
+memoized, with its observed reads. The read callback tracks a
+dependency whether the producer was fresh or already cached.
+Publication compares the old and new read sets to update
+reverse edges, installs the new value, and clears dirty.
+Failure leaves the old edge set and dirty status in place.
+If publication involves fallible allocation, reserve space
+or delay replacement until all pieces can be installed.
+
+An active stack cycle tells more than an arbitrary maximal
+component of the old dependency graph. Report the cycle
+along the current request chain. If recursion is legal and
+must produce a least fixed point, specify a separate solver
+for that family of mutually recursive queries. Returning an
+unrelated cached value merely to break the cycle hides a
+semantic choice about recursion. Concurrent evaluation needs
+additional ownership and waiting rules; two threads can
+wait on each other's active entries even when their own
+thread-local stacks contain no repeated key.
+
+\section{Do Not Confuse a Verified Result With a Changed Result}
+
+The sketch deliberately dirties the whole reverse cone and
+does not stop downstream reruns when a result turns out
+equal. A later refinement can track both the last revision
+verified and the last revision changed. For example, a
+comment edit can change a parse result but leave exported
+types equal; downstream type checks need only the latter.
+This optimization requires a definition of equality that
+covers every observable field of the shared result, including
+diagnostic ranges if those are in the value. A useful design
+separates semantic payloads from revision-specific diagnostic
+projection so unchanged payloads can feed new ranges.
+Do not conflate the two stamps or certify downstream entries
+before their required dependencies are verified.
+
+Use a fresh build as the test oracle after each edit. Test
+the failed-local lookup becoming successful, a subsequent
+import edit that should not dirty the new result, and removal
+of the local entry to restore import lookup. Cancel evaluation
+midway through recording reads and ensure the result was
+not marked clean. Track invalidation cone sizes, nodes
+actually requested, equal recomputed payloads, and memory
+retained by old keys or abandoned snapshots. For a large
+project it can be cheaper to evict a coherent set of memos
+and rebuild them than to retain a graph no current editor
+view will request, but eviction must not make a dependent
+look clean after the only invalidation edge is discarded.
+
+\section{Choose What Eviction Promises to Existing Readers}
+
+Consider evicting the result of \texttt{Find(draw)} while
+its consumer \texttt{TypeCall} is still clean. Removing the
+producer's outgoing edges completely now breaks the path
+from the missing local declaration to \texttt{TypeCall}.
+There are two useful answers. Keep a compact dependency
+tombstone for the producer even after discarding its value,
+and propagate dirtiness through that entry just as through
+a full memo. Or mark and evict the producer and mark its
+reverse cone dirty while the old edges are still available.
+Discarding both value and edges without doing either creates
+a stale cache no matter how good the query keys are.
+
+For a tombstone implementation, distinguish ``no value but
+edges known'' from ``no entry.'' A demanded former producer
+recomputes and installs both its new answer and its exact
+read set. The tombstone has a maintenance cost; if it
+retains whole ASTs indirectly through keys, it fails as a
+memory optimization. Track retained bytes of read lists
+and key metadata, not just values removed.
+
+Test an edit sequence that evicts the lookup before a local
+\texttt{draw} is added, then requests only \texttt{TypeCall}.
+The type must follow the new local declaration. Follow with
+a request for an unrelated function whose dependencies
+are still intact to ensure the strategy didn't silently
+disable memoization. Large-cone invalidation and compact
+tombstones offer different time and space tradeoffs; test
+both edit latency and the latency of the first later query.
